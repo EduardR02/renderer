@@ -1,14 +1,17 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
@@ -40,6 +43,58 @@ class TaskQueue {
   std::atomic<bool> stop_{false};
 };
 
+// A fetched track list (playlist or album) plus the playlist snapshot id used
+// for edits; albums leave snapshot_id empty.
+struct CachedTrackList {
+  std::vector<TrackRef> tracks;
+  std::string snapshot_id;
+};
+
+// Bounded LRU cache of fetched track lists keyed by resource id ("p:"+id for
+// playlists, "a:"+id for albums). Entries stay fresh for ttl after insertion;
+// stale entries are dropped on access. UI thread only.
+class TrackListCache {
+ public:
+  using Clock = std::chrono::steady_clock;
+  using TimePoint = Clock::time_point;
+  using NowFn = std::function<TimePoint()>;
+
+  explicit TrackListCache(size_t capacity = 20,
+                          Clock::duration ttl = std::chrono::minutes(10),
+                          NowFn now = [] { return Clock::now(); });
+
+  // Copies a fresh entry into out and marks it most recently used. Returns
+  // false when the key is absent or stale (a stale entry is evicted).
+  bool Get(const std::string& key, CachedTrackList* out);
+  void Put(const std::string& key, CachedTrackList value);
+  void Invalidate(const std::string& key);
+  void Clear();
+  size_t Size() const;
+
+ private:
+  struct Entry {
+    CachedTrackList value;
+    TimePoint fetched;
+  };
+
+  size_t capacity_;
+  Clock::duration ttl_;
+  NowFn now_;
+  // Front is the most recently used entry.
+  std::list<std::pair<std::string, Entry>> order_;
+  std::unordered_map<std::string,
+                     std::list<std::pair<std::string, Entry>>::iterator>
+      index_;
+};
+
+// True when an HTTP error on playlist content is the known Spotify
+// development-mode restriction: development-mode apps receive 403 for
+// playlists owned by accounts that are not on the app's dashboard allowlist
+// (Settings > Users and Access); extended quota mode lifts the restriction.
+bool IsDevModePlaylistRestriction(int status, const std::string& ownerId,
+                                  const std::string& meId);
+
+
 struct RunOptions {
   bool smoke = false;
   int smokeSeconds = 6;
@@ -47,7 +102,25 @@ struct RunOptions {
   std::wstring isolationTestRoot;
 };
 
-enum class MiddleMode { Queue, Playlist, ArtistAlbums, AlbumTracks };
+// Projects a playback position forward between engine state events. The engine
+// emits state on transitions and a 2-second heartbeat while playing; the UI
+// timer renders the projected position so the seek bar moves smoothly without
+// polling. While paused (or with an unknown duration) the position is static.
+class PositionProjector {
+ public:
+  // Records a new base: an authoritative engine event, a control intent, or a
+  // seek release. While playing, Current() advances from this base.
+  void Reset(int64_t positionMs, bool playing, ULONGLONG nowTick);
+  // Projected position in milliseconds, clamped to [0, durationMs].
+  int64_t Current(ULONGLONG nowTick, int64_t durationMs) const;
+
+ private:
+  int64_t base_position_ms_ = 0;
+  ULONGLONG base_tick_ = 0;
+  bool playing_ = false;
+};
+
+enum class MiddleMode { Queue, Playlist, ArtistTracks, AlbumTracks };
 
 class Application {
  public:
@@ -87,6 +160,8 @@ class Application {
   void OnCycleRepeat();
 
   void OnRefreshAll();
+  // Recomputes engine audio-cache usage and publishes it to the Settings page.
+  void OnSettingsShown();
   void OnTrayShow();
   void OnTrayCommand(UINT id);
   void OnTimer(UINT id);
@@ -113,9 +188,13 @@ class Application {
   bool EngineReady();
   void OnEngineState(PlaybackEngineState state);
   void OnEngineError(std::string error);
+  void OnEngineCommandError(std::string error);
+  void ResetProjectionBase();
   void RefreshQueue();
-  void RefreshPlaylists();
+  void RefreshPlaylists(bool force = false);
   void RequestPlaylistTracks(const std::string& id);
+  void ShowPlaylistTracks(const std::string& id, const CachedTrackList& cached);
+  void OpenAlbumTracks(const AlbumRef& album);
   void EnsureCover(const std::string& url);
   void RequestCoverFile(const std::string& url, bool nowPlaying);
   void UpdatePlaybackUi();
@@ -135,6 +214,7 @@ class Application {
   std::unique_ptr<SpotifyApi> api_;
   PlaybackEngineClient engine_;
   PlaybackEngineState playback_;
+  PositionProjector projector_;
   MainWindow window_;
   TrayIcon tray_;
   TaskQueue api_tasks_;
@@ -150,8 +230,10 @@ class Application {
   std::string last_cover_url_;
   std::string current_playlist_id_;
   std::string current_playlist_snapshot_;
-  std::wstring current_artist_name_;
   MiddleMode middle_mode_ = MiddleMode::Queue;
+  TrackListCache track_cache_;
+  std::optional<std::chrono::steady_clock::time_point> playlists_fetched_at_;
+  AlbumRef current_album_;
   RunOptions options_;
 
   template <typename T>

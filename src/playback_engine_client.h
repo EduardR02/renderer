@@ -53,6 +53,10 @@ class PlaybackEngineClient {
  public:
   using StateCallback = std::function<void(PlaybackEngineState)>;
   using ErrorCallback = std::function<void(std::string)>;
+  // A command was rejected by the engine (response ok=false). Transport-level
+  // failures keep flowing through ErrorCallback; only rejected commands use
+  // this callback so the app can reconcile its optimistic UI state.
+  using CommandErrorCallback = std::function<void(std::string)>;
 
   PlaybackEngineClient() = default;
   ~PlaybackEngineClient();
@@ -61,7 +65,8 @@ class PlaybackEngineClient {
 
   bool Start(const std::wstring& executable, const std::wstring& stateDirectory,
              const std::wstring& diagnosticLog, StateCallback onState,
-             ErrorCallback onError, std::string* error = nullptr);
+             ErrorCallback onError, CommandErrorCallback onCommandError,
+             std::string* error = nullptr);
   void Shutdown();
   bool Running() const;
 
@@ -97,6 +102,7 @@ class PlaybackEngineClient {
   std::mutex callback_mutex_;
   StateCallback on_state_;
   ErrorCallback on_error_;
+  CommandErrorCallback on_command_error_;
   std::atomic<uint64_t> next_request_id_{1};
   std::atomic<bool> stopping_{false};
 };

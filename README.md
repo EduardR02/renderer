@@ -13,7 +13,7 @@ Playback authentication and Web API authentication are intentionally separate. W
 
 ## Playback
 
-The local engine uses librespot 0.8.0 and sends 320 kbps Ogg Vorbis audio through WASAPI. The native UI sends newline-delimited JSON over redirected anonymous stdin/stdout pipes. The engine owns the queue and publishes immediate state changes plus position updates every 250 ms while playing.
+The local engine uses librespot 0.8.0 and sends 320 kbps Ogg Vorbis audio through WASAPI. The native UI sends newline-delimited JSON over redirected anonymous stdin/stdout pipes. The engine owns the queue and publishes immediate state changes plus a position heartbeat every two seconds while playing.
 
 The UI supports:
 

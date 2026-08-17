@@ -25,6 +25,16 @@ std::wstring LogFile();
 std::wstring CoverDir();
 std::wstring CoverFile(const std::string& cacheName);
 
+// The engine's audio cache directory (engine state dir + "audio"; matches the
+// path the engine builds in create_state).
+std::wstring EngineAudioCacheDir();
+// Matches the engine's hard-coded AUDIO_CACHE_LIMIT_BYTES.
+inline constexpr uint64_t kAudioCacheLimitBytes =
+    static_cast<uint64_t>(1024) * 1024 * 1024;
+// Recursively sums regular-file sizes under dir, never following reparse
+// points. Returns 0 for a missing/unreadable dir or one outside the root.
+uint64_t SumFileBytesUnderDir(const std::wstring& dir);
+
 bool EnsureDirs();
 // Rejects roots/directories redirected through junctions, symlinks, or other
 // reparse points.

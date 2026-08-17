@@ -17,6 +17,8 @@ namespace sr {
 namespace {
 
 constexpr UINT kSmokeTimer = 1;
+// Drives local position projection between engine state events (4 Hz).
+constexpr UINT kPositionTimer = 2;
 
 
 std::pair<std::string, std::string> SplitOrigin(const std::string& url) {
@@ -35,6 +37,25 @@ void ApplyAlbumMetadata(std::vector<TrackRef>& tracks, const AlbumRef& album) {
     if (track.cover_url.empty()) track.cover_url = album.cover_url;
   }
 }
+
+}  // namespace
+
+void PositionProjector::Reset(int64_t positionMs, bool playing,
+                              ULONGLONG nowTick) {
+  base_position_ms_ = positionMs;
+  playing_ = playing;
+  base_tick_ = nowTick;
+}
+
+int64_t PositionProjector::Current(ULONGLONG nowTick,
+                                   int64_t durationMs) const {
+  if (!playing_ || durationMs <= 0) return base_position_ms_;
+  const int64_t elapsed =
+      nowTick >= base_tick_ ? static_cast<int64_t>(nowTick - base_tick_) : 0;
+  return std::clamp<int64_t>(base_position_ms_ + elapsed, 0, durationMs);
+}
+
+namespace {
 
 bool SameQueue(const std::vector<TrackRef>& left,
                const std::vector<TrackRef>& right) {
@@ -91,6 +112,79 @@ void TaskQueue::Post(std::function<void()> task) {
     tasks_.push_back(std::move(task));
   }
   wake_.notify_one();
+}
+
+namespace {
+
+constexpr std::chrono::minutes kPlaylistListTtl(10);
+
+std::wstring FormatByteSize(uint64_t bytes) {
+  constexpr uint64_t kMiB = 1024ull * 1024;
+  constexpr uint64_t kGiB = 1024ull * kMiB;
+  if (bytes >= kGiB) {
+    const uint64_t whole = bytes / kGiB;
+    const uint64_t frac = (bytes % kGiB) * 100 / kGiB;
+    const std::wstring padded = frac < 10 ? L"0" + std::to_wstring(frac)
+                                          : std::to_wstring(frac);
+    return std::to_wstring(whole) + L"." + padded + L" GB";
+  }
+  return std::to_wstring(bytes / kMiB) + L" MB";
+}
+
+std::wstring CacheUsageText(uint64_t bytes) {
+  return L"Audio: Ogg Vorbis 320 kbps  ·  WASAPI  ·  cache " +
+         FormatByteSize(bytes) + L" / 1 GiB";
+}
+
+}  // namespace
+
+TrackListCache::TrackListCache(size_t capacity, Clock::duration ttl, NowFn now)
+    : capacity_(std::max<size_t>(capacity, 1)),
+      ttl_(ttl),
+      now_(std::move(now)) {}
+
+bool TrackListCache::Get(const std::string& key, CachedTrackList* out) {
+  auto found = index_.find(key);
+  if (found == index_.end()) return false;
+  auto it = found->second;
+  if (now_() - it->second.fetched >= ttl_) {
+    order_.erase(it);
+    index_.erase(found);
+    return false;
+  }
+  order_.splice(order_.begin(), order_, it);
+  if (out) *out = it->second.value;
+  return true;
+}
+
+void TrackListCache::Put(const std::string& key, CachedTrackList value) {
+  auto found = index_.find(key);
+  if (found != index_.end()) order_.erase(found->second);
+  order_.emplace_front(key, Entry{std::move(value), now_()});
+  index_[key] = order_.begin();
+  while (order_.size() > capacity_) {
+    index_.erase(order_.back().first);
+    order_.pop_back();
+  }
+}
+
+void TrackListCache::Invalidate(const std::string& key) {
+  auto found = index_.find(key);
+  if (found == index_.end()) return;
+  order_.erase(found->second);
+  index_.erase(found);
+}
+
+void TrackListCache::Clear() {
+  order_.clear();
+  index_.clear();
+}
+
+size_t TrackListCache::Size() const { return order_.size(); }
+
+bool IsDevModePlaylistRestriction(int status, const std::string& ownerId,
+                                  const std::string& meId) {
+  return status == 403 && !ownerId.empty() && !meId.empty() && ownerId != meId;
 }
 
 Application::~Application() { Shutdown(); }
@@ -182,6 +276,11 @@ void Application::StartEngine() {
               OnEngineError(std::move(message));
             });
           },
+          [this](std::string message) {
+            PostUi([this, message = std::move(message)]() mutable {
+              OnEngineCommandError(std::move(message));
+            });
+          },
           &error)) {
     playback_.ready = false;
     playback_.auth_state = EngineAuthState::Error;
@@ -220,13 +319,17 @@ void Application::Shutdown() {
 }
 
 void Application::StartTimers() {
-  if (hwnd_ && options_.smoke)
+  if (!hwnd_) return;
+  if (options_.smoke)
     ::SetTimer(hwnd_, kSmokeTimer, std::max(1, options_.smokeSeconds) * 1000,
                nullptr);
+  ::SetTimer(hwnd_, kPositionTimer, 250, nullptr);
 }
 
 void Application::StopTimers() {
-  if (hwnd_) ::KillTimer(hwnd_, kSmokeTimer);
+  if (!hwnd_) return;
+  ::KillTimer(hwnd_, kSmokeTimer);
+  ::KillTimer(hwnd_, kPositionTimer);
 }
 
 bool Application::IsAuthed() const {
@@ -421,6 +524,8 @@ void Application::ClearTokens() {
 void Application::HandleApiError(const std::string& message, int status,
                                  int retryAfter,
                                  const std::wstring& context) {
+  LOG_ERROR(WideToUtf8(context) + ": " + message +
+            (status ? " (HTTP " + std::to_string(status) + ")" : ""));
   if (status == 401) {
     ClearTokens();
     window_.SetSetupMode(true);
@@ -459,30 +564,17 @@ void Application::OnSearchActivate(int item) {
   if (kinds[item] == 0 && index < result.tracks.size()) {
     PlayTracks(result.tracks, static_cast<int>(index));
   } else if (kinds[item] == 1 && index < result.albums.size()) {
-    AlbumRef album = result.albums[index];
-    PostTask<std::vector<TrackRef>>(
-        [this, id = album.id] { return api_->GetAlbumTracks(id); },
-        [this, album](std::vector<TrackRef> tracks) {
-          ApplyAlbumMetadata(tracks, album);
-          middle_mode_ = MiddleMode::AlbumTracks;
-          window_.SetMiddleLabel(Utf8ToWide(album.name));
-          window_.SetMiddleTracks(tracks);
-        },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Album");
-        });
+    OpenAlbumTracks(result.albums[index]);
   } else if (kinds[item] == 2 && index < result.artists.size()) {
-    ArtistRef artist = result.artists[index];
-    current_artist_name_ = Utf8ToWide(artist.name);
-    PostTask<std::vector<AlbumRef>>(
-        [this, id = artist.id] { return api_->GetArtistAlbums(id); },
-        [this](std::vector<AlbumRef> albums) {
-          middle_mode_ = MiddleMode::ArtistAlbums;
-          window_.SetMiddleLabel(current_artist_name_ + L" — albums");
-          window_.SetMiddleAlbums(albums);
+    const ArtistRef artist = result.artists[index];
+    PostTask<std::vector<TrackRef>>(
+        [this, id = artist.id] { return api_->GetArtistTopTracks(id); },
+        [this, artist](std::vector<TrackRef> tracks) {
+          middle_mode_ = MiddleMode::ArtistTracks;
+          window_.SetArtistPage(artist, tracks);
         },
         [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Artist albums");
+          HandleApiError(message, status, retry, L"Artist top tracks");
         });
   }
 }
@@ -514,32 +606,22 @@ void Application::OnSearchContext(UINT command, int item) {
     RefreshQueue();
     RunEngineCommand([this, track] { engine_.AddQueue(track); }, L"Add to queue");
   } else if (command == IDM_CTX_OPEN_ALBUM && !track.album_id.empty()) {
-    AlbumRef album{track.album_id, "spotify:album:" + track.album_id,
-                   track.album_name, track.artist_names, track.cover_url};
-    PostTask<std::vector<TrackRef>>(
-        [this, id = album.id] { return api_->GetAlbumTracks(id); },
-        [this, album](std::vector<TrackRef> tracks) {
-          ApplyAlbumMetadata(tracks, album);
-          middle_mode_ = MiddleMode::AlbumTracks;
-          window_.SetMiddleLabel(Utf8ToWide(album.name));
-          window_.SetMiddleTracks(tracks);
-        },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Album tracks");
-        });
+    OpenAlbumTracks(AlbumRef{track.album_id, "spotify:album:" + track.album_id,
+                             track.album_name, track.artist_names,
+                             track.cover_url});
   } else if (command == IDM_CTX_ARTIST_ALBUMS && !track.artist_id.empty()) {
-    current_artist_name_ = track.artist_names.empty()
-                               ? L"Artist"
-                               : Utf8ToWide(track.artist_names.front());
-    PostTask<std::vector<AlbumRef>>(
-        [this, id = track.artist_id] { return api_->GetArtistAlbums(id); },
-        [this](std::vector<AlbumRef> albums) {
-          middle_mode_ = MiddleMode::ArtistAlbums;
-          window_.SetMiddleLabel(current_artist_name_ + L" — albums");
-          window_.SetMiddleAlbums(albums);
+    ArtistRef artist{track.artist_id, "spotify:artist:" + track.artist_id,
+                     track.artist_names.empty() ? std::string{}
+                                                : track.artist_names.front(),
+                     track.cover_url};
+    PostTask<std::vector<TrackRef>>(
+        [this, id = artist.id] { return api_->GetArtistTopTracks(id); },
+        [this, artist](std::vector<TrackRef> tracks) {
+          middle_mode_ = MiddleMode::ArtistTracks;
+          window_.SetArtistPage(artist, tracks);
         },
         [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Artist albums");
+          HandleApiError(message, status, retry, L"Artist top tracks");
         });
   }
 }
@@ -562,7 +644,10 @@ void Application::OnAddToPlaylist(int playlistIndex) {
         api_->AddTracksToPlaylist(playlist, {uri});
         return true;
       },
-      [this](bool) { window_.SetStatus(L"Added to playlist"); },
+      [this, playlist](bool) {
+        track_cache_.Invalidate("p:" + playlist);
+        window_.SetStatus(L"Added to playlist");
+      },
       [this](std::string message, int status, int retry) {
         HandleApiError(message, status, retry, L"Add to playlist");
       });
@@ -581,34 +666,12 @@ void Application::OnMiddleCombo(int index) {
 }
 
 void Application::OnMiddleActivate(int index) {
-  if (middle_mode_ == MiddleMode::ArtistAlbums) {
-    const auto& albums = window_.middleAlbums();
-    if (index < 0 || static_cast<size_t>(index) >= albums.size()) return;
-    AlbumRef album = albums[index];
-    PostTask<std::vector<TrackRef>>(
-        [this, id = album.id] { return api_->GetAlbumTracks(id); },
-        [this, album](std::vector<TrackRef> tracks) {
-          ApplyAlbumMetadata(tracks, album);
-          middle_mode_ = MiddleMode::AlbumTracks;
-          window_.SetMiddleLabel(Utf8ToWide(album.name));
-          window_.SetMiddleTracks(tracks);
-        },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Album tracks");
-        });
-    return;
-  }
   const auto& tracks = window_.middleTracks();
   if (index < 0 || static_cast<size_t>(index) >= tracks.size()) return;
   PlayTracks(tracks, index);
 }
 
 void Application::OnMiddleContext(UINT command, int index) {
-  if (command == IDM_CTX_PLAY_MIDDLE &&
-      middle_mode_ == MiddleMode::ArtistAlbums) {
-    OnMiddleActivate(index);
-    return;
-  }
   const auto& tracks = window_.middleTracks();
   if (index < 0 || static_cast<size_t>(index) >= tracks.size()) return;
   const TrackRef track = tracks[index];
@@ -671,32 +734,22 @@ void Application::OnMiddleContext(UINT command, int index) {
         [this, index, destination] { engine_.MoveQueue(index, destination); },
         L"Move queue item");
   } else if (command == IDM_CTX_OPEN_ALBUM && !track.album_id.empty()) {
-    AlbumRef album{track.album_id, "spotify:album:" + track.album_id,
-                   track.album_name, track.artist_names, track.cover_url};
-    PostTask<std::vector<TrackRef>>(
-        [this, id = album.id] { return api_->GetAlbumTracks(id); },
-        [this, album](std::vector<TrackRef> albumTracks) {
-          ApplyAlbumMetadata(albumTracks, album);
-          middle_mode_ = MiddleMode::AlbumTracks;
-          window_.SetMiddleLabel(Utf8ToWide(album.name));
-          window_.SetMiddleTracks(albumTracks);
-        },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Album tracks");
-        });
+    OpenAlbumTracks(AlbumRef{track.album_id, "spotify:album:" + track.album_id,
+                             track.album_name, track.artist_names,
+                             track.cover_url});
   } else if (command == IDM_CTX_ARTIST_ALBUMS && !track.artist_id.empty()) {
-    current_artist_name_ = track.artist_names.empty()
-                               ? L"Artist"
-                               : Utf8ToWide(track.artist_names.front());
-    PostTask<std::vector<AlbumRef>>(
-        [this, id = track.artist_id] { return api_->GetArtistAlbums(id); },
-        [this](std::vector<AlbumRef> albums) {
-          middle_mode_ = MiddleMode::ArtistAlbums;
-          window_.SetMiddleLabel(current_artist_name_ + L" — albums");
-          window_.SetMiddleAlbums(albums);
+    ArtistRef artist{track.artist_id, "spotify:artist:" + track.artist_id,
+                     track.artist_names.empty() ? std::string{}
+                                                : track.artist_names.front(),
+                     track.cover_url};
+    PostTask<std::vector<TrackRef>>(
+        [this, id = artist.id] { return api_->GetArtistTopTracks(id); },
+        [this, artist](std::vector<TrackRef> tracks) {
+          middle_mode_ = MiddleMode::ArtistTracks;
+          window_.SetArtistPage(artist, tracks);
         },
         [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Artist albums");
+          HandleApiError(message, status, retry, L"Artist top tracks");
         });
   } else if (middle_mode_ == MiddleMode::Playlist &&
              command == IDM_CTX_MIDDLE_REMOVE) {
@@ -706,7 +759,10 @@ void Application::OnMiddleContext(UINT command, int index) {
                                          current_playlist_snapshot_);
           return true;
         },
-        [this](bool) { RequestPlaylistTracks(current_playlist_id_); },
+        [this](bool) {
+          track_cache_.Invalidate("p:" + current_playlist_id_);
+          RequestPlaylistTracks(current_playlist_id_);
+        },
         [this](std::string message, int status, int retry) {
           HandleApiError(message, status, retry, L"Remove track");
         });
@@ -721,7 +777,10 @@ void Application::OnMiddleContext(UINT command, int index) {
                                       1, current_playlist_snapshot_);
           return true;
         },
-        [this](bool) { RequestPlaylistTracks(current_playlist_id_); },
+        [this](bool) {
+          track_cache_.Invalidate("p:" + current_playlist_id_);
+          RequestPlaylistTracks(current_playlist_id_);
+        },
         [this](std::string message, int status, int retry) {
           HandleApiError(message, status, retry, L"Reorder playlist");
         });
@@ -743,7 +802,7 @@ void Application::OnNewPlaylist() {
         if (me_id_.empty()) me_id_ = api_->GetMeId();
         return api_->CreatePlaylist(me_id_, value);
       },
-      [this](PlaylistRef) { RefreshPlaylists(); },
+      [this](PlaylistRef) { RefreshPlaylists(true); },
       [this](std::string message, int status, int retry) {
         HandleApiError(message, status, retry, L"Create playlist");
       });
@@ -760,7 +819,7 @@ void Application::OnRenamePlaylist() {
         api_->RenamePlaylist(id, value);
         return true;
       },
-      [this](bool) { RefreshPlaylists(); },
+      [this](bool) { RefreshPlaylists(true); },
       [this](std::string message, int status, int retry) {
         HandleApiError(message, status, retry, L"Rename playlist");
       });
@@ -777,9 +836,10 @@ void Application::OnDeletePlaylist() {
         api_->DeletePlaylist(id);
         return true;
       },
-      [this](bool) {
+      [this, id = playlists_[index].id](bool) {
+        track_cache_.Invalidate("p:" + id);
         middle_mode_ = MiddleMode::Queue;
-        RefreshPlaylists();
+        RefreshPlaylists(true);
         RefreshQueue();
       },
       [this](std::string message, int status, int retry) {
@@ -797,6 +857,7 @@ void Application::PlayTracks(const std::vector<TrackRef>& tracks, int index) {
   playback_.duration_ms = std::max(0, tracks[index].duration_ms);
   playback_.position_ms = 0;
   playback_.playing = true;
+  ResetProjectionBase();
   UpdatePlaybackUi();
   RefreshQueue();
   RunEngineCommand(
@@ -826,6 +887,7 @@ void Application::OnTogglePlay() {
   if (!EngineReady()) return;
   const bool play = !playback_.playing;
   playback_.playing = play;
+  ResetProjectionBase();
   UpdatePlaybackUi();
   RunEngineCommand([this, play] { play ? engine_.Play() : engine_.Pause(); },
                    play ? L"Play" : L"Pause");
@@ -841,6 +903,7 @@ void Application::OnNext() {
     playback_.duration_ms =
         playback_.queue[playback_.current_index].duration_ms;
     playback_.playing = true;
+    ResetProjectionBase();
     UpdatePlaybackUi();
   }
   RunEngineCommand([this] { engine_.Next(); }, L"Next");
@@ -850,6 +913,7 @@ void Application::OnPrevious() {
   if (!EngineReady()) return;
   if (playback_.position_ms > 3000) {
     playback_.position_ms = 0;
+    ResetProjectionBase();
     UpdatePlaybackUi();
   } else if (!playback_.shuffle && playback_.current_index > 0) {
     --playback_.current_index;
@@ -858,6 +922,7 @@ void Application::OnPrevious() {
     playback_.duration_ms =
         playback_.queue[playback_.current_index].duration_ms;
     playback_.playing = true;
+    ResetProjectionBase();
     UpdatePlaybackUi();
   }
   RunEngineCommand([this] { engine_.Previous(); }, L"Previous");
@@ -867,6 +932,7 @@ void Application::OnSeekTo(int positionMs) {
   if (!EngineReady()) return;
   playback_.position_ms =
       std::clamp<int64_t>(positionMs, 0, playback_.duration_ms);
+  ResetProjectionBase();
   UpdatePlaybackUi();
   RunEngineCommand([this, positionMs] { engine_.Seek(positionMs); }, L"Seek");
 }
@@ -905,6 +971,7 @@ void Application::OnEngineState(PlaybackEngineState state) {
       playback_.auth_state != state.auth_state ||
       playback_.error != state.error;
   playback_ = std::move(state);
+  ResetProjectionBase();
   UpdatePlaybackUi();
   if (queueChanged) RefreshQueue();
   if (statusChanged) {
@@ -921,11 +988,26 @@ void Application::OnEngineState(PlaybackEngineState state) {
   }
 }
 
+void Application::OnEngineCommandError(std::string error) {
+  window_.SetStatus(L"Playback command failed: " + Utf8ToWide(error));
+  // Reconcile the optimistic UI state with the engine's actual state.
+  try {
+    engine_.Status();
+  } catch (const std::exception&) {
+  }
+}
+
+void Application::ResetProjectionBase() {
+  projector_.Reset(playback_.position_ms, playback_.playing,
+                   ::GetTickCount64());
+}
+
 void Application::OnEngineError(std::string error) {
   LOG_ERROR("playback engine: " + error);
   playback_.ready = false;
   playback_.auth_state = EngineAuthState::Error;
   playback_.error = std::move(error);
+  projector_.Reset(playback_.position_ms, false, ::GetTickCount64());
   UpdatePlaybackUi();
   window_.SetEngineStatus(EngineStatusText());
   window_.SetStatus(L"Playback engine: " + Utf8ToWide(playback_.error));
@@ -937,12 +1019,28 @@ void Application::RefreshQueue() {
   window_.SetQueueTracks(playback_.queue);
 }
 
-void Application::RefreshPlaylists() {
+void Application::RefreshPlaylists(bool force) {
   if (!IsAuthed()) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (!force && playlists_fetched_at_.has_value() && !playlists_.empty() &&
+      now - *playlists_fetched_at_ < kPlaylistListTtl) {
+    window_.SetPlaylists(playlists_);
+    return;
+  }
   PostTask<std::vector<PlaylistRef>>(
-      [this] { return api_->GetMyPlaylists(); },
+      [this] {
+        if (me_id_.empty()) {
+          try {
+            me_id_ = api_->GetMeId();
+          } catch (const ApiError& error) {
+            LOG_WARN(std::string("could not load account id: ") + error.what());
+          }
+        }
+        return api_->GetMyPlaylists();
+      },
       [this](std::vector<PlaylistRef> playlists) {
         playlists_ = std::move(playlists);
+        playlists_fetched_at_ = std::chrono::steady_clock::now();
         window_.SetPlaylists(playlists_);
       },
       [this](std::string message, int status, int retry) {
@@ -951,6 +1049,11 @@ void Application::RefreshPlaylists() {
 }
 
 void Application::RequestPlaylistTracks(const std::string& id) {
+  CachedTrackList cached;
+  if (track_cache_.Get("p:" + id, &cached)) {
+    ShowPlaylistTracks(id, cached);
+    return;
+  }
   PostTask<std::pair<std::vector<TrackRef>, std::string>>(
       [this, id] {
         std::string snapshot;
@@ -958,18 +1061,69 @@ void Application::RequestPlaylistTracks(const std::string& id) {
         return std::make_pair(std::move(tracks), std::move(snapshot));
       },
       [this, id](std::pair<std::vector<TrackRef>, std::string> result) {
-        current_playlist_id_ = id;
-        current_playlist_snapshot_ = std::move(result.second);
-        window_.SetMiddleTracks(result.first);
-        const auto found = std::find_if(
-            playlists_.begin(), playlists_.end(),
-            [&id](const PlaylistRef& playlist) { return playlist.id == id; });
-        window_.SetMiddleLabel(found == playlists_.end()
-                                   ? L"Playlist"
-                                   : Utf8ToWide(found->name));
+        CachedTrackList cached{std::move(result.first),
+                               std::move(result.second)};
+        ShowPlaylistTracks(id, cached);
+        track_cache_.Put("p:" + id, std::move(cached));
+      },
+      [this, id](std::string message, int status, int retry) {
+        const PlaylistRef* playlist = nullptr;
+        for (const auto& candidate : playlists_)
+          if (candidate.id == id) playlist = &candidate;
+        if (IsDevModePlaylistRestriction(
+                status, playlist ? playlist->owner_id : std::string(),
+                me_id_)) {
+          LOG_WARN(std::string("development-mode 403 for playlist ") + id +
+                   " (owner " + (playlist ? playlist->owner_id : "unknown") +
+                   "): " + message);
+          window_.SetStatus(
+              L"Playlist tracks: Spotify development-mode restriction (HTTP "
+              L"403). This playlist belongs to another account; "
+              L"development-mode apps can only read playlists owned by "
+              L"accounts on the app's allowlist. Add the owner in your "
+              L"Spotify developer dashboard (Settings > Users and Access), or "
+              L"request extended quota mode for the app.");
+          return;
+        }
+        HandleApiError(message, status, retry, L"Playlist tracks");
+      });
+}
+
+void Application::ShowPlaylistTracks(const std::string& id,
+                                     const CachedTrackList& cached) {
+  current_playlist_id_ = id;
+  current_playlist_snapshot_ = cached.snapshot_id;
+  window_.SetMiddleTracks(cached.tracks);
+  const auto found = std::find_if(
+      playlists_.begin(), playlists_.end(),
+      [&id](const PlaylistRef& playlist) { return playlist.id == id; });
+  window_.SetMiddleLabel(found == playlists_.end()
+                             ? L"Playlist"
+                             : Utf8ToWide(found->name));
+}
+
+void Application::OpenAlbumTracks(const AlbumRef& album) {
+  CachedTrackList cached;
+  if (track_cache_.Get("a:" + album.id, &cached)) {
+    current_album_ = album;
+    middle_mode_ = MiddleMode::AlbumTracks;
+    window_.SetMiddleLabel(Utf8ToWide(album.name));
+    window_.SetMiddleTracks(cached.tracks);
+    return;
+  }
+  PostTask<std::vector<TrackRef>>(
+      [this, id = album.id] { return api_->GetAlbumTracks(id); },
+      [this, album](std::vector<TrackRef> tracks) {
+        ApplyAlbumMetadata(tracks, album);
+        CachedTrackList cached{std::move(tracks), {}};
+        current_album_ = album;
+        middle_mode_ = MiddleMode::AlbumTracks;
+        window_.SetMiddleLabel(Utf8ToWide(album.name));
+        window_.SetMiddleTracks(cached.tracks);
+        track_cache_.Put("a:" + album.id, std::move(cached));
       },
       [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Playlist tracks");
+        HandleApiError(message, status, retry, L"Album tracks");
       });
 }
 
@@ -1016,10 +1170,27 @@ void Application::RequestCoverFile(const std::string& url, bool nowPlaying) {
 }
 
 void Application::OnRefreshAll() {
+  // The playlist list is served from cache while fresh (< 10 min); explicit
+  // refresh refetches it only once stale. Track lists always refetch.
   RefreshPlaylists();
+  track_cache_.Clear();
+  if (middle_mode_ == MiddleMode::Playlist && !current_playlist_id_.empty())
+    RequestPlaylistTracks(current_playlist_id_);
+  else if (middle_mode_ == MiddleMode::AlbumTracks && !current_album_.id.empty())
+    OpenAlbumTracks(current_album_);
   RefreshQueue();
   if (engine_.Running())
     RunEngineCommand([this] { engine_.Status(); }, L"Refresh engine status");
+}
+
+void Application::OnSettingsShown() {
+  if (options_.smoke || options_.demo) return;
+  const std::wstring dir = paths::EngineAudioCacheDir();
+  window_.SetCacheUsage(L"Audio: measuring cache usage...");
+  api_tasks_.Post([this, dir] {
+    const uint64_t bytes = paths::SumFileBytesUnderDir(dir);
+    PostUi([this, bytes] { window_.SetCacheUsage(CacheUsageText(bytes)); });
+  });
 }
 
 void Application::UpdatePlaybackUi() {
@@ -1064,7 +1235,17 @@ void Application::OnTrayCommand(UINT id) {
 }
 
 void Application::OnTimer(UINT id) {
-  if (id == kSmokeTimer) ::DestroyWindow(hwnd_);
+  if (id == kSmokeTimer) {
+    ::DestroyWindow(hwnd_);
+    return;
+  }
+  if (id != kPositionTimer) return;
+  const int64_t projected =
+      projector_.Current(::GetTickCount64(), playback_.duration_ms);
+  if (projected != playback_.position_ms) {
+    playback_.position_ms = projected;
+    UpdatePlaybackUi();
+  }
 }
 
 void Application::OnExit() {

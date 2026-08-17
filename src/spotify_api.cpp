@@ -233,6 +233,23 @@ std::vector<AlbumRef> SpotifyApi::GetArtistAlbums(const std::string& artistId) {
   return out;
 }
 
+std::vector<TrackRef> SpotifyApi::GetArtistTopTracks(const std::string& artistId) {
+  HttpResponse r = Authed(
+      "GET", AppendQuery("/v1/artists/" + UrlEncode(artistId) + "/top-tracks",
+                         "market=from_token"));
+  EnsureOk(r, "artist top tracks");
+  std::vector<TrackRef> out;
+  try {
+    json j = json::parse(r.body);
+    if (const json* tracks = JGet(j, "tracks")) {
+      for (const auto& t : *tracks) out.push_back(ParseTrack(t));
+    }
+  } catch (...) {
+    throw ApiError(0, 0, "artist top tracks: malformed response");
+  }
+  return out;
+}
+
 std::vector<TrackRef> SpotifyApi::GetAlbumTracks(const std::string& albumId) {
   HttpResponse r = Authed(
       "GET", AppendQuery("/v1/albums/" + UrlEncode(albumId) + "/tracks", "limit=50"));
@@ -261,31 +278,46 @@ std::string SpotifyApi::GetMeId() {
 }
 
 std::vector<PlaylistRef> SpotifyApi::GetMyPlaylists() {
-  HttpResponse r = Authed("GET", AppendQuery("/v1/me/playlists", "limit=50"));
-  EnsureOk(r, "playlists");
   std::vector<PlaylistRef> out;
-  try {
-    json j = json::parse(r.body);
-    if (const json* items = JGet(j, "items")) {
-      for (const auto& p : *items) {
-        PlaylistRef pl;
-        pl.id = JStr(&p, "id");
-        pl.uri = JStr(&p, "uri");
-        pl.name = JStr(&p, "name");
-        const json* owner = JGet(p, "owner");
-        if (owner) pl.owner = JStr(owner, "display_name");
-        const json* images = JGet(p, "images");
-        if (images && images->is_array() && !images->empty())
-          pl.cover_url = JStr(&images->front(), "url");
-        pl.collaborative = JBool(&p, "collaborative");
-        const json* tracks = JGet(p, "tracks");
-        if (tracks) pl.tracks_total = JInt(tracks, "total");
-        pl.snapshot_id = JStr(&p, "snapshot_id");
-        out.push_back(std::move(pl));
+  std::string path = AppendQuery("/v1/me/playlists", "limit=50");
+  // Follow `next` so users with more than 50 playlists see the whole library;
+  // bounded so a malformed server cannot loop forever.
+  for (int page = 0; page < 8 && !path.empty(); ++page) {
+    HttpResponse r = Authed("GET", path);
+    EnsureOk(r, "playlists");
+    try {
+      json j = json::parse(r.body);
+      if (const json* items = JGet(j, "items")) {
+        for (const auto& p : *items) {
+          PlaylistRef pl;
+          pl.id = JStr(&p, "id");
+          pl.uri = JStr(&p, "uri");
+          pl.name = JStr(&p, "name");
+          const json* owner = JGet(p, "owner");
+          if (owner) {
+            pl.owner = JStr(owner, "display_name");
+            pl.owner_id = JStr(owner, "id");
+          }
+          const json* images = JGet(p, "images");
+          if (images && images->is_array() && !images->empty())
+            pl.cover_url = JStr(&images->front(), "url");
+          pl.collaborative = JBool(&p, "collaborative");
+          const json* tracks = JGet(p, "tracks");
+          if (tracks) pl.tracks_total = JInt(tracks, "total");
+          pl.snapshot_id = JStr(&p, "snapshot_id");
+          out.push_back(std::move(pl));
+        }
       }
+      path.clear();
+      const json* next = JGet(j, "next");
+      if (next && next->is_string() && !next->get<std::string>().empty()) {
+        const std::string nextUrl = next->get<std::string>();
+        const size_t apiPos = nextUrl.find("/v1/");
+        if (apiPos != std::string::npos) path = nextUrl.substr(apiPos);
+      }
+    } catch (...) {
+      throw ApiError(0, 0, "playlists: malformed response");
     }
-  } catch (...) {
-    throw ApiError(0, 0, "playlists: malformed response");
   }
   return out;
 }

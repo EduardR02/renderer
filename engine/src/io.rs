@@ -46,6 +46,40 @@ impl ProtocolWriter {
     }
 }
 
+#[cfg(test)]
+struct CaptureBuffer(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for CaptureBuffer {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("capture buffer lock was poisoned"))?
+            .extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl ProtocolWriter {
+    /// Creates a writer that appends serialized messages to a shared buffer so
+    /// tests can inspect exactly what the engine would emit on stdout.
+    pub fn capture() -> (Self, Arc<Mutex<Vec<u8>>>) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer: Box<dyn Write + Send> = Box::new(CaptureBuffer(Arc::clone(&buffer)));
+        (
+            Self {
+                inner: Arc::new(Mutex::new(BufWriter::new(writer))),
+            },
+            buffer,
+        )
+    }
+}
+
 pub fn spawn_input_reader(sender: mpsc::UnboundedSender<Input>) {
     std::thread::Builder::new()
         .name("protocol-input".to_owned())

@@ -69,6 +69,21 @@ pub async fn authenticate(
     create_playback(session, cache).await
 }
 
+/// Player configuration for the standalone engine.
+///
+/// `position_update_interval` is intentionally left at its `None` default: the
+/// UI projects position locally between engine events, and the engine emits a
+/// single position heartbeat every two seconds while playing. librespot must
+/// not stream 250 ms `PositionChanged` events.
+fn player_config() -> PlayerConfig {
+    PlayerConfig {
+        bitrate: Bitrate::Bitrate320,
+        gapless: true,
+        normalisation: false,
+        ..PlayerConfig::default()
+    }
+}
+
 async fn create_playback(session: Session, cache: Cache) -> Result<PlaybackHandles, String> {
     let mixer = Arc::new(
         SoftMixer::open(MixerConfig::default())
@@ -80,13 +95,7 @@ async fn create_playback(session: Session, cache: Cache) -> Result<PlaybackHandl
     let backend = audio_backend::find(Some("rodio".to_owned()))
         .ok_or_else(|| "the rodio audio backend is not compiled in".to_owned())?;
     let (audio_ready_tx, audio_ready_rx) = std_mpsc::sync_channel(1);
-    let config = PlayerConfig {
-        bitrate: Bitrate::Bitrate320,
-        gapless: true,
-        normalisation: false,
-        position_update_interval: Some(Duration::from_millis(250)),
-        ..PlayerConfig::default()
-    };
+    let config = player_config();
     let player = Player::new(config, session.clone(), mixer.get_soft_volume(), move || {
         let sink = backend(None, AudioFormat::S16);
         let _ = audio_ready_tx.send(());
@@ -126,4 +135,17 @@ pub fn percent_to_volume(percent: u8) -> u16 {
 
 fn volume_to_percent(volume: u16) -> u8 {
     ((u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::player_config;
+
+    #[test]
+    fn player_config_does_not_poll_position() {
+        // Event cadence: the engine emits state on transitions plus a 2 s
+        // position heartbeat while playing. librespot must not be configured
+        // to stream a 250 ms PositionChanged event for the UI to poll.
+        assert!(player_config().position_update_interval.is_none());
+    }
 }

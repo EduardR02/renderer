@@ -13,8 +13,10 @@ use io::{Input, ProtocolWriter};
 use librespot_core::cache::Cache;
 use protocol::{Command, Response};
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 
 const AUDIO_CACHE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+const POSITION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let state_directory = match parse_arguments(std::env::args_os().skip(1).collect()) {
@@ -74,6 +76,9 @@ async fn run(
     engine.start_authentication(auth_sender.clone());
     engine.emit_state()?;
 
+    let mut position_heartbeat = tokio::time::interval(POSITION_HEARTBEAT_INTERVAL);
+    position_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             input = input_receiver.recv() => {
@@ -118,6 +123,11 @@ async fn run(
                     if engine.on_player_signal(signal) {
                         engine.emit_state()?;
                     }
+                }
+            }
+            _ = position_heartbeat.tick() => {
+                if engine.tick_position() {
+                    engine.emit_state()?;
                 }
             }
         }

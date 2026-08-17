@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use librespot_core::SpotifyUri;
 use librespot_core::cache::Cache;
@@ -21,6 +22,7 @@ pub struct Engine {
     mixer: Option<Arc<SoftMixer>>,
     session: Option<librespot_core::Session>,
     play_request_id: Option<u64>,
+    position_anchor: Option<(u32, Instant)>,
     shuffle_pool: Vec<usize>,
     history: Vec<usize>,
     random_state: u64,
@@ -91,6 +93,7 @@ impl Engine {
             mixer: None,
             session: None,
             play_request_id: None,
+            position_anchor: None,
             shuffle_pool: Vec::new(),
             history: Vec::new(),
             random_state,
@@ -124,6 +127,33 @@ impl Engine {
             queue: &self.state.queue,
             error: self.state.error.as_deref(),
         })
+    }
+
+    /// Records an authoritative playback position and re-anchors the drift
+    /// projection at the current wall clock. Called on every player event and
+    /// command that establishes a position (track change, play/pause, seek,
+    /// position correction) so `tick_position` projects from the newest truth.
+    fn update_position(&mut self, position_ms: u32) {
+        self.state.position_ms = position_ms.min(self.state.duration_ms);
+        self.position_anchor = Some((self.state.position_ms, Instant::now()));
+    }
+
+    /// Advances the reported position from the latest anchor and reports
+    /// whether a state event should be emitted. Emits at most once per call;
+    /// while paused the position is static and no event is produced.
+    pub fn tick_position(&mut self) -> bool {
+        if !self.state.playing {
+            return false;
+        }
+        let Some((anchor_position_ms, anchor_time)) = self.position_anchor else {
+            return false;
+        };
+        let elapsed_ms = u32::try_from(anchor_time.elapsed().as_millis())
+            .unwrap_or(u32::MAX);
+        self.state.position_ms = anchor_position_ms
+            .saturating_add(elapsed_ms)
+            .min(self.state.duration_ms);
+        true
     }
 
     pub fn start_authentication(&mut self, sender: mpsc::UnboundedSender<AuthSignal>) {
@@ -324,8 +354,8 @@ impl Engine {
 
         self.state.queue = queue;
         self.state.current_index = Some(index);
-        self.state.position_ms = position_ms.min(self.state.queue[index].duration_ms);
         self.state.duration_ms = self.state.queue[index].duration_ms;
+        self.update_position(position_ms);
         self.state.playing = true;
         self.state.error = None;
         self.history.clear();
@@ -345,6 +375,7 @@ impl Engine {
             self.player()?.play();
         }
         self.state.playing = true;
+        self.update_position(self.state.position_ms);
         self.state.error = None;
         Ok(true)
     }
@@ -355,6 +386,7 @@ impl Engine {
         }
         self.player()?.pause();
         self.state.playing = false;
+        self.update_position(self.state.position_ms);
         self.state.error = None;
         Ok(true)
     }
@@ -365,7 +397,7 @@ impl Engine {
         }
         let position = position_ms.min(self.state.duration_ms);
         self.player()?.seek(position);
-        self.state.position_ms = position;
+        self.update_position(position);
         self.state.error = None;
         Ok(true)
     }
@@ -391,8 +423,8 @@ impl Engine {
                 self.shuffle_pool.push(current);
             }
             self.state.current_index = Some(index);
-            self.state.position_ms = 0;
             self.state.duration_ms = self.state.queue[index].duration_ms;
+            self.update_position(0);
             self.state.error = None;
             let start_playing = self.state.playing;
             self.load_current(start_playing)?;
@@ -414,15 +446,15 @@ impl Engine {
                     self.history.push(current);
                 }
                 self.state.current_index = Some(index);
-                self.state.position_ms = 0;
                 self.state.duration_ms = self.state.queue[index].duration_ms;
+                self.update_position(0);
                 self.state.error = None;
                 self.load_current(true)?;
             }
             None => {
                 self.player()?.stop();
                 self.state.playing = false;
-                self.state.position_ms = self.state.duration_ms;
+                self.update_position(self.state.duration_ms);
             }
         }
         Ok(true)
@@ -487,16 +519,16 @@ impl Engine {
             Some(_) if self.state.queue.is_empty() => {
                 self.player()?.stop();
                 self.state.current_index = None;
-                self.state.position_ms = 0;
                 self.state.duration_ms = 0;
                 self.state.playing = false;
+                self.update_position(0);
                 self.play_request_id = None;
             }
             Some(current) if index == current => {
                 let replacement = current.min(self.state.queue.len() - 1);
                 self.state.current_index = Some(replacement);
-                self.state.position_ms = 0;
                 self.state.duration_ms = self.state.queue[replacement].duration_ms;
+                self.update_position(0);
                 reload = true;
             }
             Some(current) if index < current => self.state.current_index = Some(current - 1),
@@ -619,7 +651,7 @@ impl Engine {
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
                 self.state.playing = true;
-                self.state.position_ms = position_ms;
+                self.update_position(position_ms);
                 self.state.error = None;
                 true
             }
@@ -629,7 +661,7 @@ impl Engine {
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
                 self.state.playing = false;
-                self.state.position_ms = position_ms;
+                self.update_position(position_ms);
                 true
             }
             PlayerEvent::PositionChanged {
@@ -647,7 +679,7 @@ impl Engine {
                 track_id,
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
-                self.state.position_ms = position_ms.min(self.state.duration_ms);
+                self.update_position(position_ms);
                 true
             }
             PlayerEvent::EndOfTrack {
@@ -750,8 +782,155 @@ fn remap_current_index_after_move(current: usize, from: usize, to: usize) -> usi
 
 #[cfg(test)]
 mod tests {
-    use super::{remap_current_index_after_move, sequential_next_index};
-    use crate::protocol::RepeatMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use librespot_core::SpotifyUri;
+    use librespot_playback::player::PlayerEvent;
+
+    use super::{
+        remap_current_index_after_move, sequential_next_index, Engine, PlaybackState, PlayerSignal,
+    };
+    use crate::io::ProtocolWriter;
+    use crate::protocol::{RepeatMode, TrackRef};
+
+    fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let (writer, buffer) = ProtocolWriter::capture();
+        let cache = librespot_core::cache::Cache::new(
+            None::<PathBuf>,
+            None::<PathBuf>,
+            None::<PathBuf>,
+            None,
+        )
+        .expect("cache with no paths");
+        (
+            Engine::new(writer, cache, PathBuf::new()),
+            buffer,
+        )
+    }
+
+    fn track_ref() -> TrackRef {
+        TrackRef {
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            ..TrackRef::default()
+        }
+    }
+
+    fn track_uri() -> SpotifyUri {
+        SpotifyUri::from_uri("spotify:track:0123456789ABCDEFGHIJKL").expect("valid track uri")
+    }
+
+    fn playback_state(duration_ms: u32) -> PlaybackState {
+        PlaybackState {
+            ready: true,
+            auth_state: crate::protocol::AuthState::Ready,
+            playing: false,
+            position_ms: 0,
+            duration_ms,
+            volume: 50,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            current_index: Some(0),
+            queue: vec![track_ref()],
+            error: None,
+        }
+    }
+
+    fn playing_engine() -> Engine {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.play_request_id = Some(7);
+        engine
+    }
+
+    #[test]
+    fn playing_and_paused_transitions_update_state_immediately() {
+        let mut engine = playing_engine();
+        let uri = track_uri();
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: 5_000,
+        }));
+        assert!(engine.state.playing);
+        assert_eq!(engine.state.position_ms, 5_000);
+
+        assert!(engine.on_player_event(PlayerEvent::Paused {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: 8_000,
+        }));
+        assert!(!engine.state.playing);
+        assert_eq!(engine.state.position_ms, 8_000);
+    }
+
+    #[test]
+    fn transition_events_emit_state_lines_with_fresh_positions() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.play_request_id = Some(7);
+        let uri = track_uri();
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: uri,
+            position_ms: 12_345,
+        }));
+        engine.emit_state().expect("state emits");
+
+        let line = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            std::mem::take(&mut *bytes)
+        };
+        let value: serde_json::Value = serde_json::from_slice(&line).expect("state json");
+        assert_eq!(value["type"], "state");
+        assert_eq!(value["playing"], true);
+        assert_eq!(value["position_ms"], 12_345);
+    }
+
+    #[test]
+    fn drift_tick_reports_position_only_while_playing_with_an_anchor() {
+        let mut engine = playing_engine();
+        engine.state.playing = false;
+        assert!(!engine.tick_position());
+
+        engine.state.playing = true;
+        assert!(!engine.tick_position(), "no anchor yet");
+
+        engine.update_position(10_000);
+        assert!(engine.tick_position());
+        assert!(engine.state.position_ms >= 10_000);
+        assert!(engine.state.position_ms < 11_000);
+
+        engine.state.playing = false;
+        assert!(!engine.tick_position(), "paused positions are static");
+    }
+
+    #[test]
+    fn drift_tick_clamps_at_the_track_end() {
+        let mut engine = playing_engine();
+        engine.state.playing = true;
+        engine.state.duration_ms = 30_000;
+        engine.update_position(29_950);
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(engine.tick_position());
+        assert_eq!(engine.state.position_ms, 30_000);
+    }
+
+    #[test]
+    fn stale_generation_events_do_not_emit() {
+        let mut engine = playing_engine();
+        let uri = track_uri();
+        engine.generation = 9;
+        assert!(!engine.on_player_signal(PlayerSignal::Event {
+            generation: 8,
+            event: PlayerEvent::Playing {
+                play_request_id: 7,
+                track_id: uri,
+                position_ms: 5_000,
+            },
+        }));
+    }
 
     #[test]
     fn sequential_queue_stops_or_wraps_at_the_end() {

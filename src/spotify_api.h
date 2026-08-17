@@ -38,7 +38,7 @@ struct SearchResult {
 
 struct PlaylistRef {
   std::string id, uri, name;
-  std::string owner, cover_url;
+  std::string owner, owner_id, cover_url;
   bool collaborative = false;
   int tracks_total = 0;
   std::string snapshot_id;
@@ -65,6 +65,7 @@ class SpotifyApi {
   // Browsing / search
   SearchResult Search(const std::string& query, int limit = 10);
   std::vector<AlbumRef> GetArtistAlbums(const std::string& artistId);
+  std::vector<TrackRef> GetArtistTopTracks(const std::string& artistId);
   std::vector<TrackRef> GetAlbumTracks(const std::string& albumId);
   std::string GetMeId();
 

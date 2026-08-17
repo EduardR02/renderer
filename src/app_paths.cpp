@@ -257,6 +257,36 @@ std::wstring CoverFile(const std::string& cacheName) {
   return IsPathUnder(Root(), result) ? result : std::wstring();
 }
 
+std::wstring EngineAudioCacheDir() { return EngineStateDir() + L"\\audio"; }
+
+uint64_t SumFileBytesUnderDir(const std::wstring& dir) {
+  if (dir.empty() || !IsPathUnder(Root(), dir)) return 0;
+  uint64_t total = 0;
+  std::vector<std::wstring> pending{dir};
+  while (!pending.empty()) {
+    std::wstring current = std::move(pending.back());
+    pending.pop_back();
+    WIN32_FIND_DATAW data{};
+    HANDLE find = ::FindFirstFileW((current + L"\\*").c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) continue;
+    do {
+      if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+      const std::wstring name = data.cFileName;
+      if (name == L"." || name == L"..") continue;
+      if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        pending.push_back(current + L"\\" + name);
+      } else {
+        ULARGE_INTEGER size;
+        size.HighPart = data.nFileSizeHigh;
+        size.LowPart = data.nFileSizeLow;
+        total += size.QuadPart;
+      }
+    } while (::FindNextFileW(find, &data));
+    ::FindClose(find);
+  }
+  return total;
+}
+
 bool ValidateOwnedRoot() { return IsDirectoryWithoutReparse(Root()); }
 
 bool EnsureDirs() {
