@@ -1,0 +1,184 @@
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::sync::{Arc, Mutex};
+
+use serde::Serialize;
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+use crate::protocol::Request;
+
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum Input {
+    Request(Request),
+    Invalid {
+        request_id: String,
+        error: String,
+    },
+    Eof,
+}
+
+#[derive(Clone)]
+pub struct ProtocolWriter {
+    inner: Arc<Mutex<BufWriter<Box<dyn Write + Send>>>>,
+}
+
+impl ProtocolWriter {
+    pub fn capture_stdout() -> io::Result<Self> {
+        let output = protocol_output()?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(BufWriter::new(output))),
+        })
+    }
+
+    pub fn send<T: Serialize>(&self, value: &T) -> Result<(), String> {
+        let mut output = self
+            .inner
+            .lock()
+            .map_err(|_| "protocol output lock was poisoned".to_owned())?;
+        serde_json::to_writer(&mut *output, value)
+            .map_err(|error| format!("could not serialize protocol message: {error}"))?;
+        output
+            .write_all(b"\n")
+            .and_then(|_| output.flush())
+            .map_err(|error| format!("could not write protocol message: {error}"))
+    }
+}
+
+pub fn spawn_input_reader(sender: mpsc::UnboundedSender<Input>) {
+    std::thread::Builder::new()
+        .name("protocol-input".to_owned())
+        .spawn(move || {
+            let mut reader = BufReader::new(io::stdin().lock());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = sender.send(Input::Eof);
+                        break;
+                    }
+                    Ok(_) if line.trim().is_empty() => continue,
+                    Ok(_) if line.len() > MAX_REQUEST_BYTES => {
+                        if sender
+                            .send(Input::Invalid {
+                                request_id: String::new(),
+                                error: format!(
+                                    "request exceeds the {MAX_REQUEST_BYTES}-byte protocol limit"
+                                ),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(_) => {
+                        let input = decode_request(line.trim_end());
+                        if sender.send(input).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Input::Invalid {
+                            request_id: String::new(),
+                            error: format!("could not read stdin: {error}"),
+                        });
+                        let _ = sender.send(Input::Eof);
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("could not start protocol input thread");
+}
+
+fn decode_request(line: &str) -> Input {
+    let value: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(error) => {
+            return Input::Invalid {
+                request_id: String::new(),
+                error: format!("invalid JSON: {error}"),
+            };
+        }
+    };
+    let request_id = value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match serde_json::from_value::<Request>(value) {
+        Ok(request) if request.request_id.is_empty() => Input::Invalid {
+            request_id,
+            error: "request_id must not be empty".to_owned(),
+        },
+        Ok(request) => Input::Request(request),
+        Err(error) => Input::Invalid {
+            request_id,
+            error: format!("invalid request: {error}"),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
+    use std::fs::File;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+
+    const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12_i32 as u32;
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(kind: u32) -> isize;
+        fn SetStdHandle(kind: u32, handle: isize) -> i32;
+        fn GetCurrentProcess() -> isize;
+        fn DuplicateHandle(
+            source_process: isize,
+            source_handle: isize,
+            target_process: isize,
+            target_handle: *mut isize,
+            desired_access: u32,
+            inherit_handle: i32,
+            options: u32,
+        ) -> i32;
+    }
+
+    let mut duplicate = 0_isize;
+    unsafe {
+        let process = GetCurrentProcess();
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if stdout == 0 || stdout == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if DuplicateHandle(
+            process,
+            stdout,
+            process,
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let output = File::from_raw_handle(duplicate as RawHandle);
+
+        // librespot-oauth and the rodio device lister contain println! calls. Keep
+        // their text out of the protocol pipe while retaining our private duplicate.
+        let stderr = GetStdHandle(STD_ERROR_HANDLE);
+        if stderr == 0 || stderr == -1 || SetStdHandle(STD_OUTPUT_HANDLE, stderr) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Box::new(output))
+    }
+}
+
+#[cfg(not(windows))]
+fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
+    Ok(Box::new(io::stdout()))
+}

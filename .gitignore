@@ -1,0 +1,19 @@
+# Build output
+/build*/
+/dist/
+/engine/target/
+*.obj
+*.pdb
+*.ilk
+*.user
+
+# Editor
+.vs/
+.idea/
+*.swp
+
+# Never commit app-owned runtime state, tokens, or logs
+# (they live under %LOCALAPPDATA%\SpotifyRenderer at runtime, not here,
+# but guard any accidental local copies anyway)
+*.dat
+*.log
