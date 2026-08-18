@@ -1,5 +1,14 @@
 <script>
-  import { playback, api, togglePlay, toggleLiked, isTrackLiked, navigate, route } from "../lib/state.svelte.js";
+  import {
+    playback,
+    api,
+    togglePlay,
+    toggleLiked,
+    isTrackLiked,
+    navigate,
+    route,
+    positionMs,
+  } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import Slider from "./Slider.svelte";
@@ -11,7 +20,7 @@
   const current = $derived(
     playback.current_index >= 0 ? playback.queue[playback.current_index] ?? null : null
   );
-  const pos = $derived(dragging && dragPos !== null ? dragPos : playback.position_ms);
+  const pos = $derived(dragging && dragPos !== null ? dragPos : positionMs());
   const isLiked = $derived(current ? isTrackLiked(current.uri) : false);
 
   function onSeekCommit(v) {
@@ -22,15 +31,21 @@
     api.setVolume(v).catch(() => {});
   }
 
+  // `track` is the engine's name for repeat-one; anything outside
+  // off/context/track is rejected outright by the Rust command layer.
   function cycleRepeat() {
-    const order = ["off", "context", "one"];
+    const order = ["off", "context", "track"];
     const i = order.indexOf(playback.repeat);
     const next = order[(i + 1) % order.length];
     api.setRepeat(next).catch(() => {});
   }
 
   const repeatTitle = $derived(
-    playback.repeat === "one" ? "Repeat one" : playback.repeat === "context" ? "Repeat all" : "Repeat off"
+    playback.repeat === "track"
+      ? "Repeat one"
+      : playback.repeat === "context"
+        ? "Repeat all"
+        : "Repeat off"
   );
 </script>
 
@@ -86,7 +101,7 @@
         <Icon name="next" size={21} />
       </button>
       <button class="ctl" class:on={playback.repeat !== "off"} title={repeatTitle} onclick={cycleRepeat}>
-        <Icon name={playback.repeat === "one" ? "repeat-one" : "repeat"} size={17} />
+        <Icon name={playback.repeat === "track" ? "repeat-one" : "repeat"} size={17} />
       </button>
     </div>
 
@@ -96,7 +111,7 @@
         <Slider
           min={0}
           max={playback.duration_ms || 0}
-          value={playback.position_ms}
+          value={positionMs()}
           label="Seek"
           step={5000}
           onCommit={(v) => {

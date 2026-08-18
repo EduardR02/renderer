@@ -32,10 +32,13 @@ pub struct AppState {
     pub tracks_cache: Vec<PlaylistTracksEntry>,
     #[serde(skip)]
     pub data_dir: PathBuf,
-    /// True while a background library refresh (with retries) is running;
-    /// concurrent triggers coalesce onto that one chain.
+    /// True while a background library refresh (with retries) is running.
     #[serde(skip)]
     pub library_fetching: bool,
+    /// Set when a trigger arrives mid-chain; the running chain re-runs once
+    /// more instead of the trigger being dropped.
+    #[serde(skip)]
+    pub library_refresh_queued: bool,
 }
 
 impl AppState {
@@ -48,6 +51,7 @@ impl AppState {
             tracks_cache: Vec::new(),
             data_dir,
             library_fetching: false,
+            library_refresh_queued: false,
         }
     }
 }
@@ -79,6 +83,12 @@ pub fn data_dir() -> PathBuf {
             .join("SpotifyRenderer");
     }
     std::env::temp_dir().join("SpotifyRenderer")
+}
+
+/// Diagnostic logs: `%LOCALAPPDATA%\SpotifyRenderer\logs` — the app's own
+/// `spotify_renderer.log` and the engine's `playback_engine.log`.
+pub fn logs_dir() -> PathBuf {
+    data_dir().join("logs")
 }
 
 /// Engine `--state-dir`: `%LOCALAPPDATA%\SpotifyRenderer\engine`, overridable

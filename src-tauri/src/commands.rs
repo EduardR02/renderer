@@ -1,6 +1,7 @@
 //! Tauri command layer: frontend-facing commands plus the background tasks
 //! that keep `AppState`, the disk caches, and the frontend events in sync.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -14,9 +15,10 @@ use crate::app::{
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, RestoreSnapshot};
+use crate::log;
 use crate::types::{
-    AlbumDetail, AppState as AppStateSnapshot, ArtistDetail, Playlist, PlaylistDetail,
-    SearchResult, Track,
+    AlbumDetail, AppState as AppStateSnapshot, ArtistDetail, PlaybackState, Playlist,
+    PlaylistDetail, SearchResult, Track,
 };
 
 // ---------------------------------------------------------------------------
@@ -24,48 +26,48 @@ use crate::types::{
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn play(client: State<'_, EngineClient>) -> Result<(), String> {
+pub async fn play(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.play().await
 }
 
 #[tauri::command]
-pub async fn pause(client: State<'_, EngineClient>) -> Result<(), String> {
+pub async fn pause(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.pause().await
 }
 
 #[tauri::command]
-pub async fn next(client: State<'_, EngineClient>) -> Result<(), String> {
+pub async fn next(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.next().await
 }
 
 #[tauri::command]
-pub async fn previous(client: State<'_, EngineClient>) -> Result<(), String> {
+pub async fn previous(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.previous().await
 }
 
 #[tauri::command]
-pub async fn seek(client: State<'_, EngineClient>, position_ms: u32) -> Result<(), String> {
+pub async fn seek(client: State<'_, Arc<EngineClient>>, position_ms: u32) -> Result<(), String> {
     client.seek(position_ms).await
 }
 
 #[tauri::command]
-pub async fn set_volume(client: State<'_, EngineClient>, percent: u8) -> Result<(), String> {
+pub async fn set_volume(client: State<'_, Arc<EngineClient>>, percent: u8) -> Result<(), String> {
     client.set_volume(percent).await
 }
 
 #[tauri::command]
-pub async fn set_shuffle(client: State<'_, EngineClient>, enabled: bool) -> Result<(), String> {
+pub async fn set_shuffle(client: State<'_, Arc<EngineClient>>, enabled: bool) -> Result<(), String> {
     client.set_shuffle(enabled).await
 }
 
 #[tauri::command]
-pub async fn set_repeat(client: State<'_, EngineClient>, mode: String) -> Result<(), String> {
+pub async fn set_repeat(client: State<'_, Arc<EngineClient>>, mode: String) -> Result<(), String> {
     client.set_repeat(&mode).await
 }
 
 #[tauri::command]
 pub async fn play_queue(
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     queue: Vec<Track>,
     index: usize,
 ) -> Result<(), String> {
@@ -73,18 +75,18 @@ pub async fn play_queue(
 }
 
 #[tauri::command]
-pub async fn add_queue(client: State<'_, EngineClient>, track: Track) -> Result<(), String> {
+pub async fn add_queue(client: State<'_, Arc<EngineClient>>, track: Track) -> Result<(), String> {
     client.add_queue(&track).await
 }
 
 #[tauri::command]
-pub async fn remove_queue(client: State<'_, EngineClient>, index: usize) -> Result<(), String> {
+pub async fn remove_queue(client: State<'_, Arc<EngineClient>>, index: usize) -> Result<(), String> {
     client.remove_queue(index).await
 }
 
 #[tauri::command]
 pub async fn move_queue(
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     from: usize,
     to: usize,
 ) -> Result<(), String> {
@@ -98,7 +100,7 @@ pub async fn move_queue(
 #[tauri::command]
 pub async fn search(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     query: String,
     limit: Option<usize>,
 ) -> Result<SearchResult, String> {
@@ -113,7 +115,7 @@ pub async fn search(
 pub async fn browse_playlists(
     app: AppHandle,
     state: State<'_, Mutex<AppState>>,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
 ) -> Result<Vec<Playlist>, String> {
     match fetch_library(&state, &client, &app).await {
         Ok(playlists) => Ok(playlists),
@@ -132,7 +134,7 @@ pub async fn browse_playlists(
 pub async fn browse_playlist(
     app: AppHandle,
     state: State<'_, Mutex<AppState>>,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<PlaylistDetail, String> {
     let cached = {
@@ -156,7 +158,7 @@ pub async fn browse_playlist(
 #[tauri::command]
 pub async fn browse_album(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<AlbumDetail, String> {
     let detail = AlbumDetail::from(client.browse_album(&id).await?);
@@ -167,7 +169,7 @@ pub async fn browse_album(
 #[tauri::command]
 pub async fn browse_artist(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<ArtistDetail, String> {
     let detail = ArtistDetail::from(client.browse_artist(&id).await?);
@@ -182,7 +184,7 @@ pub async fn browse_artist(
 #[tauri::command]
 pub async fn create_playlist(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     name: String,
 ) -> Result<(), String> {
     client.create_playlist(&name).await?;
@@ -193,7 +195,7 @@ pub async fn create_playlist(
 #[tauri::command]
 pub async fn rename_playlist(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     id: String,
     name: String,
 ) -> Result<(), String> {
@@ -205,7 +207,7 @@ pub async fn rename_playlist(
 #[tauri::command]
 pub async fn delete_playlist(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<(), String> {
     client.delete_playlist(&id).await?;
@@ -222,7 +224,7 @@ pub async fn delete_playlist(
 #[tauri::command]
 pub async fn add_playlist_tracks(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     id: String,
     uris: Vec<String>,
 ) -> Result<(), String> {
@@ -234,7 +236,7 @@ pub async fn add_playlist_tracks(
 #[tauri::command]
 pub async fn remove_playlist_tracks(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     id: String,
     uris: Vec<String>,
 ) -> Result<(), String> {
@@ -246,7 +248,7 @@ pub async fn remove_playlist_tracks(
 #[tauri::command]
 pub async fn reorder_playlist_tracks(
     app: AppHandle,
-    client: State<'_, EngineClient>,
+    client: State<'_, Arc<EngineClient>>,
     id: String,
     from: usize,
     to: usize,
@@ -261,17 +263,17 @@ pub async fn reorder_playlist_tracks(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn status(client: State<'_, EngineClient>) -> Result<(), String> {
+pub async fn status(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.status().await
 }
 
 #[tauri::command]
-pub async fn login(client: State<'_, EngineClient>) -> Result<(), String> {
+pub async fn login(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.login().await
 }
 
 #[tauri::command]
-pub async fn logout(client: State<'_, EngineClient>) -> Result<(), String> {
+pub async fn logout(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.logout().await?;
     client.clear_restore_pending().await;
     Ok(())
@@ -315,15 +317,30 @@ fn library_retry_delay(attempt: usize) -> Duration {
         .min(LIBRARY_RETRY_MAX)
 }
 
-/// Consumes engine state lines, mirrors them into `AppState`, emits the
-/// `state`/`session` events, restores playback after an engine respawn, and
-/// projects `position_ms` locally between heartbeats.
+/// True when `next` differs from `previous` in nothing but `position_ms`.
+///
+/// The engine heartbeats its whole state — queue included — every couple of
+/// seconds. Re-emitting that to the frontend just to advance a progress bar
+/// costs a full serialize + IPC hop + `JSON.parse` + Svelte proxy rebuild of
+/// the entire queue, which is precisely the per-second churn this app exists
+/// to avoid. Heartbeats that only moved the playhead go out as a `position`
+/// number instead; the frontend projects between them off a monotonic clock.
+fn position_only_change(previous: &PlaybackState, next: &PlaybackState) -> bool {
+    if previous.position_ms == next.position_ms {
+        return false;
+    }
+    let mut probe = previous.clone();
+    probe.position_ms = next.position_ms;
+    probe == *next
+}
+
+/// Consumes engine state lines, mirrors them into `AppState`, and emits the
+/// `state`/`position`/`session` events. There is no periodic work here: the
+/// playhead is projected in the frontend between engine heartbeats.
 pub async fn consume_states(app: AppHandle) {
-    let client = app.state::<EngineClient>();
+    // Owned handle so spawned tasks do not borrow the AppHandle.
+    let client = app.state::<Arc<EngineClient>>().inner().clone();
     let mut states = client.subscribe_state();
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tick.tick().await; // anchor so the first projection tick counts a full second
 
     // Instant first paint: hydrate `AppState` from the on-disk library
     // snapshot and emit it before the engine is ready, so a returning user
@@ -331,66 +348,78 @@ pub async fn consume_states(app: AppHandle) {
     // get_state). The ready-transition fetch below supersedes it.
     load_library_from_disk(&app);
 
-    let mut last_auth = String::new();
-    let mut last_username = String::new();
+    let mut previous: Option<PlaybackState> = None;
+    let mut last_error = String::new();
 
     loop {
-        tokio::select! {
-            state = states.recv() => {
-                let Ok(state) = state else { continue };
-                let became_ready = state.auth_state == "ready" && last_auth != "ready";
-                let session_changed =
-                    state.auth_state != last_auth || state.username != last_username;
-                last_auth = state.auth_state.clone();
-                last_username = state.username.clone();
+        let state = match states.recv().await {
+            Ok(state) => state,
+            // The engine out-ran this consumer; the next line is a full
+            // state, so resyncing on it loses nothing.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
 
-                // A respawned engine becomes ready with a blank session; put
-                // the pre-crash playback back before anything else sees it.
-                if let Some(snapshot) = client.take_restore_pending().await {
-                    if state.auth_state == "ready" {
-                        restore_playback(&client, &snapshot).await;
-                    } else {
-                        client.put_restore_pending(snapshot).await;
-                    }
-                }
+        let (became_ready, session_changed, auth_changed, position_only) = match &previous {
+            Some(prev) => (
+                state.auth_state == "ready" && prev.auth_state != "ready",
+                state.auth_state != prev.auth_state || state.username != prev.username,
+                state.auth_state != prev.auth_state,
+                position_only_change(prev, &state),
+            ),
+            None => (state.auth_state == "ready", true, true, false),
+        };
 
-                {
-                    let guard = app.state::<Mutex<AppState>>();
-                    let mut guard = guard.lock();
-                    guard.playback = state.clone();
-                    if !state.username.is_empty() {
-                        guard.me_id = state.username.clone();
-                    }
-                }
-                let _ = app.emit("state", &state);
-                if session_changed {
-                    let _ = app.emit(
-                        "session",
-                        json!({
-                            "auth_state": state.auth_state,
-                            "username": state.username,
-                            "error": state.error,
-                        }),
-                    );
-                }
-                if became_ready {
-                    spawn_refresh_library(app.clone());
-                }
-            }
-            _ = tick.tick() => {
-                let guard = app.state::<Mutex<AppState>>();
-                let mut guard = guard.lock();
-                if guard.playback.playing {
-                    let projected = guard.playback.position_ms.saturating_add(1000);
-                    let duration = guard.playback.duration_ms;
-                    guard.playback.position_ms =
-                        if duration > 0 { projected.min(duration) } else { projected };
-                    let snapshot = guard.playback.clone();
-                    drop(guard);
-                    let _ = app.emit("state", &snapshot);
-                }
+        if auth_changed {
+            log::info(&format!("engine auth_state -> {}", state.auth_state));
+        }
+        if became_ready {
+            log::info(&format!("engine ready; username={}", state.username));
+        }
+        if !state.error.is_empty() && state.error != last_error {
+            last_error = state.error.clone();
+            log::error(&format!("engine error: {}", state.error));
+        }
+
+        // A respawned engine becomes ready with a blank session; put the
+        // pre-crash playback back before anything else sees it.
+        if let Some(snapshot) = client.take_restore_pending().await {
+            if state.auth_state == "ready" {
+                restore_playback(&client, &snapshot).await;
+            } else {
+                client.put_restore_pending(snapshot).await;
             }
         }
+
+        {
+            let guard = app.state::<Mutex<AppState>>();
+            let mut guard = guard.lock();
+            guard.playback = state.clone();
+            if !state.username.is_empty() {
+                guard.me_id = state.username.clone();
+            }
+        }
+
+        if position_only {
+            let _ = app.emit("position", state.position_ms);
+        } else {
+            let _ = app.emit("state", &state);
+        }
+        if session_changed {
+            let _ = app.emit(
+                "session",
+                json!({
+                    "auth_state": state.auth_state,
+                    "username": state.username,
+                    "error": state.error,
+                }),
+            );
+        }
+        if became_ready {
+            spawn_refresh_library(app.clone());
+        }
+
+        previous = Some(state);
     }
 }
 
@@ -404,11 +433,13 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) {
         if let Err(error) =
             client.play_queue(&snapshot.queue, index, snapshot.position_ms).await
         {
-            eprintln!("SpotifyRenderer: could not restore the queue after engine restart: {error}");
+            log::warn(&format!(
+                "could not restore the queue after engine restart: {error}"
+            ));
         }
     }
     if let Err(error) = client.set_volume(snapshot.volume).await {
-        eprintln!("SpotifyRenderer: could not restore volume: {error}");
+        log::warn(&format!("could not restore volume: {error}"));
     }
     let _ = client.set_shuffle(snapshot.shuffle).await;
     let _ = client.set_repeat(&snapshot.repeat).await;
@@ -443,21 +474,32 @@ fn load_library_from_disk(app: &AppHandle) {
 /// frontend boot pull) coalesce onto it.
 fn spawn_refresh_library(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let client = app.state::<EngineClient>();
+        let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
         {
             let mut guard = state.lock();
             if guard.library_fetching {
-                return; // a refresh chain is already in flight
+                // A chain is mid-flight, and its backoff can run for a
+                // minute. Dropping this trigger would strand whatever just
+                // changed (a rename, a new playlist) until the next restart,
+                // so mark it and let the running chain pick it up.
+                guard.library_refresh_queued = true;
+                return;
             }
             guard.library_fetching = true;
         }
-        let result = refresh_library_with_retry(&state, &client, &app).await;
-        state.lock().library_fetching = false;
-        if let Err(error) = result {
-            eprintln!(
-                "SpotifyRenderer: library refresh failed after {LIBRARY_RETRY_ATTEMPTS} attempts: {error}"
-            );
+        loop {
+            let result = refresh_library_with_retry(&state, &client, &app).await;
+            if let Err(error) = result {
+                log::error(&format!(
+                    "library refresh failed after {LIBRARY_RETRY_ATTEMPTS} attempts: {error}"
+                ));
+            }
+            let mut guard = state.lock();
+            if !std::mem::take(&mut guard.library_refresh_queued) {
+                guard.library_fetching = false;
+                return;
+            }
         }
     });
 }
@@ -475,11 +517,13 @@ async fn refresh_library_with_retry(
         match fetch_library(state, client, app).await {
             Ok(_) => return Ok(()),
             Err(error) => {
-                eprintln!("SpotifyRenderer: library refresh failed ({error})");
+                log::warn(&format!(
+                    "library refresh attempt {attempt} failed: {error}"
+                ));
                 last_error = error;
                 if attempt < LIBRARY_RETRY_ATTEMPTS {
                     let delay = library_retry_delay(attempt);
-                    eprintln!("SpotifyRenderer: retrying in {}s", delay.as_secs());
+                    log::warn(&format!("retrying library refresh in {}s", delay.as_secs()));
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -490,15 +534,15 @@ async fn refresh_library_with_retry(
 
 fn spawn_refresh_playlist(app: AppHandle, id: String) {
     tauri::async_runtime::spawn(async move {
-        let client = app.state::<EngineClient>();
+        let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
         match fetch_playlist(&state, &client, &id).await {
             Ok(detail) => {
                 let _ = app.emit("playlist-tracks", &detail);
             }
-            Err(error) => eprintln!(
-                "SpotifyRenderer: background refresh of playlist {id} failed: {error}"
-            ),
+            Err(error) => log::error(&format!(
+                "background refresh of playlist {id} failed: {error}"
+            )),
         }
     });
 }
@@ -579,5 +623,47 @@ mod tests {
             .map(|attempt| library_retry_delay(attempt).as_secs())
             .collect();
         assert_eq!(delays, vec![5, 10, 20, 40, 60, 60]);
+    }
+
+    fn playing_state(position_ms: u32) -> PlaybackState {
+        PlaybackState {
+            auth_state: "ready".to_owned(),
+            playing: true,
+            position_ms,
+            duration_ms: 200_000,
+            current_index: Some(0),
+            current_uri: "spotify:track:a".to_owned(),
+            queue: vec![Track::default()],
+            ..PlaybackState::default()
+        }
+    }
+
+    #[test]
+    fn heartbeats_that_only_move_the_playhead_skip_the_full_state_emit() {
+        assert!(position_only_change(&playing_state(1_000), &playing_state(3_000)));
+        // An unchanged heartbeat is not a position change: nothing is emitted
+        // for it either way, but it must not masquerade as one.
+        assert!(!position_only_change(&playing_state(1_000), &playing_state(1_000)));
+    }
+
+    #[test]
+    fn any_other_field_forces_a_full_state_emit() {
+        let before = playing_state(1_000);
+
+        let mut paused = playing_state(3_000);
+        paused.playing = false;
+        assert!(!position_only_change(&before, &paused), "play/pause is a full state");
+
+        let mut skipped = playing_state(3_000);
+        skipped.current_uri = "spotify:track:b".to_owned();
+        assert!(!position_only_change(&before, &skipped), "track change is a full state");
+
+        let mut requeued = playing_state(3_000);
+        requeued.queue.clear();
+        assert!(!position_only_change(&before, &requeued), "queue change is a full state");
+
+        let mut louder = playing_state(3_000);
+        louder.volume = louder.volume.wrapping_add(1);
+        assert!(!position_only_change(&before, &louder), "volume change is a full state");
     }
 }

@@ -7,8 +7,9 @@
 //! the session re-syncs after a restart.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, watch};
 
 use crate::app::engine_state_dir;
+use crate::log;
 use crate::types::{PlaybackState, Track};
 
 /// Replies for playback/session commands arrive promptly; browse and edit
@@ -31,9 +33,18 @@ const BROWSE_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPAWN_BACKOFF_START: Duration = Duration::from_secs(2);
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Suppresses a console window for a spawned process (Windows only).
+/// Roll the engine log once past this size, keeping one previous generation.
+const ENGINE_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Spawns the engine with no console at all (Windows only).
+///
+/// `CREATE_NO_WINDOW` only hides the console window — Windows still allocates
+/// a console and a `conhost.exe` to back it. The engine needs neither: stdin
+/// and stdout are pipes and stderr is redirected to the log file, so nothing
+/// ever touches a console. `DETACHED_PROCESS` skips the allocation outright,
+/// dropping a process and any chance of a window flashing on startup.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 /// One engine reply (any non-`state` line). `data` carries the payload of
 /// `browse_*`/`edit_*` responses; plain `response` lines leave it `None`.
@@ -101,7 +112,7 @@ impl EngineClient {
             shutting_down: AtomicBool::new(false),
         });
         if let Err(error) = client.spawn_engine() {
-            eprintln!("SpotifyRenderer: could not start the playback engine: {error}");
+            log::error(&format!("engine spawn failed at startup: {error}"));
         }
         client
     }
@@ -143,17 +154,22 @@ impl EngineClient {
                         let _ = self.exit_tx.send(false);
                     }
                     Err(error) => {
-                        eprintln!(
-                            "SpotifyRenderer: engine spawn failed ({error}); retrying in {}s",
+                        log::error(&format!(
+                            "engine spawn failed ({error}); retrying in {}s",
                             backoff.as_secs()
-                        );
+                        ));
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(RESPAWN_BACKOFF_MAX);
                         continue;
                     }
                 }
                 // Re-sync the fresh engine's session ("re-send status").
-                let _ = self.request("status", Value::Null).await;
+                match self.request("status", Value::Null).await {
+                    Ok(_) => log::info("engine respawned; status re-requested"),
+                    Err(error) => log::warn(&format!(
+                        "engine respawned but status re-request failed: {error}"
+                    )),
+                }
             }
             let mut exited = self.exit_tx.subscribe();
             if self.process.lock().is_none() {
@@ -169,10 +185,10 @@ impl EngineClient {
             if self.shutting_down.load(Ordering::SeqCst) {
                 return;
             }
-            eprintln!(
-                "SpotifyRenderer: engine exited; respawning in {}s",
+            log::warn(&format!(
+                "engine exited; respawning in {}s",
                 backoff.as_secs()
-            );
+            ));
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(RESPAWN_BACKOFF_MAX);
         }
@@ -186,18 +202,39 @@ impl EngineClient {
         })?;
         std::fs::create_dir_all(&self.state_dir)
             .map_err(|error| format!("could not create engine state dir: {error}"))?;
+        // The engine's diagnostics live in the same file the panic hook
+        // appends to: env_logger stderr (apresolve/connect attempts and
+        // failures at info level) plus panic reports via --log-file.
+        let logs_dir = crate::app::logs_dir();
+        let _ = std::fs::create_dir_all(&logs_dir);
+        let engine_log = logs_dir.join("playback_engine.log");
+        rotate_if_large(&engine_log);
         let mut command = Command::new(&exe);
         command
             .arg("--state-dir")
             .arg(&self.state_dir)
+            .arg("--log-file")
+            .arg(&engine_log)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(match OpenOptions::new().create(true).append(true).open(&engine_log) {
+                Ok(file) => Stdio::from(file),
+                Err(_) => Stdio::null(),
+            })
+            // Info level surfaces librespot's "Connecting to AP ..." lines
+            // and apresolve failures; the default warn level only shows
+            // failures, which hides whether the engine is even trying.
+            // Symphonia is pinned to error: it warns once per frame gap
+            // ("skipping junk at N bytes"), thousands of lines per track,
+            // which is continuous disk I/O for no diagnostic value.
+            .env(
+                "RUST_LOG",
+                "info,symphonia_bundle_mp3=error,symphonia_core=error",
+            );
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            // Never let the (debug) engine pop a console window.
-            command.creation_flags(CREATE_NO_WINDOW);
+            command.creation_flags(DETACHED_PROCESS);
         }
         let mut child = command
             .spawn()
@@ -210,9 +247,14 @@ impl EngineClient {
             .stdin
             .take()
             .ok_or_else(|| "engine stdin is unavailable".to_owned())?;
+        let pid = child.id();
         *self.stdin.lock() = Some(stdin);
         *self.process.lock() = Some(child);
         spawn_reader(stdout, self);
+        log::info(&format!(
+            "engine spawned (pid {pid}); log={}",
+            engine_log.display()
+        ));
         Ok(())
     }
 
@@ -465,6 +507,7 @@ impl EngineClient {
 
     /// Graceful engine shutdown for app exit; falls back to a hard kill.
     pub fn shutdown_engine(&self) {
+        log::info("engine shutdown requested");
         self.shutting_down.store(true, Ordering::SeqCst);
         let line = build_line(&self.next_request_id(), "shutdown", &Value::Null);
         let _ = self.write_line(&line);
@@ -489,6 +532,7 @@ impl EngineClient {
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
+        log::warn("engine process exited (stdout closed)");
         // Fail any in-flight requests so awaiters do not hang.
         let mut pending = self.pending.blocking_lock();
         for (_, sender) in pending.drain() {
@@ -515,7 +559,8 @@ impl EngineClient {
         if let Some(sender) = pending.remove(request_id) {
             let _ = sender.send(reply);
         }
-    }}
+    }
+}
 
 /// Reader thread: parses one protocol line per iteration. `state` lines are
 /// fanned out to subscribers; every other line is routed to the pending
@@ -544,9 +589,9 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
                         if value.get("type").and_then(Value::as_str) == Some("state") {
                             match serde_json::from_value::<PlaybackState>(value) {
                                 Ok(state) => client.on_state(&state),
-                                Err(error) => eprintln!(
-                                    "SpotifyRenderer: could not parse engine state line: {error}"
-                                ),
+                                Err(error) => log::error(&format!(
+                                    "could not parse engine state line: {error}"
+                                )),
                             }
                         } else {
                             let request_id = value
@@ -567,6 +612,27 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
             client.on_eof();
         })
         .expect("could not start engine reader thread");
+}
+
+/// Rolls the engine log to `<name>.log.1` once it grows past
+/// [`ENGINE_LOG_MAX_BYTES`], discarding the previous generation. Best-effort:
+/// if anything fails the current file simply keeps growing.
+fn rotate_if_large(path: &Path) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() < ENGINE_LOG_MAX_BYTES {
+        return;
+    }
+    let previous = path.with_extension("log.1");
+    let _ = std::fs::remove_file(&previous);
+    if std::fs::rename(path, &previous).is_ok() {
+        log::info(&format!(
+            "engine log rolled at {} bytes -> {}",
+            metadata.len(),
+            previous.display()
+        ));
+    }
 }
 
 fn build_line(request_id: &str, kind: &str, args: &Value) -> String {

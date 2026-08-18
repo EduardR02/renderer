@@ -55,6 +55,13 @@
   <div class="row">
     <Sidebar />
     <main class="content">
+      {#if playback.auth_state === "authenticating"}
+        <div class="connecting-banner" role="status">
+          <span class="spinner" aria-hidden="true"></span>
+          <span>Connecting to Spotify…</span>
+        </div>
+      {/if}
+
       {#if playback.error}
         <div class="error-banner" role="alert">
           <span class="error-text">{playback.error}</span>
@@ -106,6 +113,32 @@
     min-width: 0;
     overflow-y: auto;
     background: var(--bg-base);
+  }
+  .connecting-banner {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    background: rgba(30, 215, 96, 0.12);
+    color: #1ed760;
+    font-size: var(--font-sm);
+  }
+  .spinner {
+    width: 13px;
+    height: 13px;
+    flex: none;
+    border-radius: var(--radius-full);
+    border: 2px solid rgba(30, 215, 96, 0.25);
+    border-top-color: #1ed760;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .error-banner {
     position: sticky;

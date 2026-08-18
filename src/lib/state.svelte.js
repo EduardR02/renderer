@@ -50,11 +50,38 @@ export const playback = $state({
 
 export const session = $state({ auth_state: null, username: null, error: null });
 
+/* ---------------- Playhead projection ---------------- */
+/* The Rust side emits a full `state` only when something other than the
+   playhead changed; a plain heartbeat arrives as a `position` number. Between
+   syncs the playhead is projected here off a monotonic clock, so advancing the
+   progress bar costs one number assignment instead of re-parsing the whole
+   queue and rebuilding its Svelte proxies once a second. */
+
+const playhead = $state({ base_ms: 0, at: 0, now: 0 });
+
+/** Pins the playhead to `ms` as of right now; projection restarts from here. */
+function anchorPlayhead(ms) {
+  const t = performance.now();
+  playhead.base_ms = ms;
+  playhead.at = t;
+  playhead.now = t;
+}
+
+/** The playhead in ms, projected forward from the last engine sync. */
+export function positionMs() {
+  const elapsed = playback.playing ? Math.max(0, playhead.now - playhead.at) : 0;
+  const projected = playhead.base_ms + elapsed;
+  return playback.duration_ms > 0
+    ? Math.min(projected, playback.duration_ms)
+    : projected;
+}
+
 export function applyPlayback(payload) {
   if (!payload) return;
   for (const key of Object.keys(playback)) {
     if (key in payload) playback[key] = payload[key];
   }
+  if ("position_ms" in payload) anchorPlayhead(payload.position_ms);
 }
 
 export function applySession(payload) {
@@ -71,7 +98,11 @@ export function applySession(payload) {
 }
 
 export function isLoggedOut() {
-  return playback.auth_state === "logged_out" || session.auth_state === "logged_out";
+  // The engine emits `needs_login` (with a fresh auth_url) when no session
+  // exists or the last connect attempt failed; `logged_out` is kept for
+  // compatibility with older engines. Both must show the LoginView.
+  return ["logged_out", "needs_login"].includes(playback.auth_state) ||
+    ["logged_out", "needs_login"].includes(session.auth_state);
 }
 
 /* ---------------- Browse data ---------------- */
@@ -128,8 +159,13 @@ export const api = {
   pause: () => invoke("pause"),
   next: () => invoke("next"),
   previous: () => invoke("previous"),
-  seek: (positionMs) =>
-    invoke("seek", { positionMs: Math.max(0, Math.round(positionMs)) }),
+  seek: (ms) => {
+    const target = Math.max(0, Math.round(ms));
+    // Anchor optimistically: without this the knob snaps back to the last
+    // engine sync until the next heartbeat lands, then jumps forward again.
+    anchorPlayhead(target);
+    return invoke("seek", { positionMs: target });
+  },
   setVolume: (percent) =>
     invoke("set_volume", { percent: Math.min(100, Math.max(0, Math.round(percent))) }),
   setShuffle: (enabled) => invoke("set_shuffle", { enabled: !!enabled }),
@@ -159,7 +195,11 @@ export const api = {
 /** Optimistic play/pause flip; reconciled by the next `state` event. */
 export function togglePlay() {
   if (!playback.queue.length) return;
+  // Capture where the playhead actually is before the flip, so resuming
+  // projects from there rather than from the last engine sync.
+  const at = positionMs();
   playback.playing = !playback.playing;
+  anchorPlayhead(at);
   invoke(playback.playing ? "play" : "pause").catch(() => {});
 }
 
@@ -176,6 +216,11 @@ export async function initEvents() {
   bootstrapped = true;
 
   listen("state", (e) => applyPlayback(e.payload)).catch(() => {});
+  // Heartbeats that only moved the playhead: a bare number, no queue.
+  listen("position", (e) => {
+    playback.position_ms = e.payload ?? 0;
+    anchorPlayhead(playback.position_ms);
+  }).catch(() => {});
   listen("session", (e) => applySession(e.payload)).catch(() => {});
   listen("library", (e) => setLibrary(e.payload)).catch(() => {});
   listen("playlist-tracks", (e) => {
@@ -204,4 +249,10 @@ export async function initEvents() {
     })
     .catch(() => {});
   api.browsePlaylists().catch(() => {});
+
+  // Advance the projected playhead. 250ms reads as smooth on a progress bar
+  // and touches exactly one number; nothing else in the tree invalidates.
+  setInterval(() => {
+    if (playback.playing) playhead.now = performance.now();
+  }, 250);
 }

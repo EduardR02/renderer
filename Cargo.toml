@@ -3,3 +3,11 @@
 [workspace]
 resolver = "3"
 members = ["engine", "src-tauri"]
+
+# Release builds are what actually get run, so pay the compile time once for a
+# smaller, faster binary: cross-crate inlining, no parallel-codegen splits, and
+# no symbol table shipped.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
