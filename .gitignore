@@ -1,19 +1,16 @@
-# Build output
-/build*/
-/dist/
-/engine/target/
-*.obj
-*.pdb
-*.ilk
-*.user
+# Rust / Cargo
+/target/
+engine/target/
+
+# Node / frontend
+node_modules/
+/build/
 
 # Editor
 .vs/
 .idea/
 *.swp
 
-# Never commit app-owned runtime state, tokens, or logs
-# (they live under %LOCALAPPDATA%\SpotifyRenderer at runtime, not here,
-# but guard any accidental local copies anyway)
+# App-owned runtime state (lives under %LOCALAPPDATA%\SpotifyRenderer)
 *.dat
 *.log

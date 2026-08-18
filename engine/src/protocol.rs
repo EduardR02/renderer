@@ -180,7 +180,7 @@ pub struct Response<'a> {
 /// user's Spotify username; `owner_name` is their display name when the
 /// source carries it (the rootlist only exposes usernames, so it is empty
 /// there).
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlaylistRef {
     pub id: String,
     pub uri: String,
@@ -196,7 +196,7 @@ pub struct PlaylistRef {
 /// Payload of a successful [`Command::BrowsePlaylist`] response. `revision`
 /// is the playlist4 revision hex-encoded (the value Web API edits call the
 /// snapshot id).
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlaylistBrowse {
     pub id: String,
     pub uri: String,
@@ -211,7 +211,7 @@ pub struct PlaylistBrowse {
 }
 
 /// Album reference inside browse responses.
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AlbumRef {
     pub id: String,
     pub uri: String,
@@ -222,7 +222,7 @@ pub struct AlbumRef {
 }
 
 /// Payload of a successful [`Command::BrowseAlbum`] response.
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AlbumBrowse {
     pub id: String,
     pub uri: String,
@@ -234,7 +234,7 @@ pub struct AlbumBrowse {
 }
 
 /// Artist reference inside browse responses.
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArtistRef {
     pub id: String,
     pub uri: String,
@@ -244,7 +244,7 @@ pub struct ArtistRef {
 }
 
 /// Payload of a successful [`Command::BrowseArtist`] response.
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArtistBrowse {
     pub id: String,
     pub uri: String,
@@ -256,7 +256,7 @@ pub struct ArtistBrowse {
 }
 
 /// Payload of a successful [`Command::BrowseSearch`] response.
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SearchBrowse {
     pub tracks: Vec<TrackRef>,
     pub albums: Vec<AlbumRef>,

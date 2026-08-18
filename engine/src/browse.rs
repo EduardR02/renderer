@@ -51,7 +51,7 @@ use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 use std::time::Duration;
 
-use crate::protocol::{AlbumRef, ArtistRef, PlaylistRef, TrackRef};
+use spotify_playback_engine::protocol::{AlbumRef, ArtistRef, PlaylistRef, TrackRef};
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
 const COVER_BASE: &str = "https://i.scdn.co/image/";
@@ -602,7 +602,7 @@ async fn metadata_get<T: Metadata>(
 pub async fn playlist_browse(
     session: &Session,
     id: &str,
-) -> Result<crate::protocol::PlaylistBrowse, String> {
+) -> Result<spotify_playback_engine::protocol::PlaylistBrowse, String> {
     let uri = playlist_uri(id)?;
     let playlist: Playlist = metadata_get(session, &uri, "playlist").await?;
     let (owner_id, owner_name) = match &playlist.id {
@@ -613,7 +613,7 @@ pub async fn playlist_browse(
         _ => (String::new(), String::new()),
     };
     let tracks = fetch_tracks(session, playlist.tracks()).await?;
-    Ok(crate::protocol::PlaylistBrowse {
+    Ok(spotify_playback_engine::protocol::PlaylistBrowse {
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
         name: playlist.name().to_owned(),
@@ -642,12 +642,12 @@ fn playlist_attributes_cover(attributes: &librespot_metadata::playlist::attribut
 pub async fn album_browse(
     session: &Session,
     id: &str,
-) -> Result<crate::protocol::AlbumBrowse, String> {
+) -> Result<spotify_playback_engine::protocol::AlbumBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}"))
         .map_err(|error| format!("invalid album id: {error}"))?;
     let album: Album = metadata_get(session, &uri, "album").await?;
     let tracks = fetch_tracks(session, album.tracks()).await?;
-    Ok(crate::protocol::AlbumBrowse {
+    Ok(spotify_playback_engine::protocol::AlbumBrowse {
         id: id_of(&album.id),
         uri: uri_of(&album.id),
         name: album.name.clone(),
@@ -671,14 +671,14 @@ async fn fetch_albums<'a>(
 pub async fn artist_browse(
     session: &Session,
     id: &str,
-) -> Result<crate::protocol::ArtistBrowse, String> {
+) -> Result<spotify_playback_engine::protocol::ArtistBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
         .map_err(|error| format!("invalid artist id: {error}"))?;
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
     let top_tracks = artist.top_tracks.for_country(&session.country());
     let top_tracks = fetch_tracks(session, top_tracks.iter()).await?;
     let albums = fetch_albums(session, artist.albums_current()).await?;
-    Ok(crate::protocol::ArtistBrowse {
+    Ok(spotify_playback_engine::protocol::ArtistBrowse {
         id: id_of(&artist.id),
         uri: uri_of(&artist.id),
         name: artist.name.clone(),
@@ -1053,7 +1053,7 @@ pub async fn search_browse(
     session: &Session,
     query: &str,
     limit: usize,
-) -> Result<crate::protocol::SearchBrowse, String> {
+) -> Result<spotify_playback_engine::protocol::SearchBrowse, String> {
     if query.trim().is_empty() {
         return Err("search query must not be empty".to_owned());
     }
@@ -1069,7 +1069,7 @@ pub async fn search_browse(
         };
         let parsed: SearchDesktopResponse = serde_json::from_slice(&payload)
             .map_err(|error| format!("unparseable search response: {error}"))?;
-        return Ok(crate::protocol::SearchBrowse {
+        return Ok(spotify_playback_engine::protocol::SearchBrowse {
             tracks: parsed
                 .data
                 .searchV2
@@ -1449,7 +1449,7 @@ mod tests {
             }
         }"#;
         let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        let converted = crate::protocol::SearchBrowse {
+        let converted = spotify_playback_engine::protocol::SearchBrowse {
             tracks: parsed
                 .data
                 .searchV2

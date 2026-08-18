@@ -13,7 +13,7 @@ use crate::auth::{
     prepare_oauth,
 };
 use crate::io::ProtocolWriter;
-use crate::protocol::{AuthState, BrowseResponse, Command, RepeatMode, Response, StateEvent, TrackRef};
+use spotify_playback_engine::protocol::{AuthState, BrowseResponse, Command, RepeatMode, Response, StateEvent, TrackRef};
 use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
@@ -1168,7 +1168,7 @@ mod tests {
         Engine, PlaybackState, PlayerSignal, TRACK_CHANGE_MIN_INTERVAL,
     };
     use crate::io::ProtocolWriter;
-    use crate::protocol::{RepeatMode, TrackRef};
+    use spotify_playback_engine::protocol::{RepeatMode, TrackRef};
 
     fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
         let (writer, buffer) = ProtocolWriter::capture();
@@ -1199,7 +1199,7 @@ mod tests {
     fn playback_state(duration_ms: u32) -> PlaybackState {
         PlaybackState {
             ready: true,
-            auth_state: crate::protocol::AuthState::Ready,
+            auth_state: spotify_playback_engine::protocol::AuthState::Ready,
             auth_url: None,
             playing: false,
             position_ms: 0,
@@ -1491,7 +1491,7 @@ mod tests {
         engine.state.playing = true;
 
         assert!(engine.logout().expect("logout succeeds"));
-        assert!(engine.state.auth_state == crate::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin);
         assert!(!engine.state.ready);
         assert!(!engine.state.playing);
         assert!(engine.state.current_index.is_none());
@@ -1527,7 +1527,7 @@ mod tests {
         assert!(engine.logout().expect("first logout"));
         assert!(!fixture.credentials_exist());
         assert!(engine.logout().expect("second logout is a no-op"));
-        assert!(engine.state.auth_state == crate::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin);
     }
 
     #[test]
@@ -1536,7 +1536,7 @@ mod tests {
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         engine.start_authentication(sender);
         assert!(!engine.auth_running, "no implicit flow may start");
-        assert!(engine.state.auth_state == crate::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin);
         assert!(engine.state.auth_url.is_some());
 
         engine.emit_state().expect("state emits");
@@ -1554,18 +1554,18 @@ mod tests {
     #[test]
     fn login_is_a_noop_while_a_session_is_live() {
         let mut engine = playing_engine(); // ready with a player-less state
-        engine.state.auth_state = crate::protocol::AuthState::Ready;
+        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Ready;
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine.login(&sender).expect("login no-ops when authenticated"));
         assert!(!engine.auth_running);
-        assert!(engine.state.auth_state == crate::protocol::AuthState::Ready);
+        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Ready);
     }
 
     #[test]
     fn login_is_a_noop_while_a_flow_is_already_running() {
         let mut engine = test_engine().0;
         engine.auth_running = true;
-        engine.state.auth_state = crate::protocol::AuthState::Authenticating;
+        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?running".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine.login(&sender).expect("login no-ops while authenticating"));
@@ -1588,7 +1588,7 @@ mod tests {
             .expect("needs_login publishes a url");
         let pending = engine.begin_login_flow().expect("flow begins");
         assert_eq!(pending.auth_url, published, "the flow must use the published URL");
-        assert!(engine.state.auth_state == crate::protocol::AuthState::Authenticating);
+        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating);
         assert!(engine.auth_running);
         assert_eq!(engine.state.auth_url.as_deref(), Some(published.as_str()));
         assert!(engine.pending_auth.is_none());
@@ -1597,17 +1597,17 @@ mod tests {
     #[test]
     fn begin_login_flow_prepares_a_fresh_attempt_when_none_is_pending() {
         let mut engine = test_engine().0;
-        engine.state.auth_state = crate::protocol::AuthState::NeedsLogin;
+        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::NeedsLogin;
         let pending = engine.begin_login_flow().expect("flow begins");
         assert!(pending.auth_url.starts_with("https://accounts.spotify.com/authorize?"));
-        assert!(engine.state.auth_state == crate::protocol::AuthState::Authenticating);
+        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating);
         assert_eq!(engine.state.auth_url.as_deref(), Some(pending.auth_url.as_str()));
     }
 
     #[test]
     fn failed_auth_signal_returns_to_needs_login_with_a_fresh_url() {
         let mut engine = test_engine().0;
-        engine.state.auth_state = crate::protocol::AuthState::Authenticating;
+        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?first".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine.on_auth_signal(
@@ -1617,7 +1617,7 @@ mod tests {
             },
             sender,
         ));
-        assert!(engine.state.auth_state == crate::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin);
         assert!(!engine.state.ready);
         assert!(!engine.auth_running);
         let retry_url = engine.state.auth_url.clone().expect("retry url published");

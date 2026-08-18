@@ -4,7 +4,6 @@ mod browse;
 mod edits;
 mod engine;
 mod io;
-mod protocol;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -15,7 +14,7 @@ use engine::{AuthSignal, Engine, PlayerSignal};
 use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
-use protocol::{AlbumBrowse, ArtistBrowse, Command, PlaylistBrowse, PlaylistRef, Response, SearchBrowse};
+use spotify_playback_engine::protocol::{AlbumBrowse, ArtistBrowse, Command, PlaylistBrowse, PlaylistRef, Response, SearchBrowse};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 

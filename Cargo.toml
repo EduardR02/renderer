@@ -1,0 +1,5 @@
+# Cargo workspace: the Tauri shell plus the Rust playback engine.
+# `cargo build --release` at the repo root builds both.
+[workspace]
+resolver = "3"
+members = ["engine", "src-tauri"]

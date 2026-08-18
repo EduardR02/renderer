@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::protocol::Request;
+use spotify_playback_engine::protocol::Request;
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 

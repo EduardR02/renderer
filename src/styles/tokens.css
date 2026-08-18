@@ -1,0 +1,69 @@
+/* ------------------------------------------------------------------ */
+/* Design tokens — Spotify visual language, pruned                     */
+/* Surfaces are separated by subtle luminance, not borders.            */
+/* ------------------------------------------------------------------ */
+:root {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg-sidebar: #0a0a0a;
+  --bg-base: #121212;
+  --bg-elevated: #181818;
+  --bg-highlight: #1f1f1f;
+  --bg-hover: #242424;
+  --bg-active: #2a2a2a;
+  --bg-input: #242424;
+  --bg-menu: #282828;
+  --bg-menu-hover: #3e3e3e;
+  --bg-cover-fallback: linear-gradient(145deg, #2e2e2e 0%, #1c1c1c 100%);
+
+  /* Text */
+  --text-primary: #ffffff;
+  --text-secondary: #b3b3b3;
+  --text-subdued: #6a6a6a;
+
+  /* Accent */
+  --accent: #1db954;
+  --accent-hover: #1ed760;
+  --accent-active: #169c46;
+  --danger: #f15e6c;
+
+  /* Radii — small corners, only player controls go full-round */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-full: 9999px;
+
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  /* Typography */
+  --font-stack:
+    "Circular", -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter",
+    "Helvetica Neue", Arial, sans-serif;
+  --font-xs: 12px;
+  --font-sm: 13px;
+  --font-md: 14px;
+  --font-lg: 16px;
+  --font-xl: 20px;
+  --font-2xl: 28px;
+  --font-3xl: 40px;
+
+  /* Motion — 120–180ms, only in response to interaction */
+  --transition-fast: 120ms ease;
+  --transition-base: 180ms ease;
+
+  /* Layout */
+  --sidebar-width: 232px;
+  --player-height: 90px;
+
+  /* Scrollbars */
+  --scrollbar-thumb: rgba(255, 255, 255, 0.25);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.45);
+}

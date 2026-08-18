@@ -40,7 +40,7 @@ use protocol::playlist4_external as p4;
 use protobuf::Message;
 use serde::Deserialize;
 
-use crate::protocol::PlaylistRef;
+use spotify_playback_engine::protocol::PlaylistRef;
 
 // ---------------------------------------------------------------------------
 // pure op builders (unit-tested)
