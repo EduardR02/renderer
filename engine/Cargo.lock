@@ -2525,10 +2525,15 @@ dependencies = [
 name = "spotify-playback-engine"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "env_logger",
+ "futures-util",
+ "http",
  "librespot-core",
+ "librespot-metadata",
  "librespot-playback",
  "oauth2",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

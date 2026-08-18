@@ -1188,8 +1188,8 @@ void MainWindow::CreateChildren() {
   engineGroupLbl_ = makeStatic(L"SPOTIFY SESSION", CID_ENGINE_GROUP);
   engineGuideLbl_ = makeStatic(
       L"SpotifyPlaybackEngine signs in once with your Spotify account. That "
-      L"same session powers audio and mints Web API access for search, "
-      L"library, playlists, and artwork.",
+      L"same local session powers audio and browsing — search, playlists, "
+      L"albums, and artists — no developer app is involved.",
       CID_ENGINE_GUIDE);
   engineStatusLbl_ = makeStatic(
       L"Standalone engine: starting", CID_ENGINE_STATUS,
@@ -1203,8 +1203,8 @@ void MainWindow::CreateChildren() {
 
   settingsTitle_ = makeStatic(L"Settings", CID_SETTINGS_TITLE);
   settingsGuide_ = makeStatic(
-      L"One Spotify sign-in covers local playback and Web API browsing. "
-      L"No developer app is required.",
+      L"One Spotify sign-in covers local playback and browsing through the "
+      L"engine's session. No developer app is required.",
       0);
 
   tooltip_ = ::CreateWindowExW(

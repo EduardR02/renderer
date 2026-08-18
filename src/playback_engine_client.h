@@ -35,6 +35,9 @@ struct PlaybackEngineState {
   // Spotify OAuth authorize URL for the current/next login attempt, present
   // while the engine is NeedsLogin (and while the flow it started runs).
   std::string auth_url;
+  // The signed-in account name from the engine's session, present while the
+  // session is Ready. Used as the Web API user id for playlist edits.
+  std::string username;
   bool playing = false;
   int64_t position_ms = 0;
   int64_t duration_ms = 0;
@@ -59,19 +62,25 @@ inline bool LogoutButtonEnabled(const PlaybackEngineState& state) {
 }
 
 struct EngineMessage {
-  enum class Kind { Response, State, WebApiToken } kind = Kind::Response;
+  enum class Kind { Response, State, WebApiToken, Data } kind = Kind::Response;
   std::string request_id;
   bool ok = false;
   std::string error;
   PlaybackEngineState state;
   // Present only on successful web_api_token responses.
   WebApiToken token;
+  // The full response object for browse_* (spclient) responses; the browse
+  // accessors below parse their payloads from it.
+  nlohmann::json data;
 };
 
 
 
 TrackRef TrackRefFromEngineJson(const nlohmann::json& value);
 nlohmann::json TrackRefToEngineJson(const TrackRef& track);
+PlaylistRef PlaylistRefFromEngineJson(const nlohmann::json& value);
+AlbumRef AlbumRefFromEngineJson(const nlohmann::json& value);
+ArtistRef ArtistRefFromEngineJson(const nlohmann::json& value);
 EngineMessage ParseEngineMessage(const std::string& line);
 nlohmann::json BuildEngineRequest(const std::string& requestId,
                                   const std::string& type,
@@ -135,6 +144,23 @@ class PlaybackEngineClient {
   bool RequestWebApiToken(WebApiToken* out, std::string* error,
                           int timeoutMs = 20000);
 
+  // Blocking browse round-trips served by the engine's spclient session
+  // (same protocol machinery as RequestWebApiToken). Each returns false with
+  // `error` set on transport failure, engine rejection, malformed payload, or
+  // timeout. Playlist/album/artist ids are the engine's Spotify ids.
+  bool BrowsePlaylists(int length, std::vector<PlaylistRef>* out,
+                       std::string* error, int timeoutMs = 20000);
+  bool BrowsePlaylist(const std::string& id, std::vector<TrackRef>* tracks,
+                      std::string* revisionOut, std::string* error,
+                      int timeoutMs = 20000);
+  bool BrowseAlbum(const std::string& id, std::vector<TrackRef>* tracks,
+                   std::string* error, int timeoutMs = 20000);
+  bool BrowseArtist(const std::string& id, std::vector<TrackRef>* topTracks,
+                    std::vector<AlbumRef>* albums, std::string* error,
+                    int timeoutMs = 20000);
+  bool BrowseSearch(const std::string& query, int limit, SearchResult* out,
+                    std::string* error, int timeoutMs = 20000);
+
  private:
   std::string Send(const std::string& type, nlohmann::json arguments = {});
   // Writes one line-protocol request under an explicit request id; throws
@@ -145,16 +171,25 @@ class PlaybackEngineClient {
   void ReportError(std::string message);
   void CloseHandles();
 
-  // Blocks RequestWebApiToken callers until the reader thread delivers the
-  // matching web_api_token message.
-  struct TokenWaiter {
+  // One blocking round-trip: RequestWebApiToken and the browse_* methods
+  // register a waiter keyed by request id; the reader thread fills either the
+  // token (web_api_token) or the raw response object (browse_*) and wakes it.
+  struct Waiter {
     std::mutex mutex;
     std::condition_variable cv;
     bool done = false;
     bool ok = false;
     std::string error;
     WebApiToken token;
+    nlohmann::json data;
   };
+
+  // Writes a request and blocks until the reader delivers a matching
+  // response. On success returns true with the full response object in
+  // `data`; on failure returns false with `error` set. `timeoutMs` bounds
+  // the whole round-trip.
+  bool RequestData(const std::string& type, nlohmann::json arguments,
+                   nlohmann::json* data, std::string* error, int timeoutMs);
 
   HANDLE process_ = nullptr;
   HANDLE thread_ = nullptr;
@@ -169,8 +204,8 @@ class PlaybackEngineClient {
   ErrorCallback on_error_;
   ResponseCallback on_response_;
   CommandErrorCallback on_command_error_;
-  std::mutex token_wait_mutex_;
-  std::unordered_map<std::string, std::shared_ptr<TokenWaiter>> token_waiters_;
+  std::mutex waiter_mutex_;
+  std::unordered_map<std::string, std::shared_ptr<Waiter>> waiters_;
   std::atomic<uint64_t> next_request_id_{1};
   std::atomic<bool> stopping_{false};
 };

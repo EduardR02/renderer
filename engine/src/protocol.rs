@@ -77,6 +77,32 @@ pub enum Command {
     /// can browse without its own OAuth app. Responded to with
     /// [`WebApiTokenResponse`].
     WebApiToken,
+    /// User playlist library via the spclient rootlist (first `length`
+    /// entries). Responded to with a `browse_playlists` message.
+    BrowsePlaylists {
+        length: usize,
+    },
+    /// Playlist metadata and tracks via `/playlist/v2/playlist/{id}`.
+    /// Responded to with a `browse_playlist` message.
+    BrowsePlaylist {
+        id: String,
+    },
+    /// Album metadata and tracks via the extended-metadata album endpoint.
+    /// Responded to with a `browse_album` message.
+    BrowseAlbum {
+        id: String,
+    },
+    /// Artist metadata, top tracks, and albums via the extended-metadata
+    /// artist endpoint. Responded to with a `browse_artist` message.
+    BrowseArtist {
+        id: String,
+    },
+    /// Search via the spclient searchview endpoint. Responded to with a
+    /// `browse_search` message.
+    BrowseSearch {
+        query: String,
+        limit: usize,
+    },
     /// Clears the cached credentials and tears the session down; the engine
     /// immediately reports `needs_login` (with a fresh authorize URL).
     Logout,
@@ -135,6 +161,107 @@ pub struct WebApiTokenResponse<'a> {
     pub expires_in: Option<u64>,
 }
 
+/// Playlist reference inside browse responses. `owner_id` is the owning
+/// user's Spotify username; `owner_name` is their display name when the
+/// source carries it (the rootlist only exposes usernames, so it is empty
+/// there).
+#[derive(Serialize)]
+pub struct PlaylistRef {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub owner_id: String,
+    pub owner_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_count: Option<u32>,
+}
+
+/// Payload of a successful [`Command::BrowsePlaylist`] response. `revision`
+/// is the playlist4 revision hex-encoded (the value Web API edits call the
+/// snapshot id).
+#[derive(Serialize)]
+pub struct PlaylistBrowse {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub owner_id: String,
+    pub owner_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+    pub tracks: Vec<TrackRef>,
+}
+
+/// Album reference inside browse responses.
+#[derive(Serialize)]
+pub struct AlbumRef {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub artist_names: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+}
+
+/// Payload of a successful [`Command::BrowseAlbum`] response.
+#[derive(Serialize)]
+pub struct AlbumBrowse {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub artist_names: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+    pub tracks: Vec<TrackRef>,
+}
+
+/// Artist reference inside browse responses.
+#[derive(Serialize)]
+pub struct ArtistRef {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portrait_url: Option<String>,
+}
+
+/// Payload of a successful [`Command::BrowseArtist`] response.
+#[derive(Serialize)]
+pub struct ArtistBrowse {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portrait_url: Option<String>,
+    pub top_tracks: Vec<TrackRef>,
+    pub albums: Vec<AlbumRef>,
+}
+
+/// Payload of a successful [`Command::BrowseSearch`] response.
+#[derive(Serialize)]
+pub struct SearchBrowse {
+    pub tracks: Vec<TrackRef>,
+    pub albums: Vec<AlbumRef>,
+    pub artists: Vec<ArtistRef>,
+}
+
+/// Envelope for every `browse_*` response: the payload travels in `data` on
+/// success, error text only on failure. `kind` matches the command name.
+#[derive(Serialize)]
+pub struct BrowseResponse<'a, T: Serialize> {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub request_id: &'a str,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<&'a T>,
+}
+
 #[derive(Serialize)]
 pub struct StateEvent<'a> {
     #[serde(rename = "type")]
@@ -146,6 +273,11 @@ pub struct StateEvent<'a> {
     /// while the flow it started is `Authenticating`; regenerated per attempt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<&'a str>,
+    /// Spotify username of the live session, present once authenticated.
+    /// The UI uses it for Web API calls that need a user id (`/v1/users/…`)
+    /// instead of the removed `/v1/me` round-trip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     pub playing: bool,
     pub position_ms: u32,
     pub duration_ms: u32,
@@ -162,8 +294,8 @@ pub struct StateEvent<'a> {
 mod tests {
     use serde_json::json;
 
-    use super::{AuthState, Command, RepeatMode, Request, Response, StateEvent, TrackRef,
-                WebApiTokenResponse};
+    use super::{AuthState, BrowseResponse, Command, PlaylistRef, RepeatMode, Request, Response,
+                SearchBrowse, StateEvent, TrackRef, WebApiTokenResponse};
 
     #[test]
     fn web_api_token_command_deserializes_from_the_line_protocol() {
@@ -273,6 +405,7 @@ mod tests {
             ready: true,
             auth_state: AuthState::Ready,
             auth_url: None,
+            username: Some("alice".to_owned()),
             playing: true,
             position_ms: 7_500,
             duration_ms: 123_456,
@@ -305,6 +438,7 @@ mod tests {
             ready: false,
             auth_state: AuthState::NeedsLogin,
             auth_url: Some("https://accounts.spotify.com/authorize?state=abc"),
+            username: None,
             playing: false,
             position_ms: 0,
             duration_ms: 0,
@@ -339,5 +473,196 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(logout.command, Command::Logout));
+    }
+
+    #[test]
+    fn browse_commands_deserialize_from_the_line_protocol() {
+        let playlists: Request = serde_json::from_value(json!({
+            "request_id": "request-11",
+            "type": "browse_playlists",
+            "length": 50,
+        }))
+        .unwrap();
+        assert!(matches!(
+            playlists.command,
+            Command::BrowsePlaylists { length: 50 }
+        ));
+
+        let playlist: Request = serde_json::from_value(json!({
+            "request_id": "request-12",
+            "type": "browse_playlist",
+            "id": "0123456789ABCDEFGHIJKL",
+        }))
+        .unwrap();
+        assert!(matches!(
+            playlist.command,
+            Command::BrowsePlaylist { ref id } if id == "0123456789ABCDEFGHIJKL"
+        ));
+
+        let album: Request = serde_json::from_value(json!({
+            "request_id": "request-13",
+            "type": "browse_album",
+            "id": "0abcdefghijklmnopqrstu",
+        }))
+        .unwrap();
+        assert!(matches!(album.command, Command::BrowseAlbum { .. }));
+
+        let artist: Request = serde_json::from_value(json!({
+            "request_id": "request-14",
+            "type": "browse_artist",
+            "id": "0123456789ABCDEFGHIJKL",
+        }))
+        .unwrap();
+        assert!(matches!(artist.command, Command::BrowseArtist { .. }));
+
+        let search: Request = serde_json::from_value(json!({
+            "request_id": "request-15",
+            "type": "browse_search",
+            "query": "fire & ice",
+            "limit": 10,
+        }))
+        .unwrap();
+        assert!(matches!(
+            search.command,
+            Command::BrowseSearch { ref query, limit: 10 } if query == "fire & ice"
+        ));
+    }
+
+    #[test]
+    fn browse_response_serializes_the_data_envelope() {
+        let playlists = vec![PlaylistRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:playlist:0123456789ABCDEFGHIJKL".to_owned(),
+            name: "Road Trip".to_owned(),
+            owner_id: "alice".to_owned(),
+            owner_name: String::new(),
+            cover_url: Some("https://i.scdn.co/image/0123".to_owned()),
+            track_count: Some(42),
+        }];
+        let payload = SearchBrowse {
+            tracks: vec![TrackRef {
+                id: "2abcdefghijklmnopqrstu".to_owned(),
+                uri: "spotify:track:2abcdefghijklmnopqrstu".to_owned(),
+                name: "Track".to_owned(),
+                ..TrackRef::default()
+            }],
+            albums: Vec::new(),
+            artists: Vec::new(),
+        };
+
+        let success = serde_json::to_value(BrowseResponse {
+            kind: "browse_search",
+            request_id: "request-15",
+            ok: true,
+            error: None,
+            data: Some(&payload),
+        })
+        .unwrap();
+        assert_eq!(
+            success,
+            json!({
+                "type": "browse_search",
+                "request_id": "request-15",
+                "ok": true,
+                "data": {
+                    "tracks": [{
+                        "id": "2abcdefghijklmnopqrstu",
+                        "uri": "spotify:track:2abcdefghijklmnopqrstu",
+                        "name": "Track",
+                        "artist_names": [],
+                        "artist_id": "",
+                        "album_id": "",
+                        "album_name": "",
+                        "cover_url": "",
+                        "duration_ms": 0
+                    }],
+                    "albums": [],
+                    "artists": []
+                }
+            })
+        );
+
+        let failure = serde_json::to_value(BrowseResponse::<SearchBrowse> {
+            kind: "browse_search",
+            request_id: "request-15",
+            ok: false,
+            error: Some("search request failed: unavailable"),
+            data: None,
+        })
+        .unwrap();
+        assert_eq!(
+            failure,
+            json!({
+                "type": "browse_search",
+                "request_id": "request-15",
+                "ok": false,
+                "error": "search request failed: unavailable"
+            })
+        );
+        assert!(failure.get("data").is_none());
+
+        // browse_playlists carries its payload as a bare array in `data`.
+        let lists = serde_json::to_value(BrowseResponse {
+            kind: "browse_playlists",
+            request_id: "request-11",
+            ok: true,
+            error: None,
+            data: Some(&playlists),
+        })
+        .unwrap();
+        assert_eq!(
+            lists["data"],
+            json!([{
+                "id": "0123456789ABCDEFGHIJKL",
+                "uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
+                "name": "Road Trip",
+                "owner_id": "alice",
+                "owner_name": "",
+                "cover_url": "https://i.scdn.co/image/0123",
+                "track_count": 42
+            }])
+        );
+    }
+
+    #[test]
+    fn state_serialization_carries_the_username_while_logged_in() {
+        let state = serde_json::to_value(StateEvent {
+            kind: "state",
+            ready: true,
+            auth_state: AuthState::Ready,
+            auth_url: None,
+            username: Some("alice".to_owned()),
+            playing: false,
+            position_ms: 0,
+            duration_ms: 0,
+            volume: 50,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            current_index: None,
+            current_uri: None,
+            queue: &[],
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(state["username"], "alice");
+        let logged_out = serde_json::to_value(StateEvent {
+            kind: "state",
+            ready: false,
+            auth_state: AuthState::NeedsLogin,
+            auth_url: None,
+            username: None,
+            playing: false,
+            position_ms: 0,
+            duration_ms: 0,
+            volume: 50,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            current_index: None,
+            current_uri: None,
+            queue: &[],
+            error: None,
+        })
+        .unwrap();
+        assert!(logged_out.get("username").is_none());
     }
 }

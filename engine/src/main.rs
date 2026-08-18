@@ -1,4 +1,5 @@
 mod auth;
+mod browse;
 mod engine;
 mod io;
 mod protocol;
@@ -96,21 +97,45 @@ async fn run(
                 match input.unwrap_or(Input::Eof) {
                     Input::Request(request) => {
                         let request_id = request.request_id;
-                        if matches!(&request.command, Command::Shutdown) {
-                            let success = Ok(true);
-                            engine.send_response(&request_id, &success)?;
-                            engine.shutdown();
-                            break;
-                        }
-                        let mint_token = matches!(&request.command, Command::WebApiToken);
-                        let result = engine.process_command(request.command, &auth_sender).await;
-                        if mint_token {
-                            engine.send_web_token_response(&request_id, &result)?;
-                        } else {
-                            engine.send_response(&request_id, &result)?;
-                        }
-                        if matches!(result, Ok(true)) {
-                            engine.emit_state()?;
+                        match request.command {
+                            Command::Shutdown => {
+                                let success = Ok(true);
+                                engine.send_response(&request_id, &success)?;
+                                engine.shutdown();
+                                break;
+                            }
+                            Command::BrowsePlaylists { length } => {
+                                let result = engine.browse_playlists(length).await;
+                                engine.send_browse_response(&request_id, "browse_playlists", &result)?;
+                            }
+                            Command::BrowsePlaylist { id } => {
+                                let result = engine.browse_playlist(&id).await;
+                                engine.send_browse_response(&request_id, "browse_playlist", &result)?;
+                            }
+                            Command::BrowseAlbum { id } => {
+                                let result = engine.browse_album(&id).await;
+                                engine.send_browse_response(&request_id, "browse_album", &result)?;
+                            }
+                            Command::BrowseArtist { id } => {
+                                let result = engine.browse_artist(&id).await;
+                                engine.send_browse_response(&request_id, "browse_artist", &result)?;
+                            }
+                            Command::BrowseSearch { query, limit } => {
+                                let result = engine.browse_search(&query, limit).await;
+                                engine.send_browse_response(&request_id, "browse_search", &result)?;
+                            }
+                            command => {
+                                let mint_token = matches!(&command, Command::WebApiToken);
+                                let result = engine.process_command(command, &auth_sender).await;
+                                if mint_token {
+                                    engine.send_web_token_response(&request_id, &result)?;
+                                } else {
+                                    engine.send_response(&request_id, &result)?;
+                                }
+                                if matches!(result, Ok(true)) {
+                                    engine.emit_state()?;
+                                }
+                            }
                         }
                     }
                     Input::Invalid { request_id, error } => {

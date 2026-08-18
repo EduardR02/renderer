@@ -451,8 +451,9 @@ void Application::StopTimers() {
 }
 
 bool Application::IsAuthed() const {
-  // Browsing tokens are minted by the playback engine from its own Spotify
-  // session, so browsing is available exactly when the engine reports ready.
+  // Browsing and playlist edits both ride on the playback engine's Spotify
+  // session (spclient browse + login5-minted Web API tokens), so they are
+  // available exactly when the engine reports ready.
   return playback_.ready;
 }
 
@@ -505,7 +506,13 @@ void Application::OnSearch(const std::string& query) {
   if (Trim(query).empty()) return;
   window_.SetStatus(L"Searching...");
   PostTask<SearchResult>(
-      [this, query] { return api_->Search(query); },
+      [this, query] {
+        SearchResult result;
+        std::string error;
+        if (!engine_.BrowseSearch(query, 10, &result, &error))
+          throw std::runtime_error(error.empty() ? "search failed" : error);
+        return result;
+      },
       [this](SearchResult result) {
         window_.SetSearchResults(result);
         window_.SetStatus(L"Search complete");
@@ -529,7 +536,15 @@ void Application::OnSearchActivate(int item) {
   } else if (kinds[item] == 2 && index < result.artists.size()) {
     const ArtistRef artist = result.artists[index];
     PostTask<std::vector<TrackRef>>(
-        [this, id = artist.id] { return api_->GetArtistTopTracks(id); },
+        [this, id = artist.id] {
+          std::vector<TrackRef> topTracks;
+          std::vector<AlbumRef> albums;
+          std::string error;
+          if (!engine_.BrowseArtist(id, &topTracks, &albums, &error))
+            throw std::runtime_error(error.empty() ? "artist browse failed"
+                                                   : error);
+          return topTracks;
+        },
         [this, artist](std::vector<TrackRef> tracks) {
           middle_mode_ = MiddleMode::ArtistTracks;
           window_.SetArtistPage(artist, tracks);
@@ -579,7 +594,15 @@ void Application::OnSearchContext(UINT command, int item) {
                                                 : track.artist_names.front(),
                      track.cover_url};
     PostTask<std::vector<TrackRef>>(
-        [this, id = artist.id] { return api_->GetArtistTopTracks(id); },
+        [this, id = artist.id] {
+          std::vector<TrackRef> topTracks;
+          std::vector<AlbumRef> albums;
+          std::string error;
+          if (!engine_.BrowseArtist(id, &topTracks, &albums, &error))
+            throw std::runtime_error(error.empty() ? "artist browse failed"
+                                                   : error);
+          return topTracks;
+        },
         [this, artist](std::vector<TrackRef> tracks) {
           middle_mode_ = MiddleMode::ArtistTracks;
           window_.SetArtistPage(artist, tracks);
@@ -717,7 +740,15 @@ void Application::OnMiddleContext(UINT command, int index) {
                                                 : track.artist_names.front(),
                      track.cover_url};
     PostTask<std::vector<TrackRef>>(
-        [this, id = artist.id] { return api_->GetArtistTopTracks(id); },
+        [this, id = artist.id] {
+          std::vector<TrackRef> topTracks;
+          std::vector<AlbumRef> albums;
+          std::string error;
+          if (!engine_.BrowseArtist(id, &topTracks, &albums, &error))
+            throw std::runtime_error(error.empty() ? "artist browse failed"
+                                                   : error);
+          return topTracks;
+        },
         [this, artist](std::vector<TrackRef> tracks) {
           middle_mode_ = MiddleMode::ArtistTracks;
           window_.SetArtistPage(artist, tracks);
@@ -773,7 +804,9 @@ void Application::OnNewPlaylist() {
   if (!name || Trim(WideToUtf8(*name)).empty()) return;
   PostTask<PlaylistRef>(
       [this, value = WideToUtf8(*name)] {
-        if (me_id_.empty()) me_id_ = api_->GetMeId();
+        if (me_id_.empty())
+          throw std::runtime_error(
+              "sign in with Spotify in Settings before creating playlists");
         return api_->CreatePlaylist(me_id_, value);
       },
       [this](PlaylistRef) { RefreshPlaylists(true); },
@@ -1056,6 +1089,11 @@ void Application::OnEngineState(PlaybackEngineState state) {
       playback_.error != reconciled.error;
   const bool becameReady = !playback_.ready && reconciled.ready;
   playback_ = std::move(reconciled);
+  // The engine's session account doubles as the Web API user id for playlist
+  // edits; /v1/me is no longer consulted.
+  if (playback_.auth_state == EngineAuthState::Ready &&
+      !playback_.username.empty())
+    me_id_ = playback_.username;
   ResetProjectionBase();
   UpdatePlaybackUi();
   if (queueChanged) RefreshQueue();
@@ -1210,47 +1248,27 @@ void Application::RefreshPlaylists(bool force) {
     return;
   }
   // Relaunch fast path: a fresh on-disk copy of the library skips the
-  // startup /me + /me/playlists fetch entirely.
+  // startup engine round-trip entirely.
   if (!force && LoadPlaylistCache()) return;
-  FetchPlaylistPage({}, 0);
+  FetchPlaylists();
 }
 
-void Application::FetchPlaylistPage(const std::string& nextPath,
-                                    int pageIndex) {
-  if (pageIndex < 0 || pageIndex >= kMaxPlaylistPages) return;
-  PostTask<PlaylistsPage>(
-      [this, nextPath] {
-        // The account id rides along on the first page so the startup path
-        // stays a single serialized request; a rate limit here cannot mask
-        // the playlist fetch.
-        if (nextPath.empty() && me_id_.empty()) {
-          try {
-            me_id_ = api_->GetMeId();
-          } catch (const ApiError& error) {
-            LOG_WARN(std::string("could not load account id: ") + error.what());
-          }
-        }
-        return api_->GetMyPlaylistsPage(nextPath);
+void Application::FetchPlaylists() {
+  PostTask<std::vector<PlaylistRef>>(
+      [this] {
+        std::vector<PlaylistRef> list;
+        std::string error;
+        if (!engine_.BrowsePlaylists(kPlaylistFetchLength, &list, &error))
+          throw std::runtime_error(error.empty() ? "playlists unavailable"
+                                                 : error);
+        return list;
       },
-      [this, pageIndex](PlaylistsPage page) {
-        if (pageIndex == 0)
-          playlists_ = std::move(page.items);
-        else
-          playlists_.insert(playlists_.end(), page.items.begin(),
-                            page.items.end());
+      [this](std::vector<PlaylistRef> list) {
+        playlists_ = std::move(list);
         if (!playlists_fetched_at_.has_value())
           playlists_fetched_at_ = std::chrono::steady_clock::now();
         window_.SetPlaylists(playlists_);
         SavePlaylistCache();
-        if (!page.next_path.empty() && pageIndex + 1 < kMaxPlaylistPages) {
-          // Lazy pagination: remaining pages fetch one at a time, paced, so
-          // the startup burst is at most the first page.
-          ScheduleDelayedApiTask(
-              kPlaylistPageDelaySeconds,
-              [this, next = page.next_path, pageIndex] {
-                FetchPlaylistPage(next, pageIndex + 1);
-              });
-        }
       },
       [this](std::string message, int status, int retry) {
         HandleApiError(message, status, retry, L"Playlists");
@@ -1359,9 +1377,13 @@ void Application::RequestPlaylistTracks(const std::string& id) {
   }
   PostTask<std::pair<std::vector<TrackRef>, std::string>>(
       [this, id] {
-        std::string snapshot;
-        auto tracks = api_->GetPlaylistTracks(id, &snapshot);
-        return std::make_pair(std::move(tracks), std::move(snapshot));
+        std::vector<TrackRef> tracks;
+        std::string revision;
+        std::string error;
+        if (!engine_.BrowsePlaylist(id, &tracks, &revision, &error))
+          throw std::runtime_error(error.empty() ? "playlist unavailable"
+                                                 : error);
+        return std::make_pair(std::move(tracks), std::move(revision));
       },
       [this, id](std::pair<std::vector<TrackRef>, std::string> result) {
         CachedTrackList cached{std::move(result.first),
@@ -1397,7 +1419,13 @@ void Application::OpenAlbumTracks(const AlbumRef& album) {
     return;
   }
   PostTask<std::vector<TrackRef>>(
-      [this, id = album.id] { return api_->GetAlbumTracks(id); },
+      [this, id = album.id] {
+        std::vector<TrackRef> tracks;
+        std::string error;
+        if (!engine_.BrowseAlbum(id, &tracks, &error))
+          throw std::runtime_error(error.empty() ? "album unavailable" : error);
+        return tracks;
+      },
       [this, album](std::vector<TrackRef> tracks) {
         ApplyAlbumMetadata(tracks, album);
         CachedTrackList cached{std::move(tracks), {}};

@@ -115,11 +115,8 @@ class DelayedTaskQueue {
 // Rate-limit (429/503) auto-retry cap per API task: bounded so a persistent
 // limit can never spin forever; the final failure is shown to the user.
 inline constexpr int kMaxApiRetries = 3;
-// Pacing between playlist-list pages fetched lazily after startup.
-inline constexpr int kPlaylistPageDelaySeconds = 1;
-// Hard bound on playlist-list pages (50 playlists each), matching the old
-// full-fetch cap so a malformed server cannot loop forever.
-inline constexpr int kMaxPlaylistPages = 8;
+// Playlist-library fetch size for the engine browse_playlists round-trip.
+inline constexpr int kPlaylistFetchLength = 500;
 
 struct RunOptions {
   bool smoke = false;
@@ -248,9 +245,9 @@ class Application {
   void ScheduleDelayedApiTask(int delaySeconds, std::function<void()> task);
   bool LoadPlaylistCache();
   void SavePlaylistCache();
-  // Fetches one playlist page (plus the account id on the first page), then
-  // lazily paces the remaining pages through ScheduleDelayedApiTask.
-  void FetchPlaylistPage(const std::string& nextPath, int pageIndex);
+  // Fetches the whole playlist library in one engine browse_playlists
+  // round-trip (spclient rootlist; no Web API pagination).
+  void FetchPlaylists();
 
   void PlayTracks(const std::vector<TrackRef>& tracks, int index);
   // Runs an engine command; returns the request id the transport assigned (or

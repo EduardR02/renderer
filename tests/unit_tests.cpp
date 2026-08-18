@@ -833,5 +833,232 @@ TEST_CASE("login and logout requests use the line protocol command types") {
   CHECK((logout == json{{"request_id", "51"}, {"type", "logout"}}));
 }
 
+TEST_CASE("browse requests carry the engine command arguments") {
+  const json playlists = BuildEngineRequest(
+      "60", "browse_playlists", {{"length", 500}});
+  CHECK(playlists["request_id"] == "60");
+  CHECK(playlists["type"] == "browse_playlists");
+  CHECK(playlists["length"] == 500);
+
+  const json playlist = BuildEngineRequest("61", "browse_playlist",
+                                           {{"id", "playlist-123"}});
+  CHECK((playlist == json{{"request_id", "61"},
+                          {"type", "browse_playlist"},
+                          {"id", "playlist-123"}}));
+
+  const json album = BuildEngineRequest("62", "browse_album",
+                                        {{"id", "album-456"}});
+  CHECK(album["id"] == "album-456");
+
+  const json artist = BuildEngineRequest("63", "browse_artist",
+                                         {{"id", "artist-789"}});
+  CHECK(artist["id"] == "artist-789");
+
+  const json search = BuildEngineRequest(
+      "64", "browse_search", {{"query", "daft punk"}, {"limit", 10}});
+  CHECK(search["query"] == "daft punk");
+  CHECK(search["limit"] == 10);
+}
+
+TEST_CASE("browse responses parse as data messages with the raw payload") {
+  const json line = {
+      {"type", "browse_playlists"},
+      {"request_id", "70"},
+      {"ok", true},
+      {"data", json::array()},
+  };
+  const EngineMessage message = ParseEngineMessage(line.dump());
+  REQUIRE(message.kind == EngineMessage::Kind::Data);
+  CHECK(message.request_id == "70");
+  CHECK(message.ok);
+  CHECK(message.data["data"].is_array());
+}
+
+TEST_CASE("browse_playlists payload maps to PlaylistRef models") {
+  // browse_playlists is the one command whose "data" payload is the bare
+  // playlist array (matching the contract "-> [...]" literally).
+  const json line = {
+      {"type", "browse_playlists"},
+      {"request_id", "71"},
+      {"ok", true},
+      {"data",
+       json::array({
+           {{"id", "pl1"},
+            {"uri", "spotify:playlist:pl1"},
+            {"name", "Chill"},
+            {"owner_id", "user-a"},
+            {"owner_name", "Alice"},
+            {"cover_url", "https://i.scdn.co/image/abc"},
+            {"track_count", 42}},
+           {{"id", "pl2"},
+            {"name", "Workout"},
+            {"owner_id", "user-b"},
+            {"owner_name", "Bob"},
+            {"collaborative", true}},
+       })},
+  };
+  const EngineMessage message = ParseEngineMessage(line.dump());
+  const json& items = message.data["data"];
+  REQUIRE(items.size() == 2);
+  const PlaylistRef full = PlaylistRefFromEngineJson(items[0]);
+  CHECK(full.id == "pl1");
+  CHECK(full.uri == "spotify:playlist:pl1");  // the engine's own uri
+  CHECK(full.name == "Chill");
+  CHECK(full.owner == "Alice");
+  CHECK(full.owner_id == "user-a");
+  CHECK(full.cover_url == "https://i.scdn.co/image/abc");
+  CHECK(full.tracks_total == 42);
+  CHECK_FALSE(full.collaborative);
+  const PlaylistRef minimal = PlaylistRefFromEngineJson(items[1]);
+  // Absent uri is rebuilt from the id; the engine may send an empty owner
+  // name (rootlist carries no display name).
+  CHECK(minimal.uri == "spotify:playlist:pl2");
+  CHECK(minimal.owner == "Bob");
+  CHECK(minimal.cover_url.empty());
+  CHECK(minimal.tracks_total == 0);
+  CHECK(minimal.collaborative);
+  CHECK(minimal.snapshot_id.empty());
+}
+
+TEST_CASE("browse_playlist payload maps tracks and the edit revision") {
+  const json line = {
+      {"type", "browse_playlist"},
+      {"request_id", "72"},
+      {"ok", true},
+      {"data",
+       json{{"id", "pl1"},
+            {"uri", "spotify:playlist:pl1"},
+            {"name", "Chill"},
+            {"revision", "snap-9"},
+            {"owner_id", "user-a"},
+            {"owner_name", ""},
+            {"tracks", json::array({TrackRefToEngineJson(ExampleTrack())})}}},
+  };
+  const EngineMessage message = ParseEngineMessage(line.dump());
+  const json& payload = message.data["data"];
+  CHECK(payload["revision"] == "snap-9");
+  const TrackRef track = TrackRefFromEngineJson(payload["tracks"][0]);
+  CHECK(track.id == "track-id");
+  CHECK(track.uri == "spotify:track:abc");
+  CHECK(track.album_name == "Local Sessions");
+  CHECK(track.duration_ms == 243001);
+}
+
+TEST_CASE("browse_album payload maps track lists") {
+  const json line = {
+      {"type", "browse_album"},
+      {"request_id", "73"},
+      {"ok", true},
+      {"data",
+       json{{"id", "album-1"},
+            {"uri", "spotify:album:album-1"},
+            {"name", "Discovery"},
+            {"artist_names", json::array({"Daft Punk"})},
+            {"cover_url", "https://i.scdn.co/image/discovery"},
+            {"tracks", json::array({TrackRefToEngineJson(ExampleTrack())})}}},
+  };
+  const EngineMessage message = ParseEngineMessage(line.dump());
+  REQUIRE(message.data["data"]["tracks"].size() == 1);
+  CHECK(TrackRefFromEngineJson(message.data["data"]["tracks"][0]).name ==
+        "Signal Path");
+}
+
+TEST_CASE("browse_artist payload maps top tracks and albums") {
+  const json line = {
+      {"type", "browse_artist"},
+      {"request_id", "74"},
+      {"ok", true},
+      {"data",
+       json{{"id", "artist-1"},
+            {"uri", "spotify:artist:artist-1"},
+            {"name", "Daft Punk"},
+            {"portrait_url", "https://i.scdn.co/image/portrait"},
+            {"top_tracks", json::array({TrackRefToEngineJson(ExampleTrack())})},
+            {"albums",
+             json::array({
+                 {{"id", "album-1"},
+                  {"uri", "spotify:album:album-1"},
+                  {"name", "Discovery"},
+                  {"artist_names", json::array({"Daft Punk"})},
+                  {"cover_url", "https://i.scdn.co/image/discovery"}},
+                 {{"id", "album-2"}, {"name", "Homework"}},
+             })}}},
+  };
+  const EngineMessage message = ParseEngineMessage(line.dump());
+  const json& albums = message.data["data"]["albums"];
+  REQUIRE(albums.size() == 2);
+  const AlbumRef album = AlbumRefFromEngineJson(albums[0]);
+  CHECK(album.id == "album-1");
+  CHECK(album.uri == "spotify:album:album-1");
+  CHECK(album.name == "Discovery");
+  CHECK(album.artist_names == std::vector<std::string>({"Daft Punk"}));
+  CHECK(album.cover_url == "https://i.scdn.co/image/discovery");
+  CHECK(AlbumRefFromEngineJson(albums[1]).artist_names.empty());
+  const ArtistRef artist = ArtistRefFromEngineJson(
+      json{{"id", "artist-1"},
+           {"uri", "spotify:artist:artist-1"},
+           {"name", "Daft Punk"},
+           {"portrait_url", "https://i.scdn.co/image/portrait"}});
+  CHECK(artist.id == "artist-1");
+  CHECK(artist.uri == "spotify:artist:artist-1");
+  CHECK(artist.name == "Daft Punk");
+  CHECK(artist.cover_url == "https://i.scdn.co/image/portrait");
+}
+
+TEST_CASE("browse_search payload maps tracks, albums, and artists") {
+  const json line = {
+      {"type", "browse_search"},
+      {"request_id", "75"},
+      {"ok", true},
+      {"data",
+       json{{"tracks", json::array({TrackRefToEngineJson(ExampleTrack())})},
+            {"albums",
+             json::array({{{"id", "album-9"},
+                           {"name", "Random Access Memories"}}})},
+            {"artists",
+             json::array({{{"id", "artist-9"}, {"name", "Daft Punk"}}})}}},
+  };
+  const EngineMessage message = ParseEngineMessage(line.dump());
+  CHECK(message.data["data"]["tracks"].size() == 1);
+  CHECK(message.data["data"]["albums"].size() == 1);
+  CHECK(message.data["data"]["artists"].size() == 1);
+}
+
+TEST_CASE("browse error responses carry the failure without payload access") {
+  const EngineMessage message = ParseEngineMessage(
+      R"({"type":"browse_search","request_id":"76","ok":false,"error":"searchview unavailable"})");
+  REQUIRE(message.kind == EngineMessage::Kind::Data);
+  CHECK_FALSE(message.ok);
+  CHECK(message.error == "searchview unavailable");
+}
+
+TEST_CASE("browse responses reject missing request ids and unknown types") {
+  CHECK_THROWS_AS(ParseEngineMessage(
+                      R"({"type":"browse_playlists","ok":true})"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(ParseEngineMessage(R"({"type":"browse_playlists"})"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(ParseEngineMessage(R"({"type":"browse_nope","request_id":"1","ok":true})"),
+                  std::invalid_argument);
+}
+
+TEST_CASE("browse model conversion tolerates absent optional fields") {
+  const PlaylistRef playlist = PlaylistRefFromEngineJson(
+      json{{"id", "pl-x"}, {"name", "Untitled"}});
+  CHECK(playlist.uri == "spotify:playlist:pl-x");
+  CHECK(playlist.owner.empty());
+  CHECK(playlist.owner_id.empty());
+  CHECK(playlist.cover_url.empty());
+  CHECK(playlist.tracks_total == 0);
+
+  const AlbumRef album = AlbumRefFromEngineJson(json{{"id", "al-x"}});
+  CHECK(album.uri == "spotify:album:al-x");
+  CHECK(album.name.empty());
+
+  CHECK_THROWS_AS(PlaylistRefFromEngineJson(json::array()), std::invalid_argument);
+  CHECK_THROWS_AS(AlbumRefFromEngineJson(json::array()), std::invalid_argument);
+  CHECK_THROWS_AS(ArtistRefFromEngineJson(json::array()), std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace sr

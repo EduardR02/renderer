@@ -47,16 +47,6 @@ struct PlaylistRef {
   std::string snapshot_id;
 };
 
-// One page of the user's playlist library. `next_path` is the origin-relative
-// path of the next page ("" when this was the last page); callers fetch pages
-// one at a time so startup never bursts pagination.
-struct PlaylistsPage {
-  std::vector<PlaylistRef> items;
-  std::string next_path;
-  int total = 0;
-};
-
-
 struct ApiError : std::runtime_error {
   int status = 0;
   int retry_after = 0;  // seconds from Retry-After (429/503), 0 if absent
@@ -128,19 +118,10 @@ class SpotifyApi {
   SpotifyApi(std::shared_ptr<HttpClient> api, std::function<std::string()> getToken,
              std::function<bool(int)> refreshToken);
 
-  // Browsing / search
-  SearchResult Search(const std::string& query, int limit = 10);
-  std::vector<AlbumRef> GetArtistAlbums(const std::string& artistId);
-  std::vector<TrackRef> GetArtistTopTracks(const std::string& artistId);
-  std::vector<TrackRef> GetAlbumTracks(const std::string& albumId);
-  std::string GetMeId();
-
-  // Playlists. GetMyPlaylistsPage fetches exactly one page (limit=50): pass
-  // the previous page's `next_path` to continue. Callers own pagination so
-  // the request rate stays under control.
-  PlaylistsPage GetMyPlaylistsPage(const std::string& nextPath = {});
-  std::vector<TrackRef> GetPlaylistTracks(const std::string& playlistId,
-                                          std::string* snapshotIdOut);
+  // Playlist editing only: browsing (search, playlists, albums, artists) is
+  // served by the playback engine's spclient session via PlaybackEngineClient
+  // browse_* commands; this client stays for the low-volume Web API edit
+  // calls below, authenticated with the engine-minted login5 token.
   PlaylistRef CreatePlaylist(const std::string& meId, const std::string& name);
   void RenamePlaylist(const std::string& playlistId, const std::string& name);
   void DeletePlaylist(const std::string& playlistId);

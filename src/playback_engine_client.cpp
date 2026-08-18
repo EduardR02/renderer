@@ -94,6 +94,69 @@ TrackRef TrackRefFromEngineJson(const nlohmann::json& value) {
   return track;
 }
 
+namespace {
+
+// Common conversions between the engine's browse payloads and the app's
+// model structs (playlist/album/artist references are identified by Spotify
+// ids; the engine does not send URIs, so they are rebuilt from ids).
+std::string SpotifyUri(const char* kind, const std::string& id) {
+  return id.empty() ? std::string() : std::string("spotify:") + kind + ":" + id;
+}
+
+int CountField(const nlohmann::json& value, const char* name) {
+  auto it = value.find(name);
+  return it != value.end() && it->is_number_integer() &&
+                 *it >= 0 && *it <= std::numeric_limits<int>::max()
+             ? it->get<int>()
+             : 0;
+}
+
+}  // namespace
+
+PlaylistRef PlaylistRefFromEngineJson(const nlohmann::json& value) {
+  if (!value.is_object()) throw std::invalid_argument("playlist must be an object");
+  PlaylistRef playlist;
+  playlist.id = StringField(value, "id");
+  playlist.uri = StringField(value, "uri");
+  if (playlist.uri.empty()) playlist.uri = SpotifyUri("playlist", playlist.id);
+  playlist.name = StringField(value, "name");
+  playlist.owner = StringField(value, "owner_name");
+  playlist.owner_id = StringField(value, "owner_id");
+  playlist.cover_url = StringField(value, "cover_url");
+  playlist.collaborative = BooleanField(value, "collaborative");
+  playlist.tracks_total = CountField(value, "track_count");
+  playlist.snapshot_id = StringField(value, "revision");
+  return playlist;
+}
+
+AlbumRef AlbumRefFromEngineJson(const nlohmann::json& value) {
+  if (!value.is_object()) throw std::invalid_argument("album must be an object");
+  AlbumRef album;
+  album.id = StringField(value, "id");
+  album.uri = StringField(value, "uri");
+  if (album.uri.empty()) album.uri = SpotifyUri("album", album.id);
+  album.name = StringField(value, "name");
+  album.cover_url = StringField(value, "cover_url");
+  auto artists = value.find("artist_names");
+  if (artists != value.end() && artists->is_array()) {
+    album.artist_names.reserve(artists->size());
+    for (const auto& artist : *artists)
+      if (artist.is_string()) album.artist_names.push_back(artist.get<std::string>());
+  }
+  return album;
+}
+
+ArtistRef ArtistRefFromEngineJson(const nlohmann::json& value) {
+  if (!value.is_object()) throw std::invalid_argument("artist must be an object");
+  ArtistRef artist;
+  artist.id = StringField(value, "id");
+  artist.uri = StringField(value, "uri");
+  if (artist.uri.empty()) artist.uri = SpotifyUri("artist", artist.id);
+  artist.name = StringField(value, "name");
+  artist.cover_url = StringField(value, "portrait_url");
+  return artist;
+}
+
 nlohmann::json TrackRefToEngineJson(const TrackRef& track) {
   return {
       {"id", track.id},
@@ -137,6 +200,21 @@ EngineMessage ParseEngineMessage(const std::string& line) {
         throw std::invalid_argument(
             "web_api_token response carries an invalid token");
     }
+    message.data = std::move(value);
+    return message;
+  }
+  if (type == "browse_playlists" || type == "browse_playlist" ||
+      type == "browse_album" || type == "browse_artist" ||
+      type == "browse_search") {
+    // spclient browse response: the whole object is kept so the browse
+    // accessors can parse their payloads (and validate their shapes).
+    message.kind = EngineMessage::Kind::Data;
+    message.request_id = StringField(value, "request_id");
+    if (message.request_id.empty())
+      throw std::invalid_argument("browse response has no request_id");
+    message.ok = BooleanField(value, "ok");
+    message.error = StringField(value, "error");
+    message.data = std::move(value);
     return message;
   }
   if (type != "state") throw std::invalid_argument("unknown engine message type");
@@ -154,6 +232,7 @@ EngineMessage ParseEngineMessage(const std::string& line) {
   else
     state.auth_state = EngineAuthState::Authenticating;
   state.auth_url = StringField(value, "auth_url");
+  state.username = StringField(value, "username");
   state.playing = BooleanField(value, "playing");
   state.position_ms = std::max<int64_t>(0, IntegerField(value, "position_ms"));
   state.duration_ms = std::max<int64_t>(0, IntegerField(value, "duration_ms"));
@@ -328,12 +407,13 @@ void PlaybackEngineClient::Shutdown() {
     } catch (...) {
     }
   }
-  // The reader thread is about to end: fail every in-flight token wait so
-  // blocked RequestWebApiToken callers never stall shutdown.
-  std::unordered_map<std::string, std::shared_ptr<TokenWaiter>> waiters;
+  // The reader thread is about to end: fail every in-flight blocking
+  // round-trip (RequestWebApiToken, browse_*) so callers never stall
+  // shutdown.
+  std::unordered_map<std::string, std::shared_ptr<Waiter>> waiters;
   {
-    std::lock_guard<std::mutex> lock(token_wait_mutex_);
-    waiters.swap(token_waiters_);
+    std::lock_guard<std::mutex> lock(waiter_mutex_);
+    waiters.swap(waiters_);
   }
   for (const auto& [id, waiter] : waiters) {
     (void)id;
@@ -472,17 +552,34 @@ bool PlaybackEngineClient::RequestWebApiToken(WebApiToken* out,
     if (error) *error = "token output is required";
     return false;
   }
+  nlohmann::json data;
+  if (!RequestData("web_api_token", {}, &data, error, timeoutMs)) return false;
+  // ParseEngineMessage already validated the token fields of the response.
+  out->token_type = StringField(data, "token_type");
+  out->access_token = StringField(data, "access_token");
+  out->expires_in = IntegerField(data, "expires_in");
+  return true;
+}
+
+bool PlaybackEngineClient::RequestData(const std::string& type,
+                                       nlohmann::json arguments,
+                                       nlohmann::json* data,
+                                       std::string* error, int timeoutMs) {
+  if (!data) {
+    if (error) *error = "response output is required";
+    return false;
+  }
   const std::string requestId = std::to_string(next_request_id_.fetch_add(1));
-  auto waiter = std::make_shared<TokenWaiter>();
+  auto waiter = std::make_shared<Waiter>();
   {
-    std::lock_guard<std::mutex> lock(token_wait_mutex_);
-    token_waiters_.emplace(requestId, waiter);
+    std::lock_guard<std::mutex> lock(waiter_mutex_);
+    waiters_.emplace(requestId, waiter);
   }
   try {
-    WriteRequest(requestId, "web_api_token", nlohmann::json{});
+    WriteRequest(requestId, type, std::move(arguments));
   } catch (const std::exception& exception) {
-    std::lock_guard<std::mutex> lock(token_wait_mutex_);
-    token_waiters_.erase(requestId);
+    std::lock_guard<std::mutex> lock(waiter_mutex_);
+    waiters_.erase(requestId);
     if (error) *error = exception.what();
     return false;
   }
@@ -491,21 +588,212 @@ bool PlaybackEngineClient::RequestWebApiToken(WebApiToken* out,
       lock, std::chrono::milliseconds(std::max(1, timeoutMs)),
       [&] { return waiter->done; });
   if (!completed) {
-    std::lock_guard<std::mutex> waiterLock(token_wait_mutex_);
-    token_waiters_.erase(requestId);
+    std::lock_guard<std::mutex> waiterLock(waiter_mutex_);
+    waiters_.erase(requestId);
     std::lock_guard<std::mutex> pendingLock(pending_mutex_);
     pending_requests_.erase(requestId);
-    if (error) *error = "timed out waiting for the Spotify Web API token";
+    if (error) *error = "timed out waiting for the playback engine";
     return false;
   }
   if (!waiter->ok) {
     if (error)
       *error = waiter->error.empty()
-                   ? "playback engine could not mint a Spotify Web API token"
+                   ? std::string("playback engine rejected ") + type
                    : waiter->error;
     return false;
   }
-  *out = std::move(waiter->token);
+  *data = std::move(waiter->data);
+  return true;
+}
+
+namespace {
+
+// Shared browse plumbing: one RequestData round-trip (which returns the full
+// response object), then parse the payload field named `field` inside the
+// response's "data" object via `parseOne`. Returns false (with error) when
+// the payload object or the field array is missing or malformed.
+bool ParseBrowsePayload(
+    bool ok, std::string* error, const nlohmann::json& response,
+    const char* field,
+    const std::function<void(const nlohmann::json&)>& parseOne) {
+  if (!ok) return false;
+  try {
+    auto envelope = response.find("data");
+    if (envelope == response.end() || !envelope->is_object()) {
+      if (error) *error = "browse response has no data object";
+      return false;
+    }
+    auto found = envelope->find(field);
+    if (found == envelope->end() || !found->is_array()) {
+      if (error)
+        *error = std::string("browse response has no ") + field + " array";
+      return false;
+    }
+    for (const auto& item : *found) parseOne(item);
+    return true;
+  } catch (const std::exception& exception) {
+    if (error) *error = std::string("malformed browse response: ") + exception.what();
+    return false;
+  }
+}
+
+}  // namespace
+
+bool PlaybackEngineClient::BrowsePlaylists(int length,
+                                           std::vector<PlaylistRef>* out,
+                                           std::string* error,
+                                           int timeoutMs) {
+  if (!out) {
+    if (error) *error = "playlist output is required";
+    return false;
+  }
+  nlohmann::json data;
+  const bool ok = RequestData(
+      "browse_playlists",
+      {{"length", std::max(1, std::min(length, 1000))}}, &data, error,
+      timeoutMs);
+  out->clear();
+  if (!ok) return false;
+  // Unlike the other browse commands, browse_playlists carries the bare
+  // playlist array directly as its "data" payload.
+  try {
+    auto array = data.find("data");
+    if (array == data.end() || !array->is_array()) {
+      if (error) *error = "browse response has no playlists array";
+      return false;
+    }
+    out->reserve(array->size());
+    for (const auto& item : *array)
+      out->push_back(PlaylistRefFromEngineJson(item));
+    return true;
+  } catch (const std::exception& exception) {
+    if (error)
+      *error = std::string("malformed browse response: ") + exception.what();
+    return false;
+  }
+}
+
+bool PlaybackEngineClient::BrowsePlaylist(const std::string& id,
+                                          std::vector<TrackRef>* tracks,
+                                          std::string* revisionOut,
+                                          std::string* error,
+                                          int timeoutMs) {
+  if (id.empty()) {
+    if (error) *error = "playlist id is required";
+    return false;
+  }
+  if (!tracks) {
+    if (error) *error = "track output is required";
+    return false;
+  }
+  nlohmann::json data;
+  const bool ok = RequestData("browse_playlist", {{"id", id}}, &data, error,
+                              timeoutMs);
+  tracks->clear();
+  if (!ParseBrowsePayload(ok, error, data, "tracks",
+                          [&](const nlohmann::json& item) {
+                            tracks->push_back(TrackRefFromEngineJson(item));
+                          }))
+    return false;
+  if (revisionOut) {
+    auto envelope = data.find("data");
+    if (envelope != data.end() && envelope->is_object())
+      *revisionOut = StringField(*envelope, "revision");
+    else
+      revisionOut->clear();
+  }
+  return true;
+}
+
+bool PlaybackEngineClient::BrowseAlbum(const std::string& id,
+                                       std::vector<TrackRef>* tracks,
+                                       std::string* error, int timeoutMs) {
+  if (id.empty()) {
+    if (error) *error = "album id is required";
+    return false;
+  }
+  if (!tracks) {
+    if (error) *error = "track output is required";
+    return false;
+  }
+  nlohmann::json data;
+  const bool ok = RequestData("browse_album", {{"id", id}}, &data, error,
+                              timeoutMs);
+  tracks->clear();
+  if (!ParseBrowsePayload(ok, error, data, "tracks",
+                          [&](const nlohmann::json& item) {
+                            tracks->push_back(TrackRefFromEngineJson(item));
+                          }))
+    return false;
+  return true;
+}
+
+bool PlaybackEngineClient::BrowseArtist(const std::string& id,
+                                        std::vector<TrackRef>* topTracks,
+                                        std::vector<AlbumRef>* albums,
+                                        std::string* error, int timeoutMs) {
+  if (id.empty()) {
+    if (error) *error = "artist id is required";
+    return false;
+  }
+  if (!topTracks || !albums) {
+    if (error) *error = "artist outputs are required";
+    return false;
+  }
+  nlohmann::json data;
+  const bool ok = RequestData("browse_artist", {{"id", id}}, &data, error,
+                              timeoutMs);
+  topTracks->clear();
+  albums->clear();
+  if (!ok) return false;
+  if (!ParseBrowsePayload(ok, error, data, "top_tracks",
+                          [&](const nlohmann::json& item) {
+                            topTracks->push_back(TrackRefFromEngineJson(item));
+                          }))
+    return false;
+  if (!ParseBrowsePayload(ok, error, data, "albums",
+                          [&](const nlohmann::json& item) {
+                            albums->push_back(AlbumRefFromEngineJson(item));
+                          }))
+    return false;
+  return true;
+}
+
+bool PlaybackEngineClient::BrowseSearch(const std::string& query, int limit,
+                                        SearchResult* out, std::string* error,
+                                        int timeoutMs) {
+  if (!out) {
+    if (error) *error = "search output is required";
+    return false;
+  }
+  if (Trim(query).empty()) {
+    if (error) *error = "search query is required";
+    return false;
+  }
+  nlohmann::json data;
+  const bool ok = RequestData(
+      "browse_search",
+      {{"query", query}, {"limit", std::max(1, std::min(limit, 50))}}, &data,
+      error, timeoutMs);
+  out->tracks.clear();
+  out->albums.clear();
+  out->artists.clear();
+  if (!ok) return false;
+  if (!ParseBrowsePayload(ok, error, data, "tracks",
+                          [&](const nlohmann::json& item) {
+                            out->tracks.push_back(TrackRefFromEngineJson(item));
+                          }))
+    return false;
+  if (!ParseBrowsePayload(ok, error, data, "albums",
+                          [&](const nlohmann::json& item) {
+                            out->albums.push_back(AlbumRefFromEngineJson(item));
+                          }))
+    return false;
+  if (!ParseBrowsePayload(ok, error, data, "artists",
+                          [&](const nlohmann::json& item) {
+                            out->artists.push_back(ArtistRefFromEngineJson(item));
+                          }))
+    return false;
   return true;
 }
 
@@ -548,24 +836,28 @@ void PlaybackEngineClient::ReaderLoop() {
             ReportError("playback engine returned an unknown request_id");
             continue;
           }
-          if (message.kind == EngineMessage::Kind::WebApiToken) {
-            std::shared_ptr<TokenWaiter> waiter;
+          if (message.kind == EngineMessage::Kind::WebApiToken ||
+              message.kind == EngineMessage::Kind::Data) {
+            std::shared_ptr<Waiter> waiter;
             {
-              std::lock_guard<std::mutex> lock(token_wait_mutex_);
-              auto found = token_waiters_.find(message.request_id);
-              if (found != token_waiters_.end()) {
+              std::lock_guard<std::mutex> lock(waiter_mutex_);
+              auto found = waiters_.find(message.request_id);
+              if (found != waiters_.end()) {
                 waiter = found->second;
-                token_waiters_.erase(found);
+                waiters_.erase(found);
               }
             }
             if (waiter) {
               std::lock_guard<std::mutex> lock(waiter->mutex);
               waiter->done = true;
               waiter->ok = message.ok;
-              if (message.ok)
-                waiter->token = std::move(message.token);
-              else
+              if (message.ok) {
+                waiter->data = std::move(message.data);
+                if (message.kind == EngineMessage::Kind::WebApiToken)
+                  waiter->token = std::move(message.token);
+              } else {
                 waiter->error = std::move(message.error);
+              }
               waiter->cv.notify_all();
             }
             continue;

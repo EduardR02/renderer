@@ -11,10 +11,13 @@ use crate::auth::{
     PendingAuth, PlaybackHandles, complete_oauth, connect_cached, percent_to_volume,
     prepare_oauth,
 };
+use crate::browse;
 use crate::io::ProtocolWriter;
 use crate::protocol::{
-    AuthState, Command, RepeatMode, Response, StateEvent, TrackRef, WebApiTokenResponse,
+    AlbumBrowse, ArtistBrowse, AuthState, BrowseResponse, Command, PlaylistBrowse, PlaylistRef,
+    RepeatMode, Response, SearchBrowse, StateEvent, TrackRef, WebApiTokenResponse,
 };
+use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
 /// restart window (OnPrevious in app.cpp) so both sides agree.
@@ -156,6 +159,7 @@ impl Engine {
             auth_state: self.state.auth_state,
             auth_url: self.state.auth_url.as_deref(),
             playing: self.state.playing,
+            username: self.session.as_ref().map(|session| session.username()),
             position_ms: self.state.position_ms,
             duration_ms: self.state.duration_ms,
             volume: self.state.volume,
@@ -400,7 +404,12 @@ impl Engine {
             | Command::Shutdown
             | Command::WebApiToken
             | Command::Login
-            | Command::Logout => unreachable!(),
+            | Command::Logout
+            | Command::BrowsePlaylists { .. }
+            | Command::BrowsePlaylist { .. }
+            | Command::BrowseAlbum { .. }
+            | Command::BrowseArtist { .. }
+            | Command::BrowseSearch { .. } => unreachable!(),
             Command::PlayQueue {
                 queue,
                 index,
@@ -501,6 +510,70 @@ impl Engine {
             ok: result.is_ok(),
             error: result.as_ref().err().map(String::as_str),
         })
+    }
+
+    /// Sends a typed `browse_*` response: `data` carries the payload on
+    /// success, error text only on failure. `kind` must match the command
+    /// name so the UI can route the response.
+    pub fn send_browse_response<T: Serialize>(
+        &self,
+        request_id: &str,
+        kind: &'static str,
+        result: &Result<T, String>,
+    ) -> Result<(), String> {
+        let (ok, error, data) = match result {
+            Ok(data) => (true, None, Some(data)),
+            Err(error) => (false, Some(error.as_str()), None),
+        };
+        self.writer.send(&BrowseResponse {
+            kind,
+            request_id,
+            ok,
+            error,
+            data,
+        })
+    }
+
+    /// The live session for browse commands: browsing only needs the
+    /// authenticated session (unlike playback commands, no player yet).
+    fn browse_session(&self) -> Result<&librespot_core::Session, String> {
+        self.session.as_ref().ok_or_else(|| match self.state.auth_state {
+            AuthState::Authenticating => "Spotify authentication is still in progress".to_owned(),
+            AuthState::NeedsLogin => {
+                "Spotify login is required; use the Log in button in Settings".to_owned()
+            }
+            AuthState::Error => self
+                .state
+                .error
+                .clone()
+                .unwrap_or_else(|| "Spotify authentication failed".to_owned()),
+            AuthState::Ready => "the Spotify session is unavailable".to_owned(),
+        })
+    }
+
+    pub async fn browse_playlists(&mut self, length: usize) -> Result<Vec<PlaylistRef>, String> {
+        let session = self.browse_session()?;
+        browse::playlists_browse(session, length).await
+    }
+
+    pub async fn browse_playlist(&mut self, id: &str) -> Result<PlaylistBrowse, String> {
+        let session = self.browse_session()?;
+        browse::playlist_browse(session, id).await
+    }
+
+    pub async fn browse_album(&mut self, id: &str) -> Result<AlbumBrowse, String> {
+        let session = self.browse_session()?;
+        browse::album_browse(session, id).await
+    }
+
+    pub async fn browse_artist(&mut self, id: &str) -> Result<ArtistBrowse, String> {
+        let session = self.browse_session()?;
+        browse::artist_browse(session, id).await
+    }
+
+    pub async fn browse_search(&mut self, query: &str, limit: usize) -> Result<SearchBrowse, String> {
+        let session = self.browse_session()?;
+        browse::search_browse(session, query, limit).await
     }
 
     pub fn on_player_signal(&mut self, signal: PlayerSignal) -> bool {
