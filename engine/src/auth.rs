@@ -10,7 +10,7 @@ use librespot_core::config::SessionConfig;
 use librespot_core::Session;
 use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
-use librespot_playback::mixer::{Mixer, MixerConfig};
+use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume};
 use librespot_playback::player::{Player, PlayerEventChannel};
 use oauth2::basic::BasicClient;
 use oauth2::{
@@ -248,10 +248,16 @@ async fn create_playback(session: Session, cache: Cache) -> Result<PlaybackHandl
 
     let (audio_ready_tx, audio_ready_rx) = std_mpsc::sync_channel(1);
     let config = player_config();
-    let player = Player::new(config, session.clone(), mixer.get_soft_volume(), move || {
+    // Volume is applied by the rodio sink (see audio::set_sink_volume), not
+    // per decoded packet, so a transport volume change is audible on the
+    // next output callback instead of after the write-ahead buffer plays
+    // out. The player's volume getter is therefore a no-op (always 1.0);
+    // the SoftMixer is kept purely as the volume store/persistence.
+    let player = Player::new(config, session.clone(), Box::new(NoOpVolume), move || {
         // Custom immediate-stop rodio sink: pause/stop must not drain the
-        // buffered queue (~0.5 s of audio) before silencing the output.
+        // buffered queue before silencing the output.
         let sink = crate::audio::open_default_sink(AudioFormat::S16);
+        crate::audio::set_sink_volume(cached_volume);
         let _ = audio_ready_tx.send(());
         sink
     });

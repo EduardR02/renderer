@@ -247,6 +247,11 @@ std::wstring PlaylistListCacheFile() {
   return path ? *path : std::wstring();
 }
 
+std::wstring PlaylistTracksCacheFile() {
+  auto path = Resolve(L"playlist_tracks_cache.json");
+  return path ? *path : std::wstring();
+}
+
 std::wstring CoverFile(const std::string& cacheName) {
   std::wstring leaf;
   for (unsigned char c : cacheName) {

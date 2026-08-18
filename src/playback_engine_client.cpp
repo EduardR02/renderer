@@ -341,7 +341,8 @@ bool PlaybackEngineClient::Start(const std::wstring& executable,
 
   PROCESS_INFORMATION process{};
   std::wstring command = QuoteArgument(executable) + L" --state-dir " +
-                         QuoteArgument(stateDirectory);
+                         QuoteArgument(stateDirectory) + L" --log-file " +
+                         QuoteArgument(diagnosticLog);
   std::vector<wchar_t> mutableCommand(command.begin(), command.end());
   mutableCommand.push_back(L'\0');
   std::wstring workingDirectory = ParentDirectory(executable);

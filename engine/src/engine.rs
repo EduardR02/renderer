@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use librespot_core::SpotifyUri;
 use librespot_core::cache::Cache;
@@ -19,6 +19,14 @@ use serde::Serialize;
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
 /// restart window (OnPrevious in app.cpp) so both sides agree.
 const PREVIOUS_RESTART_THRESHOLD_MS: u32 = 3_000;
+/// Minimum spacing between command-driven track changes (PlayQueue, Next,
+/// Previous). Loading an uncached track fetches its audio decryption key
+/// from Spotify's key service, which rate-limits bursts ("Unable to load
+/// key, continuing without decryption") and playback dies with decoder
+/// errors. 250 ms bounds key requests to roughly 4-8/s while keeping rapid
+/// next/prev responsive; presses are delayed, never dropped. Natural
+/// end-of-track advances are not paced.
+const TRACK_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct Engine {
     writer: ProtocolWriter,
@@ -34,10 +42,19 @@ pub struct Engine {
     session: Option<librespot_core::Session>,
     play_request_id: Option<u64>,
     position_anchor: Option<(u32, Instant)>,
+    /// When the last command-driven track change (PlayQueue/Next/Previous)
+    /// was dispatched, for pacing rapid presses (see
+    /// [`TRACK_CHANGE_MIN_INTERVAL`]). `None` until the first change.
+    last_track_change: Option<Instant>,
     shuffle_pool: Vec<usize>,
     history: Vec<usize>,
     random_state: u64,
     generation: u64,
+    /// A seek is mid-transition (the player was paused by [`Engine::seek`]
+    /// and its `Playing` event has not arrived yet). While set, the
+    /// transient `Paused` event that the seek's own pause produces is
+    /// suppressed so the UI never sees a play/pause blip on seek.
+    seek_in_flight: bool,
     auth_running: bool,
     /// The prepared OAuth attempt whose authorize URL is published in
     /// `needs_login` state; `login` consumes it so the UI opens exactly the
@@ -116,10 +133,12 @@ impl Engine {
             session: None,
             play_request_id: None,
             position_anchor: None,
+            last_track_change: None,
             shuffle_pool: Vec::new(),
             history: Vec::new(),
             random_state,
             generation: 0,
+            seek_in_flight: false,
             auth_running: false,
             pending_auth: None,
         }
@@ -357,6 +376,20 @@ impl Engine {
         }
     }
 
+    /// Waits out any remaining [`TRACK_CHANGE_MIN_INTERVAL`] since the last
+    /// command-driven track change, then re-arms the interval. Called before
+    /// dispatching PlayQueue/Next/Previous so rapid presses advance at a
+    /// bounded rate instead of bursting audio-key requests at Spotify's key
+    /// service. Delays the command loop briefly; presses are never dropped.
+    async fn pace_track_change(&mut self) {
+        let wait =
+            track_change_wait(self.last_track_change, Instant::now(), TRACK_CHANGE_MIN_INTERVAL);
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        self.last_track_change = Some(Instant::now());
+    }
+
     pub async fn process_command(
         &mut self,
         command: Command,
@@ -375,6 +408,17 @@ impl Engine {
             return self.logout();
         }
         self.ensure_ready()?;
+        // Pace command-driven track changes so rapid next/prev spam cannot
+        // burst audio-key requests (each load of an uncached track fetches
+        // its decryption key; the key service rate-limits bursts and
+        // playback dies). Only PlayQueue/Next/Previous are paced; other
+        // commands may wait a tick — no press is dropped.
+        if matches!(
+            &command,
+            Command::PlayQueue { .. } | Command::Next | Command::Previous
+        ) {
+            self.pace_track_change().await;
+        }
         match command {
             Command::Status
             | Command::Shutdown
@@ -611,6 +655,9 @@ impl Engine {
         self.state.error = None;
         self.history.clear();
         self.rebuild_shuffle_pool();
+        // The first load starts a fresh pacing window for subsequent
+        // command-driven changes.
+        self.last_track_change = Some(Instant::now());
         self.load_current(true)?;
         Ok(true)
     }
@@ -635,6 +682,9 @@ impl Engine {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
+        // A user pause supersedes any in-flight seek transition: its own
+        // Paused event must be delivered, not suppressed.
+        self.seek_in_flight = false;
         self.player()?.pause();
         self.state.playing = false;
         self.update_position(self.state.position_ms);
@@ -647,7 +697,20 @@ impl Engine {
             return Err("the queue has no current track".to_owned());
         }
         let position = position_ms.min(self.state.duration_ms);
-        self.player()?.seek(position);
+        // Pause clears the rodio output queue instantly (the custom sink's
+        // stop), seek while paused skips librespot's full read-ahead wait
+        // (preload_data_before_playback is a no-op in the Paused state),
+        // and play resumes the decoder at the new position — its blocking
+        // read fetches the target range itself, so the jump lands in
+        // roughly one network round trip instead of a drain of buffered
+        // audio plus a full 3-second-window fetch. The transient Paused
+        // event is suppressed while seek_in_flight is set; a user pause
+        // sent later clears the flag first and is handled normally.
+        self.seek_in_flight = true;
+        let player = self.player()?;
+        player.pause();
+        player.seek(position);
+        player.play();
         self.update_position(position);
         self.state.error = None;
         Ok(true)
@@ -699,6 +762,12 @@ impl Engine {
     }
 
     fn advance(&mut self, at_end: bool) -> Result<bool, String> {
+        if at_end {
+            // A natural end-of-track advance is not user-paced, but it
+            // refreshes the change clock so a press right after a track ends
+            // is not double-waited (the load has already started).
+            self.last_track_change = Some(Instant::now());
+        }
         let current = self
             .state
             .current_index
@@ -735,6 +804,9 @@ impl Engine {
             .set_volume(volume);
         self.cache.save_volume(volume);
         self.player()?.emit_volume_changed_event(volume);
+        // The audible volume lives on the rodio sink (per-packet attenuation
+        // is disabled); apply it there so the change is heard immediately.
+        crate::audio::set_sink_volume(volume);
         self.state.volume = percent;
         self.state.error = None;
         Ok(true)
@@ -919,11 +991,23 @@ impl Engine {
                 track_id,
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
+                // The seek's play() completed: its transient pause is over.
+                self.seek_in_flight = false;
                 self.state.playing = true;
                 self.update_position(position_ms);
                 self.state.error = None;
                 true
             }
+            // The Paused produced by a seek's own pause() is transient: the
+            // engine already reported playing=true and the seek target
+            // position; dropping it keeps the UI from blipping. A user
+            // pause clears seek_in_flight in Engine::pause before its event
+            // arrives, so a real pause is never swallowed.
+            PlayerEvent::Paused {
+                play_request_id,
+                track_id,
+                ..
+            } if self.seek_in_flight && self.is_current_event(play_request_id, &track_id) => false,
             PlayerEvent::Paused {
                 play_request_id,
                 track_id,
@@ -1016,6 +1100,7 @@ impl Engine {
             player.stop();
         }
         self.play_request_id = None;
+        self.seek_in_flight = false;
         self.mixer = None;
         if let Some(session) = self.session.take() {
             session.shutdown();
@@ -1058,18 +1143,29 @@ fn remap_current_index_after_move(current: usize, from: usize, to: usize) -> usi
     }
 }
 
+/// The time to wait before the next command-driven track change may start:
+/// zero when none is needed (no prior change, or the interval has already
+/// elapsed). Pure so pacing is unit-testable without a real timer.
+fn track_change_wait(last: Option<Instant>, now: Instant, interval: Duration) -> Duration {
+    let Some(t) = last else {
+        return Duration::ZERO;
+    };
+    let elapsed = now.checked_duration_since(t).unwrap_or_default();
+    interval.saturating_sub(elapsed)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
 
     use librespot_core::SpotifyUri;
     use librespot_playback::player::PlayerEvent;
     use super::{
-        remap_current_index_after_move, sequential_next_index, AuthSignal, Engine, PlaybackState,
-        PlayerSignal,
+        remap_current_index_after_move, sequential_next_index, track_change_wait, AuthSignal,
+        Engine, PlaybackState, PlayerSignal, TRACK_CHANGE_MIN_INTERVAL,
     };
     use crate::io::ProtocolWriter;
     use crate::protocol::{RepeatMode, TrackRef};
@@ -1289,6 +1385,38 @@ mod tests {
             Some(0)
         );
         assert_eq!(sequential_next_index(0, 0, RepeatMode::Context), None);
+    }
+
+    #[test]
+    fn track_change_pacing_waits_out_the_minimum_interval() {
+        let start = Instant::now();
+        let interval = TRACK_CHANGE_MIN_INTERVAL;
+        // No prior change: proceed immediately.
+        assert_eq!(track_change_wait(None, start, interval), Duration::ZERO);
+        // Change made right now: the full interval applies.
+        assert_eq!(track_change_wait(Some(start), start, interval), interval);
+        // One millisecond before the interval elapses: one millisecond left.
+        assert_eq!(
+            track_change_wait(
+                Some(start),
+                start + interval - Duration::from_millis(1),
+                interval
+            ),
+            Duration::from_millis(1)
+        );
+        // Interval elapsed exactly, or beyond: no wait.
+        assert_eq!(
+            track_change_wait(Some(start), start + interval, interval),
+            Duration::ZERO
+        );
+        assert_eq!(
+            track_change_wait(
+                Some(start),
+                start + interval + Duration::from_millis(50),
+                interval
+            ),
+            Duration::ZERO
+        );
     }
 
     #[test]

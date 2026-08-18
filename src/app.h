@@ -145,6 +145,39 @@ PlaylistCacheUse ClassifyPlaylistCache(int64_t fetchedAtUnixSeconds,
                                        int64_t ttlMinutes,
                                        bool fetchFailed);
 
+// One persisted browse_playlist cache entry: the TrackRef list, the edit
+// revision, and the unix-seconds time it was fetched. Per-entry timestamps
+// let old playlists stay cached without going stale as a group.
+struct CachedPlaylistTracks {
+  std::string id;
+  CachedTrackList value;
+  int64_t fetched_at = 0;
+};
+
+// Persisted browse_playlist results: the last `kPlaylistTracksCacheCapacity`
+// playlists fetched, each fresh for `kPlaylistTracksTtlMinutes`. Playlist
+// clicks resolve from disk instantly (no engine round-trip); a stale copy is
+// shown immediately with a background refresh; a failed refresh keeps the
+// cached copy instead of surfacing an error.
+inline constexpr int kPlaylistTracksCacheCapacity = 25;
+inline constexpr int kPlaylistTracksTtlMinutes = 30;
+
+// Sorts entries most-recent-first (stable) and drops the oldest beyond
+// kPlaylistTracksCacheCapacity. Pure so eviction is unit-testable.
+void TrimPlaylistTracksCache(std::vector<CachedPlaylistTracks>* entries);
+
+// Serializes entries to the version-1 cache document (the shape
+// ParsePlaylistTracksCacheDoc reads back). Pure so persistence is
+// unit-testable without the Application.
+nlohmann::json BuildPlaylistTracksCacheDoc(
+    const std::vector<CachedPlaylistTracks>& entries, int64_t nowUnixSeconds);
+
+// Parses a cache document into entries, skipping malformed rows. Returns
+// false (leaving *out untouched) when the document is not a usable version-1
+// cache. Pure so loading is unit-testable without the Application.
+bool ParsePlaylistTracksCacheDoc(const nlohmann::json& doc,
+                                 std::vector<CachedPlaylistTracks>* out);
+
 struct RunOptions {
   bool smoke = false;
   int smokeSeconds = 6;
@@ -298,6 +331,28 @@ class Application {
   void RefreshQueue();
   void RefreshPlaylists(bool force = false);
   void RequestPlaylistTracks(const std::string& id);
+  // Backfills the cover_url of playlists the server has no artwork for from
+  // the persisted tracks cache (the first track's cover — the same art the
+  // playlist view shows). Mirrors the official client's client-side tile
+  // for coverless playlists; the server data is never modified.
+  void ApplyPlaylistCoverFallbacks();
+  // Kicks off background track fetches for playlists the server still has
+  // no artwork for, so the rail's mosaic tiles populate without waiting
+  // for a click. Visible rail rows are fetched first (the window's
+  // filtered row order) and the batch is capped so a large coverless
+  // library never floods the serial API queue at startup.
+  void EagerFetchCoverlessPlaylists();
+  // Engine round-trip for one playlist's tracks. `refreshOnly` is true when
+  // a (stale) cached copy is already on screen: a failure then keeps the
+  // cached copy visible instead of surfacing an error.
+  void FetchPlaylistTracksBackground(const std::string& id, bool refreshOnly);
+  // Lazy load of the on-disk playlist-tracks cache (once per process).
+  void EnsurePlaylistTracksCacheLoaded();
+  // Upserts one fetched playlist into the disk cache and persists it
+  // (bounded to kPlaylistTracksCacheCapacity, trimmed oldest-first).
+  void SavePlaylistTracksCache(const std::string& id, const CachedTrackList& value);
+  // Drops one playlist from the disk cache (after edits make it stale).
+  void InvalidatePlaylistTracksCache(const std::string& id);
   void ShowPlaylistTracks(const std::string& id, const CachedTrackList& cached);
   void OpenAlbumTracks(const AlbumRef& album);
   void EnsureCover(const std::string& url);
@@ -338,6 +393,10 @@ class Application {
   MiddleMode middle_mode_ = MiddleMode::Queue;
   TrackListCache track_cache_;
   std::optional<std::chrono::steady_clock::time_point> playlists_fetched_at_;
+  // On-disk browse_playlist cache mirror (persisted to
+  // paths::PlaylistTracksCacheFile, most-recent-first). UI thread only.
+  std::vector<CachedPlaylistTracks> playlist_tracks_cache_;
+  bool playlist_tracks_cache_loaded_ = false;
   AlbumRef current_album_;
   RunOptions options_;
 

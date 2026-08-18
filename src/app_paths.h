@@ -25,6 +25,11 @@ std::wstring CoverFile(const std::string& cacheName);
 // App-owned serialized copy of the playlist library (rate-limit mitigation:
 // relaunches skip the startup fetch while this is fresh).
 std::wstring PlaylistListCacheFile();
+// App-owned serialized copy of fetched browse_playlist results (last
+// kPlaylistTracksCacheCapacity playlists, per-entry TTL): playlist clicks
+// resolve instantly from disk while the engine round-trip refreshes in the
+// background.
+std::wstring PlaylistTracksCacheFile();
 
 // The engine's audio cache directory (engine state dir + "audio"; matches the
 // path the engine builds in create_state).

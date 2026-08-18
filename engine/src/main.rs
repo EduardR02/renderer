@@ -104,8 +104,9 @@ fn configure_audio_fetch() {
 }
 
 fn main() -> ExitCode {
-    let state_directory = match parse_arguments(std::env::args_os().skip(1).collect()) {
-        Ok(path) => path,
+    let (state_directory, log_file) = match parse_arguments(std::env::args_os().skip(1).collect())
+    {
+        Ok(arguments) => arguments,
         Err(error) => {
             eprintln!("SpotifyPlaybackEngine: {error}");
             return ExitCode::from(2);
@@ -121,6 +122,10 @@ fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .target(env_logger::Target::Stderr)
         .init();
+    // Installed after the logger: every panic (any thread, including
+    // librespot's player thread) is appended to the engine log file so a
+    // future death is diagnosable even when stderr is gone.
+    install_panic_hook(log_file);
 
     let (cache, temporary_directory, credentials_file) = match create_state(&state_directory) {
         Ok(state) => state,
@@ -428,15 +433,92 @@ async fn run(
     Ok(())
 }
 
-fn parse_arguments(arguments: Vec<OsString>) -> Result<PathBuf, String> {
-    if arguments.len() != 2 || arguments[0] != "--state-dir" {
-        return Err("usage: SpotifyPlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned());
+/// Parses `--state-dir <path>` (required) and `--log-file <path>` (optional,
+/// the diagnostic log the parent redirects stderr to; the panic hook appends
+/// there too). Accepts the arguments in any order and tolerates extra
+/// pairs, so older launchers that only pass `--state-dir` keep working.
+fn parse_arguments(arguments: Vec<OsString>) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let mut state_directory: Option<PathBuf> = None;
+    let mut log_file: Option<PathBuf> = None;
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let name = arguments[index].to_string_lossy().into_owned();
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("{name} requires a value"))?;
+        let path = PathBuf::from(value);
+        match name.as_str() {
+            "--state-dir" => {
+                if state_directory.is_some() {
+                    return Err("--state-dir given more than once".to_owned());
+                }
+                if !path.is_absolute() {
+                    return Err("--state-dir must be an absolute path".to_owned());
+                }
+                state_directory = Some(path);
+            }
+            "--log-file" => {
+                log_file = Some(path);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+        index += 2;
     }
-    let path = PathBuf::from(&arguments[1]);
-    if !path.is_absolute() {
-        return Err("--state-dir must be an absolute path".to_owned());
+    let state_directory = state_directory
+        .ok_or_else(|| "usage: SpotifyPlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned())?;
+    Ok((state_directory, log_file))
+}
+
+/// One panic report: thread, payload, location, and a captured backtrace.
+/// Pure so the hook logic is unit-testable without panicking.
+fn format_panic_report(thread: &str, info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = if let Some(message) = info.payload().downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = info.payload().downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "Box<dyn Any>".to_owned()
+    };
+    let location = info
+        .location()
+        .map(|location| format!("{location}"))
+        .unwrap_or_else(|| "unknown location".to_owned());
+    let backtrace = std::backtrace::Backtrace::capture();
+    format!(
+        "thread '{thread}' panicked at {location}:\n{payload}\nstack backtrace:\n{backtrace}"
+    )
+}
+
+/// Appends one panic report to the engine log file. Called from the panic
+/// hook, so it must never panic itself: every fallible step is ignored.
+fn append_panic_to_log(path: &std::path::Path, report: &str) {
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{report}");
+        let _ = file.flush();
     }
-    Ok(path)
+}
+
+/// Installs the process panic hook: every panic in any thread prints the
+/// usual stderr report (so the parent's redirected stderr still shows it)
+/// and appends a copy to the engine log file. The hook never panics; a
+/// log-file write failure is silently ignored.
+fn install_panic_hook(log_file: Option<PathBuf>) {
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        let report = format_panic_report(&thread, info);
+        eprintln!("{report}");
+        if let Some(path) = &log_file {
+            append_panic_to_log(path, &report);
+        }
+    }));
 }
 
 /// Marker-file version of the audio cache layout. When the marker is absent
@@ -615,6 +697,140 @@ mod tests {
             params.download_timeout,
             Duration::from_secs(3),
             "dead-hang detection must stay quick"
+        );
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(|arg| OsString::from(*arg)).collect()
+    }
+
+    #[test]
+    fn parse_arguments_requires_state_dir_and_accepts_an_optional_log_file() {
+        let (state, log) = parse_arguments(os(&["--state-dir", "C:\\sr\\engine"]))
+            .expect("state dir alone");
+        assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
+        assert!(log.is_none(), "log file is optional");
+
+        let (state, log) = parse_arguments(os(&[
+            "--state-dir",
+            "C:\\sr\\engine",
+            "--log-file",
+            "C:\\sr\\logs\\playback_engine.log",
+        ]))
+        .expect("both flags");
+        assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
+        assert_eq!(
+            log,
+            Some(PathBuf::from("C:\\sr\\logs\\playback_engine.log"))
+        );
+
+        // Flag order must not matter.
+        let (state, log) = parse_arguments(os(&[
+            "--log-file",
+            "C:\\sr\\logs\\playback_engine.log",
+            "--state-dir",
+            "C:\\sr\\engine",
+        ]))
+        .expect("log file first");
+        assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
+        assert!(log.is_some());
+    }
+
+    #[test]
+    fn parse_arguments_rejects_relative_state_dir_unknown_flags_and_duplicates() {
+        assert!(parse_arguments(os(&[])).is_err(), "state dir required");
+        assert!(
+            parse_arguments(os(&["--state-dir"])).is_err(),
+            "missing value rejected"
+        );
+        assert!(
+            parse_arguments(os(&["--state-dir", "relative\\engine"])).is_err(),
+            "relative state dir rejected"
+        );
+        assert!(
+            parse_arguments(os(&["--state-dir", "C:\\a", "--bogus", "x"])).is_err(),
+            "unknown flag rejected"
+        );
+        assert!(
+            parse_arguments(os(&[
+                "--state-dir",
+                "C:\\a",
+                "--state-dir",
+                "C:\\b",
+            ]))
+            .is_err(),
+            "duplicate state dir rejected"
+        );
+    }
+
+    /// The panic hook is process-global: tests that install it must not run
+    /// concurrently with each other (or with tests that intentionally panic,
+    /// which would hit a half-installed hook).
+    static PANIC_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn panic_report_names_the_thread_payload_and_location() {
+        let _guard = PANIC_HOOK_TEST_LOCK.lock().expect("hook test lock");
+        // Capture the report produced for a real panic, then assert on it
+        // after the unwind completes (asserting inside the hook would
+        // double-panic and abort the process).
+        let report = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured = {
+            let report = std::sync::Arc::clone(&report);
+            std::panic::catch_unwind(|| {
+                std::panic::set_hook(Box::new(move |info| {
+                    let built = format_panic_report("test-thread", info);
+                    *report.lock().expect("report lock") = Some(built);
+                }));
+                panic!("test payload");
+            })
+        };
+        let _ = std::panic::take_hook(); // drop the test hook
+        assert!(captured.is_err());
+        let report = report.lock().expect("report lock").take().expect("hook ran");
+        assert!(report.contains("panicked at"));
+        assert!(report.contains("test payload"));
+        assert!(report.contains("stack backtrace"));
+        assert!(report.contains("main.rs"), "location in the report");
+    }
+
+    #[test]
+    fn panic_hook_appends_the_report_to_the_engine_log_file() {
+        let _guard = PANIC_HOOK_TEST_LOCK.lock().expect("hook test lock");
+        let scratch = ScratchDir::new();
+        // Mirror production: the app creates the log directory before the
+        // engine starts (the hook opens the file with create(true), which
+        // cannot create missing parent directories).
+        fs::create_dir_all(&scratch.directory).expect("scratch dir created");
+        let log = scratch.directory.join("playback_engine.log");
+        let previous = std::panic::take_hook();
+        install_panic_hook(Some(log.clone()));
+        let result = std::panic::catch_unwind(|| panic!("diagnosable failure"));
+        std::panic::set_hook(previous);
+        assert!(result.is_err(), "the panic still unwinds normally");
+
+        let contents = fs::read_to_string(&log).expect("panic report appended");
+        assert!(contents.contains("panicked at"), "report header present");
+        assert!(
+            contents.contains("diagnosable failure"),
+            "payload present: {contents}"
+        );
+        assert!(
+            contents.contains("panic_hook_appends_the_report_to_the_engine_log_file"),
+            "call-site location present"
+        );
+
+        // A second panic appends, never overwrites.
+        let previous = std::panic::take_hook();
+        install_panic_hook(Some(log.clone()));
+        let result = std::panic::catch_unwind(|| panic!("second failure"));
+        std::panic::set_hook(previous);
+        assert!(result.is_err());
+        let contents = fs::read_to_string(&log).expect("second report appended");
+        assert_eq!(
+            contents.matches("panicked at").count(),
+            2,
+            "both reports kept"
         );
     }
 }

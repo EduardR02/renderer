@@ -1142,5 +1142,125 @@ TEST_CASE("playlist refetch backoff doubles, caps, and stays bounded") {
   CHECK(kPlaylistRetryBaseSeconds <= kPlaylistRetryMaxSeconds);
 }
 
+namespace {
+
+CachedTrackList CachedTracksWithRevision(const std::string& revision) {
+  CachedTrackList cached;
+  cached.tracks = {ExampleTrack()};
+  cached.snapshot_id = revision;
+  return cached;
+}
+
+}  // namespace
+
+TEST_CASE("playlist tracks cache document round-trips tracks and revision") {
+  std::vector<CachedPlaylistTracks> entries;
+  entries.push_back({"pl-a", CachedTracksWithRevision("rev-1"), 1000});
+  entries.push_back({"pl-b", CachedTracksWithRevision("rev-2"), 2000});
+
+  const json doc = BuildPlaylistTracksCacheDoc(entries, 3000);
+  CHECK(doc["version"] == 1);
+  CHECK(doc["saved_at"] == 3000);
+  REQUIRE(doc["playlists"].is_array());
+  REQUIRE(doc["playlists"].size() == 2);
+
+  std::vector<CachedPlaylistTracks> parsed;
+  REQUIRE(ParsePlaylistTracksCacheDoc(doc, &parsed));
+  // The parser restores the in-memory invariant: most-recent-first.
+  REQUIRE(parsed.size() == 2);
+  CHECK(parsed[0].id == "pl-b");
+  CHECK(parsed[0].fetched_at == 2000);
+  CHECK(parsed[0].value.snapshot_id == "rev-2");
+  REQUIRE(parsed[0].value.tracks.size() == 1);
+  const TrackRef& track = parsed[0].value.tracks[0];
+  CHECK(track.id == "track-id");
+  CHECK(track.uri == "spotify:track:abc");
+  CHECK(track.name == "Signal Path");
+  CHECK(track.artist_names == ExampleTrack().artist_names);
+  CHECK(track.artist_id == "artist-id");
+  CHECK(track.album_id == "album-id");
+  CHECK(track.album_name == "Local Sessions");
+  CHECK(track.cover_url == "https://i.scdn.co/image/example");
+  CHECK(track.duration_ms == 243001);
+  CHECK(parsed[1].id == "pl-a");
+  CHECK(parsed[1].fetched_at == 1000);
+  CHECK(parsed[1].value.snapshot_id == "rev-1");
+}
+
+TEST_CASE("playlist tracks cache evicts the oldest beyond capacity") {
+  std::vector<CachedPlaylistTracks> entries;
+  // 30 distinct playlists, fetched one second apart, oldest first.
+  for (int i = 0; i < 30; ++i) {
+    CachedPlaylistTracks entry;
+    entry.id = "pl-" + std::to_string(i);
+    entry.fetched_at = 1000 + i;
+    entry.value = CachedTracksWithRevision("rev");
+    entries.push_back(std::move(entry));
+  }
+  TrimPlaylistTracksCache(&entries);
+  REQUIRE(entries.size() == static_cast<size_t>(kPlaylistTracksCacheCapacity));
+  CHECK(entries.front().id == "pl-29");
+  CHECK(entries.back().id == "pl-5");
+
+  // A re-fetched playlist (Application upserts with a newer fetched_at,
+  // replacing the existing entry in place) jumps to the front; the window
+  // keeps its oldest survivor because the upsert does not add an entry.
+  for (CachedPlaylistTracks& entry : entries) {
+    if (entry.id == "pl-20") entry.fetched_at = 2000 + 30;
+  }
+  TrimPlaylistTracksCache(&entries);
+  REQUIRE(entries.size() == static_cast<size_t>(kPlaylistTracksCacheCapacity));
+  CHECK(entries.front().id == "pl-20");
+  CHECK(entries.back().id == "pl-5");
+}
+
+TEST_CASE("playlist tracks cache stale copy serves only as fetch fallback") {
+  const int64_t now = 1'800'000'000;
+  // The per-entry TTL follows the same classification as the playlist
+  // library, with the disk-cache TTL (30 minutes).
+  CHECK(ClassifyPlaylistCache(now - 60, now, kPlaylistTracksTtlMinutes, false) ==
+        PlaylistCacheUse::Fresh);
+  CHECK(ClassifyPlaylistCache(now - 1'700, now, kPlaylistTracksTtlMinutes,
+                              false) == PlaylistCacheUse::Fresh);
+  // At the boundary it is stale.
+  CHECK(ClassifyPlaylistCache(now - 1'800, now, kPlaylistTracksTtlMinutes,
+                              false) == PlaylistCacheUse::None);
+  // A stale copy serves the click (shown instantly, refreshed in the
+  // background); only a failed refresh keeps it as the visible fallback.
+  CHECK(ClassifyPlaylistCache(now - 1'800, now, kPlaylistTracksTtlMinutes,
+                              true) == PlaylistCacheUse::StaleFallback);
+  CHECK(ClassifyPlaylistCache(now - 86'400, now, kPlaylistTracksTtlMinutes,
+                              true) == PlaylistCacheUse::StaleFallback);
+}
+
+TEST_CASE("playlist tracks cache parsing rejects unusable documents") {
+  std::vector<CachedPlaylistTracks> out;
+  CHECK_FALSE(ParsePlaylistTracksCacheDoc(json::object(), &out));
+  CHECK_FALSE(ParsePlaylistTracksCacheDoc(
+      json{{"version", 2}, {"playlists", json::array()}}, &out));
+  CHECK_FALSE(ParsePlaylistTracksCacheDoc(
+      json{{"version", 1}, {"playlists", "nope"}}, &out));
+  // Malformed rows are skipped, valid rows survive.
+  json playlistList = json::array();
+  playlistList.push_back(json{{"id", ""}, {"fetched_at", 1}});
+  json okEntry = json::object();
+  okEntry["id"] = "pl-ok";
+  okEntry["fetched_at"] = 100;
+  okEntry["revision"] = "r";
+  okEntry["tracks"] = json::array({TrackRefToEngineJson(ExampleTrack())});
+  playlistList.push_back(std::move(okEntry));
+  const json doc = {{"version", 1}, {"playlists", std::move(playlistList)}};
+  REQUIRE(ParsePlaylistTracksCacheDoc(doc, &out));
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].id == "pl-ok");
+  CHECK(out[0].fetched_at == 100);
+  CHECK(out[0].value.snapshot_id == "r");
+  REQUIRE(out[0].value.tracks.size() == 1);
+  const TrackRef& track = out[0].value.tracks[0];
+  CHECK(track.id == "track-id");
+  CHECK(track.uri == "spotify:track:abc");
+  CHECK(track.duration_ms == 243001);
+}
+
 }  // namespace
 }  // namespace sr

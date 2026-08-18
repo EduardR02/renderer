@@ -2526,6 +2526,7 @@ name = "spotify-playback-engine"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
  "cpal",
  "env_logger",
  "futures-util",
@@ -2536,7 +2537,6 @@ dependencies = [
  "librespot-playback",
  "librespot-protocol",
  "oauth2",
- "percent-encoding",
  "protobuf",
  "reqwest",
  "rodio",

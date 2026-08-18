@@ -217,7 +217,7 @@ inline bool RowMatchesCurrentUri(const ListRow& row,
 // dialog-style navigation (Tab, arrows). IsDialogMessage consumes VK_RETURN
 // even though the main window has no default pushbutton, so Enter typed in
 // the search box never reaches the edit's own subclass, which is what routes
-// it to the Search button (the same WM_COMMAND as clicking it). Messages for
+// it to the Search button (the same path as clicking it). Messages for
 // which this returns true must skip dialog navigation and go straight to
 // TranslateMessage/DispatchMessage.
 inline bool SearchEnterBypassesDialogNavigation(const MSG& message) {

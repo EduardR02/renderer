@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
@@ -11,6 +13,9 @@
 #include "playback_engine_client.h"
 #include "spotify_api.h"
 #include "ui_rows.h"
+namespace Gdiplus {
+class Bitmap;
+}
 namespace sr {
 
 class Application;
@@ -21,12 +26,20 @@ class MainWindow {
   enum class WorkspaceKind { Collection, Search, Settings };
 
   MainWindow() = default;
-  ~MainWindow() = default;
+  // Out of line so the Gdiplus::Bitmap members (unique_ptr to a
+  // forward-declared type) are destroyed where gdiplus.h is complete.
+  ~MainWindow();
 
   bool Create(HINSTANCE instance, Application* app);
   void Destroy();
   HWND hwnd() const { return hwnd_; }
   void SetSearchResults(const SearchResult& result);
+  // Submits the search box exactly like clicking the Search button: blank
+  // queries are ignored, the search workspace opens, then the app search
+  // runs (demo mode only switches the workspace). Shared by the button's
+  // WM_COMMAND and by Enter in the search edit (EditSubclass), so both
+  // take the same path.
+  void SubmitSearch();
   void SetPlayback(const PlaybackEngineState& playback);
   // Timer-driven position projection: updates only the seek bar and elapsed
   // label without copying the whole playback state (queue included) at 4 Hz.
@@ -45,6 +58,13 @@ class MainWindow {
   void SetMiddleTracks(const std::vector<TrackRef>& tracks);
   void SetArtistPage(const ArtistRef& artist, const std::vector<TrackRef>& tracks);
   void SetPlaylists(const std::vector<PlaylistRef>& playlists);
+  // Backfills the rail art for one coverless playlist (first-track cover,
+  // mirroring the playlist view) without disturbing selection or layout.
+  void SetPlaylistCoverFallback(const std::string& id, const std::string& url);
+  // Publishes the first up-to-4 track covers of a coverless playlist; the
+  // rail tile then renders a 2x2 mosaic instead of the single cover.
+  void SetPlaylistMosaicCovers(const std::string& id,
+                               std::vector<std::string> covers);
   void SetQueueTracks(const std::vector<TrackRef>& tracks);
   void SetStatus(const std::wstring& text);
   void SetCoverFile(const std::wstring& path);
@@ -57,6 +77,11 @@ class MainWindow {
   int SelectedResultIndex() const;
   int MiddleComboIndex() const;
   const std::vector<PlaylistRef>& playlists() const { return playlists_; }
+  // Row order of the rail (middle indices, 0 = Queue) after the live filter;
+  // lets the app fetch eager artwork for the visible rows first.
+  const std::vector<int>& filteredPlaylistIndices() const {
+    return filteredPlaylistIndices_;
+  }
   const SearchResult& search() const { return search_; }
   const std::vector<int>& resultKinds() const { return resultKinds_; }
   const std::vector<TrackRef>& middleTracks() const { return middleTracks_; }
@@ -92,6 +117,15 @@ class MainWindow {
   void AddTooltip(HWND control, const wchar_t* text);
   void SetTooltipText(HWND control, const std::wstring& text);
   void RebuildPlaylistRail();
+  // Lazily composited 2x2 mosaic for a coverless playlist's rail tile;
+  // returns nullptr until every cell's art has arrived (caller falls back
+  // to the seeded tile). Cells fill top-left first; empty cells stay
+  // transparent over the row base. Cached per playlist id so scrolling
+  // never re-composites.
+  Gdiplus::Bitmap* PlaylistMosaicBitmap(const std::string& id, int size);
+  // Repaints only the rail rows whose art uses `url` (single cover or a
+  // mosaic cell), so artwork arrivals never force a full-rail repaint.
+  void InvalidateRailRowsForUrl(const std::string& url);
   void SelectPlaylistRow(int comboIndex, bool activate);
   void BeginNestedCollection(CollectionKind kind, const std::wstring& title,
                              const std::string& artworkUrl);
@@ -141,6 +175,15 @@ class MainWindow {
   std::vector<ListRow> searchRows_;
   std::vector<ListRow> middleRows_;
   std::vector<TrackRef> demoTracks_;
+  // Per-playlist 2x2 mosaic cell covers (first up-to-4 track covers) for
+  // coverless playlists; the rail tile draws the mosaic once every cell is
+  // in artworkCache_.
+  std::unordered_map<std::string, std::vector<std::string>>
+      playlistMosaicCovers_;
+  // Composited mosaic bitmaps per playlist id; dropped when the covers
+  // change and on DPI changes (sizes are baked into the bitmap). Raw
+  // pointers so gdiplus.h stays out of the header; freed in ~MainWindow.
+  std::unordered_map<std::string, Gdiplus::Bitmap*> playlistMosaicCache_;
   bool resultsLoading_ = false;
   bool middleLoading_ = false;
   ArtworkCache* artworkCache_ = nullptr;

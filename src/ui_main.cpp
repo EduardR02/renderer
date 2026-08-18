@@ -55,6 +55,10 @@ constexpr wchar_t kEditFocusProp[] = L"SRO.EditFocus";
 // Backdrop color behind a subclassed edit (the parent surface its rounded
 // corners blend into), set at creation via SetPropW.
 constexpr wchar_t kEditBackdropProp[] = L"SRO.EditBackdrop";
+// Cue-banner text for a subclassed edit, captured from EM_SETCUEBANNER so
+// WM_PAINT can render it without relying on EM_GETCUEBANNER (which answers
+// FALSE for these controls). Heap copy; freed on re-set and WM_NCDESTROY.
+constexpr wchar_t kEditCueProp[] = L"SRO.EditCue";
 
 // Windows hides focus indicators until the user navigates with the keyboard
 // (SPI_GETKEYBOARDCUES, the same mechanism UxTheme uses). Focus rings on
@@ -136,6 +140,10 @@ void FillEllipseGp(Gdiplus::Graphics& graphics, const RECT& bounds,
 }
 
 constexpr wchar_t kListHoverProp[] = L"SRO.ListHover";
+// Set while the rail's scrollbar thumb is being dragged: hover tracking
+// (which invalidates rows on every WM_MOUSEMOVE) is suppressed for the
+// duration so scroll repaints are not doubled by hover repaints.
+constexpr wchar_t kRailScrollingProp[] = L"SRO.RailScrolling";
 
 // Child control ids. The subclassed edit ids are shared constants so the
 // Enter-routing contract stays testable; the asserts pin the sequential enum
@@ -193,15 +201,32 @@ struct CoverCtx {
   MainWindow* owner = nullptr;
 };
 
-// Search and playlist-filter edits use native cue banners so the hint is
-// rendered by the edit control itself, exactly where typed text and the caret
-// go (same margins, same vertical centering). Enter in the main search box
-// submits through the search button — the same path as clicking it. The rail
-// filter already applies per keystroke, so Enter there falls through to the
-// default edit behavior. The boxes themselves are pills (rounded outline on
-// the outer rect, accent while focused) painted entirely in WM_NCPAINT; the
-// app's message loop must not let IsDialogMessage consume Enter before it
-// reaches this subclass (see SearchEnterBypassesDialogNavigation).
+// Search and playlist-filter edits are pills: the rounded outline (accent
+// while focused) is painted in WM_NCPAINT, and the client area is painted in
+// WM_PAINT with the fill, text or cue banner, and selection so no native
+// edit artifact (dotted focus rectangle, themed border, white background)
+// shows through. Enter in the main search box submits through the owning
+// MainWindow — SubmitSearch, the same path as clicking the Search button.
+// The rail filter already applies per keystroke, so Enter there falls
+// through to the default edit behavior. The app's message loop must not let
+// IsDialogMessage consume Enter before it reaches this subclass (see
+// SearchEnterBypassesDialogNavigation).
+
+// Font line height (tmHeight + tmExternalLeading) of a subclassed edit, in
+// the font the control currently reports. Shared by the vertical padding and
+// the subclass-owned caret block.
+int EditLineHeight(HWND control) {
+  HDC dc = ::GetDC(control);
+  HFONT font = reinterpret_cast<HFONT>(
+      ::SendMessageW(control, WM_GETFONT, 0, 0));
+  HGDIOBJ old =
+      ::SelectObject(dc, font ? font : ::GetStockObject(DEFAULT_GUI_FONT));
+  TEXTMETRICW metrics{};
+  ::GetTextMetricsW(dc, &metrics);
+  ::SelectObject(dc, old);
+  ::ReleaseDC(control, dc);
+  return metrics.tmHeight + metrics.tmExternalLeading;
+}
 
 // Vertical inset per side for the client rect of a tall single-line edit.
 // Native single-line edits anchor their text, caret, and cue banner to a
@@ -215,28 +240,91 @@ int EditVerticalPad(HWND control) {
   // rect already reflects any earlier WM_NCCALCSIZE adjustment.
   RECT window{};
   ::GetWindowRect(control, &window);
-  HDC dc = ::GetDC(control);
-  HFONT font = reinterpret_cast<HFONT>(
-      ::SendMessageW(control, WM_GETFONT, 0, 0));
-  HGDIOBJ old =
-      ::SelectObject(dc, font ? font : ::GetStockObject(DEFAULT_GUI_FONT));
-  TEXTMETRICW metrics{};
-  ::GetTextMetricsW(dc, &metrics);
-  ::SelectObject(dc, old);
-  ::ReleaseDC(control, dc);
-  const int lineHeight = metrics.tmHeight + metrics.tmExternalLeading;
   // The format rectangle reserves 2px above and below the line.
-  return EditCenteringInset(window.bottom - window.top, lineHeight + 4);
+  return EditCenteringInset(window.bottom - window.top,
+                            EditLineHeight(control) + 4);
+}
+
+// The native edit never sees WM_SETFOCUS (the subclass owns the caret), so
+// every message that moves the selection must re-sync the caret to the
+// selection end. EM_POSFROMCHAR reports the native caret position in the
+// shrunken client; an empty control reports -1, which lands at the left
+// margin.
+void RepositionCaret(HWND control) {
+  if (::GetPropW(control, kEditFocusProp) == nullptr) return;
+  const DWORD sel = static_cast<DWORD>(
+      ::SendMessageW(control, EM_GETSEL, 0, 0));
+  const LONG position = static_cast<LONG>(
+      ::SendMessageW(control, EM_POSFROMCHAR, HIWORD(sel), 0));
+  if (position != -1) {
+    ::SetCaretPos(static_cast<short>(LOWORD(position)),
+                  static_cast<short>(HIWORD(position)));
+  } else {
+    const DWORD margins = static_cast<DWORD>(
+        ::SendMessageW(control, EM_GETMARGINS, 0, 0));
+    ::SetCaretPos(LOWORD(margins), 0);
+  }
 }
 
 LRESULT CALLBACK EditSubclass(HWND control, UINT message, WPARAM wparam,
                               LPARAM lparam, UINT_PTR, DWORD_PTR) {
   if (message == WM_KEYDOWN && wparam == VK_RETURN &&
       EditRoleForControl(::GetDlgCtrlID(control)) == EditRole::Search) {
-    HWND parent = ::GetParent(control);
-    ::SendMessageW(parent, WM_COMMAND,
-                   MAKEWPARAM(CID_SEARCH_BTN, BN_CLICKED), 0);
+    // TEMPORARY diagnostic: locate why Enter in the search box does not
+    // submit; remove after the user's single test.
+    // Call the submit path on the owning MainWindow (stored in the parent's
+    // GWLP_USERDATA by WndProc) directly instead of synthesizing a
+    // WM_COMMAND, which never reached the Search button's handler reliably.
+    auto* window = reinterpret_cast<MainWindow*>(
+        ::GetWindowLongPtrW(::GetParent(control), GWLP_USERDATA));
+    if (window) window->SubmitSearch();
     return 0;
+  }
+  if (message == WM_KEYDOWN) {
+    // The native edit moves its internal selection on the navigation and
+    // editing keys; the caret is ours, so follow it. (The Enter submit
+    // above already returned.)
+    const bool movesCaret = wparam == VK_LEFT || wparam == VK_RIGHT ||
+                            wparam == VK_HOME || wparam == VK_END ||
+                            wparam == VK_BACK || wparam == VK_DELETE;
+    LRESULT result = ::DefSubclassProc(control, message, wparam, lparam);
+    if (movesCaret) RepositionCaret(control);
+    return result;
+  }
+  if (message == WM_CHAR && wparam == VK_RETURN &&
+      EditRoleForControl(::GetDlgCtrlID(control)) == EditRole::Search) {
+    // TranslateMessage turns the Enter keydown into WM_CHAR(0x0D); the
+    // native edit beeps on it. The keydown already submitted via
+    // SubmitSearch, so swallow the character.
+    return 0;
+  }
+  if (message == WM_CHAR) {
+    // Typing edits the text and moves the selection end; re-sync the
+    // subclass-owned caret after the native edit runs. (The Enter swallow
+    // above already returned.)
+    LRESULT result = ::DefSubclassProc(control, message, wparam, lparam);
+    RepositionCaret(control);
+    return result;
+  }
+  if (message == EM_SETCUEBANNER) {
+    // Own the cue text (WM_PAINT renders it; EM_GETCUEBANNER is unreliable
+    // here). Replace the stored copy, then keep the native state in sync.
+    wchar_t* previous =
+        static_cast<wchar_t*>(::GetPropW(control, kEditCueProp));
+    if (previous) {
+      ::HeapFree(::GetProcessHeap(), 0, previous);
+      ::RemovePropW(control, kEditCueProp);
+    }
+    if (lparam) {
+      const wchar_t* source = reinterpret_cast<const wchar_t*>(lparam);
+      const size_t length = wcslen(source) + 1;
+      wchar_t* copy = static_cast<wchar_t*>(
+          ::HeapAlloc(::GetProcessHeap(), 0, length * sizeof(wchar_t)));
+      if (copy) {
+        wcscpy_s(copy, length, source);
+        ::SetPropW(control, kEditCueProp, reinterpret_cast<HANDLE>(copy));
+      }
+    }
   }
   if (message == WM_NCCALCSIZE) {
     const int pad = EditVerticalPad(control);
@@ -282,13 +370,144 @@ LRESULT CALLBACK EditSubclass(HWND control, UINT message, WPARAM wparam,
     ::ReleaseDC(control, dc);
     return 0;
   }
-  if (message == WM_SETFOCUS || message == WM_KILLFOCUS) {
-    if (message == WM_SETFOCUS)
-      ::SetPropW(control, kEditFocusProp, reinterpret_cast<HANDLE>(1));
-    else
-      ::RemovePropW(control, kEditFocusProp);
-    // Focus changes the pill outline (non-client), which InvalidateRect
-    // alone never repaints.
+  if (message == WM_PAINT) {
+    // Paint the client here: the pill fill, the text or cue banner at the
+    // native margins, and the selection highlight. Nothing native is
+    // painted (no DefSubclassProc), so the themed border/background never
+    // shows and the focus rectangle is never drawn — WM_SETFOCUS is not
+    // forwarded and the caret is the subclass-owned block from the caret
+    // API, which survives this repaint.
+    PAINTSTRUCT paint{};
+    HDC dc = ::BeginPaint(control, &paint);
+    RECT client{};
+    ::GetClientRect(control, &client);
+    RECT window{};
+    ::GetWindowRect(control, &window);
+    const int width = window.right - window.left;
+    const int height = window.bottom - window.top;
+    RECT pill{1, 1, width - 1, height - 1};
+    {
+      Gdiplus::Graphics graphics(dc);
+      FillRoundedRectGp(graphics, pill, std::min(width, height) / 2, kEdit);
+    }
+
+    HFONT font = reinterpret_cast<HFONT>(
+        ::SendMessageW(control, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont =
+        ::SelectObject(dc, font ? font : ::GetStockObject(DEFAULT_GUI_FONT));
+    const int oldBkMode = ::SetBkMode(dc, TRANSPARENT);
+    const COLORREF oldTextColor = ::SetTextColor(dc, kText);
+
+    const DWORD margins = static_cast<DWORD>(
+        ::SendMessageW(control, EM_GETMARGINS, 0, 0));
+    const int leftMargin = LOWORD(margins);
+    const int rightMargin = HIWORD(margins);
+
+    wchar_t text[512] = {};
+    const int textLen = ::GetWindowTextW(control, text, 512);
+    const wchar_t* cue =
+        static_cast<const wchar_t*>(::GetPropW(control, kEditCueProp));
+    const bool showCue = textLen == 0 && cue && cue[0] != L'\0';
+
+    // Horizontal scroll: the native edit keeps its internal scroll offset
+    // and the caret visible. EM_POSFROMCHAR reports where the caret
+    // character currently lands in the client, so drawing the text with
+    // that character at exactly that x reproduces the scrolled layout (and
+    // keeps the blinking caret on the right character). The caret sits at
+    // the selection end, except for selections dragged backward, where it
+    // is the start; the caret is always visible, so prefer whichever end
+    // lies inside the client.
+    const DWORD sel = static_cast<DWORD>(
+        ::SendMessageW(control, EM_GETSEL, 0, 0));
+    const int selStart = LOWORD(sel);
+    const int selEnd = HIWORD(sel);
+    int anchor = selEnd;
+    int anchorX = static_cast<short>(
+        LOWORD(::SendMessageW(control, EM_POSFROMCHAR, anchor, 0)));
+    if (selStart != selEnd) {
+      const int startX = static_cast<short>(
+          LOWORD(::SendMessageW(control, EM_POSFROMCHAR, selStart, 0)));
+      const bool anchorVisible = anchorX >= 0 && anchorX < client.right;
+      const bool startVisible = startX >= 0 && startX < client.right;
+      if (startVisible && !anchorVisible) {
+        anchor = selStart;
+        anchorX = startX;
+      }
+    }
+    int drawX = leftMargin;
+    if (anchorX >= 0) {
+      SIZE prefixSize{};
+      ::GetTextExtentPoint32W(dc, text, std::min(anchor, textLen),
+                              &prefixSize);
+      drawX = anchorX - prefixSize.cx;
+      if (drawX > leftMargin) drawX = leftMargin;
+    }
+
+    const bool focused = ::GetPropW(control, kEditFocusProp) != nullptr;
+    const bool showSelection = focused && !showCue && selStart < selEnd;
+    if (showSelection) {
+      const int preLen = std::min(selStart, textLen);
+      const int selLen = std::min(selEnd, textLen) - preLen;
+      SIZE sizePre{}, sizeSel{};
+      ::GetTextExtentPoint32W(dc, text, preLen, &sizePre);
+      ::GetTextExtentPoint32W(dc, text + preLen, selLen, &sizeSel);
+      RECT highlight{drawX + sizePre.cx, client.top,
+                     drawX + sizePre.cx + sizeSel.cx, client.bottom};
+      HBRUSH selectBrush = ::CreateSolidBrush(kControl);
+      ::FillRect(dc, &highlight, selectBrush);
+      ::DeleteObject(selectBrush);
+      RECT part{drawX, client.top, client.right - rightMargin, client.bottom};
+      ::DrawTextW(dc, text, preLen, &part,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+      part.left = drawX + sizePre.cx;
+      ::DrawTextW(dc, text + preLen, selLen, &part,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+      part.left = drawX + sizePre.cx + sizeSel.cx;
+      const int postStart = std::min(selEnd, textLen);
+      ::DrawTextW(dc, text + postStart, textLen - postStart, &part,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    } else {
+      if (showCue) ::SetTextColor(dc, kBorder);
+      RECT part{drawX, client.top, client.right - rightMargin, client.bottom};
+      ::DrawTextW(dc, showCue ? cue : text, showCue ? -1 : textLen, &part,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    }
+
+    ::SetTextColor(dc, oldTextColor);
+    ::SetBkMode(dc, oldBkMode);
+    ::SelectObject(dc, oldFont);
+    ::EndPaint(control, &paint);
+    return 0;
+  }
+  if (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP) {
+    // Clicks (and drag-release) move the caret/selection in the native
+    // edit, which must run first; the click also triggers WM_SETFOCUS,
+    // which creates our caret. Re-sync after the native edit has updated
+    // its state.
+    LRESULT result = ::DefSubclassProc(control, message, wparam, lparam);
+    RepositionCaret(control);
+    return result;
+  }
+  if (message == WM_SETFOCUS) {
+    ::SetPropW(control, kEditFocusProp, reinterpret_cast<HANDLE>(1));
+    // Never forward the focus messages: the native edit would draw its
+    // dotted focus rectangle around the full-width client (square corners
+    // poking past the pill's rounded caps) and create its own caret. The
+    // caret is ours — a solid block the size of the font line, placed at
+    // the selection end like the native one.
+    const int caretWidth =
+        std::max(1, ::MulDiv(2, ::GetDpiForWindow(control), 96));
+    ::CreateCaret(control, nullptr, caretWidth, EditLineHeight(control));
+    RepositionCaret(control);
+    ::ShowCaret(control);
+    ::RedrawWindow(control, nullptr, nullptr,
+                   RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN);
+    return 0;
+  }
+  if (message == WM_KILLFOCUS) {
+    ::RemovePropW(control, kEditFocusProp);
+    ::HideCaret(control);
+    ::DestroyCaret();
     ::RedrawWindow(control, nullptr, nullptr,
                    RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN);
     return 0;
@@ -296,6 +515,9 @@ LRESULT CALLBACK EditSubclass(HWND control, UINT message, WPARAM wparam,
   if (message == WM_NCDESTROY) {
     ::RemovePropW(control, kEditFocusProp);
     ::RemovePropW(control, kEditBackdropProp);
+    wchar_t* cue = static_cast<wchar_t*>(::GetPropW(control, kEditCueProp));
+    if (cue) ::HeapFree(::GetProcessHeap(), 0, cue);
+    ::RemovePropW(control, kEditCueProp);
     ::RemoveWindowSubclass(control, EditSubclass, 1);
   }
   return ::DefSubclassProc(control, message, wparam, lparam);
@@ -448,10 +670,56 @@ LRESULT CALLBACK ListSubclass(HWND control, UINT message, WPARAM wparam, LPARAM 
 
 // The playlist rail is an owner-draw listbox; hover state (like the song
 // lists) uses the same track-mouse/leave pattern, but hit testing goes
-// through LB_ITEMFROMPOINT, not LVM_HITTEST.
+// through LB_ITEMFROMPOINT, not LVM_HITTEST. The wheel/scroll handling
+// keeps scrolling cheap and deterministic (see below).
 LRESULT CALLBACK RailListSubclass(HWND control, UINT message, WPARAM wparam,
                                   LPARAM lparam, UINT_PTR, DWORD_PTR) {
-  if (message == WM_MOUSEMOVE) {
+  if (message == WM_ERASEBKGND) {
+    // Owner-draw rows cover the entire client rect; the default listbox
+    // erase (WM_CTLCOLORLISTBOX brush) would flash before every repaint.
+    // Paint the sidebar background ourselves so an empty rail stays dark
+    // instead of showing the listbox's white class background.
+    HDC dc = reinterpret_cast<HDC>(wparam);
+    RECT rect{};
+    ::GetClientRect(control, &rect);
+    HBRUSH brush = ::CreateSolidBrush(kSidebar);
+    ::FillRect(dc, &rect, brush);
+    ::DeleteObject(brush);
+    return 1;
+  }
+  if (message == WM_MOUSEWHEEL) {
+    // The native listbox wheel path scrolls the band without regard for
+    // the system wheel setting and repaints per detent, which reads as
+    // jumpy next to the tracks list. Delegate explicitly to WM_VSCROLL
+    // with SPI_GETWHEELSCROLLLINES lines per notch (page when configured
+    // so) — the same step the ListView uses — so wheel and scrollbar share
+    // one code path with consistent per-step paint cost.
+    const short delta = GET_WHEEL_DELTA_WPARAM(wparam);
+    if (delta != 0) {
+      UINT lines = 3;
+      ::SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+      if (lines == WHEEL_PAGESCROLL) {
+        ::SendMessageW(control, WM_VSCROLL,
+                       MAKEWPARAM(delta > 0 ? SB_PAGEUP : SB_PAGEDOWN, 0), 0);
+      } else {
+        const WPARAM step = delta > 0 ? SB_LINEUP : SB_LINEDOWN;
+        for (UINT i = 0; i < lines; ++i)
+          ::SendMessageW(control, WM_VSCROLL, MAKEWPARAM(step, 0), 0);
+      }
+      return 0;
+    }
+  }
+  if (message == WM_VSCROLL) {
+    // While the scrollbar thumb is dragged the listbox repaints scrolled
+    // bands on every track; hover tracking would layer row invalidations
+    // on top of those paints. Suppress hover repaints for the drag.
+    const WORD request = LOWORD(wparam);
+    if (request == SB_THUMBTRACK)
+      ::SetPropW(control, kRailScrollingProp, reinterpret_cast<HANDLE>(1));
+    else if (request == SB_ENDSCROLL)
+      ::RemovePropW(control, kRailScrollingProp);
+  } else if (message == WM_MOUSEMOVE) {
+    if (::GetPropW(control, kRailScrollingProp) != nullptr) return 0;
     POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
     LONG hit = static_cast<LONG>(
         ::SendMessageW(control, LB_ITEMFROMPOINT, 0,
@@ -484,6 +752,7 @@ LRESULT CALLBACK RailListSubclass(HWND control, UINT message, WPARAM wparam,
     ::InvalidateRect(control, nullptr, FALSE);
   } else if (message == WM_NCDESTROY) {
     ::RemovePropW(control, kListHoverProp);
+    ::RemovePropW(control, kRailScrollingProp);
     ::RemoveWindowSubclass(control, RailListSubclass, 1);
   }
   return ::DefSubclassProc(control, message, wparam, lparam);
@@ -622,8 +891,14 @@ LRESULT CALLBACK SliderProc(HWND control, UINT message, WPARAM wparam, LPARAM lp
       HDC dc = ::BeginPaint(control, &paint);
       RECT rect{};
       ::GetClientRect(control, &rect);
+      // Paint into an off-screen buffer and blit once: drawing straight to
+      // the window DC flickers on every repaint (the slider redraws on each
+      // engine heartbeat and position tick).
+      HDC buffer = ::CreateCompatibleDC(dc);
+      HBITMAP bitmap = ::CreateCompatibleBitmap(dc, rect.right, rect.bottom);
+      HGDIOBJ oldBitmap = ::SelectObject(buffer, bitmap);
       HBRUSH background = ::CreateSolidBrush(kPlayer);
-      ::FillRect(dc, &rect, background);
+      ::FillRect(buffer, &rect, background);
       ::DeleteObject(background);
 
       int dpi = static_cast<int>(::GetDpiForWindow(control));
@@ -638,7 +913,7 @@ LRESULT CALLBACK SliderProc(HWND control, UINT message, WPARAM wparam, LPARAM lp
           (context->position - context->minimum) / span);
       int thumbRadius = std::max(5, ::MulDiv(7, dpi, 96));
       {
-        Gdiplus::Graphics graphics(dc);
+        Gdiplus::Graphics graphics(buffer);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         FillRoundedRectGp(graphics, channel, channelHeight, kTrack);
         RECT progress = channel;
@@ -656,6 +931,10 @@ LRESULT CALLBACK SliderProc(HWND control, UINT message, WPARAM wparam, LPARAM lp
                               1.0f);
         }
       }
+      ::BitBlt(dc, 0, 0, rect.right, rect.bottom, buffer, 0, 0, SRCCOPY);
+      ::SelectObject(buffer, oldBitmap);
+      ::DeleteObject(bitmap);
+      ::DeleteDC(buffer);
       ::EndPaint(control, &paint);
       return 0;
     }
@@ -1064,23 +1343,35 @@ void MainWindow::RebuildPlaylistRail() {
   ::InvalidateRect(playlistList_, nullptr, FALSE);
   // Fetch covers for the visible playlists through the existing artwork
   // machinery; rows fall back to seeded tiles until art arrives. Dedup via
-  // the same requested-set as the track lists.
+  // the same requested-set as the track lists. A coverless playlist with
+  // mosaic covers requests every mosaic cell instead of the single
+  // fallback cover.
   if (app_ && artworkCache_) {
     if (artworkCache_->requested.size() >= 512)
       artworkCache_->requested.clear();
-    size_t issued = 0;
-    for (size_t row = 1; row < filteredPlaylistIndices_.size() && issued < 12;
-         ++row) {
+    // No per-rebuild cap: every visible row requests its art; the
+    // requested-set below dedups repeats.
+    for (size_t row = 1; row < filteredPlaylistIndices_.size(); ++row) {
       const PlaylistRef* playlist = RailPlaylistForRow(
           playlists_, filteredPlaylistIndices_, static_cast<int>(row));
-      if (!playlist || playlist->cover_url.empty()) continue;
+      if (!playlist) continue;
+      const auto mosaic = playlistMosaicCovers_.find(playlist->id);
+      if (mosaic != playlistMosaicCovers_.end() &&
+          !mosaic->second.empty()) {
+        for (const std::string& url : mosaic->second) {
+          if (artworkCache_->images.find(url) != artworkCache_->images.end())
+            continue;
+          if (artworkCache_->requested.insert(url).second)
+            app_->OnTrackArtworkNeeded(url);
+        }
+        continue;
+      }
+      if (playlist->cover_url.empty()) continue;
       const std::string& url = playlist->cover_url;
       if (artworkCache_->images.find(url) != artworkCache_->images.end())
         continue;
-      if (artworkCache_->requested.insert(url).second) {
+      if (artworkCache_->requested.insert(url).second)
         app_->OnTrackArtworkNeeded(url);
-        ++issued;
-      }
     }
   }
 }
@@ -1202,6 +1493,11 @@ void MainWindow::UpdateWorkspaceArtwork(const std::string& url) {
     app_->OnTrackArtworkNeeded(url);
 }
 
+MainWindow::~MainWindow() {
+  for (auto& entry : playlistMosaicCache_) delete entry.second;
+  playlistMosaicCache_.clear();
+}
+
 void MainWindow::CreateChildren() {
   artworkCache_ = new ArtworkCache();
   brushBg_ = ::CreateSolidBrush(kBg);
@@ -1253,7 +1549,10 @@ void MainWindow::CreateChildren() {
   auto makeEdit = [this](int id, COLORREF backdrop) {
     HWND edit = ::CreateWindowExW(
         0, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_BORDER |
+        // No WS_BORDER: EditSubclass paints the whole outline as a pill in
+        // WM_NCPAINT, and the native border's dotted focus rectangle would
+        // render inside/over the pill while the box has focus.
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS |
             ES_AUTOHSCROLL,
         0, 0, 10, 10, hwnd_,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hinst_, nullptr);
@@ -1261,6 +1560,9 @@ void MainWindow::CreateChildren() {
     // surface behind the box).
     ::SetPropW(edit, kEditBackdropProp,
                reinterpret_cast<HANDLE>(static_cast<INT_PTR>(backdrop)));
+    // Subclass first so the cue-banner capture below (and every later
+    // message) goes through EditSubclass.
+    ::SetWindowSubclass(edit, EditSubclass, 1, 0);
     // Interior margins must scale with DPI so typed text lines up with the
     // cue banner (both are rendered by the edit control itself).
     int margin = ::MulDiv(12, dpi_, 96);
@@ -1272,7 +1574,6 @@ void MainWindow::CreateChildren() {
     else if (EditRoleForControl(id) == EditRole::Filter)
       ::SendMessageW(edit, EM_SETCUEBANNER, TRUE,
                      reinterpret_cast<LPARAM>(L"Filter playlists"));
-    ::SetWindowSubclass(edit, EditSubclass, 1, 0);
     return edit;
   };
 
@@ -1480,7 +1781,7 @@ void MainWindow::Layout() {
     ::MoveWindow(control, x, y, std::max(0, w), std::max(0, h), TRUE);
   };
 
-  const int sidebarWidth = scale(238);
+  const int sidebarWidth = scale(296);
   const int playerHeight = scale(98);
   const int playerY = height - playerHeight;
   const int railPad = scale(16);
@@ -1681,65 +1982,85 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
       FillRoundedRectGp(graphics, highlight, scale(8),
                         selected ? kSelect : kControl);
     }
+    // 40px artwork tile (the "nice middle" between the old 32px icon and
+    // Spotify's oversized squares), vertically centered in the 52px row.
+    const int railIconSize = scale(40);
     RECT iconRect = draw->rcItem;
-    iconRect.left += scale(6);
-    iconRect.right = iconRect.left + scale(32);
+    iconRect.left += scale(8);
+    iconRect.right = iconRect.left + railIconSize;
+    iconRect.top += scale(6);
+    iconRect.bottom = iconRect.top + railIconSize;
     const COLORREF rowForeground =
         disabled ? kDisabled : (selected || hot ? kText : kDim);
     if (draw->itemID == 0) {
       // The Queue entry is not a playlist; it keeps its library glyph.
-      DrawFluentIcon(draw->hDC, iconRect, fontIcon16_,
+      DrawFluentIcon(draw->hDC, iconRect, fontIcon20_,
                      selected ? kAccent : rowForeground, FluentIcon::Queue);
     } else {
       // Playlist rows show the playlist cover art from the shared artwork
       // cache; until art arrives (or when a playlist has none) a seeded tile
-      // with the playlist glyph is drawn instead.
+      // with the playlist glyph is drawn instead. Coverless playlists with
+      // fetched tracks render a 2x2 mosaic of the first four covers — the
+      // composited bitmap is cached per playlist, so scrolling repaints a
+      // 1:1 copy instead of re-scaling four images per paint.
       const PlaylistRef* playlist = RailPlaylistForRow(
           playlists_, filteredPlaylistIndices_,
           static_cast<int>(draw->itemID));
-      Gdiplus::Image* image = nullptr;
-      if (playlist && artworkCache_ && !playlist->cover_url.empty()) {
-        auto found = artworkCache_->images.find(playlist->cover_url);
-        if (found != artworkCache_->images.end()) image = found->second.get();
-      }
-      if (image && image->GetWidth() > 0 && image->GetHeight() > 0) {
+      Gdiplus::Bitmap* mosaic =
+          playlist ? PlaylistMosaicBitmap(playlist->id, railIconSize)
+                   : nullptr;
+      if (mosaic) {
         Gdiplus::Graphics graphics(draw->hDC);
-        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        graphics.SetInterpolationMode(
-            Gdiplus::InterpolationModeHighQualityBicubic);
-        UINT sourceWidth = image->GetWidth();
-        UINT sourceHeight = image->GetHeight();
-        UINT sourceSize = std::min(sourceWidth, sourceHeight);
-        graphics.DrawImage(
-            image,
-            Gdiplus::Rect(iconRect.left, iconRect.top,
-                          iconRect.right - iconRect.left,
-                          iconRect.bottom - iconRect.top),
-            (sourceWidth - sourceSize) / 2, (sourceHeight - sourceSize) / 2,
-            sourceSize, sourceSize, Gdiplus::UnitPixel);
+        graphics.DrawImage(mosaic, iconRect.left, iconRect.top,
+                           static_cast<INT>(iconRect.right - iconRect.left),
+                           static_cast<INT>(iconRect.bottom - iconRect.top));
       } else {
-        uint32_t seed =
-            playlist
-                ? RowArtworkSeed(playlist->cover_url,
-                                 Utf8ToWide(playlist->name))
-                : RowArtworkSeed(std::string(), L"");
-        COLORREF tile =
-            RGB(0x25 + (seed & 0x0F), 0x29 + ((seed >> 4) & 0x0F),
-                0x2D + ((seed >> 8) & 0x0F));
-        {
+        Gdiplus::Image* image = nullptr;
+        if (playlist && artworkCache_ && !playlist->cover_url.empty()) {
+          auto found = artworkCache_->images.find(playlist->cover_url);
+          if (found != artworkCache_->images.end())
+            image = found->second.get();
+        }
+        if (image && image->GetWidth() > 0 && image->GetHeight() > 0) {
           Gdiplus::Graphics graphics(draw->hDC);
           graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-          FillRoundedRectGp(graphics, iconRect, scale(6), tile);
+          graphics.SetInterpolationMode(
+              Gdiplus::InterpolationModeHighQualityBicubic);
+          UINT sourceWidth = image->GetWidth();
+          UINT sourceHeight = image->GetHeight();
+          UINT sourceSize = std::min(sourceWidth, sourceHeight);
+          graphics.DrawImage(
+              image,
+              Gdiplus::Rect(iconRect.left, iconRect.top,
+                            iconRect.right - iconRect.left,
+                            iconRect.bottom - iconRect.top),
+              (sourceWidth - sourceSize) / 2,
+              (sourceHeight - sourceSize) / 2, sourceSize, sourceSize,
+              Gdiplus::UnitPixel);
+        } else {
+          uint32_t seed =
+              playlist
+                  ? RowArtworkSeed(playlist->cover_url,
+                                   Utf8ToWide(playlist->name))
+                  : RowArtworkSeed(std::string(), L"");
+          COLORREF tile =
+              RGB(0x25 + (seed & 0x0F), 0x29 + ((seed >> 4) & 0x0F),
+                  0x2D + ((seed >> 8) & 0x0F));
+          {
+            Gdiplus::Graphics graphics(draw->hDC);
+            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            FillRoundedRectGp(graphics, iconRect, scale(8), tile);
+          }
+          DrawFluentIcon(draw->hDC, iconRect, fontIcon20_, rowForeground,
+                         FluentIcon::Playlist);
         }
-        DrawFluentIcon(draw->hDC, iconRect, fontIcon16_, rowForeground,
-                       FluentIcon::Playlist);
       }
     }
     wchar_t text[512] = {};
     ::SendMessageW(draw->hwndItem, LB_GETTEXT, draw->itemID,
                    reinterpret_cast<LPARAM>(text));
     RECT textRect = draw->rcItem;
-    textRect.left += scale(44);
+    textRect.left += scale(56);
     textRect.right -= scale(8);
     ::SetBkMode(draw->hDC, TRANSPARENT);
     ::SetTextColor(draw->hDC, rowForeground);
@@ -1927,7 +2248,7 @@ LRESULT MainWindow::OnMeasureItem(WPARAM, LPARAM lParam) {
   }
   if (measure->CtlType == ODT_LISTBOX &&
       measure->CtlID == CID_PLAYLIST_LIST) {
-    measure->itemHeight = ::MulDiv(38, dpi_, 96);
+    measure->itemHeight = ::MulDiv(52, dpi_, 96);
     return TRUE;
   }
   return FALSE;
@@ -1963,7 +2284,7 @@ COLORREF MainWindow::ButtonBaseColor(HWND control) const {
   const int playerY =
       parent.bottom - ::MulDiv(98, dpi_, 96);
   if (centerY >= playerY) return kPlayer;
-  if (origin.x + rc.right - rc.left <= ::MulDiv(238, dpi_, 96))
+  if (origin.x + rc.right - rc.left <= ::MulDiv(296, dpi_, 96))
     return kSidebar;
   if (origin.y < ::MulDiv(64, dpi_, 96)) return kBg;
   return kPanel;
@@ -2522,7 +2843,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       auto scale = [self](int value) {
         return ::MulDiv(value, self->dpi_, 96);
       };
-      const int sidebarWidth = scale(238);
+      const int sidebarWidth = scale(296);
       const int playerHeight = scale(98);
       const int playerY = client.bottom - playerHeight;
       RECT sidebar{0, 0, sidebarWidth, playerY};
@@ -2572,7 +2893,11 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                      comboHeight);
       ::SendMessageW(self->middleCombo_, CB_SETITEMHEIGHT, 0, comboHeight);
       ::SendMessageW(self->playlistList_, LB_SETITEMHEIGHT, 0,
-                     ::MulDiv(38, self->dpi_, 96));
+                     ::MulDiv(52, self->dpi_, 96));
+      // Mosaic tiles are composited at the rail icon size of the old DPI;
+      // the next paint rebuilds them at the new size.
+      for (auto& entry : self->playlistMosaicCache_) delete entry.second;
+      self->playlistMosaicCache_.clear();
       const int editMargin = ::MulDiv(12, self->dpi_, 96);
       for (HWND edit : {self->searchEdit_, self->playlistFilterEdit_}) {
         if (edit)
@@ -2661,23 +2986,11 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             self->app_->OnMiddleCombo(self->MiddleComboIndex());
           }
           return 0;
-        case CID_SEARCH_BTN: {
-          std::string query = self->SearchQuery();
-          if (query.find_first_not_of(" \t\r\n") == std::string::npos)
-            return 0;
-          self->ShowWorkspace(WorkspaceKind::Search);
-          if (self->demoMode_) return 0;
-          if (self->app_->IsAuthed()) {
-            self->searchRows_.clear();
-            self->resultKinds_.clear();
-            self->resultsLoading_ = true;
-            self->SetListMessage(
-                self->resultsList_, L"Searching Spotify",
-                L"Tracks, albums and artists will appear here.");
-          }
-          self->app_->OnSearch(query);
+        case CID_SEARCH_BTN:
+          // Clicking Search and pressing Enter in the search box share one
+          // submit path (see SubmitSearch).
+          self->SubmitSearch();
           return 0;
-        }
         case CID_BACK_BTN:
           if (self->workspaceKind_ == WorkspaceKind::Settings) {
             self->ShowWorkspace(self->previousWorkspaceKind_);
@@ -3004,6 +3317,95 @@ void MainWindow::SetPlaylists(const std::vector<PlaylistRef>& pls) {
   RebuildPlaylistRail();
   UpdateWorkspaceHeader();
 }
+void MainWindow::SetPlaylistCoverFallback(const std::string& id,
+                                          const std::string& url) {
+  if (url.empty()) return;
+  for (PlaylistRef& playlist : playlists_) {
+    if (playlist.id != id || !playlist.cover_url.empty()) continue;
+    playlist.cover_url = url;
+    RebuildPlaylistRail();
+    return;
+  }
+}
+
+void MainWindow::SetPlaylistMosaicCovers(const std::string& id,
+                                         std::vector<std::string> covers) {
+  if (id.empty()) return;
+  playlistMosaicCovers_[id] = std::move(covers);
+  // The composited bitmap reflects the old cell set; drop it so the next
+  // paint rebuilds from the new covers.
+  auto cached = playlistMosaicCache_.find(id);
+  if (cached != playlistMosaicCache_.end()) {
+    delete cached->second;
+    playlistMosaicCache_.erase(cached);
+  }
+  RebuildPlaylistRail();
+}
+
+Gdiplus::Bitmap* MainWindow::PlaylistMosaicBitmap(const std::string& id,
+                                                  int size) {
+  const auto covers = playlistMosaicCovers_.find(id);
+  if (covers == playlistMosaicCovers_.end() || covers->second.empty())
+    return nullptr;
+  const auto cached = playlistMosaicCache_.find(id);
+  if (cached != playlistMosaicCache_.end()) return cached->second;
+  if (!artworkCache_) return nullptr;
+  // Build lazily once every cell has art; until then the caller draws the
+  // seeded tile (the covers are already requested by RebuildPlaylistRail).
+  for (const std::string& url : covers->second)
+    if (artworkCache_->images.find(url) == artworkCache_->images.end())
+      return nullptr;
+  auto* bitmap = new Gdiplus::Bitmap(size, size, PixelFormat32bppARGB);
+  Gdiplus::Graphics graphics(bitmap);
+  // Empty cells (fewer than four covers) stay transparent over the row
+  // base painted underneath.
+  graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+  graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+  graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+  const int cell = (size + 1) / 2;
+  const size_t cellCount = std::min<size_t>(covers->second.size(), 4);
+  for (size_t i = 0; i < cellCount; ++i) {
+    Gdiplus::Image* image = artworkCache_->images[covers->second[i]].get();
+    UINT sourceWidth = image->GetWidth();
+    UINT sourceHeight = image->GetHeight();
+    UINT sourceSize = std::min(sourceWidth, sourceHeight);
+    graphics.DrawImage(
+        image,
+        Gdiplus::Rect(static_cast<int>(i % 2) * cell,
+                      static_cast<int>(i / 2) * cell, cell, cell),
+        (sourceWidth - sourceSize) / 2, (sourceHeight - sourceSize) / 2,
+        sourceSize, sourceSize, Gdiplus::UnitPixel);
+  }
+  auto previous = playlistMosaicCache_.find(id);
+  if (previous != playlistMosaicCache_.end()) delete previous->second;
+  playlistMosaicCache_[id] = bitmap;
+  return bitmap;
+}
+
+void MainWindow::InvalidateRailRowsForUrl(const std::string& url) {
+  if (!playlistList_ || url.empty()) return;
+  for (size_t row = 1; row < filteredPlaylistIndices_.size(); ++row) {
+    const PlaylistRef* playlist = RailPlaylistForRow(
+        playlists_, filteredPlaylistIndices_, static_cast<int>(row));
+    if (!playlist) continue;
+    bool usesUrl = playlist->cover_url == url;
+    if (!usesUrl) {
+      const auto mosaic = playlistMosaicCovers_.find(playlist->id);
+      if (mosaic != playlistMosaicCovers_.end())
+        for (const std::string& cell : mosaic->second)
+          if (cell == url) {
+            usesUrl = true;
+            break;
+          }
+    }
+    if (!usesUrl) continue;
+    RECT rc{};
+    if (::SendMessageW(playlistList_, LB_GETITEMRECT, row,
+                       reinterpret_cast<LPARAM>(&rc)) != LB_ERR)
+      ::InvalidateRect(playlistList_, &rc, FALSE);
+  }
+}
+
 void MainWindow::SetMiddleLabel(const std::wstring& text) {
   workspaceTitle_ = text;
   if (text == L"Queue") {
@@ -3022,6 +3424,7 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
   const bool playingChanged = playback_.playing != playback.playing;
   const bool readyChanged = playback_.ready != playback.ready;
   const bool uriChanged = playback_.current_uri != playback.current_uri;
+  const bool durationChanged = playback_.duration_ms != playback.duration_ms;
   const std::string previousUri = playback_.current_uri;
   playback_ = playback;
   if (uriChanged) {
@@ -3108,8 +3511,12 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
       playback.duration_ms, 0, std::numeric_limits<int>::max()));
   const int position = static_cast<int>(std::clamp<int64_t>(
       playback.position_ms, 0, static_cast<int64_t>(duration)));
-  ::SendMessageW(seekBar_, TBM_SETRANGEMIN, FALSE, 0);
-  ::SendMessageW(seekBar_, TBM_SETRANGEMAX, TRUE, std::max(1, duration));
+  // The range only moves when the track duration changes; re-sending it on
+  // every state event (2 s heartbeat) churns the slider for no visual gain.
+  if (durationChanged) {
+    ::SendMessageW(seekBar_, TBM_SETRANGEMIN, FALSE, 0);
+    ::SendMessageW(seekBar_, TBM_SETRANGEMAX, TRUE, std::max(1, duration));
+  }
   if (!seekDragging_)
     ::SendMessageW(seekBar_, TBM_SETPOS, TRUE, position);
   setEnabled(seekBar_, playback.ready && duration > 0);
@@ -3198,7 +3605,7 @@ void MainWindow::SetTrackArtwork(const std::string& url,
   auto existing = artworkCache_->images.find(url);
   if (existing != artworkCache_->images.end()) {
     setWorkspaceImage(existing->second.get());
-    if (playlistList_) ::InvalidateRect(playlistList_, nullptr, FALSE);
+    InvalidateRailRowsForUrl(url);
     return;
   }
   std::unique_ptr<Gdiplus::Image> source(
@@ -3230,7 +3637,7 @@ void MainWindow::SetTrackArtwork(const std::string& url,
   setWorkspaceImage(workspaceImage);
   if (resultsList_) ::InvalidateRect(resultsList_, nullptr, FALSE);
   if (tracksList_) ::InvalidateRect(tracksList_, nullptr, FALSE);
-  if (playlistList_) ::InvalidateRect(playlistList_, nullptr, FALSE);
+  InvalidateRailRowsForUrl(url);
 }
 
 
@@ -3313,6 +3720,23 @@ std::string MainWindow::SearchQuery() const {
   char buf[512] = {};
   ::GetWindowTextA(searchEdit_, buf, 511);
   return buf;
+}
+
+void MainWindow::SubmitSearch() {
+  // TEMPORARY diagnostic: locate why Enter in the search box does not
+  // submit; remove after the user's single test.
+  std::string query = SearchQuery();
+  if (query.find_first_not_of(" \t\r\n") == std::string::npos) return;
+  ShowWorkspace(WorkspaceKind::Search);
+  if (demoMode_) return;
+  if (app_->IsAuthed()) {
+    searchRows_.clear();
+    resultKinds_.clear();
+    resultsLoading_ = true;
+    SetListMessage(resultsList_, L"Searching Spotify",
+                   L"Tracks, albums and artists will appear here.");
+  }
+  app_->OnSearch(query);
 }
 
 int MainWindow::SelectedTrackIndex() const {

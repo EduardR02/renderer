@@ -21,26 +21,25 @@
 //!   URIs and are fetched in ~40-URI batches — never one request per track
 //!   (per-URI `Track::get` bursts trip the endpoint's per-request rate
 //!   limiter and log hundreds of 'Resource has been exhausted' errors).
-//! - Search: the searchview service is reached over Mercury
-//!   (`hm://searchview/km/v4/search/{q}`) exactly like the working
-//!   implementations in librespot-java's `SearchManager` and
-//!   librespot-python's `SearchManager` (both still shipping this shape as
-//!   of 2026): `entityVersion=2` plus non-empty `country` (from the
-//!   session), `locale`, `imageSize`, `catalogue`, and `username` values.
-//!   The engine's earlier HTTP spclient variant (`/searchview/...` with
-//!   `request_as_json`) kept answering `400 INVALID_ARGUMENT` even with
-//!   country/locale filled — the HTTP front door also receives spclient's
-//!   auto-appended `product=0&country=..&salt=..` query params, which the
-//!   strict searchview transcoding rejects. Mercury carries exactly the
-//!   accepted parameter set and is what both reference clients use. Parsing
-//!   stays tolerant: unknown/missing fields degrade to empty strings, zeros,
-//!   and empty lists instead of failing the whole browse, and failures log
-//!   the gRPC status and response body.
+//! - Search: the searchview service (Mercury `hm://searchview/km/v4/search`
+//!   or HTTP spclient `/searchview/km/v4/search`) is retired — it answers
+//!   404 over Mercury and 400 INVALID_ARGUMENT over HTTP (verified live
+//!   2026-08-18, both with the session's real country/locale). The official
+//!   web/desktop client searches through the pathfinder GraphQL API
+//!   (`POST https://api-partner.spotify.com/pathfinder/v2/query`,
+//!   `operationName=searchDesktop`, persisted-query `sha256Hash`), which
+//!   accepts the same first-party session bearer + client token the engine
+//!   already holds (no developer app). The hash rotates; the newest known
+//!   hash is tried first and the previous one is the fallback (verified
+//!   live: both return results). Parsing stays tolerant: unknown/missing
+//!   fields degrade to empty strings, zeros, and empty lists instead of
+//!   failing the whole browse.
 
 use std::collections::HashSet;
 
 use base64::Engine as _;
-use http::Method;
+use bytes::Bytes;
+use http::{Method, Request};
 use librespot_core::error::ErrorKind;
 use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
@@ -48,7 +47,6 @@ use librespot_protocol::extended_metadata::{
     BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
 };
 use librespot_protocol::extension_kind::ExtensionKind;
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 use std::time::Duration;
@@ -75,13 +73,16 @@ const METADATA_BACKOFF_MAX_MS: u64 = 2_000;
 /// Retries after the first attempt when a browse request fails: the spclient
 /// front door answers transient 5xx (502/503) and the metadata/search
 /// services sit behind the same proxy/CDN layer, so a bounded retry absorbs
-/// them before an error reaches the UI. Same capped exponential schedule as
-/// the metadata batches; the whole cycle (3 retries, at most 1750 ms of
-/// sleep) fits comfortably inside the UI's 20-second browse round-trip
-/// timeout.
-const BROWSE_RETRY_ATTEMPTS: usize = 3;
-const BROWSE_BACKOFF_BASE_MS: u64 = 250;
-const BROWSE_BACKOFF_MAX_MS: u64 = 2_000;
+/// them before an error reaches the UI. Longer than the per-batch metadata
+/// schedule because a rootlist/playlist fetch is one round-trip: 5 retries
+/// with capped exponential backoff (500 ms doubling to a 4 s cap, at most
+/// 11.5 s of sleep) ride out multi-second proxy hiccups while staying inside
+/// the UI's 20-second browse round-trip timeout. Transient 502s fail fast
+/// (connection error, no body), so the typical retry costs well under a
+/// second; only a sustained outage reaches the sleep bound.
+const BROWSE_RETRY_ATTEMPTS: usize = 5;
+const BROWSE_BACKOFF_BASE_MS: u64 = 500;
+const BROWSE_BACKOFF_MAX_MS: u64 = 4_000;
 
 /// Upper bounds mirroring the endpoints' practical limits; larger requests
 /// are clamped instead of refused.
@@ -298,15 +299,27 @@ async fn fetch_extended_batch(
 /// order; each batch is one POST; items missing from the response or failing
 /// per-entity resolution are skipped; a batch is skipped only after its
 /// retries with backoff are exhausted.
+///
+/// A *total* batch failure is an error, never an empty result: returning a
+/// success with zero items when the endpoint is failing (e.g. rate-limited)
+/// would make the app cache "empty playlist" and show a bare list for a
+/// playlist that actually has tracks. Partial failures keep the resolved
+/// items and skip the failed batch, like before.
 async fn fetch_extended<'a, T>(
     session: &Session,
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
     kind: ExtensionKind,
     parse: impl Fn(&str, &[u8]) -> Option<T>,
-) -> Vec<T> {
+) -> Result<Vec<T>, String> {
     let unique = dedupe_uris(uris.into_iter());
+    if unique.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut results: Vec<Option<T>> = (0..unique.len()).map(|_| None).collect();
+    let mut batches_total = 0usize;
+    let mut batches_failed = 0usize;
     for chunk in metadata_chunks(&unique, METADATA_BATCH_SIZE) {
+        batches_total += 1;
         match fetch_extended_batch(session, chunk, kind).await {
             Ok(entries) => {
                 for (entity_uri, payload) in entries {
@@ -319,11 +332,17 @@ async fn fetch_extended<'a, T>(
             }
             Err(error) => {
                 // Only a fully retried batch failure skips its items.
+                batches_failed += 1;
                 eprintln!("skipping {count} unresolvable item(s): {error}", count = chunk.len());
             }
         }
     }
-    results.into_iter().flatten().collect()
+    if batches_failed == batches_total {
+        return Err(format!(
+            "all {batches_total} {kind:?} metadata batch(es) failed; no items could be resolved"
+        ));
+    }
+    Ok(results.into_iter().flatten().collect())
 }
 
 /// Parses one extended-metadata track payload into the protocol's `TrackRef`
@@ -352,7 +371,7 @@ fn parse_album_payload(entity_uri: &str, payload: &[u8]) -> Option<AlbumRef> {
 pub async fn fetch_tracks<'a>(
     session: &Session,
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
-) -> Vec<TrackRef> {
+) -> Result<Vec<TrackRef>, String> {
     fetch_extended(session, uris, ExtensionKind::TRACK_V4, parse_track_payload).await
 }
 
@@ -593,7 +612,7 @@ pub async fn playlist_browse(
         ),
         _ => (String::new(), String::new()),
     };
-    let tracks = fetch_tracks(session, playlist.tracks()).await;
+    let tracks = fetch_tracks(session, playlist.tracks()).await?;
     Ok(crate::protocol::PlaylistBrowse {
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
@@ -627,7 +646,7 @@ pub async fn album_browse(
     let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}"))
         .map_err(|error| format!("invalid album id: {error}"))?;
     let album: Album = metadata_get(session, &uri, "album").await?;
-    let tracks = fetch_tracks(session, album.tracks()).await;
+    let tracks = fetch_tracks(session, album.tracks()).await?;
     Ok(crate::protocol::AlbumBrowse {
         id: id_of(&album.id),
         uri: uri_of(&album.id),
@@ -643,7 +662,7 @@ pub async fn album_browse(
 async fn fetch_albums<'a>(
     session: &Session,
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
-) -> Vec<AlbumRef> {
+) -> Result<Vec<AlbumRef>, String> {
     fetch_extended(session, uris, ExtensionKind::ALBUM_V4, parse_album_payload).await
 }
 
@@ -657,8 +676,8 @@ pub async fn artist_browse(
         .map_err(|error| format!("invalid artist id: {error}"))?;
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
     let top_tracks = artist.top_tracks.for_country(&session.country());
-    let top_tracks = fetch_tracks(session, top_tracks.iter()).await;
-    let albums = fetch_albums(session, artist.albums_current()).await;
+    let top_tracks = fetch_tracks(session, top_tracks.iter()).await?;
+    let albums = fetch_albums(session, artist.albums_current()).await?;
     Ok(crate::protocol::ArtistBrowse {
         id: id_of(&artist.id),
         uri: uri_of(&artist.id),
@@ -670,83 +689,123 @@ pub async fn artist_browse(
 }
 
 // ---------------------------------------------------------------------------
-// search (searchview)
+// search (pathfinder searchDesktop)
 // ---------------------------------------------------------------------------
 
-/// Raw protobuf-JSON of the searchview response. Field names follow the
-/// official client's protobuf-JSON mapping and stay optional everywhere so a
+/// Raw JSON of the pathfinder `searchDesktop` GraphQL response. Field names
+/// follow the persisted-query's schema and stay optional everywhere so a
 /// renamed/missing field degrades to an empty section, never an error.
 #[derive(Default, Deserialize)]
-struct SearchJson {
+struct SearchDesktopResponse {
     #[serde(default)]
-    results: SearchResultsJson,
+    data: SearchDesktopData,
 }
 
 #[derive(Default, Deserialize)]
-struct SearchResultsJson {
+#[allow(non_snake_case)] // GraphQL schema field names
+struct SearchDesktopData {
     #[serde(default)]
-    tracks: TrackHitSectionJson,
-    #[serde(default)]
-    albums: AlbumHitSectionJson,
-    #[serde(default)]
-    artists: ArtistHitSectionJson,
+    searchV2: SearchV2Json,
 }
 
 #[derive(Default, Deserialize)]
-struct TrackHitSectionJson {
+#[allow(non_snake_case)] // GraphQL schema field names
+struct SearchV2Json {
     #[serde(default)]
-    hits: Vec<SearchTrackHitJson>,
+    tracksV2: SearchTrackSectionJson,
+    #[serde(default)]
+    albumsV2: SearchAlbumSectionJson,
+    #[serde(default)]
+    artists: SearchArtistSectionJson,
 }
 
 #[derive(Default, Deserialize)]
-struct AlbumHitSectionJson {
+struct SearchTrackSectionJson {
     #[serde(default)]
-    hits: Vec<SearchAlbumHitJson>,
+    items: Vec<SearchTrackWrapperJson>,
 }
 
 #[derive(Default, Deserialize)]
-struct ArtistHitSectionJson {
+struct SearchAlbumSectionJson {
     #[serde(default)]
-    hits: Vec<SearchArtistHitJson>,
+    items: Vec<SearchAlbumWrapperJson>,
 }
 
+#[derive(Default, Deserialize)]
+struct SearchArtistSectionJson {
+    #[serde(default)]
+    items: Vec<SearchArtistWrapperJson>,
+}
+
+/// Track hits are wrapped twice: `items[].item.data`.
+#[derive(Default, Deserialize)]
+struct SearchTrackWrapperJson {
+    #[serde(default)]
+    item: SearchTrackItemJson,
+}
 
 #[derive(Default, Deserialize)]
+struct SearchTrackItemJson {
+    #[serde(default)]
+    data: SearchTrackHitJson,
+}
+
+/// Album/artist hits are wrapped once: `items[].data`.
+#[derive(Default, Deserialize)]
+struct SearchAlbumWrapperJson {
+    #[serde(default)]
+    data: SearchAlbumHitJson,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchArtistWrapperJson {
+    #[serde(default)]
+    data: SearchArtistHitJson,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // GraphQL schema field names
 struct SearchTrackHitJson {
     #[serde(default)]
     uri: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    artists: Vec<SearchArtistJson>,
+    artists: SearchArtistListJson,
     #[serde(default)]
-    album: Option<SearchAlbumJson>,
-    #[serde(default)]
-    image: Vec<SearchImageJson>,
+    albumOfTrack: Option<SearchAlbumOfTrackJson>,
     #[serde(default)]
     duration: Option<SearchDurationJson>,
 }
 
 #[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // GraphQL schema field names
 struct SearchAlbumHitJson {
     #[serde(default)]
     uri: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    artists: Vec<SearchArtistJson>,
+    artists: SearchArtistListJson,
     #[serde(default)]
-    image: Vec<SearchImageJson>,
+    coverArt: Option<SearchCoverArtJson>,
 }
 
 #[derive(Default, Deserialize)]
 struct SearchArtistHitJson {
     #[serde(default)]
     uri: Option<String>,
+    /// Some responses carry a top-level `name`, others only `profile.name`.
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    image: Vec<SearchImageJson>,
+    profile: Option<SearchProfileJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchArtistListJson {
+    #[serde(default)]
+    items: Vec<SearchArtistJson>,
 }
 
 #[derive(Default, Deserialize)]
@@ -754,33 +813,49 @@ struct SearchArtistJson {
     #[serde(default)]
     uri: Option<String>,
     #[serde(default)]
-    name: Option<String>,
+    profile: Option<SearchProfileJson>,
 }
 
 #[derive(Default, Deserialize)]
-struct SearchAlbumJson {
-    #[serde(default)]
-    uri: Option<String>,
+struct SearchProfileJson {
     #[serde(default)]
     name: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
-struct SearchImageJson {
-    /// `spotify:image:{40-hex-file-id}` (the official client's image uri).
+#[allow(non_snake_case)] // GraphQL schema field names
+struct SearchAlbumOfTrackJson {
     #[serde(default)]
     uri: Option<String>,
-    file_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    coverArt: Option<SearchCoverArtJson>,
 }
 
 #[derive(Default, Deserialize)]
+struct SearchCoverArtJson {
+    #[serde(default)]
+    sources: Vec<SearchImageSourceJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchImageSourceJson {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    width: Option<u32>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // GraphQL schema field names
 struct SearchDurationJson {
-    /// protobuf-JSON maps int64 to a string, so accept both.
+    /// The schema types this as an Int; accept strings too for tolerance.
     #[serde(default)]
-    milliseconds: Option<serde_json::Value>,
+    totalMilliseconds: Option<serde_json::Value>,
 }
 
-/// Extracts the 22-char id from a `spotify:{type}:{id}` hit uri.
+/// Extracts the 22-char id from a `spotify:{type}:{id}` uri.
 fn hit_id(raw_uri: Option<&str>) -> String {
     raw_uri
         .and_then(|uri| uri.rsplit(':').next())
@@ -788,21 +863,16 @@ fn hit_id(raw_uri: Option<&str>) -> String {
         .to_owned()
 }
 
-fn hit_image(images: &[SearchImageJson]) -> Option<String> {
-    images.iter().find_map(|image| {
-        if let Some(uri) = image.uri.as_deref() {
-            if let Some(file_id) = uri.strip_prefix("spotify:image:") {
-                if !file_id.is_empty() {
-                    return Some(format!("{COVER_BASE}{file_id}"));
-                }
-            }
-        }
-        image
-            .file_id
-            .as_deref()
-            .filter(|file_id| !file_id.is_empty())
-            .map(|file_id| format!("{COVER_BASE}{file_id}"))
-    })
+/// Picks a cover URL from the image sources: the first ≥300 px source when
+/// present, otherwise the first.
+fn hit_image(cover: Option<&SearchCoverArtJson>) -> Option<String> {
+    cover?
+        .sources
+        .iter()
+        .find(|source| source.width.unwrap_or(0) >= 300)
+        .or_else(|| cover?.sources.first())
+        .and_then(|source| source.url.clone())
+        .filter(|url| !url.is_empty())
 }
 
 fn parse_millis(value: Option<&serde_json::Value>) -> u32 {
@@ -814,33 +884,46 @@ fn parse_millis(value: Option<&serde_json::Value>) -> u32 {
     millis.and_then(|ms| u32::try_from(ms).ok()).unwrap_or(0)
 }
 
+fn artist_name(artist: &SearchArtistJson) -> String {
+    artist
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.name.clone())
+        .unwrap_or_default()
+}
+
 fn track_ref_from_hit(hit: &SearchTrackHitJson) -> TrackRef {
     TrackRef {
         id: hit_id(hit.uri.as_deref()),
         uri: hit.uri.clone().unwrap_or_default(),
         name: hit.name.clone().unwrap_or_default(),
-        artist_names: hit
-            .artists
-            .iter()
-            .filter_map(|artist| artist.name.clone())
-            .collect(),
+        artist_names: hit.artists.items.iter().map(artist_name).collect(),
         artist_id: hit
             .artists
+            .items
             .first()
             .map(|artist| hit_id(artist.uri.as_deref()))
             .unwrap_or_default(),
         album_id: hit
-            .album
+            .albumOfTrack
             .as_ref()
             .map(|album| hit_id(album.uri.as_deref()))
             .unwrap_or_default(),
         album_name: hit
-            .album
+            .albumOfTrack
             .as_ref()
             .and_then(|album| album.name.clone())
             .unwrap_or_default(),
-        cover_url: hit_image(&hit.image).unwrap_or_default(),
-        duration_ms: parse_millis(hit.duration.as_ref().and_then(|d| d.milliseconds.as_ref())),
+        cover_url: hit
+            .albumOfTrack
+            .as_ref()
+            .and_then(|album| hit_image(album.coverArt.as_ref()))
+            .unwrap_or_default(),
+        duration_ms: parse_millis(
+            hit.duration
+                .as_ref()
+                .and_then(|duration| duration.totalMilliseconds.as_ref()),
+        ),
     }
 }
 
@@ -849,12 +932,8 @@ fn album_ref_from_hit(hit: &SearchAlbumHitJson) -> AlbumRef {
         id: hit_id(hit.uri.as_deref()),
         uri: hit.uri.clone().unwrap_or_default(),
         name: hit.name.clone().unwrap_or_default(),
-        artist_names: hit
-            .artists
-            .iter()
-            .filter_map(|artist| artist.name.clone())
-            .collect(),
-        cover_url: hit_image(&hit.image),
+        artist_names: hit.artists.items.iter().map(artist_name).collect(),
+        cover_url: hit_image(hit.coverArt.as_ref()),
     }
 }
 
@@ -862,49 +941,114 @@ fn artist_ref_from_hit(hit: &SearchArtistHitJson) -> ArtistRef {
     ArtistRef {
         id: hit_id(hit.uri.as_deref()),
         uri: hit.uri.clone().unwrap_or_default(),
-        name: hit.name.clone().unwrap_or_default(),
-        portrait_url: hit_image(&hit.image),
+        name: hit
+            .name
+            .clone()
+            .or_else(|| {
+                hit.profile
+                    .as_ref()
+                    .and_then(|profile| profile.name.clone())
+            })
+            .unwrap_or_default(),
+        // The searchDesktop persisted query returns no artist avatar.
+        portrait_url: None,
     }
 }
 
-/// Locale sent to searchview; the engine session carries no user locale, and
-/// librespot-java's default preferred locale is "en".
-const SEARCH_LOCALE: &str = "en";
+/// Pathfinder persisted-query hashes for `operationName=searchDesktop`,
+/// newest first. The hashes rotate; when the primary is rejected the
+/// previous one is tried. Both verified live against a real session
+/// (2026-08-18).
+const SEARCH_DESKTOP_HASHES: &[&str] = &[
+    "3c9d3f60dac5dea3876b6db3f534192b1c1d90032c4233c1bbaba526db41eb31",
+    "21969b655b795601fb2d2204a4243188e75fdc6d3520e7b9cd3f4db2aff9591e",
+];
 
-/// Builds the searchview request URI. `country` must be the session's
-/// two-letter country code and `locale` a language tag: the searchview
-/// service answers 400 INVALID_ARGUMENT when either is empty. The URI
-/// mirrors librespot-java's `SearchManager` byte for byte (path
-/// `hm://searchview/km/v4/search/{q}` plus `entityVersion`, `limit`,
-/// `imageSize`, `catalogue`, `country`, `locale`, `username`), which is the
-/// request shape both working reference clients send over Mercury. Sending
-/// the same parameters over the HTTP spclient front door instead fails with
-/// 400 INVALID_ARGUMENT (the HTTP path also receives spclient's
-/// auto-appended `product`/`salt` query params, which the strict searchview
-/// transcoding rejects).
-pub fn search_endpoint(
-    query: &str,
-    limit: usize,
-    country: &str,
-    locale: &str,
-    username: &str,
-) -> String {
-    let encoded = utf8_percent_encode(query.trim(), NON_ALPHANUMERIC);
-    format!(
-        "hm://searchview/km/v4/search/{encoded}?entityVersion=2&limit={limit}&imageSize=&catalogue=&country={country}&locale={locale}&username={user}",
-        limit = limit.clamp(1, MAX_SEARCH_LIMIT),
-        country = utf8_percent_encode(country, NON_ALPHANUMERIC),
-        locale = utf8_percent_encode(locale, NON_ALPHANUMERIC),
-        user = username,
-    )
+/// The pathfinder GraphQL endpoint the official web/desktop client uses for
+/// search.
+const PATHFINDER_ENDPOINT: &str = "https://api-partner.spotify.com/pathfinder/v2/query";
+
+/// Builds the `searchDesktop` request body. The variables mirror what the
+/// official client sends; the persisted-query hash selects the document.
+fn search_desktop_body(query: &str, limit: usize, hash: &str) -> String {
+    serde_json::json!({
+        "extensions": { "persistedQuery": { "sha256Hash": hash, "version": 1 } },
+        "operationName": "searchDesktop",
+        "variables": {
+            "searchTerm": query,
+            "offset": 0,
+            "limit": limit.clamp(1, MAX_SEARCH_LIMIT),
+            "numberOfTopResults": 5,
+            "includeArtistHasConcertsField": false,
+            "includeAudiobooks": false,
+            "includeAuthors": false,
+            "includePreReleases": false,
+        },
+    })
+    .to_string()
 }
 
-/// Search via the searchview service over Mercury (the transport both
-/// librespot-java and librespot-python use for this endpoint). Failures
-/// carry the gRPC status and, when present, the server's response body so
-/// the next iteration can read the exact rejection message. The response
-/// mapping is tolerant: any section the server leaves out (or names
-/// differently) simply yields an empty list.
+/// One pathfinder searchDesktop attempt for a given hash: POST with the
+/// session's login5 bearer + client token, transient failures retried with
+/// the bounded backoff. A client error (e.g. a 400 persisted-query
+/// rejection) fails fast so the caller can fall back to the previous hash.
+async fn search_desktop_once(session: &Session, body: &str) -> Result<Vec<u8>, String> {
+    let token = session
+        .login5()
+        .auth_token()
+        .await
+        .map_err(|error| format!("search authentication failed: {error}"))?;
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(PATHFINDER_ENDPOINT)
+        .header("Content-Type", "application/json")
+        .header(
+            "Authorization",
+            format!("{} {}", token.token_type, token.access_token),
+        );
+    if let Ok(client_token) = session.spclient().client_token().await {
+        builder = builder.header("client-token", client_token.as_str());
+    }
+    let request = builder
+        .body(Bytes::from(body.to_owned()))
+        .map_err(|error| format!("search request construction failed: {error}"))?;
+
+    let backoffs = backoff_sequence(
+        BROWSE_RETRY_ATTEMPTS,
+        BROWSE_BACKOFF_BASE_MS,
+        BROWSE_BACKOFF_MAX_MS,
+    );
+    let mut attempt = 0usize;
+    loop {
+        match session.http_client().request_body(request.clone()).await {
+            Ok(bytes) => return Ok(bytes.to_vec()),
+            Err(error) => {
+                let transient = browse_error_is_transient(error.kind, http_status_of(&error));
+                if !transient || attempt >= backoffs.len() {
+                    return Err(format!(
+                        "search request failed after {} attempt(s) (last error: {error})",
+                        attempt + 1,
+                    ));
+                }
+                let backoff = backoffs[attempt];
+                eprintln!(
+                    "search request failed ({error}); retrying in {backoff} ms (attempt {}/{})",
+                    attempt + 1,
+                    backoffs.len() + 1,
+                );
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Search via the official client's pathfinder GraphQL `searchDesktop`
+/// operation, authenticated with the session's own login5 bearer + client
+/// token (no developer app). Hash rotation is handled by trying the newest
+/// known persisted-query hash first and the previous one on rejection; a
+/// renamed/missing response field degrades to an empty section, never an
+/// error.
 pub async fn search_browse(
     session: &Session,
     query: &str,
@@ -913,101 +1057,49 @@ pub async fn search_browse(
     if query.trim().is_empty() {
         return Err("search query must not be empty".to_owned());
     }
-    let uri = search_endpoint(
-        query,
-        limit,
-        &session.country(),
-        SEARCH_LOCALE,
-        &session.username(),
-    );
-    // The Mercury round-trip is retried with the bounded backoff schedule:
-    // transport failures (librespot reports Mercury errors as `Unavailable`)
-    // and server-side status codes (gRPC-style 4 deadline / 13 internal /
-    // 14 unavailable) are transient; client errors such as 400
-    // INVALID_ARGUMENT fail fast.
-    let backoffs = backoff_sequence(
-        BROWSE_RETRY_ATTEMPTS,
-        BROWSE_BACKOFF_BASE_MS,
-        BROWSE_BACKOFF_MAX_MS,
-    );
-    let mut attempt = 0usize;
-    let response = loop {
-        let response = match session.mercury().get(&uri) {
-            Ok(request) => match request.await {
-                Ok(response) => response,
-                Err(error) => {
-                    if !browse_error_is_transient(error.kind, http_status_of(&error))
-                        || attempt >= backoffs.len()
-                    {
-                        return Err(format!(
-                            "search request failed: {uri} after {} attempts (last error: {error})",
-                            attempt + 1,
-                        ));
-                    }
-                    let backoff = backoffs[attempt];
-                    eprintln!(
-                        "search request {uri} failed ({error}); retrying in {backoff} ms (attempt {}/{})",
-                        attempt + 1,
-                        backoffs.len() + 1,
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff)).await;
-                    attempt += 1;
-                    continue;
-                }
-            },
-            Err(error) => return Err(format!("search request failed: {error}")),
+    let mut last_error = String::new();
+    for hash in SEARCH_DESKTOP_HASHES {
+        let body = search_desktop_body(query.trim(), limit, hash);
+        let payload = match search_desktop_once(session, &body).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_error = error;
+                continue;
+            }
         };
-        let transient = response.status_code != 200
-            && matches!(response.status_code, 4 | 13 | 14);
-        if !transient || attempt >= backoffs.len() {
-            break response;
-        }
-        let backoff = backoffs[attempt];
-        eprintln!(
-            "search request {uri} failed (status {}); retrying in {backoff} ms (attempt {}/{})",
-            response.status_code,
-            attempt + 1,
-            backoffs.len() + 1,
-        );
-        tokio::time::sleep(Duration::from_millis(backoff)).await;
-        attempt += 1;
-    };
-    if response.status_code != 200 {
-        let body = response
-            .payload
-            .first()
-            .and_then(|payload| String::from_utf8(payload.clone()).ok())
-            .filter(|body| !body.is_empty())
-            .map(|body| {
-                let mut body = body;
-                body.truncate(512);
-                format!(": {body}")
-            })
-            .unwrap_or_default();
-        return Err(format!(
-            "search request failed: {uri} after {} attempt(s) (status {}):{}",
-            attempt + 1,
-            response.status_code,
-            body
-        ));
+        let parsed: SearchDesktopResponse = serde_json::from_slice(&payload)
+            .map_err(|error| format!("unparseable search response: {error}"))?;
+        return Ok(crate::protocol::SearchBrowse {
+            tracks: parsed
+                .data
+                .searchV2
+                .tracksV2
+                .items
+                .iter()
+                .map(|wrapper| track_ref_from_hit(&wrapper.item.data))
+                .collect(),
+            albums: parsed
+                .data
+                .searchV2
+                .albumsV2
+                .items
+                .iter()
+                .map(|wrapper| album_ref_from_hit(&wrapper.data))
+                .collect(),
+            artists: parsed
+                .data
+                .searchV2
+                .artists
+                .items
+                .iter()
+                .map(|wrapper| artist_ref_from_hit(&wrapper.data))
+                .collect(),
+        });
     }
-    let body = response
-        .payload
-        .first()
-        .ok_or_else(|| "search returned no payload".to_owned())?;
-    let parsed: SearchJson = serde_json::from_slice(body)
-        .map_err(|error| format!("unparseable search response: {error}"))?;
-    Ok(crate::protocol::SearchBrowse {
-        tracks: parsed.results.tracks.hits.iter().map(track_ref_from_hit).collect(),
-        albums: parsed.results.albums.hits.iter().map(album_ref_from_hit).collect(),
-        artists: parsed
-            .results
-            .artists
-            .hits
-            .iter()
-            .map(artist_ref_from_hit)
-            .collect(),
-    })
+    Err(format!(
+        "search failed with all {} persisted-query hashes; last error: {last_error}",
+        SEARCH_DESKTOP_HASHES.len()
+    ))
 }
 
 #[cfg(test)]
@@ -1313,47 +1405,74 @@ mod tests {
     }
 
     #[test]
-    fn search_json_maps_tracks_albums_and_artists() {
+    fn search_desktop_json_maps_tracks_albums_and_artists() {
         let body = r#"{
-            "results": {
-                "tracks": {
-                    "hits": [{
-                        "uri": "spotify:track:2abcdefghijklmnopqrstu",
-                        "name": "Search Track",
-                        "artists": [{"uri": "spotify:artist:0123456789ABCDEFGHIJKL", "name": "Search Artist"}],
-                        "album": {"uri": "spotify:album:0abcdefghijklmnopqrstu", "name": "Search Album"},
-                        "image": [{"uri": "spotify:image:ab67616d0000b2730123456789abcdef01234567", "size": "DEFAULT"}],
-                        "duration": {"milliseconds": "211000"},
-                        "playable": true
-                    }],
-                    "hitLimit": 10
-                },
-                "albums": {
-                    "hits": [{
-                        "uri": "spotify:album:1abcdefghijklmnopqrstu",
-                        "name": "Album Hit",
-                        "artists": [{"name": "Album Artist"}],
-                        "image": []
-                    }]
-                },
-                "artists": {
-                    "hits": [{
-                        "uri": "spotify:artist:3abcdefghijklmnopqrstu",
-                        "name": "Artist Hit"
-                    }]
+            "data": {
+                "searchV2": {
+                    "tracksV2": {
+                        "totalCount": 1,
+                        "items": [{
+                            "item": {
+                                "data": {
+                                    "__typename": "Track",
+                                    "uri": "spotify:track:2abcdefghijklmnopqrstu",
+                                    "name": "Search Track",
+                                    "artists": {"items": [{"uri": "spotify:artist:0123456789ABCDEFGHIJKL", "profile": {"name": "Search Artist"}}]},
+                                    "albumOfTrack": {
+                                        "uri": "spotify:album:0abcdefghijklmnopqrstu",
+                                        "name": "Search Album",
+                                        "coverArt": {"sources": [
+                                            {"height": 64, "url": "https://i.scdn.co/image/ab67616d000048510123456789abcdef01234567", "width": 64},
+                                            {"height": 300, "url": "https://i.scdn.co/image/ab67616d00001e020123456789abcdef01234567", "width": 300}
+                                        ]}
+                                    },
+                                    "duration": {"totalMilliseconds": 211000}
+                                }
+                            }
+                        }]
+                    },
+                    "albumsV2": {
+                        "items": [{"data": {
+                            "uri": "spotify:album:1abcdefghijklmnopqrstu",
+                            "name": "Album Hit",
+                            "artists": {"items": [{"profile": {"name": "Album Artist"}}]},
+                            "coverArt": {"sources": [{"url": "https://i.scdn.co/image/ab67616d000048511abcdefghijklmnopqrstu", "width": 64}]}
+                        }}]
+                    },
+                    "artists": {
+                        "items": [{"data": {
+                            "uri": "spotify:artist:3abcdefghijklmnopqrstu",
+                            "profile": {"name": "Artist Hit"}
+                        }}]
+                    }
                 }
             }
         }"#;
-        let parsed: SearchJson = serde_json::from_str(body).unwrap();
+        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
         let converted = crate::protocol::SearchBrowse {
-            tracks: parsed.results.tracks.hits.iter().map(track_ref_from_hit).collect(),
-            albums: parsed.results.albums.hits.iter().map(album_ref_from_hit).collect(),
-            artists: parsed
-                .results
-                .artists
-                .hits
+            tracks: parsed
+                .data
+                .searchV2
+                .tracksV2
+                .items
                 .iter()
-                .map(artist_ref_from_hit)
+                .map(|wrapper| track_ref_from_hit(&wrapper.item.data))
+                .collect(),
+            albums: parsed
+                .data
+                .searchV2
+                .albumsV2
+                .items
+                .iter()
+                .map(|wrapper| album_ref_from_hit(&wrapper.data))
+                .collect(),
+            artists: parsed
+                .data
+                .searchV2
+                .artists
+                .items
+                .iter()
+                .map(|wrapper| artist_ref_from_hit(&wrapper.data))
                 .collect(),
         };
 
@@ -1368,14 +1487,19 @@ mod tests {
         assert_eq!(track.album_name, "Search Album");
         assert_eq!(
             track.cover_url,
-            "https://i.scdn.co/image/ab67616d0000b2730123456789abcdef01234567"
+            "https://i.scdn.co/image/ab67616d00001e020123456789abcdef01234567",
+            "the ≥300px source wins over the 64px one"
         );
         assert_eq!(track.duration_ms, 211_000);
 
         assert_eq!(converted.albums.len(), 1);
         assert_eq!(converted.albums[0].id, "1abcdefghijklmnopqrstu");
         assert_eq!(converted.albums[0].artist_names, vec!["Album Artist".to_owned()]);
-        assert_eq!(converted.albums[0].cover_url, None);
+        assert_eq!(
+            converted.albums[0].cover_url.as_deref(),
+            Some("https://i.scdn.co/image/ab67616d000048511abcdefghijklmnopqrstu"),
+            "the only source is used when no ≥300px source exists"
+        );
 
         assert_eq!(converted.artists.len(), 1);
         assert_eq!(converted.artists[0].id, "3abcdefghijklmnopqrstu");
@@ -1384,18 +1508,30 @@ mod tests {
     }
 
     #[test]
-    fn search_json_tolerates_unknown_shapes() {
-        let body = r#"{"weird": true, "results": {"tracks": {"somethingElse": [1, 2]}}}"#;
-        let parsed: SearchJson = serde_json::from_str(body).unwrap();
-        let tracks: Vec<TrackRef> = parsed.results.tracks.hits.iter().map(track_ref_from_hit).collect();
-        assert!(tracks.is_empty());
+    fn search_desktop_json_tolerates_unknown_shapes() {
+        let body = r#"{"weird": true, "data": {"searchV2": {"tracksV2": {"somethingElse": [1, 2]}}}}"#;
+        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        assert!(parsed.data.searchV2.tracksV2.items.is_empty());
+        assert!(parsed.data.searchV2.albumsV2.items.is_empty());
+        assert!(parsed.data.searchV2.artists.items.is_empty());
+
+        // A track with only a URI yields empty strings, never an error.
+        let bare = r#"{"data": {"searchV2": {"tracksV2": {"items": [{"item": {"data": {"uri": "spotify:track:2abcdefghijklmnopqrstu"}}}]}}}}"#;
+        let parsed: SearchDesktopResponse = serde_json::from_str(bare).unwrap();
+        let track = track_ref_from_hit(&parsed.data.searchV2.tracksV2.items[0].item.data);
+        assert_eq!(track.id, "2abcdefghijklmnopqrstu");
+        assert_eq!(track.name, "");
+        assert!(track.artist_names.is_empty());
+        assert_eq!(track.cover_url, "");
+        assert_eq!(track.duration_ms, 0);
+
         // Duration may arrive as a JSON number as well as a string.
         let duration: SearchDurationJson =
-            serde_json::from_str(r#"{"milliseconds": 184000}"#).unwrap();
-        assert_eq!(parse_millis(duration.milliseconds.as_ref()), 184_000);
+            serde_json::from_str(r#"{"totalMilliseconds": 184000}"#).unwrap();
+        assert_eq!(parse_millis(duration.totalMilliseconds.as_ref()), 184_000);
         let bad: SearchDurationJson =
-            serde_json::from_str(r#"{"milliseconds": "not-a-number"}"#).unwrap();
-        assert_eq!(parse_millis(bad.milliseconds.as_ref()), 0);
+            serde_json::from_str(r#"{"totalMilliseconds": "not-a-number"}"#).unwrap();
+        assert_eq!(parse_millis(bad.totalMilliseconds.as_ref()), 0);
     }
 
     #[test]
@@ -1409,26 +1545,27 @@ mod tests {
     }
 
     #[test]
-    fn search_endpoint_encodes_the_query_and_fills_session_values() {
-        // The searchview service rejects empty country/locale with 400
-        // INVALID_ARGUMENT; the URI must always carry the session's
-        // two-letter country code and a locale. The shape mirrors
-        // librespot-java's SearchManager exactly (Mercury `hm://` transport,
-        // entityVersion/limit/imageSize/catalogue/country/locale/username).
-        let endpoint = search_endpoint("fire & ice?", 10, "US", "en", "alice");
-        assert!(endpoint.starts_with("hm://searchview/km/v4/search/fire%20%26%20ice%3F?"));
-        assert!(endpoint.contains("entityVersion=2"));
-        assert!(endpoint.contains("&limit=10"));
-        assert!(endpoint.contains("&imageSize="));
-        assert!(endpoint.contains("&catalogue="));
-        assert!(endpoint.contains("&country=US"));
-        assert!(endpoint.contains("&locale=en"));
-        assert!(endpoint.contains("&username=alice"));
+    fn search_desktop_body_builds_the_persisted_query_payload() {
+        let body = search_desktop_body("fire & ice?", 10, SEARCH_DESKTOP_HASHES[0]);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["operationName"], "searchDesktop");
+        assert_eq!(
+            parsed["extensions"]["persistedQuery"]["sha256Hash"],
+            SEARCH_DESKTOP_HASHES[0]
+        );
+        assert_eq!(parsed["extensions"]["persistedQuery"]["version"], 1);
+        assert_eq!(parsed["variables"]["searchTerm"], "fire & ice?");
+        assert_eq!(parsed["variables"]["limit"], 10);
+        assert_eq!(parsed["variables"]["offset"], 0);
 
-        let clamped = search_endpoint("q", 5000, "US", "en", "alice");
-        assert!(clamped.contains("&limit=50"));
-        assert!(clamped.contains("&country=US"), "country must never be empty");
-        assert!(clamped.contains("&locale=en"), "locale must never be empty");
+        let clamped = search_desktop_body("q", 5000, SEARCH_DESKTOP_HASHES[0]);
+        let parsed: serde_json::Value = serde_json::from_str(&clamped).unwrap();
+        assert_eq!(parsed["variables"]["limit"], 50, "limit clamped to the endpoint bound");
+
+        // The newest known hash is tried first; the previous one is the
+        // rotation fallback, so a hash rejection degrades gracefully.
+        assert_eq!(SEARCH_DESKTOP_HASHES.len(), 2);
+        assert_ne!(SEARCH_DESKTOP_HASHES[0], SEARCH_DESKTOP_HASHES[1]);
     }
 
     #[test]
@@ -1469,16 +1606,17 @@ mod tests {
 
     #[test]
     fn browse_retry_schedule_is_bounded_and_fits_the_ui_timeout() {
-        // The whole rootlist/metadata/search retry cycle must stay well
+        // The whole rootlist/playlist/search retry cycle must stay well
         // inside the UI's 20-second browse round-trip timeout
-        // (playback_engine_client.h default timeoutMs).
+        // (playback_engine_client.h default timeoutMs). 5 retries at
+        // 500 ms..4 s cap: 500+1000+2000+4000+4000 = 11.5 s of sleep max.
         let backoffs = backoff_sequence(
             BROWSE_RETRY_ATTEMPTS,
             BROWSE_BACKOFF_BASE_MS,
             BROWSE_BACKOFF_MAX_MS,
         );
         assert_eq!(backoffs.len(), BROWSE_RETRY_ATTEMPTS);
-        assert_eq!(backoffs, vec![250, 500, 1000]);
+        assert_eq!(backoffs, vec![500, 1000, 2000, 4000, 4000]);
         let total_sleep_ms: u64 = backoffs.iter().sum();
         assert!(
             total_sleep_ms < 20_000,

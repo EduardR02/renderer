@@ -84,6 +84,10 @@ echo == Build ==
 "%CMAKE%" --build "%BUILD_DIR%"
 if errorlevel 1 exit /b 1
 
+echo == Copy engine next to the app ==
+copy /y "%BUILD_DIR%\engine-target\release\SpotifyPlaybackEngine.exe" "%BUILD_DIR%\SpotifyPlaybackEngine.exe" >nul
+if errorlevel 1 exit /b 1
+
 
 if "%RUN_TESTS%"=="1" (
   echo == Rust tests ==

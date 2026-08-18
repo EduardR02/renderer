@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -245,6 +246,74 @@ PlaylistCacheUse ClassifyPlaylistCache(int64_t fetchedAtUnixSeconds,
   return fetchFailed ? PlaylistCacheUse::StaleFallback : PlaylistCacheUse::None;
 }
 
+void TrimPlaylistTracksCache(std::vector<CachedPlaylistTracks>* entries) {
+  if (!entries) return;
+  std::stable_sort(entries->begin(), entries->end(),
+                   [](const CachedPlaylistTracks& left,
+                      const CachedPlaylistTracks& right) {
+                     return left.fetched_at > right.fetched_at;
+                   });
+  if (entries->size() > static_cast<size_t>(kPlaylistTracksCacheCapacity))
+    entries->resize(kPlaylistTracksCacheCapacity);
+}
+
+json BuildPlaylistTracksCacheDoc(
+    const std::vector<CachedPlaylistTracks>& entries, int64_t nowUnixSeconds) {
+  json playlistEntries = json::array();
+  for (const CachedPlaylistTracks& entry : entries) {
+    json tracks = json::array();
+    for (const TrackRef& track : entry.value.tracks)
+      tracks.push_back(TrackRefToEngineJson(track));
+    playlistEntries.push_back(
+        {{"id", entry.id},
+         {"fetched_at", entry.fetched_at},
+         {"revision", entry.value.snapshot_id},
+         {"tracks", std::move(tracks)}});
+  }
+  return {{"version", 1},
+          {"saved_at", nowUnixSeconds},
+          {"playlists", std::move(playlistEntries)}};
+}
+
+bool ParsePlaylistTracksCacheDoc(const json& doc,
+                                 std::vector<CachedPlaylistTracks>* out) {
+  if (!out || !doc.is_object()) return false;
+  const auto version = doc.find("version");
+  if (version == doc.end() || *version != 1) return false;
+  const auto list = doc.find("playlists");
+  if (list == doc.end() || !list->is_array()) return false;
+  std::vector<CachedPlaylistTracks> parsed;
+  for (const auto& entry : *list) {
+    if (!entry.is_object()) continue;
+    const auto id = entry.find("id");
+    const auto fetched = entry.find("fetched_at");
+    if (id == entry.end() || !id->is_string() || id->get<std::string>().empty() ||
+        fetched == entry.end() || !fetched->is_number_integer())
+      continue;
+    const auto tracks = entry.find("tracks");
+    if (tracks == entry.end() || !tracks->is_array()) continue;
+    const auto revision = entry.find("revision");
+    CachedPlaylistTracks cached;
+    cached.id = id->get<std::string>();
+    cached.fetched_at = fetched->get<int64_t>();
+    if (revision != entry.end() && revision->is_string())
+      cached.value.snapshot_id = revision->get<std::string>();
+    cached.value.tracks.reserve(tracks->size());
+    for (const auto& track : *tracks) {
+      if (!track.is_object()) continue;
+      try {
+        cached.value.tracks.push_back(TrackRefFromEngineJson(track));
+      } catch (const std::exception&) {
+        // A malformed row must never fail the whole cache.
+      }
+    }
+    parsed.push_back(std::move(cached));
+  }
+  TrimPlaylistTracksCache(&parsed);
+  *out = std::move(parsed);
+  return true;
+}
+
 TrackListCache::TrackListCache(size_t capacity, Clock::duration ttl, NowFn now)
     : capacity_(std::max<size_t>(capacity, 1)),
       ttl_(ttl),
@@ -381,18 +450,19 @@ int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
 
   MSG message{};
   while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
-    if ((!accelerators_ ||
-         !::TranslateAcceleratorW(hwnd_, accelerators_, &message)) &&
-        // IsDialogMessage consumes VK_RETURN even though the main window has
-        // no default pushbutton, which would swallow Enter typed in the
-        // search box before the edit's subclass can submit it (the same
-        // WM_COMMAND as clicking Search). Send those keys straight to the
-        // edit instead; all other dialog navigation is unchanged.
-        !SearchEnterBypassesDialogNavigation(message) &&
-        !::IsDialogMessageW(hwnd_, &message)) {
-      ::TranslateMessage(&message);
-      ::DispatchMessageW(&message);
-    }
+    // IsDialogMessage consumes VK_RETURN even though the main window has no
+    // default pushbutton, which would swallow Enter typed in the search box
+    // before the edit's subclass can submit it (the same path as clicking
+    // Search). Enter on the search edit bypasses accelerator/dialog
+    // navigation entirely and is dispatched straight to the edit; all other
+    // keys keep the normal routing.
+    const bool bypassEnter = SearchEnterBypassesDialogNavigation(message);
+    if (!bypassEnter && accelerators_ &&
+        ::TranslateAcceleratorW(hwnd_, accelerators_, &message))
+      continue;
+    if (!bypassEnter && ::IsDialogMessageW(hwnd_, &message)) continue;
+    ::TranslateMessage(&message);
+    ::DispatchMessageW(&message);
   }
   Shutdown();
   return static_cast<int>(message.wParam);
@@ -649,6 +719,7 @@ void Application::OnAddToPlaylist(int playlistIndex) {
       },
       [this, playlist](bool) {
         track_cache_.Invalidate("p:" + playlist);
+        InvalidatePlaylistTracksCache(playlist);
         window_.SetStatus(L"Added to playlist");
       },
       [this](std::string message) {
@@ -785,6 +856,7 @@ void Application::OnMiddleContext(UINT command, int index) {
         },
         [this](bool) {
           track_cache_.Invalidate("p:" + current_playlist_id_);
+          InvalidatePlaylistTracksCache(current_playlist_id_);
           RequestPlaylistTracks(current_playlist_id_);
         },
       [this](std::string message) {
@@ -806,6 +878,7 @@ void Application::OnMiddleContext(UINT command, int index) {
         },
         [this](bool) {
           track_cache_.Invalidate("p:" + current_playlist_id_);
+          InvalidatePlaylistTracksCache(current_playlist_id_);
           RequestPlaylistTracks(current_playlist_id_);
         },
       [this](std::string message) {
@@ -875,6 +948,7 @@ void Application::OnDeletePlaylist() {
       },
       [this, id = playlists_[index].id](bool) {
         track_cache_.Invalidate("p:" + id);
+        InvalidatePlaylistTracksCache(id);
         middle_mode_ = MiddleMode::Queue;
         RefreshPlaylists(true);
         RefreshQueue();
@@ -1296,9 +1370,15 @@ void Application::FetchPlaylists() {
       [this](std::vector<PlaylistRef> list) {
         playlist_retry_attempts_ = 0;
         playlists_ = std::move(list);
+        ApplyPlaylistCoverFallbacks();
         if (!playlists_fetched_at_.has_value())
           playlists_fetched_at_ = std::chrono::steady_clock::now();
         window_.SetPlaylists(playlists_);
+        // Coverless playlists that have no cached tracks get their tracks
+        // fetched in the background so the rail mosaic tiles appear without
+        // a click. Runs after SetPlaylists so the rail's filtered row order
+        // (visible rows first) is current; the batch is capped.
+        EagerFetchCoverlessPlaylists();
         SavePlaylistCache();
       },
       [this](std::string message) {
@@ -1415,8 +1495,12 @@ bool Application::LoadPlaylistCache(bool allowStale) {
       loaded.push_back(std::move(playlist));
     }
     playlists_ = std::move(loaded);
+    ApplyPlaylistCoverFallbacks();
     playlists_fetched_at_ = std::chrono::steady_clock::now();
     window_.SetPlaylists(playlists_);
+    // Same eager backfill as a fresh fetch: coverless playlists without
+    // cached tracks fetch in the background so rail art appears on startup.
+    EagerFetchCoverlessPlaylists();
     LOG_INFO("playlist library loaded from cache (" +
              std::to_string(playlists_.size()) + " playlists)");
     return true;
@@ -1431,6 +1515,33 @@ void Application::RequestPlaylistTracks(const std::string& id) {
     ShowPlaylistTracks(id, cached);
     return;
   }
+  if (!options_.smoke && !options_.demo) {
+    EnsurePlaylistTracksCacheLoaded();
+    const auto found = std::find_if(
+        playlist_tracks_cache_.begin(), playlist_tracks_cache_.end(),
+        [&id](const CachedPlaylistTracks& entry) { return entry.id == id; });
+    if (found != playlist_tracks_cache_.end() &&
+        !found->value.tracks.empty()) {
+      // Within TTL: the click resolves instantly from disk with no engine
+      // round-trip. Stale: still shown instantly, refreshed in the
+      // background; the refresh failure keeps the cached copy on screen.
+      // An empty cached list is treated as a miss: it can only be a
+      // poisoned entry from a failed fetch, so it is refetched.
+      const bool fresh =
+          ClassifyPlaylistCache(found->fetched_at, NowUnixSeconds(),
+                                kPlaylistTracksTtlMinutes, false) ==
+          PlaylistCacheUse::Fresh;
+      ShowPlaylistTracks(id, found->value);
+      track_cache_.Put("p:" + id, found->value);
+      if (!fresh) FetchPlaylistTracksBackground(id, /*refreshOnly=*/true);
+      return;
+    }
+  }
+  FetchPlaylistTracksBackground(id, /*refreshOnly=*/false);
+}
+
+void Application::FetchPlaylistTracksBackground(const std::string& id,
+                                                bool refreshOnly) {
   PostTask<std::pair<std::vector<TrackRef>, std::string>>(
       [this, id] {
         std::vector<TrackRef> tracks;
@@ -1445,11 +1556,161 @@ void Application::RequestPlaylistTracks(const std::string& id) {
         CachedTrackList cached{std::move(result.first),
                                std::move(result.second)};
         ShowPlaylistTracks(id, cached);
+        // An empty result is shown but never cached: a transient engine or
+        // metadata failure must not persist as "empty playlist" (the cache
+        // would serve it until the TTL expires).
+        if (cached.tracks.empty()) return;
+        SavePlaylistTracksCache(id, cached);
+        // A coverless playlist's tracks now provide the rail tile: a 2x2
+        // mosaic of the first up-to-four track covers. Publish the cell set
+        // before the single-cover fallback below persists the first cover
+        // (the mosaic is the rail's richer art; the header keeps the
+        // single-cover path).
+        std::vector<std::string> mosaicCovers;
+        mosaicCovers.reserve(4);
+        for (const TrackRef& track : cached.tracks) {
+          if (track.cover_url.empty()) continue;
+          mosaicCovers.push_back(track.cover_url);
+          if (mosaicCovers.size() == 4) break;
+        }
+        if (!mosaicCovers.empty())
+          window_.SetPlaylistMosaicCovers(id, std::move(mosaicCovers));
+        // A coverless playlist's tracks now provide the workspace header
+        // art (the first track's cover — the same art the view shows);
+        // persist it with the library cache and refresh the sidebar.
+        ApplyPlaylistCoverFallbacks();
+        SavePlaylistCache();
+        const auto playlist = std::find_if(
+            playlists_.begin(), playlists_.end(),
+            [&id](const PlaylistRef& entry) { return entry.id == id; });
+        if (playlist != playlists_.end() && !playlist->cover_url.empty())
+          window_.SetPlaylistCoverFallback(id, playlist->cover_url);
+        // Last: Put takes the list by value and moves it away, so the disk
+        // cache write and the fallback above must run while it is intact.
         track_cache_.Put("p:" + id, std::move(cached));
       },
-      [this](std::string message) {
+      [this, refreshOnly](std::string message) {
+        if (refreshOnly) {
+          // A stale copy is already on screen: never replace it with an
+          // error dialog, just log and keep showing the cached tracks.
+          LOG_ERROR("Playlist tracks refresh: " + message);
+          window_.SetStatus(
+              L"Playlist refresh failed; showing the cached copy.");
+          return;
+        }
         HandleApiError(message, L"Playlist tracks");
       });
+}
+
+void Application::EnsurePlaylistTracksCacheLoaded() {
+  if (playlist_tracks_cache_loaded_) return;
+  playlist_tracks_cache_loaded_ = true;
+  if (options_.smoke || options_.demo) return;
+  const std::wstring file = paths::PlaylistTracksCacheFile();
+  if (file.empty() ||
+      ::GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES ||
+      !paths::IsSafeOwnedPath(file))
+    return;
+  try {
+    std::ifstream stream(file, std::ios::binary);
+    if (!stream) return;
+    std::string text((std::istreambuf_iterator<char>(stream)),
+                     std::istreambuf_iterator<char>());
+    std::vector<CachedPlaylistTracks> entries;
+    if (ParsePlaylistTracksCacheDoc(json::parse(text), &entries))
+      playlist_tracks_cache_ = std::move(entries);
+  } catch (const std::exception&) {
+    // An unreadable/foreign cache file is ignored, never fatal.
+  }
+}
+
+void Application::ApplyPlaylistCoverFallbacks() {
+  if (playlists_.empty()) return;
+  EnsurePlaylistTracksCacheLoaded();
+  for (PlaylistRef& playlist : playlists_) {
+    if (!playlist.cover_url.empty()) continue;
+    const auto found = std::find_if(
+        playlist_tracks_cache_.begin(), playlist_tracks_cache_.end(),
+        [&playlist](const CachedPlaylistTracks& entry) {
+          return entry.id == playlist.id;
+        });
+    if (found == playlist_tracks_cache_.end()) continue;
+    const std::vector<TrackRef>& tracks = found->value.tracks;
+    if (tracks.empty() || tracks.front().cover_url.empty()) continue;
+    playlist.cover_url = tracks.front().cover_url;
+  }
+}
+
+void Application::EagerFetchCoverlessPlaylists() {
+  if (options_.smoke || options_.demo || playlists_.empty()) return;
+  std::vector<const PlaylistRef*> coverless;
+  coverless.reserve(playlists_.size());
+  for (const PlaylistRef& playlist : playlists_)
+    if (playlist.cover_url.empty()) coverless.push_back(&playlist);
+  if (coverless.empty()) return;
+  // Order by rail visibility so the visible band fills first: the window's
+  // filteredPlaylistIndices_ holds middle indices (0 = Queue), so a
+  // playlist's rail rank is the position of (vector index + 1) in that
+  // list; playlists filtered out rank last.
+  const std::vector<int>& filtered = window_.filteredPlaylistIndices();
+  std::stable_sort(coverless.begin(), coverless.end(),
+                   [&filtered, this](const PlaylistRef* a,
+                                     const PlaylistRef* b) {
+                     auto rank = [&filtered, this](const PlaylistRef* playlist) {
+                       const int middleIndex =
+                           static_cast<int>(playlist - playlists_.data()) + 1;
+                       for (size_t row = 1; row < filtered.size(); ++row)
+                         if (filtered[row] == middleIndex)
+                           return static_cast<int>(row);
+                       return std::numeric_limits<int>::max();
+                     };
+                     return rank(a) < rank(b);
+                   });
+  // Cap the eager batch: the track lists of the first coverless playlists
+  // are enough to fill the visible rail, and the serial API queue must not
+  // be flooded at startup (the rest still fetch on click).
+  constexpr size_t kEagerCoverlessFetchCap = 20;
+  const size_t count = std::min(coverless.size(), kEagerCoverlessFetchCap);
+  for (size_t i = 0; i < count; ++i)
+    FetchPlaylistTracksBackground(coverless[i]->id, /*refreshOnly=*/false);
+}
+
+void Application::SavePlaylistTracksCache(const std::string& id,
+                                          const CachedTrackList& value) {
+  if (options_.smoke || options_.demo) return;
+  EnsurePlaylistTracksCacheLoaded();
+  CachedPlaylistTracks entry{id, value, NowUnixSeconds()};
+  const auto found = std::find_if(
+      playlist_tracks_cache_.begin(), playlist_tracks_cache_.end(),
+      [&id](const CachedPlaylistTracks& cached) { return cached.id == id; });
+  if (found == playlist_tracks_cache_.end()) {
+    playlist_tracks_cache_.push_back(std::move(entry));
+  } else {
+    *found = std::move(entry);
+  }
+  TrimPlaylistTracksCache(&playlist_tracks_cache_);
+  const std::wstring file = paths::PlaylistTracksCacheFile();
+  if (file.empty()) return;
+  paths::AtomicWriteOwnedFile(
+      file, BuildPlaylistTracksCacheDoc(playlist_tracks_cache_,
+                                        NowUnixSeconds())
+                .dump());
+}
+
+void Application::InvalidatePlaylistTracksCache(const std::string& id) {
+  if (options_.smoke || options_.demo) return;
+  EnsurePlaylistTracksCacheLoaded();
+  const auto found = std::find_if(
+      playlist_tracks_cache_.begin(), playlist_tracks_cache_.end(),
+      [&id](const CachedPlaylistTracks& cached) { return cached.id == id; });
+  if (found == playlist_tracks_cache_.end()) return;
+  playlist_tracks_cache_.erase(found);
+  const std::wstring file = paths::PlaylistTracksCacheFile();
+  if (file.empty()) return;
+  paths::AtomicWriteOwnedFile(
+      file, BuildPlaylistTracksCacheDoc(playlist_tracks_cache_,
+                                        NowUnixSeconds())
+                .dump());
 }
 
 void Application::ShowPlaylistTracks(const std::string& id,
