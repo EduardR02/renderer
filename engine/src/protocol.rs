@@ -73,6 +73,10 @@ pub enum Command {
         to: usize,
     },
     Shutdown,
+    /// Mints (or returns a cached) Web API access token via login5 so the UI
+    /// can browse without its own OAuth app. Responded to with
+    /// [`WebApiTokenResponse`].
+    WebApiToken,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -102,6 +106,25 @@ pub struct Response<'a> {
     pub error: Option<&'a str>,
 }
 
+/// Response for [`Command::WebApiToken`]: carries the engine-minted login5
+/// token on success (token fields are omitted on failure). `expires_in` is
+/// the skew-adjusted remaining lifetime in seconds.
+#[derive(Serialize)]
+pub struct WebApiTokenResponse<'a> {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub request_id: &'a str,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
+}
+
 #[derive(Serialize)]
 pub struct StateEvent<'a> {
     #[serde(rename = "type")]
@@ -124,7 +147,68 @@ pub struct StateEvent<'a> {
 mod tests {
     use serde_json::json;
 
-    use super::{AuthState, RepeatMode, Response, StateEvent, TrackRef};
+    use super::{AuthState, Command, RepeatMode, Request, Response, StateEvent, TrackRef,
+                WebApiTokenResponse};
+
+    #[test]
+    fn web_api_token_command_deserializes_from_the_line_protocol() {
+        let request: Request = serde_json::from_value(json!({
+            "request_id": "request-7",
+            "type": "web_api_token",
+        }))
+        .unwrap();
+        assert_eq!(request.request_id, "request-7");
+        assert!(matches!(request.command, Command::WebApiToken));
+    }
+
+    #[test]
+    fn web_api_token_response_serializes_the_token_contract() {
+        let success = serde_json::to_value(WebApiTokenResponse {
+            kind: "web_api_token",
+            request_id: "request-7",
+            ok: true,
+            error: None,
+            token_type: Some("Bearer"),
+            access_token: Some("access-token-value"),
+            expires_in: Some(3540),
+        })
+        .unwrap();
+        assert_eq!(
+            success,
+            json!({
+                "type": "web_api_token",
+                "request_id": "request-7",
+                "ok": true,
+                "token_type": "Bearer",
+                "access_token": "access-token-value",
+                "expires_in": 3540
+            })
+        );
+    }
+
+    #[test]
+    fn web_api_token_response_omits_token_fields_on_error() {
+        let failure = serde_json::to_value(WebApiTokenResponse {
+            kind: "web_api_token",
+            request_id: "request-8",
+            ok: false,
+            error: Some("could not mint a Spotify Web API token: unavailable"),
+            token_type: None,
+            access_token: None,
+            expires_in: None,
+        })
+        .unwrap();
+        assert_eq!(
+            failure,
+            json!({
+                "type": "web_api_token",
+                "request_id": "request-8",
+                "ok": false,
+                "error": "could not mint a Spotify Web API token: unavailable"
+            })
+        );
+    }
+
 
     #[test]
     fn response_serialization_omits_absent_errors_and_preserves_failures() {

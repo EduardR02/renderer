@@ -5,10 +5,8 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdio>
-#include <ctime>
 #include <stdexcept>
-
+#include <vector>
 namespace sr {
 
 std::string WideToUtf8(const std::wstring& w) {
@@ -47,40 +45,6 @@ bool StartsWith(const std::string& s, const std::string& prefix) {
   return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 
-bool StartsWithIgnoreCase(const std::string& s, const std::string& prefix) {
-  return s.size() >= prefix.size() &&
-         ToLower(s.substr(0, prefix.size())) == ToLower(prefix);
-}
-
-bool EndsWithIgnoreCase(const std::string& s, const std::string& suffix) {
-  return s.size() >= suffix.size() &&
-         ToLower(s.substr(s.size() - suffix.size())) == ToLower(suffix);
-}
-
-std::vector<std::string> SplitWs(const std::string& s) {
-  std::vector<std::string> out;
-  size_t i = 0;
-  while (i < s.size()) {
-    while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
-    size_t b = i;
-    while (i < s.size() && !std::isspace((unsigned char)s[i])) ++i;
-    if (i > b) out.push_back(s.substr(b, i - b));
-  }
-  return out;
-}
-
-std::vector<std::string> Split(const std::string& s, char sep) {
-  std::vector<std::string> out;
-  size_t b = 0;
-  for (size_t i = 0; i <= s.size(); ++i) {
-    if (i == s.size() || s[i] == sep) {
-      out.push_back(s.substr(b, i - b));
-      b = i + 1;
-    }
-  }
-  return out;
-}
-
 static bool IsUnreserved(char c) {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
          c == '-' || c == '.' || c == '_' || c == '~';
@@ -100,108 +64,6 @@ std::string UrlEncode(const std::string& s) {
     }
   }
   return out;
-}
-
-std::string UrlDecode(const std::string& s) {
-  std::string out;
-  out.reserve(s.size());
-  for (size_t i = 0; i < s.size(); ++i) {
-    if (s[i] == '%' && i + 2 < s.size()) {
-      auto nib = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-      };
-      int hi = nib(s[i + 1]), lo = nib(s[i + 2]);
-      if (hi >= 0 && lo >= 0) {
-        out.push_back((char)((hi << 4) | lo));
-        i += 2;
-        continue;
-      }
-    }
-    if (s[i] == '+') out.push_back(' ');
-    else out.push_back(s[i]);
-  }
-  return out;
-}
-
-namespace {
-bool BCryptSha256(const void* data, size_t len, std::vector<uint8_t>* out) {
-  if (!out || len > ULONG_MAX) return false;
-  BCRYPT_ALG_HANDLE alg = nullptr;
-  BCRYPT_HASH_HANDLE hash = nullptr;
-  if (::BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0)
-    return false;
-  ULONG hashLen = 0, got = 0;
-  NTSTATUS status = ::BCryptGetProperty(alg, BCRYPT_HASH_LENGTH,
-                                        reinterpret_cast<PUCHAR>(&hashLen),
-                                        sizeof(hashLen), &got, 0);
-  if (status >= 0 && hashLen != 0)
-    status = ::BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0);
-  std::vector<uint8_t> digest;
-  if (status >= 0 && hash) {
-    digest.resize(hashLen);
-    status = ::BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<void*>(data)),
-                              static_cast<ULONG>(len), 0);
-    if (status >= 0)
-      status = ::BCryptFinishHash(hash, digest.data(), hashLen, 0);
-  }
-  if (hash) ::BCryptDestroyHash(hash);
-  ::BCryptCloseAlgorithmProvider(alg, 0);
-  if (status < 0 || digest.empty()) return false;
-  *out = std::move(digest);
-  return true;
-}
-
-bool BCryptRandom(uint8_t* output, size_t size) {
-  return size <= ULONG_MAX &&
-         (size == 0 ||
-          ::BCryptGenRandom(nullptr, output, static_cast<ULONG>(size),
-                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0);
-}
-}  // namespace
-
-std::vector<uint8_t> Sha256(const void* data, size_t len, Sha256Digest provider) {
-  std::vector<uint8_t> out;
-  if (!(provider ? provider(data, len, &out) : BCryptSha256(data, len, &out)) ||
-      out.size() != 32)
-    throw std::runtime_error("SHA-256 provider failed");
-  return out;
-}
-
-static const char kBase64Url[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-std::string Base64UrlEncode(const void* data, size_t len) {
-  const uint8_t* p = (const uint8_t*)data;
-  std::string out;
-  out.reserve((len * 4 + 2) / 3);
-  size_t i = 0;
-  while (i + 3 <= len) {
-    uint32_t v = (uint32_t(p[i]) << 16) | (uint32_t(p[i + 1]) << 8) | p[i + 2];
-    out.push_back(kBase64Url[(v >> 18) & 63]);
-    out.push_back(kBase64Url[(v >> 12) & 63]);
-    out.push_back(kBase64Url[(v >> 6) & 63]);
-    out.push_back(kBase64Url[v & 63]);
-    i += 3;
-  }
-  if (i + 1 == len) {
-    uint32_t v = uint32_t(p[i]) << 16;
-    out.push_back(kBase64Url[(v >> 18) & 63]);
-    out.push_back(kBase64Url[(v >> 12) & 63]);
-  } else if (i + 2 == len) {
-    uint32_t v = (uint32_t(p[i]) << 16) | (uint32_t(p[i + 1]) << 8);
-    out.push_back(kBase64Url[(v >> 18) & 63]);
-    out.push_back(kBase64Url[(v >> 12) & 63]);
-    out.push_back(kBase64Url[(v >> 6) & 63]);
-  }
-  return out;
-}
-
-std::string Sha256Base64Url(const std::string& s, Sha256Digest provider) {
-  auto digest = Sha256(s.data(), s.size(), provider);
-  return Base64UrlEncode(digest.data(), digest.size());
 }
 
 static std::string Sha1HexImpl(const std::string& s) {
@@ -240,25 +102,6 @@ int64_t NowUnixSeconds() {
   u.HighPart = ft.dwHighDateTime;
   // 100ns intervals since 1601-01-01 → seconds since 1970-01-01.
   return (int64_t)(u.QuadPart / 10000000ULL - 11644473600ULL);
-}
-
-std::vector<uint8_t> RandomBytes(size_t n, RandomFill provider) {
-  std::vector<uint8_t> out(n);
-  if (!(provider ? provider(out.data(), out.size()) : BCryptRandom(out.data(), out.size())))
-    throw std::runtime_error("cryptographic random provider failed");
-  return out;
-}
-
-std::string RandomHex(size_t nBytes, RandomFill provider) {
-  auto bytes = RandomBytes(nBytes, provider);
-  static const char* hex = "0123456789abcdef";
-  std::string out;
-  out.reserve(nBytes * 2);
-  for (uint8_t value : bytes) {
-    out.push_back(hex[value >> 4]);
-    out.push_back(hex[value & 0xF]);
-  }
-  return out;
 }
 
 namespace {

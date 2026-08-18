@@ -258,10 +258,6 @@ void TrackListCache::Clear() {
 
 size_t TrackListCache::Size() const { return order_.size(); }
 
-bool IsDevModePlaylistRestriction(int status, const std::string& ownerId,
-                                  const std::string& meId) {
-  return status == 403 && !ownerId.empty() && !meId.empty() && ownerId != meId;
-}
 
 Application::~Application() { Shutdown(); }
 
@@ -278,8 +274,6 @@ int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
     gdiplus_token_ = 0;
 
   if (options_.smoke || options_.demo) {
-    settings_ = Settings{};
-    tokens_.reset();
     log::SetConsole(true);
   } else {
     InitCore();
@@ -292,19 +286,17 @@ int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
   }
   hwnd_ = window_.hwnd();
   tray_.Create(hwnd_, L"SpotifyRenderer — local engine starting");
-  window_.SetSetupMode(settings_.client_id.empty());
   if (options_.demo) {
-    window_.SetSetupMode(false);
     window_.SetDemo();
-  } else if (!options_.smoke) {
-    StartEngine();
+  } else {
+    window_.ShowWorkspace(MainWindow::WorkspaceKind::Collection);
+    if (!options_.smoke) StartEngine();
   }
 
   window_.Show(true);
   ::ShowWindow(hwnd_, options_.smoke ? SW_SHOWNOACTIVATE : show);
   ::UpdateWindow(hwnd_);
   StartTimers();
-  if (IsAuthed() && !options_.smoke && !options_.demo) OnRefreshAll();
   if (options_.smoke || options_.demo)
     LOG_INFO(std::string("isolated ") +
              (options_.smoke ? "smoke" : "demo") + " launch: " +
@@ -326,12 +318,13 @@ int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
 void Application::InitCore() {
   if (!paths::EnsureDirs()) return;
   log::Init(paths::LogFile());
-  settings_ = LoadSettings(paths::SettingsFile());
-  tokens_ = LoadTokenSet(paths::TokensFile());
+  web_token_.emplace(
+      [this](WebApiToken* token, std::string* error, int timeoutMs) {
+        return engine_.RequestWebApiToken(token, error, timeoutMs);
+      });
   api_http_ = std::make_shared<HttpClient>("https://api.spotify.com");
-  accounts_http_ = std::make_shared<HttpClient>("https://accounts.spotify.com");
   api_ = std::make_unique<SpotifyApi>(
-      api_http_, accounts_http_, [this] { return GetAccessToken(); },
+      api_http_, [this] { return GetAccessToken(); },
       [this](int timeout) { return RefreshToken(timeout); });
   api_tasks_.Start();
   artwork_tasks_.Start();
@@ -386,14 +379,12 @@ void Application::Shutdown() {
   shutting_down_ = true;
   engine_restart_pending_ = false;
   StopTimers();
-  oauth_listener_.Stop();
   artwork_tasks_.DiscardPending();
   api_tasks_.Stop();
   artwork_tasks_.Stop();
   engine_.Shutdown();
   tray_.Destroy();
   api_.reset();
-  accounts_http_.reset();
   api_http_.reset();
   if (window_.hwnd()) window_.Destroy();
   hwnd_ = nullptr;
@@ -419,13 +410,9 @@ void Application::StopTimers() {
 }
 
 bool Application::IsAuthed() const {
-  std::lock_guard<std::mutex> lock(tokens_mutex_);
-  return tokens_.has_value() && !tokens_->access_token.empty();
-}
-
-Settings Application::GetSettings() const {
-  std::lock_guard<std::mutex> lock(settings_mutex_);
-  return settings_;
+  // Browsing tokens are minted by the playback engine from its own Spotify
+  // session, so browsing is available exactly when the engine reports ready.
+  return playback_.ready;
 }
 
 void Application::PostUi(std::function<void()> function) {
@@ -436,175 +423,14 @@ void Application::PostUi(std::function<void()> function) {
     delete heap;
 }
 
-void Application::OnSetupSave(const std::string& clientId,
-                              const std::string& redirectUri) {
-  if (options_.smoke || options_.demo) return;
-  std::string host;
-  uint16_t port = 0;
-  if (clientId.empty() || clientId.size() > 256) {
-    window_.SetSetupStatus(
-        L"Enter the Client ID shown in your Spotify developer app.");
-    return;
-  }
-  if (!ParseLoopbackUri(redirectUri, &host, &port)) {
-    window_.SetSetupStatus(
-        L"Use a loopback redirect such as http://127.0.0.1:4382/callback.");
-    return;
-  }
-  bool saved = false;
-  {
-    std::lock_guard<std::mutex> lock(settings_mutex_);
-    settings_.client_id = clientId;
-    settings_.redirect_uri = redirectUri;
-    saved = SaveSettings(paths::SettingsFile(), settings_);
-  }
-  window_.SetSetupStatus(
-      saved ? L"Saved. Confirm the dashboard redirect URI, then authenticate browsing."
-            : L"Could not save settings.");
-}
-
-void Application::OnAuthenticate() {
-  if (options_.smoke || options_.demo) return;
-  std::string host;
-  uint16_t port = 0;
-  if (settings_.client_id.empty() ||
-      !ParseLoopbackUri(settings_.redirect_uri, &host, &port)) {
-    window_.SetSetupStatus(
-        L"Save the Client ID and exact loopback redirect URI first.");
-    return;
-  }
-  oauth_listener_.Stop();
-  try {
-    pending_pkce_ = GeneratePkce();
-    pending_state_ = RandomHex(24);
-  } catch (const std::exception&) {
-    pending_pkce_ = {};
-    pending_state_.clear();
-    window_.SetSetupStatus(
-        L"Secure random or PKCE hashing failed; authorization was not started.");
-    return;
-  }
-  std::string error;
-  if (!oauth_listener_.Start(
-          port, pending_state_,
-          [this](std::string result) {
-            HWND target = hwnd_;
-            auto* value = new std::string(std::move(result));
-            if (!target ||
-                !::PostMessageW(target, WM_SR_OAUTH_DONE, 0,
-                                reinterpret_cast<LPARAM>(value)))
-              delete value;
-          },
-          &error)) {
-    window_.SetSetupStatus(
-        L"Could not start the callback listener. The redirect port may be in use.");
-    return;
-  }
-  const std::string url =
-      BuildAuthorizeUrl(settings_.client_id, settings_.redirect_uri,
-                        pending_pkce_.challenge, pending_state_);
-  if (reinterpret_cast<INT_PTR>(::ShellExecuteW(
-          nullptr, L"open", Utf8ToWide(url).c_str(), nullptr, nullptr,
-          SW_SHOWNORMAL)) <= 32) {
-    oauth_listener_.Stop();
-    window_.SetSetupStatus(L"Could not open the authorization page.");
-    return;
-  }
-  window_.SetSetupStatus(L"Complete browsing authorization in your browser.");
-}
-
-void Application::OnOAuthResult(const std::string& result) {
-  oauth_listener_.Stop();
-  if (StartsWith(result, "error: ")) {
-    pending_pkce_ = {};
-    pending_state_.clear();
-    window_.SetSetupStatus(L"Authorization failed: " +
-                           Utf8ToWide(result.substr(7)));
-    return;
-  }
-  const std::string verifier = std::exchange(pending_pkce_.verifier, {});
-  pending_pkce_.challenge.clear();
-  pending_state_.clear();
-  if (verifier.empty()) {
-    window_.SetSetupStatus(L"Authorization session expired. Try again.");
-    return;
-  }
-  window_.SetSetupStatus(L"Exchanging authorization code...");
-  PostTask<TokenResponse>(
-      [this, code = result, verifier] {
-        std::string error;
-        auto token = ExchangeCode(*accounts_http_, settings_.client_id,
-                                  settings_.redirect_uri, code, verifier, &error);
-        if (!token) throw std::runtime_error(error);
-        return *token;
-      },
-      [this](TokenResponse token) {
-        try {
-          SaveTokens(token);
-        } catch (const std::exception& error) {
-          window_.SetSetupStatus(L"Could not protect tokens: " +
-                                 Utf8ToWide(error.what()));
-          return;
-        }
-        window_.SetSetupMode(false);
-        window_.SetStatus(L"Browsing authenticated");
-        OnRefreshAll();
-      },
-      [this](std::string message, int, int) {
-        window_.SetSetupStatus(L"Token exchange failed: " +
-                               Utf8ToWide(message));
-      });
-}
-
-std::string Application::GetAccessToken() const {
-  std::lock_guard<std::mutex> lock(tokens_mutex_);
-  return tokens_ ? tokens_->access_token : std::string();
+std::string Application::GetAccessToken() {
+  if (!web_token_) throw std::runtime_error("Web API access is unavailable");
+  return web_token_->GetAccessToken();
 }
 
 bool Application::RefreshToken(int timeoutMs) {
-  std::string refresh;
-  {
-    std::lock_guard<std::mutex> lock(tokens_mutex_);
-    if (!tokens_ || !tokens_->has_refresh || tokens_->refresh_token.empty())
-      return false;
-    refresh = tokens_->refresh_token;
-  }
-  std::string error;
-  auto token = RefreshAccessToken(*accounts_http_, settings_.client_id, refresh,
-                                  &error, timeoutMs);
-  if (!token) {
-    LOG_WARN("token refresh failed: " + error);
-    return false;
-  }
-  if (!token->has_refresh) {
-    token->refresh_token = refresh;
-    token->has_refresh = true;
-  }
-  try {
-    SaveTokens(*token);
-    return true;
-  } catch (const std::exception& exception) {
-    LOG_ERROR(std::string("token protection failed: ") + exception.what());
-    return false;
-  }
-}
-
-void Application::SaveTokens(const TokenResponse& token) {
-  TokenSet stored;
-  stored.access_token = token.access_token;
-  stored.refresh_token = token.refresh_token;
-  stored.expires_at = token.expires_at;
-  stored.has_refresh = token.has_refresh && !token.refresh_token.empty();
-  if (!SaveTokenSet(paths::TokensFile(), stored))
-    throw std::runtime_error("DPAPI token save failed");
-  std::lock_guard<std::mutex> lock(tokens_mutex_);
-  tokens_ = std::move(stored);
-}
-
-void Application::ClearTokens() {
-  std::lock_guard<std::mutex> lock(tokens_mutex_);
-  tokens_.reset();
-  paths::DeleteOwnedFile(paths::TokensFile());
+  if (!web_token_) return false;
+  return web_token_->Refresh(timeoutMs);
 }
 
 void Application::HandleApiError(const std::string& message, int status,
@@ -612,19 +438,17 @@ void Application::HandleApiError(const std::string& message, int status,
                                  const std::wstring& context) {
   LOG_ERROR(WideToUtf8(context) + ": " + message +
             (status ? " (HTTP " + std::to_string(status) + ")" : ""));
-  if (status == 401) {
-    ClearTokens();
-    window_.SetSetupMode(true);
-  }
   std::wstring text = context + L": " + Utf8ToWide(message);
   if (status == 429 && retryAfter > 0)
     text += L"; retry after " + std::to_wstring(retryAfter) + L" seconds";
   window_.SetStatus(text);
 }
 
+
 void Application::OnSearch(const std::string& query) {
   if (!IsAuthed()) {
-    window_.SetSetupMode(true);
+    window_.SetStatus(
+        L"Search needs the local playback engine to finish signing in.");
     return;
   }
   if (Trim(query).empty()) return;
@@ -1164,6 +988,9 @@ void Application::OnEngineState(PlaybackEngineState state) {
   if (becameReady) {
     engine_restart_attempts_ = 0;
     if (restore_playback_pending_) RestorePlaybackAfterRespawn();
+    // The engine session now mints browsing tokens: load the library once per
+    // successful engine authentication.
+    OnRefreshAll();
   }
 }
 
@@ -1316,25 +1143,7 @@ void Application::RequestPlaylistTracks(const std::string& id) {
         ShowPlaylistTracks(id, cached);
         track_cache_.Put("p:" + id, std::move(cached));
       },
-      [this, id](std::string message, int status, int retry) {
-        const PlaylistRef* playlist = nullptr;
-        for (const auto& candidate : playlists_)
-          if (candidate.id == id) playlist = &candidate;
-        if (IsDevModePlaylistRestriction(
-                status, playlist ? playlist->owner_id : std::string(),
-                me_id_)) {
-          LOG_WARN(std::string("development-mode 403 for playlist ") + id +
-                   " (owner " + (playlist ? playlist->owner_id : "unknown") +
-                   "): " + message);
-          window_.SetStatus(
-              L"Playlist tracks: Spotify development-mode restriction (HTTP "
-              L"403). This playlist belongs to another account; "
-              L"development-mode apps can only read playlists owned by "
-              L"accounts on the app's allowlist. Add the owner in your "
-              L"Spotify developer dashboard (Settings > Users and Access), or "
-              L"request extended quota mode for the app.");
-          return;
-        }
+      [this](std::string message, int status, int retry) {
         HandleApiError(message, status, retry, L"Playlist tracks");
       });
 }

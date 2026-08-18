@@ -236,8 +236,6 @@ std::optional<std::wstring> Resolve(const std::wstring& leaf) {
                                     : std::nullopt;
 }
 
-std::wstring SettingsFile() { return Resolve(L"settings.json").value_or(L""); }
-std::wstring TokensFile() { return Resolve(L"tokens.dat").value_or(L""); }
 std::wstring EngineStateDir() { return Root() + L"\\engine"; }
 std::wstring LogDir() { return Root() + L"\\logs"; }
 std::wstring EngineLogFile() { return LogDir() + L"\\playback_engine.log"; }
@@ -301,44 +299,6 @@ bool IsSafeOwnedPath(const std::wstring& path) {
   OwnedPathLocks locks;
   return PrepareOwnedPath(path, &candidate, &locks) &&
          ExistingRegularFileIsSafe(candidate);
-}
-
-OwnedFileReadResult ReadOwnedFile(const std::wstring& path, std::string* data,
-                                  size_t maxSize) {
-  if (!data) return OwnedFileReadResult::UnsafeOrError;
-  data->clear();
-  std::wstring candidate;
-  OwnedPathLocks locks;
-  if (!PrepareOwnedPath(path, &candidate, &locks))
-    return OwnedFileReadResult::UnsafeOrError;
-
-  DWORD error = ERROR_SUCCESS;
-  ScopedHandle file(OpenVerifiedRegularFile(
-      candidate, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-      OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, &error));
-  if (file.get() == INVALID_HANDLE_VALUE)
-    return MissingError(error) ? OwnedFileReadResult::Missing
-                               : OwnedFileReadResult::UnsafeOrError;
-
-  LARGE_INTEGER length{};
-  if (!::GetFileSizeEx(file.get(), &length) || length.QuadPart < 0 ||
-      static_cast<uint64_t>(length.QuadPart) > maxSize ||
-      static_cast<uint64_t>(length.QuadPart) > data->max_size())
-    return OwnedFileReadResult::UnsafeOrError;
-  data->resize(static_cast<size_t>(length.QuadPart));
-  size_t offset = 0;
-  while (offset < data->size()) {
-    DWORD chunk = static_cast<DWORD>(
-        std::min<size_t>(data->size() - offset, std::numeric_limits<DWORD>::max()));
-    DWORD read = 0;
-    if (!::ReadFile(file.get(), data->data() + offset, chunk, &read, nullptr) ||
-        read == 0) {
-      data->clear();
-      return OwnedFileReadResult::UnsafeOrError;
-    }
-    offset += read;
-  }
-  return OwnedFileReadResult::Ok;
 }
 
 bool AppendOwnedFile(const std::wstring& path, const std::string& data) {
@@ -411,20 +371,6 @@ bool AtomicWriteOwnedFile(const std::wstring& path, const void* data, size_t siz
 
 bool AtomicWriteOwnedFile(const std::wstring& path, const std::string& data) {
   return AtomicWriteOwnedFile(path, data.data(), data.size());
-}
-
-bool DeleteOwnedFile(const std::wstring& path) {
-  std::wstring candidate;
-  OwnedPathLocks locks;
-  if (!PrepareOwnedPath(path, &candidate, &locks)) return false;
-  DWORD error = ERROR_SUCCESS;
-  ScopedHandle file(OpenVerifiedRegularFile(
-      candidate, DELETE | FILE_READ_ATTRIBUTES,
-      FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, 0, &error));
-  if (file.get() == INVALID_HANDLE_VALUE) return MissingError(error);
-  FILE_DISPOSITION_INFO disposition{TRUE};
-  return ::SetFileInformationByHandle(file.get(), FileDispositionInfo,
-                                      &disposition, sizeof(disposition));
 }
 
 }  // namespace sr::paths

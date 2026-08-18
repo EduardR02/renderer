@@ -13,11 +13,8 @@ add_library(sr_core STATIC
   src/util.cpp
   src/app_paths.cpp
   src/log.cpp
-  src/settings.cpp
-  src/secure_store.cpp
   src/playback_engine_client.cpp
   src/http.cpp
-  src/oauth.cpp
   src/spotify_api.cpp
   src/tray.cpp
   src/ui_main.cpp
@@ -35,10 +32,9 @@ target_compile_definitions(sr_core PUBLIC
   _UNICODE
 )
 target_link_libraries(sr_core PUBLIC
-  user32 gdi32 shell32 winhttp crypt32 bcrypt advapi32 gdiplus ole32
-  comctl32 uxtheme ws2_32
+  user32 gdi32 shell32 winhttp bcrypt advapi32 gdiplus ole32
+  comctl32 uxtheme
 )
-
 add_executable(SpotifyRenderer WIN32 src/main.cpp)
 target_link_libraries(SpotifyRenderer PRIVATE sr_core)
 set_target_properties(SpotifyRenderer PROPERTIES OUTPUT_NAME "SpotifyRenderer")

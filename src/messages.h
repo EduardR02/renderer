@@ -5,8 +5,6 @@
 enum {
   // LPARAM = std::function<void()>* allocated with new; handler runs + deletes.
   WM_SR_RUN = WM_APP + 1,
-  // LPARAM = std::string* (OAuth code or "error: ..."); handler owns it.
-  WM_SR_OAUTH_DONE = WM_APP + 2,
   // LPARAM = wchar_t* (cover file path); handler owns it.
   WM_SR_COVER_LOAD = WM_APP + 3,
 };

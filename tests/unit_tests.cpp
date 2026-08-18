@@ -253,13 +253,82 @@ TEST_CASE("track list cache invalidate and clear drop entries") {
   CHECK_FALSE(cache.Get("a:b", &out));
 }
 
-TEST_CASE("playlist 403 error classification detects development-mode restriction") {
-  CHECK(IsDevModePlaylistRestriction(403, "owner-1", "me-1"));
-  CHECK_FALSE(IsDevModePlaylistRestriction(403, "me-1", "me-1"));  // own playlist
-  CHECK_FALSE(IsDevModePlaylistRestriction(403, "", "me-1"));  // unknown owner
-  CHECK_FALSE(IsDevModePlaylistRestriction(403, "owner-1", ""));  // unknown me
-  CHECK_FALSE(IsDevModePlaylistRestriction(404, "owner-1", "me-1"));
-  CHECK_FALSE(IsDevModePlaylistRestriction(0, "owner-1", "me-1"));
+TEST_CASE("web_api_token message maps minted tokens without a process") {
+  EngineMessage message = ParseEngineMessage(
+      R"({"type":"web_api_token","request_id":"77","ok":true,"token_type":"Bearer","access_token":"tok-abc","expires_in":3540})");
+  CHECK(message.kind == EngineMessage::Kind::WebApiToken);
+  CHECK(message.request_id == "77");
+  CHECK(message.ok);
+  CHECK(message.token.token_type == "Bearer");
+  CHECK(message.token.access_token == "tok-abc");
+  CHECK(message.token.expires_in == 3540);
+  CHECK(message.error.empty());
+}
+
+TEST_CASE("web_api_token error responses carry the failure without token fields") {
+  EngineMessage message = ParseEngineMessage(
+      R"({"type":"web_api_token","request_id":"78","ok":false,"error":"could not mint a Spotify Web API token: unavailable"})");
+  CHECK_FALSE(message.ok);
+  CHECK(message.error == "could not mint a Spotify Web API token: unavailable");
+  CHECK(message.token.access_token.empty());
+}
+
+TEST_CASE("web_api_token messages reject malformed token payloads") {
+  CHECK_THROWS_AS(ParseEngineMessage(R"({"type":"web_api_token","request_id":"79","ok":true,"token_type":"Bearer","access_token":"","expires_in":3600})"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(ParseEngineMessage(R"({"type":"web_api_token","request_id":"80","ok":true,"token_type":"Bearer","access_token":"tok","expires_in":0})"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(
+      ParseEngineMessage(R"({"type":"web_api_token","ok":true})"),
+      std::invalid_argument);
+}
+
+TEST_CASE("web_api_token provider reuses fresh tokens and refreshes on expiry") {
+  auto now = std::make_shared<int64_t>(1'000'000);
+  int mints = 0;
+  WebApiTokenProvider provider(
+      [&](WebApiToken* token, std::string*, int) {
+        ++mints;
+        token->token_type = "Bearer";
+        token->access_token = "token-" + std::to_string(mints);
+        token->expires_in = 3600;
+        return true;
+      },
+      [now] { return *now; });
+  CHECK(provider.GetAccessToken() == "token-1");
+  CHECK(provider.GetAccessToken() == "token-1");  // cached
+  CHECK(mints == 1);
+  *now += 3599;  // still inside the reported lifetime
+  CHECK(provider.GetAccessToken() == "token-1");
+  *now += 2;  // past expiry: the next call must re-mint
+  CHECK(provider.GetAccessToken() == "token-2");
+  CHECK(mints == 2);
+}
+
+TEST_CASE("web_api_token provider forced refresh mints a new token") {
+  int mints = 0;
+  WebApiTokenProvider provider([&](WebApiToken* token, std::string*, int) {
+    token->access_token = "token-" + std::to_string(++mints);
+    token->expires_in = 3600;
+    return true;
+  });
+  CHECK(provider.GetAccessToken() == "token-1");
+  CHECK(provider.Refresh());
+  CHECK(provider.GetAccessToken() == "token-2");
+  CHECK(mints == 2);
+}
+
+TEST_CASE("web_api_token provider surfaces engine mint failures") {
+  int calls = 0;
+  WebApiTokenProvider provider([&](WebApiToken*, std::string* error, int) {
+    ++calls;
+    if (error) *error = "engine says no";
+    return false;
+  });
+  CHECK_THROWS_WITH_AS(provider.GetAccessToken(), "engine says no",
+                       std::runtime_error);
+  CHECK_FALSE(provider.Refresh());
+  CHECK(calls == 2);
 }
 
 TEST_CASE("audio cache usage sums files under engine audio cache directory") {

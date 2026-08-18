@@ -18,10 +18,7 @@
 
 #include "http.h"
 #include "messages.h"
-#include "oauth.h"
 #include "playback_engine_client.h"
-#include "secure_store.h"
-#include "settings.h"
 #include "spotify_api.h"
 #include "tray.h"
 #include "ui_main.h"
@@ -86,13 +83,6 @@ class TrackListCache {
                      std::list<std::pair<std::string, Entry>>::iterator>
       index_;
 };
-
-// True when an HTTP error on playlist content is the known Spotify
-// development-mode restriction: development-mode apps receive 403 for
-// playlists owned by accounts that are not on the app's dashboard allowlist
-// (Settings > Users and Access); extended quota mode lifts the restriction.
-bool IsDevModePlaylistRestriction(int status, const std::string& ownerId,
-                                  const std::string& meId);
 
 
 struct RunOptions {
@@ -165,10 +155,6 @@ class Application {
   int Run(HINSTANCE instance, int show, const RunOptions& options);
 
   bool IsAuthed() const;
-  Settings GetSettings() const;
-  void OnSetupSave(const std::string& clientId, const std::string& redirectUri);
-  void OnAuthenticate();
-  void OnOAuthResult(const std::string& result);
 
   void OnSearch(const std::string& query);
   void OnSearchActivate(int item);
@@ -208,10 +194,8 @@ class Application {
   void StartTimers();
   void StopTimers();
 
-  std::string GetAccessToken() const;
+  std::string GetAccessToken();
   bool RefreshToken(int timeoutMs = 20000);
-  void SaveTokens(const TokenResponse& token);
-  void ClearTokens();
   void HandleApiError(const std::string& message, int status, int retryAfter,
                       const std::wstring& context);
 
@@ -250,13 +234,9 @@ class Application {
   HINSTANCE instance_ = nullptr;
   HWND hwnd_ = nullptr;
   HACCEL accelerators_ = nullptr;
-  Settings settings_;
-  mutable std::mutex settings_mutex_;
-  std::optional<TokenSet> tokens_;
-  mutable std::mutex tokens_mutex_;
+  std::optional<WebApiTokenProvider> web_token_;
 
   std::shared_ptr<HttpClient> api_http_;
-  std::shared_ptr<HttpClient> accounts_http_;
   std::unique_ptr<SpotifyApi> api_;
   PlaybackEngineClient engine_;
   PlaybackEngineState playback_;
@@ -266,9 +246,6 @@ class Application {
   TrayIcon tray_;
   TaskQueue api_tasks_;
   TaskQueue artwork_tasks_;
-  LoopbackListener oauth_listener_;
-  Pkce pending_pkce_;
-  std::string pending_state_;
 
   bool shutting_down_ = false;
   bool engine_restart_pending_ = false;

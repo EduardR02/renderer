@@ -155,13 +155,7 @@ enum {
   CID_ENGINE_STATUS,
   CID_CACHE_STATUS,
   CID_STATUS,
-  CID_SETUP_CLIENT_ID,
-  CID_SETUP_REDIRECT,
-  CID_SETUP_SAVE_BTN,
-  CID_SETUP_AUTH_BTN,
-  CID_SETUP_CONTINUE_BTN,
-  CID_SETUP_STATUS,
-  CID_SETUP_TITLE,
+  CID_SETTINGS_TITLE,
   CID_NOW_PLAYING_LABEL,
 };
 static_assert(CID_SEARCH_EDIT == kSearchEditControlId);
@@ -798,17 +792,14 @@ void MainWindow::ApplyFonts() {
       shuffleBtn_,         repeatBtn_,           volumeLbl_,
       localControlsLbl_,   engineGroupLbl_,      engineGuideLbl_,
       engineStatusLbl_,    cacheStatusLbl_,      statusLbl_,
-      setupTitle_,         setupGuide_,          setupClientIdLabel_,
-      setupClientId_,      setupRedirectLabel_,  setupRedirect_,
-      setupSaveBtn_,       setupAuthBtn_,        setupContinueBtn_,
-      setupStatus_};
+      settingsTitle_,      settingsGuide_};
   for (HWND control : controls) setFont(control, fontUi_);
   setFont(resultsList_, fontList_);
   setFont(tracksList_, fontList_);
   setFont(playlistList_, fontList_);
   setFont(titleLbl_, fontRowTitle_);
   setFont(middleLabel_, fontDisplay_);
-  setFont(setupTitle_, fontTitle_);
+  setFont(settingsTitle_, fontTitle_);
   setFont(brandLbl_, fontTitle_);
   setFont(libraryGroupLbl_, fontSmall_);
   setFont(resultsLabel_, fontSmall_);
@@ -820,7 +811,6 @@ void MainWindow::ApplyFonts() {
   setFont(volumeLbl_, fontSmall_);
   setFont(engineGroupLbl_, fontSmall_);
   setFont(statusLbl_, fontSmall_);
-  setFont(setupStatus_, fontSmall_);
 }
 
 void MainWindow::SetDarkTheme() {
@@ -830,16 +820,14 @@ void MainWindow::SetDarkTheme() {
   TryDarkTheme(playlistList_, L"DarkMode_Explorer");
   TryDarkTheme(searchEdit_, L"DarkMode_CFD");
   TryDarkTheme(playlistFilterEdit_, L"DarkMode_CFD");
-  TryDarkTheme(setupClientId_, L"DarkMode_CFD");
-  TryDarkTheme(setupRedirect_, L"DarkMode_CFD");
   EnableDarkTitleBar(hwnd_);
 }
-
 void MainWindow::AddTooltip(HWND control, const wchar_t* text) {
   if (!tooltip_ || !control || !text) return;
   TOOLINFOW info{};
   info.cbSize = sizeof(info);
   info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+
   info.hwnd = hwnd_;
   info.uId = reinterpret_cast<UINT_PTR>(control);
   ::SendMessageW(tooltip_, TTM_ADDTOOLW, 0,
@@ -956,7 +944,6 @@ void MainWindow::ShowWorkspace(WorkspaceKind kind) {
   if (kind != workspaceKind_ && workspaceKind_ != WorkspaceKind::Settings)
     previousWorkspaceKind_ = workspaceKind_;
   workspaceKind_ = kind;
-  setupMode_ = kind == WorkspaceKind::Settings;
   if (kind == WorkspaceKind::Settings && app_) app_->OnSettingsShown();
   Layout();
 }
@@ -1195,10 +1182,11 @@ void MainWindow::CreateChildren() {
   ::SendMessageW(volumeBar_, TBM_SETRANGEMIN, FALSE, 0);
   ::SendMessageW(volumeBar_, TBM_SETRANGEMAX, TRUE, 100);
 
-  engineGroupLbl_ = makeStatic(L"STANDALONE PLAYBACK", CID_ENGINE_GROUP);
+  engineGroupLbl_ = makeStatic(L"SPOTIFY SESSION", CID_ENGINE_GROUP);
   engineGuideLbl_ = makeStatic(
-      L"SpotifyPlaybackEngine runs locally with its own one-time browser sign-in. "
-      L"Web API authorization is used only for browsing and playlist editing.",
+      L"SpotifyPlaybackEngine signs in once with your Spotify account. That "
+      L"same session powers audio and mints Web API access for search, "
+      L"library, playlists, and artwork.",
       CID_ENGINE_GUIDE);
   engineStatusLbl_ = makeStatic(
       L"Standalone engine: starting", CID_ENGINE_STATUS,
@@ -1208,21 +1196,11 @@ void MainWindow::CreateChildren() {
       CID_CACHE_STATUS, SS_LEFT | SS_ENDELLIPSIS);
   statusLbl_ = makeStatic(L"", CID_STATUS, SS_LEFT | SS_ENDELLIPSIS);
 
-  setupTitle_ = makeStatic(L"Settings", CID_SETUP_TITLE);
-  setupGuide_ = makeStatic(
-      L"Connect Spotify Web API for search, library, playlists, albums, artists, "
-      L"and artwork. Local playback authentication is separate.",
+  settingsTitle_ = makeStatic(L"Settings", CID_SETTINGS_TITLE);
+  settingsGuide_ = makeStatic(
+      L"One Spotify sign-in covers local playback and Web API browsing. "
+      L"No developer app is required.",
       0);
-  setupClientIdLabel_ = makeStatic(L"CLIENT ID", 0);
-  setupClientId_ = makeEdit(CID_SETUP_CLIENT_ID);
-  setupRedirectLabel_ = makeStatic(L"REDIRECT URI", 0);
-  setupRedirect_ = makeEdit(CID_SETUP_REDIRECT);
-  ::SetWindowTextW(setupRedirect_, L"http://127.0.0.1:4382/callback");
-  setupSaveBtn_ = makeButton(L"SAVE", CID_SETUP_SAVE_BTN);
-  setupAuthBtn_ = makeButton(L"AUTHENTICATE", CID_SETUP_AUTH_BTN);
-  setupContinueBtn_ =
-      makeButton(L"DONE", CID_SETUP_CONTINUE_BTN);
-  setupStatus_ = makeStatic(L"", CID_SETUP_STATUS, SS_LEFT);
 
   tooltip_ = ::CreateWindowExW(
       WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
@@ -1311,9 +1289,7 @@ void MainWindow::Layout() {
   ::ShowWindow(delPlBtn_, playlistActions ? SW_SHOW : SW_HIDE);
   SetControlGroupVisible({resultsLabel_, resultsList_}, search);
   SetControlGroupVisible(
-      {setupTitle_, setupGuide_, setupClientIdLabel_, setupClientId_,
-       setupRedirectLabel_, setupRedirect_, setupSaveBtn_, setupAuthBtn_,
-       setupContinueBtn_, setupStatus_, engineGroupLbl_, engineGuideLbl_,
+      {settingsTitle_, settingsGuide_, engineGroupLbl_, engineGuideLbl_,
        engineStatusLbl_, cacheStatusLbl_, statusLbl_},
       settings);
 
@@ -1360,28 +1336,14 @@ void MainWindow::Layout() {
   } else {
     const int top = scale(76);
     const int pad = scale(22);
-    const int gap = scale(24);
     const int innerWidth = workspaceWidth - 2 * pad;
-    const int leftWidth = (innerWidth - gap) / 2;
     const int left = workspaceX + pad;
-    const int right = left + leftWidth + gap;
-    move(setupTitle_, left, top, innerWidth, scale(36));
-    move(setupGuide_, left, top + scale(42), innerWidth, scale(42));
-    move(setupClientIdLabel_, left, top + scale(100), leftWidth, scale(18));
-    move(setupClientId_, left, top + scale(123), leftWidth, scale(38));
-    move(setupRedirectLabel_, left, top + scale(176), leftWidth, scale(18));
-    move(setupRedirect_, left, top + scale(199), leftWidth, scale(38));
-    int oauthButton = (leftWidth - scale(8)) / 2;
-    move(setupSaveBtn_, left, top + scale(251), oauthButton, scale(36));
-    move(setupAuthBtn_, left + oauthButton + scale(8), top + scale(251),
-         oauthButton, scale(36));
-    move(setupStatus_, left, top + scale(299), leftWidth, scale(52));
-    move(setupContinueBtn_, left, top + scale(364), leftWidth, scale(36));
-
-    move(engineGroupLbl_, right, top + scale(100), leftWidth, scale(18));
-    move(engineGuideLbl_, right, top + scale(128), leftWidth, scale(68));
-    move(engineStatusLbl_, right, top + scale(216), leftWidth, scale(38));
-    move(cacheStatusLbl_, right, top + scale(266), leftWidth, scale(38));
+    move(settingsTitle_, left, top, innerWidth, scale(36));
+    move(settingsGuide_, left, top + scale(42), innerWidth, scale(42));
+    move(engineGroupLbl_, left, top + scale(110), innerWidth, scale(18));
+    move(engineGuideLbl_, left, top + scale(138), innerWidth, scale(68));
+    move(engineStatusLbl_, left, top + scale(226), innerWidth, scale(38));
+    move(cacheStatusLbl_, left, top + scale(276), innerWidth, scale(38));
   }
 
   // Status feedback stays visible in every workspace.
@@ -1558,14 +1520,11 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
       draw->CtlID == CID_SETTINGS_BTN &&
       workspaceKind_ == WorkspaceKind::Settings;
   const bool active = shuffleOn || repeatOn || settingsActive;
-  const bool primary = draw->CtlID == CID_SETUP_AUTH_BTN;
   COLORREF background = kControl;
   if (draw->CtlID == CID_PLAY_BTN) {
     background = disabled ? kControl : (hot ? kAccentHot : kText);
   } else if (active) {
     background = hot ? kControlHot : kSelect;
-  } else if (primary) {
-    background = disabled ? kPanel : (hot ? kAccentHot : kAccent);
   } else {
     background = hot ? kControlHot : kControl;
   }
@@ -1582,7 +1541,7 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
     Gdiplus::Graphics graphics(draw->hDC);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     FillRoundedRectGp(graphics, draw->rcItem, radius, background);
-    if (draw->CtlID != CID_PLAY_BTN && !primary) {
+    if (draw->CtlID != CID_PLAY_BTN) {
       graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
       StrokeRoundedRectGp(graphics, draw->rcItem, radius,
                           disabled ? kBorderSoft : kBorder, 1.0f);
@@ -1592,7 +1551,7 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
       disabled ? kDisabled
                : (draw->CtlID == CID_PLAY_BTN
                       ? kAccentText
-                      : (active ? kAccent : (primary ? kAccentText : kText)));
+                      : (active ? kAccent : kText));
   if (icon) {
     FluentIcon glyph = FluentIcon::More;
     switch (draw->CtlID) {
@@ -2263,14 +2222,6 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         FillRoundedRectGp(graphics, workspace, scale(12), kPanel);
       }
-      if (self->workspaceKind_ == WorkspaceKind::Settings) {
-        int dividerX = workspace.left + (workspace.right - workspace.left) / 2;
-        RECT divider{dividerX, workspace.top + scale(96), dividerX + 1,
-                     workspace.bottom - scale(58)};
-        HBRUSH dividerBrush = ::CreateSolidBrush(kBorderSoft);
-        ::FillRect(dc, &divider, dividerBrush);
-        ::DeleteObject(dividerBrush);
-      }
       RECT sidebarRule{sidebarWidth - 1, 0, sidebarWidth, playerY};
       HBRUSH rule = ::CreateSolidBrush(kBorderSoft);
       ::FillRect(dc, &sidebarRule, rule);
@@ -2311,8 +2262,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       ::SendMessageW(self->playlistList_, LB_SETITEMHEIGHT, 0,
                      ::MulDiv(38, self->dpi_, 96));
       const int editMargin = ::MulDiv(12, self->dpi_, 96);
-      for (HWND edit : {self->searchEdit_, self->playlistFilterEdit_,
-                        self->setupClientId_, self->setupRedirect_}) {
+      for (HWND edit : {self->searchEdit_, self->playlistFilterEdit_}) {
         if (edit)
           ::SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                          MAKELPARAM(editMargin, editMargin));
@@ -2449,20 +2399,6 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case CID_REPEAT_BTN:
           self->app_->OnCycleRepeat();
           return 0;
-        case CID_SETUP_SAVE_BTN: {
-          char cid[512] = {}, red[1024] = {};
-          ::GetWindowTextA(self->setupClientId_, cid, 511);
-          ::GetWindowTextA(self->setupRedirect_, red, 1023);
-          self->app_->OnSetupSave(cid, red);
-          return 0;
-        }
-        case CID_SETUP_AUTH_BTN:
-          self->app_->OnAuthenticate();
-          return 0;
-        case CID_SETUP_CONTINUE_BTN:
-          self->ShowWorkspace(WorkspaceKind::Collection);
-          self->SetStatus(L"Standalone playback continues while you browse.");
-          return 0;
         case IDC_ACC_SEARCH:
           ::SetFocus(self->searchEdit_);
           return 0;
@@ -2479,7 +2415,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
           self->app_->OnTrayShow();
           return 0;
         case IDM_TRAY_SETTINGS:
-          self->SetSetupMode(true);
+          self->ShowWorkspace(WorkspaceKind::Settings);
           return 0;
         case IDM_TRAY_EXIT:
           self->app_->OnExit();
@@ -2524,9 +2460,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       bool accent = control == self->workspaceTypeLbl_;
       bool bright = control == self->brandLbl_ || control == self->titleLbl_ ||
                     control == self->middleLabel_ ||
-                    control == self->setupTitle_ ||
-                    control == self->setupClientIdLabel_ ||
-                    control == self->setupRedirectLabel_;
+                    control == self->settingsTitle_;
       ::SetTextColor(dc, accent ? kAccent : (bright ? kText : kDim));
       bool player = control == self->nowPlayingLbl_ ||
                     control == self->titleLbl_ ||
@@ -2567,12 +2501,6 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       auto* fn = (std::function<void()>*)l;
       (*fn)();
       delete fn;
-      return 0;
-    }
-    case WM_SR_OAUTH_DONE: {
-      auto* s = (std::string*)l;
-      self->app_->OnOAuthResult(*s);
-      delete s;
       return 0;
     }
     case WM_TIMER:
@@ -2871,9 +2799,6 @@ void MainWindow::SetCacheUsage(const std::wstring& text) {
   ::SetWindowTextW(cacheStatusLbl_, text.c_str());
 }
 
-void MainWindow::SetSetupStatus(const std::wstring& text) {
-  ::SetWindowTextW(setupStatus_, text.c_str());
-}
 
 void MainWindow::SetCoverFile(const std::wstring& path) {
   if (!coverArea_ || !::IsWindow(coverArea_)) return;
@@ -2939,25 +2864,6 @@ void MainWindow::SetMiddleMode(int modeIndex) {
   RebuildPlaylistRail();
 }
 
-void MainWindow::SetSetupMode(bool setup) {
-  if (setup) {
-    std::string clientId;
-    std::string redirect;
-    if (app_) {
-      clientId = app_->GetSettings().client_id;
-      redirect = app_->GetSettings().redirect_uri;
-    }
-    ::SetWindowTextA(setupClientId_, clientId.c_str());
-    ::SetWindowTextA(setupRedirect_, redirect.c_str());
-    ::SetWindowTextW(
-        setupStatus_,
-        L"Web API access is optional for playback. The standalone engine signs "
-        L"in separately and keeps a bounded app-owned cache.");
-    ShowWorkspace(WorkspaceKind::Settings);
-  } else {
-    ShowWorkspace(WorkspaceKind::Collection);
-  }
-}
 
 void MainWindow::SetDemo() {
   demoMode_ = true;

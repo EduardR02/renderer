@@ -113,11 +113,43 @@ int ParseRetryAfter(const std::string& s) {
 
 }  // namespace
 
-SpotifyApi::SpotifyApi(std::shared_ptr<HttpClient> api, std::shared_ptr<HttpClient> accounts,
+WebApiTokenProvider::WebApiTokenProvider(RequestFn request, ClockFn clock)
+    : request_(std::move(request)), clock_(std::move(clock)) {}
+
+std::string WebApiTokenProvider::GetAccessToken() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const int64_t now = clock_();
+  if (!token_ || now >= expires_at_) {
+    WebApiToken fresh;
+    std::string error;
+    if (!request_(&fresh, &error, 20000) || fresh.access_token.empty() ||
+        fresh.expires_in <= 0)
+      throw std::runtime_error(error.empty()
+                                   ? "could not mint a Spotify Web API token"
+                                   : error);
+    token_ = std::move(fresh);
+    expires_at_ = now + token_->expires_in;
+  }
+  return token_->access_token;
+}
+
+bool WebApiTokenProvider::Refresh(int timeoutMs) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  token_.reset();
+  WebApiToken fresh;
+  std::string error;
+  if (!request_(&fresh, &error, timeoutMs) || fresh.access_token.empty() ||
+      fresh.expires_in <= 0)
+    return false;
+  expires_at_ = clock_() + fresh.expires_in;
+  token_ = std::move(fresh);
+  return true;
+}
+
+SpotifyApi::SpotifyApi(std::shared_ptr<HttpClient> api,
                        std::function<std::string()> getToken,
                        std::function<bool(int)> refreshToken)
     : api_(std::move(api)),
-      accounts_(std::move(accounts)),
       getToken_(std::move(getToken)),
       refreshToken_(std::move(refreshToken)) {}
 

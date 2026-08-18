@@ -18,6 +18,8 @@ struct ArtworkCache;
 
 class MainWindow {
  public:
+  enum class WorkspaceKind { Collection, Search, Settings };
+
   MainWindow() = default;
   ~MainWindow() = default;
 
@@ -30,7 +32,7 @@ class MainWindow {
   void SetCacheUsage(const std::wstring& text);
   void Show(bool show);
   bool Visible() const;
-  void SetSetupMode(bool setup);
+  void ShowWorkspace(WorkspaceKind kind);
   void SetDemo();
 
   std::optional<std::wstring> PromptText(HWND owner,
@@ -41,7 +43,6 @@ class MainWindow {
   void SetPlaylists(const std::vector<PlaylistRef>& playlists);
   void SetQueueTracks(const std::vector<TrackRef>& tracks);
   void SetStatus(const std::wstring& text);
-  void SetSetupStatus(const std::wstring& text);
   void SetCoverFile(const std::wstring& path);
   void SetTrackArtwork(const std::string& url, const std::wstring& path);
   void SetMiddleMode(int modeIndex);
@@ -60,7 +61,6 @@ class MainWindow {
   static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
   static LRESULT CALLBACK CoverProc(HWND, UINT, WPARAM, LPARAM);
 
-  enum class WorkspaceKind { Collection, Search, Settings };
   enum class CollectionKind { Queue, Playlist, Album, Artist };
 
   // Entry pushed before navigating into an album/artist page so Back can
@@ -88,7 +88,6 @@ class MainWindow {
   void SetTooltipText(HWND control, const std::wstring& text);
   void RebuildPlaylistRail();
   void SelectPlaylistRow(int comboIndex, bool activate);
-  void ShowWorkspace(WorkspaceKind kind);
   void BeginNestedCollection(CollectionKind kind, const std::wstring& title,
                              const std::string& artworkUrl);
   void PopNestedCollection();
@@ -110,7 +109,6 @@ class MainWindow {
   HBRUSH brushBg_ = nullptr, brushSidebar_ = nullptr, brushPanel_ = nullptr,
          brushEdit_ = nullptr, brushControl_ = nullptr, brushPlayer_ = nullptr;
   UINT dpi_ = 96;
-  bool setupMode_ = true;
   bool seekDragging_ = false;
   bool demoMode_ = false;
   bool volumeDragging_ = false;
@@ -161,13 +159,7 @@ class MainWindow {
   HWND engineGroupLbl_ = nullptr, engineGuideLbl_ = nullptr,
        engineStatusLbl_ = nullptr, cacheStatusLbl_ = nullptr;
   HWND statusLbl_ = nullptr;
-  HWND setupTitle_ = nullptr, setupGuide_ = nullptr,
-       setupClientIdLabel_ = nullptr;
-  HWND setupClientId_ = nullptr, setupRedirectLabel_ = nullptr,
-       setupRedirect_ = nullptr;
-  HWND setupSaveBtn_ = nullptr, setupAuthBtn_ = nullptr,
-       setupContinueBtn_ = nullptr;
-  HWND setupStatus_ = nullptr;
+  HWND settingsTitle_ = nullptr, settingsGuide_ = nullptr;
   HWND tooltip_ = nullptr;
   HIMAGELIST rowHeightImageList_ = nullptr;
 };

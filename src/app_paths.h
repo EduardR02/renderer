@@ -17,8 +17,6 @@ std::wstring Canonical(const std::wstring& path);
 bool IsPathUnder(const std::wstring& root, const std::wstring& path);
 std::optional<std::wstring> Resolve(const std::wstring& leaf);
 
-std::wstring SettingsFile();
-std::wstring TokensFile();
 std::wstring EngineStateDir();
 std::wstring EngineLogFile();
 std::wstring LogFile();
@@ -40,16 +38,9 @@ bool EnsureDirs();
 // reparse points.
 bool ValidateOwnedRoot();
 bool IsSafeOwnedPath(const std::wstring& path);
-enum class OwnedFileReadResult {
-  Ok,
-  Missing,
-  UnsafeOrError,
-};
 
-// Reads and appends through the same handle whose attributes and resolved final
-// path were verified while its parent directory was held against replacement.
-OwnedFileReadResult ReadOwnedFile(const std::wstring& path, std::string* data,
-                                  size_t maxSize);
+// Appends through the same handle whose attributes and resolved final path
+// were verified while its parent directory was held against replacement.
 bool AppendOwnedFile(const std::wstring& path, const std::string& data);
 
 
@@ -57,6 +48,5 @@ bool AppendOwnedFile(const std::wstring& path, const std::string& data);
 // app-owned regular file. Existing temp symlinks are never opened or followed.
 bool AtomicWriteOwnedFile(const std::wstring& path, const void* data, size_t size);
 bool AtomicWriteOwnedFile(const std::wstring& path, const std::string& data);
-bool DeleteOwnedFile(const std::wstring& path);
 
 }  // namespace sr::paths

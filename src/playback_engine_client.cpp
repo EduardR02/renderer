@@ -1,6 +1,7 @@
 #include "playback_engine_client.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -119,6 +120,23 @@ EngineMessage ParseEngineMessage(const std::string& line) {
       throw std::invalid_argument("engine response has no request_id");
     message.ok = BooleanField(value, "ok");
     message.error = StringField(value, "error");
+    return message;
+  }
+  if (type == "web_api_token") {
+    message.kind = EngineMessage::Kind::WebApiToken;
+    message.request_id = StringField(value, "request_id");
+    if (message.request_id.empty())
+      throw std::invalid_argument("web_api_token response has no request_id");
+    message.ok = BooleanField(value, "ok");
+    message.error = StringField(value, "error");
+    if (message.ok) {
+      message.token.token_type = StringField(value, "token_type");
+      message.token.access_token = StringField(value, "access_token");
+      message.token.expires_in = IntegerField(value, "expires_in");
+      if (message.token.access_token.empty() || message.token.expires_in <= 0)
+        throw std::invalid_argument(
+            "web_api_token response carries an invalid token");
+    }
     return message;
   }
   if (type != "state") throw std::invalid_argument("unknown engine message type");
@@ -307,6 +325,22 @@ void PlaybackEngineClient::Shutdown() {
     } catch (...) {
     }
   }
+  // The reader thread is about to end: fail every in-flight token wait so
+  // blocked RequestWebApiToken callers never stall shutdown.
+  std::unordered_map<std::string, std::shared_ptr<TokenWaiter>> waiters;
+  {
+    std::lock_guard<std::mutex> lock(token_wait_mutex_);
+    waiters.swap(token_waiters_);
+  }
+  for (const auto& [id, waiter] : waiters) {
+    (void)id;
+    std::lock_guard<std::mutex> lock(waiter->mutex);
+    if (waiter->done) continue;
+    waiter->done = true;
+    waiter->ok = false;
+    waiter->error = "playback engine is shutting down";
+    waiter->cv.notify_all();
+  }
   Close(&input_);
   if (process_) {
     DWORD wait = ::WaitForSingleObject(process_, 3000);
@@ -388,7 +422,15 @@ std::string PlaybackEngineClient::MoveQueue(int from, int to) {
 std::string PlaybackEngineClient::Send(const std::string& type,
                                        nlohmann::json arguments) {
   const std::string requestId = std::to_string(next_request_id_.fetch_add(1));
-  std::string line = BuildEngineRequest(requestId, type, std::move(arguments)).dump();
+  WriteRequest(requestId, type, std::move(arguments));
+  return requestId;
+}
+
+void PlaybackEngineClient::WriteRequest(const std::string& requestId,
+                                        const std::string& type,
+                                        nlohmann::json arguments) {
+  std::string line =
+      BuildEngineRequest(requestId, type, std::move(arguments)).dump();
   line.push_back('\n');
   std::lock_guard<std::mutex> lock(write_mutex_);
   if (!input_ || !Running())
@@ -414,7 +456,50 @@ std::string PlaybackEngineClient::Send(const std::string& type,
     }
     offset += written;
   }
-  return requestId;
+}
+
+bool PlaybackEngineClient::RequestWebApiToken(WebApiToken* out,
+                                              std::string* error,
+                                              int timeoutMs) {
+  if (!out) {
+    if (error) *error = "token output is required";
+    return false;
+  }
+  const std::string requestId = std::to_string(next_request_id_.fetch_add(1));
+  auto waiter = std::make_shared<TokenWaiter>();
+  {
+    std::lock_guard<std::mutex> lock(token_wait_mutex_);
+    token_waiters_.emplace(requestId, waiter);
+  }
+  try {
+    WriteRequest(requestId, "web_api_token", nlohmann::json{});
+  } catch (const std::exception& exception) {
+    std::lock_guard<std::mutex> lock(token_wait_mutex_);
+    token_waiters_.erase(requestId);
+    if (error) *error = exception.what();
+    return false;
+  }
+  std::unique_lock<std::mutex> lock(waiter->mutex);
+  const bool completed = waiter->cv.wait_for(
+      lock, std::chrono::milliseconds(std::max(1, timeoutMs)),
+      [&] { return waiter->done; });
+  if (!completed) {
+    std::lock_guard<std::mutex> waiterLock(token_wait_mutex_);
+    token_waiters_.erase(requestId);
+    std::lock_guard<std::mutex> pendingLock(pending_mutex_);
+    pending_requests_.erase(requestId);
+    if (error) *error = "timed out waiting for the Spotify Web API token";
+    return false;
+  }
+  if (!waiter->ok) {
+    if (error)
+      *error = waiter->error.empty()
+                   ? "playback engine could not mint a Spotify Web API token"
+                   : waiter->error;
+    return false;
+  }
+  *out = std::move(waiter->token);
+  return true;
 }
 
 void PlaybackEngineClient::ReaderLoop() {
@@ -454,23 +539,45 @@ void PlaybackEngineClient::ReaderLoop() {
           }
           if (!expected) {
             ReportError("playback engine returned an unknown request_id");
-          } else {
-            ResponseCallback response;
+            continue;
+          }
+          if (message.kind == EngineMessage::Kind::WebApiToken) {
+            std::shared_ptr<TokenWaiter> waiter;
+            {
+              std::lock_guard<std::mutex> lock(token_wait_mutex_);
+              auto found = token_waiters_.find(message.request_id);
+              if (found != token_waiters_.end()) {
+                waiter = found->second;
+                token_waiters_.erase(found);
+              }
+            }
+            if (waiter) {
+              std::lock_guard<std::mutex> lock(waiter->mutex);
+              waiter->done = true;
+              waiter->ok = message.ok;
+              if (message.ok)
+                waiter->token = std::move(message.token);
+              else
+                waiter->error = std::move(message.error);
+              waiter->cv.notify_all();
+            }
+            continue;
+          }
+          ResponseCallback response;
+          {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            response = on_response_;
+          }
+          if (response) response(message.request_id, message.ok);
+          if (!message.ok) {
+            CommandErrorCallback callback;
             {
               std::lock_guard<std::mutex> lock(callback_mutex_);
-              response = on_response_;
+              callback = on_command_error_;
             }
-            if (response) response(message.request_id, message.ok);
-            if (!message.ok) {
-              CommandErrorCallback callback;
-              {
-                std::lock_guard<std::mutex> lock(callback_mutex_);
-                callback = on_command_error_;
-              }
-              if (callback)
-                callback(message.error.empty() ? "playback command failed"
-                                               : std::move(message.error));
-            }
+            if (callback)
+              callback(message.error.empty() ? "playback command failed"
+                                             : std::move(message.error));
           }
         }
       } catch (const std::exception& exception) {

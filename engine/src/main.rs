@@ -91,8 +91,13 @@ async fn run(
                             engine.shutdown();
                             break;
                         }
-                        let result = engine.process_command(request.command, &auth_sender);
-                        engine.send_response(&request_id, &result)?;
+                        let mint_token = matches!(&request.command, Command::WebApiToken);
+                        let result = engine.process_command(request.command, &auth_sender).await;
+                        if mint_token {
+                            engine.send_web_token_response(&request_id, &result)?;
+                        } else {
+                            engine.send_response(&request_id, &result)?;
+                        }
                         if matches!(result, Ok(true)) {
                             engine.emit_state()?;
                         }

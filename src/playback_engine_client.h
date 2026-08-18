@@ -1,13 +1,16 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
-#include <vector>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <windows.h>
 
@@ -35,12 +38,16 @@ struct PlaybackEngineState {
 };
 
 struct EngineMessage {
-  enum class Kind { Response, State } kind = Kind::Response;
+  enum class Kind { Response, State, WebApiToken } kind = Kind::Response;
   std::string request_id;
   bool ok = false;
   std::string error;
   PlaybackEngineState state;
+  // Present only on successful web_api_token responses.
+  WebApiToken token;
 };
+
+
 
 TrackRef TrackRefFromEngineJson(const nlohmann::json& value);
 nlohmann::json TrackRefToEngineJson(const TrackRef& track);
@@ -92,11 +99,33 @@ class PlaybackEngineClient {
   std::string RemoveQueue(int index);
   std::string MoveQueue(int from, int to);
 
+  // Blocking engine round-trip that mints a Web API token (login5) from the
+  // engine's Spotify session. Returns false with `error` set when the engine
+  // is not running, the mint failed, the response was malformed, or the wait
+  // timed out. `timeoutMs` bounds the whole round-trip.
+  bool RequestWebApiToken(WebApiToken* out, std::string* error,
+                          int timeoutMs = 20000);
+
  private:
   std::string Send(const std::string& type, nlohmann::json arguments = {});
+  // Writes one line-protocol request under an explicit request id; throws
+  // std::runtime_error when the transport is unavailable or the write fails.
+  void WriteRequest(const std::string& requestId, const std::string& type,
+                    nlohmann::json arguments);
   void ReaderLoop();
   void ReportError(std::string message);
   void CloseHandles();
+
+  // Blocks RequestWebApiToken callers until the reader thread delivers the
+  // matching web_api_token message.
+  struct TokenWaiter {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    std::string error;
+    WebApiToken token;
+  };
 
   HANDLE process_ = nullptr;
   HANDLE thread_ = nullptr;
@@ -111,6 +140,8 @@ class PlaybackEngineClient {
   ErrorCallback on_error_;
   ResponseCallback on_response_;
   CommandErrorCallback on_command_error_;
+  std::mutex token_wait_mutex_;
+  std::unordered_map<std::string, std::shared_ptr<TokenWaiter>> token_waiters_;
   std::atomic<uint64_t> next_request_id_{1};
   std::atomic<bool> stopping_{false};
 };
