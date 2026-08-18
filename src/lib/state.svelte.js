@@ -192,10 +192,16 @@ export async function initEvents() {
     search.submitted = true;
   }).catch(() => {});
 
-  // Pull initial state.
+  // Pull initial state. The engine may not be ready yet, so the cached
+  // library snapshot (hydrated by the Rust side at startup) is applied here
+  // too for an instant paint; the fresh `library` event replaces it once the
+  // engine reports ready.
   api
     .getState()
-    .then(applyPlayback)
+    .then((payload) => {
+      applyPlayback(payload);
+      if (payload && Array.isArray(payload.playlists)) setLibrary(payload.playlists);
+    })
     .catch(() => {});
   api.browsePlaylists().catch(() => {});
 }

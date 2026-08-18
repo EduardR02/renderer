@@ -4,8 +4,7 @@ mod covers;
 mod engine_client;
 mod types;
 
-use std::sync::Mutex;
-
+use parking_lot::Mutex;
 use tauri::Manager;
 
 use app::{AppState, data_dir, load_tracks_cache};
@@ -47,8 +46,8 @@ pub fn run() {
         ])
         .setup(|app| {
             let state = Mutex::new(AppState::new(data_dir()));
-            let dir = state.lock().unwrap().data_dir.clone();
-            state.lock().unwrap().tracks_cache = load_tracks_cache(&dir);
+            let dir = state.lock().data_dir.clone();
+            state.lock().tracks_cache = load_tracks_cache(&dir);
             app.manage(state);
 
             // Spawn the playback engine and keep it alive across crashes.

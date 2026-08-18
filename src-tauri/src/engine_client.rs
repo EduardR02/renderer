@@ -11,8 +11,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, watch};
@@ -132,7 +134,7 @@ impl EngineClient {
             if self.shutting_down.load(Ordering::SeqCst) {
                 return;
             }
-            if self.process.lock().unwrap().is_none() {
+            if self.process.lock().is_none() {
                 // Startup spawn failed or the engine died; (re)start it.
                 match self.spawn_engine() {
                     Ok(()) => {
@@ -154,7 +156,7 @@ impl EngineClient {
                 let _ = self.request("status", Value::Null).await;
             }
             let mut exited = self.exit_tx.subscribe();
-            if self.process.lock().unwrap().is_none() {
+            if self.process.lock().is_none() {
                 // Died between the spawn and the subscribe (or a stale latch
                 // raced the reset); loop around to respawn immediately.
                 continue;
@@ -208,8 +210,8 @@ impl EngineClient {
             .stdin
             .take()
             .ok_or_else(|| "engine stdin is unavailable".to_owned())?;
-        *self.stdin.lock().unwrap() = Some(stdin);
-        *self.process.lock().unwrap() = Some(child);
+        *self.stdin.lock() = Some(stdin);
+        *self.process.lock() = Some(child);
         spawn_reader(stdout, self);
         Ok(())
     }
@@ -258,7 +260,7 @@ impl EngineClient {
     }
 
     fn write_line(&self, line: &str) -> Result<(), String> {
-        let mut stdin = self.stdin.lock().unwrap();
+        let mut stdin = self.stdin.lock();
         let pipe = stdin
             .as_mut()
             .ok_or_else(|| "the playback engine is not running".to_owned())?;
@@ -467,11 +469,11 @@ impl EngineClient {
         let line = build_line(&self.next_request_id(), "shutdown", &Value::Null);
         let _ = self.write_line(&line);
         std::thread::sleep(Duration::from_millis(400));
-        if let Some(mut child) = self.process.lock().unwrap().take() {
+        if let Some(mut child) = self.process.lock().take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        *self.stdin.lock().unwrap() = None;
+        *self.stdin.lock() = None;
     }
 
     // ------------------------------------------------------------------
@@ -479,7 +481,7 @@ impl EngineClient {
     // ------------------------------------------------------------------
 
     fn on_state(&self, state: &PlaybackState) {
-        *self.last_state.lock().unwrap() = Some(state.clone());
+        *self.last_state.lock() = Some(state.clone());
         let _ = self.state_tx.send(state.clone());
     }
 
@@ -498,13 +500,13 @@ impl EngineClient {
         }
         drop(pending);
         // Capture what to restore once a fresh engine is ready again.
-        if let Some(last) = self.last_state.lock().unwrap().clone() {
+        if let Some(last) = self.last_state.lock().clone() {
             if last.auth_state == "ready" {
                 *self.restore_pending.blocking_lock() = Some(RestoreSnapshot::from(&last));
             }
         }
-        *self.stdin.lock().unwrap() = None;
-        *self.process.lock().unwrap() = None;
+        *self.stdin.lock() = None;
+        *self.process.lock() = None;
         let _ = self.exit_tx.send(true);
     }
 

@@ -32,6 +32,10 @@ pub struct AppState {
     pub tracks_cache: Vec<PlaylistTracksEntry>,
     #[serde(skip)]
     pub data_dir: PathBuf,
+    /// True while a background library refresh (with retries) is running;
+    /// concurrent triggers coalesce onto that one chain.
+    #[serde(skip)]
+    pub library_fetching: bool,
 }
 
 impl AppState {
@@ -43,6 +47,7 @@ impl AppState {
             playlists_fetched_at: None,
             tracks_cache: Vec::new(),
             data_dir,
+            library_fetching: false,
         }
     }
 }

@@ -1,8 +1,9 @@
 //! Tauri command layer: frontend-facing commands plus the background tasks
 //! that keep `AppState`, the disk caches, and the frontend events in sync.
 
-use std::sync::Mutex;
+use std::time::Duration;
 
+use parking_lot::Mutex;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -114,7 +115,15 @@ pub async fn browse_playlists(
     state: State<'_, Mutex<AppState>>,
     client: State<'_, EngineClient>,
 ) -> Result<Vec<Playlist>, String> {
-    fetch_library(&state, &client, &app).await
+    match fetch_library(&state, &client, &app).await {
+        Ok(playlists) => Ok(playlists),
+        Err(error) => {
+            // The engine may still be coming up; retry in the background so
+            // the cached library is replaced as soon as it can be fetched.
+            spawn_refresh_library(app.clone());
+            Err(error)
+        }
+    }
 }
 
 /// Opens a playlist: serves the disk cache instantly when present and
@@ -127,12 +136,12 @@ pub async fn browse_playlist(
     id: String,
 ) -> Result<PlaylistDetail, String> {
     let cached = {
-        let guard = state.lock().unwrap();
+        let guard = state.lock();
         guard.tracks_cache.iter().find(|entry| entry.id == id).cloned()
     };
     if let Some(entry) = cached {
         let detail = {
-            let guard = state.lock().unwrap();
+            let guard = state.lock();
             playlist_detail_from_cache(&guard, &entry)
         };
         let _ = app.emit("playlist-tracks", &detail);
@@ -202,7 +211,7 @@ pub async fn delete_playlist(
     client.delete_playlist(&id).await?;
     {
         let guard = app.state::<Mutex<AppState>>();
-        let mut guard = guard.lock().unwrap();
+        let mut guard = guard.lock();
         guard.playlists.retain(|playlist| playlist.id != id);
         guard.tracks_cache.retain(|entry| entry.id != id);
     }
@@ -274,7 +283,7 @@ pub async fn logout(client: State<'_, EngineClient>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_state(state: State<'_, Mutex<AppState>>) -> Result<AppStateSnapshot, String> {
-    let guard = state.lock().unwrap();
+    let guard = state.lock();
     Ok(AppStateSnapshot {
         playback: guard.playback.clone(),
         playlists: guard.playlists.clone(),
@@ -291,6 +300,21 @@ pub async fn get_cover(url: String) -> Result<String, String> {
 // Background tasks
 // ---------------------------------------------------------------------------
 
+/// Library refresh retries: at most [`LIBRARY_RETRY_ATTEMPTS`] total fetch
+/// attempts, with 5s backoff doubling to a 60s cap between attempts.
+const LIBRARY_RETRY_ATTEMPTS: usize = 5;
+const LIBRARY_RETRY_BASE: Duration = Duration::from_secs(5);
+const LIBRARY_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Delay before the retry after the `attempt`-th failure (1-based): 5s,
+/// doubling, capped at 60s.
+fn library_retry_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4) as u32;
+    LIBRARY_RETRY_BASE
+        .saturating_mul(2_u32.pow(exponent))
+        .min(LIBRARY_RETRY_MAX)
+}
+
 /// Consumes engine state lines, mirrors them into `AppState`, emits the
 /// `state`/`session` events, restores playback after an engine respawn, and
 /// projects `position_ms` locally between heartbeats.
@@ -301,9 +325,14 @@ pub async fn consume_states(app: AppHandle) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // anchor so the first projection tick counts a full second
 
+    // Instant first paint: hydrate `AppState` from the on-disk library
+    // snapshot and emit it before the engine is ready, so a returning user
+    // sees their playlists immediately (the frontend may also pull it via
+    // get_state). The ready-transition fetch below supersedes it.
+    load_library_from_disk(&app);
+
     let mut last_auth = String::new();
     let mut last_username = String::new();
-    let mut library_loaded = false;
 
     loop {
         tokio::select! {
@@ -327,7 +356,7 @@ pub async fn consume_states(app: AppHandle) {
 
                 {
                     let guard = app.state::<Mutex<AppState>>();
-                    let mut guard = guard.lock().unwrap();
+                    let mut guard = guard.lock();
                     guard.playback = state.clone();
                     if !state.username.is_empty() {
                         guard.me_id = state.username.clone();
@@ -345,16 +374,12 @@ pub async fn consume_states(app: AppHandle) {
                     );
                 }
                 if became_ready {
-                    if !library_loaded {
-                        library_loaded = true;
-                        load_library_from_disk(&app);
-                    }
                     spawn_refresh_library(app.clone());
                 }
             }
             _ = tick.tick() => {
                 let guard = app.state::<Mutex<AppState>>();
-                let mut guard = guard.lock().unwrap();
+                let mut guard = guard.lock();
                 if guard.playback.playing {
                     let projected = guard.playback.position_ms.saturating_add(1000);
                     let duration = guard.playback.duration_ms;
@@ -390,13 +415,14 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) {
 }
 
 /// Hydrates `AppState` from the on-disk library snapshot (instant first
-/// paint), then refreshes from the engine in the background.
+/// paint) and emits it as `library`; the engine refresh that supersedes it
+/// is spawned separately once the engine reports ready.
 fn load_library_from_disk(app: &AppHandle) {
     let dir = data_dir();
     let playlists = load_playlist_list(&dir);
     {
         let guard = app.state::<Mutex<AppState>>();
-        let mut guard = guard.lock().unwrap();
+        let mut guard = guard.lock();
         if let Some(cache) = &playlists {
             guard.playlists = cache.playlists.clone();
             guard.playlists_fetched_at = cache.fetched_at;
@@ -410,14 +436,56 @@ fn load_library_from_disk(app: &AppHandle) {
     }
 }
 
+/// One background library-refresh chain: a fetch, then capped-exponential
+/// retries so a transient browse failure (engine still coming up, spclient
+/// hiccup) does not leave the library permanently stale. Only one chain runs
+/// at a time; concurrent triggers (ready transitions, playlist edits, the
+/// frontend boot pull) coalesce onto it.
 fn spawn_refresh_library(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<EngineClient>();
         let state = app.state::<Mutex<AppState>>();
-        if let Err(error) = fetch_library(&state, &client, &app).await {
-            eprintln!("SpotifyRenderer: library refresh failed: {error}");
+        {
+            let mut guard = state.lock();
+            if guard.library_fetching {
+                return; // a refresh chain is already in flight
+            }
+            guard.library_fetching = true;
+        }
+        let result = refresh_library_with_retry(&state, &client, &app).await;
+        state.lock().library_fetching = false;
+        if let Err(error) = result {
+            eprintln!(
+                "SpotifyRenderer: library refresh failed after {LIBRARY_RETRY_ATTEMPTS} attempts: {error}"
+            );
         }
     });
+}
+
+/// Fetches the library, retrying with capped exponential backoff until it
+/// succeeds or [`LIBRARY_RETRY_ATTEMPTS`] attempts are exhausted. The cached
+/// copy stays untouched (and on screen) while retries are in flight.
+async fn refresh_library_with_retry(
+    state: &Mutex<AppState>,
+    client: &EngineClient,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 1..=LIBRARY_RETRY_ATTEMPTS {
+        match fetch_library(state, client, app).await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                eprintln!("SpotifyRenderer: library refresh failed ({error})");
+                last_error = error;
+                if attempt < LIBRARY_RETRY_ATTEMPTS {
+                    let delay = library_retry_delay(attempt);
+                    eprintln!("SpotifyRenderer: retrying in {}s", delay.as_secs());
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+    Err(last_error)
 }
 
 fn spawn_refresh_playlist(app: AppHandle, id: String) {
@@ -446,7 +514,7 @@ async fn fetch_library(
     let playlists: Vec<Playlist> = references.iter().map(Playlist::from).collect();
     let fetched_at = now_secs();
     let (dir, me_id) = {
-        let guard = state.lock().unwrap();
+        let guard = state.lock();
         (guard.data_dir.clone(), guard.me_id.clone())
     };
     save_playlist_list(
@@ -459,7 +527,7 @@ async fn fetch_library(
         },
     );
     {
-        let mut guard = state.lock().unwrap();
+        let mut guard = state.lock();
         guard.playlists = playlists.clone();
         guard.playlists_fetched_at = Some(fetched_at);
     }
@@ -476,7 +544,7 @@ async fn fetch_playlist(
 ) -> Result<PlaylistDetail, String> {
     let detail = PlaylistDetail::from(client.browse_playlist(id).await?);
     let fetched_at = now_secs();
-    let mut guard = state.lock().unwrap();
+    let mut guard = state.lock();
     upsert_tracks_cache(
         &mut guard.tracks_cache,
         PlaylistTracksEntry {
@@ -499,4 +567,17 @@ async fn fetch_playlist(
     save_tracks_cache(&dir, &tracks_cache);
     save_playlist_list(&dir, &list_cache);
     Ok(detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_retry_delay_doubles_from_5s_and_caps_at_60s() {
+        let delays: Vec<u64> = (1..=6)
+            .map(|attempt| library_retry_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(delays, vec![5, 10, 20, 40, 60, 60]);
+    }
 }
