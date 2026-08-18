@@ -1,44 +1,75 @@
 //! spclient-backed browsing: turns librespot metadata and the internal
-//! `/playlist/v2` + `/searchview` JSON endpoints into the protocol's browse
-//! payloads. All network traffic goes through the engine session's spclient
-//! (login5 Bearer auth + automatic client token), so no developer Web API
-//! client id is involved.
+//! `/playlist/v2` + `/searchview` endpoints into the protocol's browse
+//! payloads. All network traffic goes through the engine session (login5
+//! Bearer auth + automatic client token), so no developer Web API client id
+//! is involved.
 //!
 //! Response-mapping notes:
 //! - Rootlist: `/playlist/v2/user/{user}/rootlist` answered as
 //!   protobuf-JSON with `contents.items`/`contents.metaItems` parallel
-//!   arrays (shape cross-checked against other spclient clients). The
-//!   rootlist carries owner usernames but no owner display names, so
-//!   `owner_name` is empty there. Playlist covers come from the raw
-//!   `attributes.picture` file id (base64 bytes -> `https://i.scdn.co/image/
-//!   {hex}`), with ready-made `pictureSize` URLs as fallback.
-//! - Search: `/searchview/km/v4/search/{q}` answered as protobuf-JSON with
-//!   `results.tracks|albums|artists.hits`. The query parameters follow
-//!   librespot-java's SearchManager: `entityVersion=2` and — critically —
-//!   non-empty `country` (from the session) and `locale` values; the
-//!   searchview service rejects requests with empty `country`/`locale` with
-//!   a 400 INVALID_ARGUMENT. Parsing stays tolerant: unknown/missing fields
-//!   degrade to empty strings, zeros, and empty lists instead of failing the
-//!   whole browse.
+//!   arrays (shape cross-checked against other spclient clients, including
+//!   mirrorfm's `spotify-private-api` which treats `attributes.picture` as a
+//!   raw base64 string). The rootlist carries owner usernames but no owner
+//!   display names, so `owner_name` is empty there. Playlist covers come
+//!   from the raw `attributes.picture` file id (base64 bytes ->
+//!   `https://i.scdn.co/image/{hex}`), with ready-made `pictureSize` URLs as
+//!   fallback.
+//! - Track/album resolution: the extended-metadata endpoint
+//!   (`POST /extended-metadata/v0/extended-metadata`, librespot's
+//!   `SpClient::get_extended_metadata(BatchedEntityRequest)`) resolves many
+//!   entity URIs per request. Playlist/album/artist contents arrive as bare
+//!   URIs and are fetched in ~40-URI batches — never one request per track
+//!   (per-URI `Track::get` bursts trip the endpoint's per-request rate
+//!   limiter and log hundreds of 'Resource has been exhausted' errors).
+//! - Search: the searchview service is reached over Mercury
+//!   (`hm://searchview/km/v4/search/{q}`) exactly like the working
+//!   implementations in librespot-java's `SearchManager` and
+//!   librespot-python's `SearchManager` (both still shipping this shape as
+//!   of 2026): `entityVersion=2` plus non-empty `country` (from the
+//!   session), `locale`, `imageSize`, `catalogue`, and `username` values.
+//!   The engine's earlier HTTP spclient variant (`/searchview/...` with
+//!   `request_as_json`) kept answering `400 INVALID_ARGUMENT` even with
+//!   country/locale filled — the HTTP front door also receives spclient's
+//!   auto-appended `product=0&country=..&salt=..` query params, which the
+//!   strict searchview transcoding rejects. Mercury carries exactly the
+//!   accepted parameter set and is what both reference clients use. Parsing
+//!   stays tolerant: unknown/missing fields degrade to empty strings, zeros,
+//!   and empty lists instead of failing the whole browse, and failures log
+//!   the gRPC status and response body.
 
 use std::collections::HashSet;
 
 use base64::Engine as _;
-use futures_util::stream::{StreamExt, iter};
 use http::Method;
 use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
+use librespot_protocol::extended_metadata::{
+    BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
+};
+use librespot_protocol::extension_kind::ExtensionKind;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::protocol::{AlbumRef, ArtistRef, PlaylistRef, TrackRef};
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
 const COVER_BASE: &str = "https://i.scdn.co/image/";
 
-/// Concurrent in-flight metadata fetches when resolving a batch of track or
-/// album URIs (playlist/album/artist contents arrive as bare URIs).
-const FETCH_CONCURRENCY: usize = 8;
+/// Entity URIs per extended-metadata POST. The endpoint answers batches of
+/// this size comfortably; larger playlists are split into several POSTs so a
+/// 1000-track playlist is ~25 requests instead of 1000.
+const METADATA_BATCH_SIZE: usize = 40;
+
+/// Retries after the first attempt when a metadata batch POST fails. Items
+/// are skipped only once the retries are exhausted.
+const METADATA_RETRY_ATTEMPTS: usize = 3;
+
+/// Capped exponential backoff between batch attempts, starting at this many
+/// milliseconds and doubling up to [`METADATA_BACKOFF_MAX_MS`].
+const METADATA_BACKOFF_BASE_MS: u64 = 250;
+const METADATA_BACKOFF_MAX_MS: u64 = 2_000;
 
 /// Upper bounds mirroring the endpoints' practical limits; larger requests
 /// are clamped instead of refused.
@@ -100,33 +131,192 @@ pub fn album_ref(album: &Album) -> AlbumRef {
 }
 
 
-/// Resolves a batch of track URIs into `TrackRef`s. URIs are deduplicated by
-/// id (playlists repeat tracks), fetched with bounded concurrency in
-/// first-appearance order, and items that fail to resolve (episodes, local
-/// files, removed tracks) are skipped.
+// ---------------------------------------------------------------------------
+// batched metadata resolution (extended-metadata)
+// ---------------------------------------------------------------------------
+
+/// The retry/backoff schedule between extended-metadata batch attempts:
+/// `METADATA_RETRY_ATTEMPTS` retries after the first attempt, backing off
+/// from `base_ms`, doubling, and capping at `max_ms`. Pure so the schedule is
+/// unit-testable.
+fn backoff_sequence(attempts: usize, base_ms: u64, max_ms: u64) -> Vec<u64> {
+    (0..attempts)
+        .map(|attempt| (base_ms << attempt).min(max_ms))
+        .collect()
+}
+
+/// Deduplicates URIs by entity id, keeping first-appearance order
+/// (playlists repeat tracks). Pure so the ordering is unit-testable.
+fn dedupe_uris<'a>(uris: impl Iterator<Item = &'a SpotifyUri>) -> Vec<SpotifyUri> {
+    let mut seen = HashSet::new();
+    uris
+        .into_iter()
+        .filter(|uri| seen.insert(id_of(uri)))
+        .cloned()
+        .collect()
+}
+
+/// Splits deduplicated URIs into extended-metadata batches of at most
+/// `batch_size`. Pure so the chunking is unit-testable.
+fn metadata_chunks(uris: &[SpotifyUri], batch_size: usize) -> Vec<&[SpotifyUri]> {
+    uris.chunks(batch_size.max(1)).collect()
+}
+
+/// Builds the protobuf request for one extended-metadata batch: one
+/// `EntityRequest` per URI asking for `kind` extensions, plus the session
+/// country in the header (as the official clients send). Pure so the request
+/// shape is unit-testable.
+fn build_batched_request(
+    uris: &[SpotifyUri],
+    kind: ExtensionKind,
+    country: &str,
+) -> BatchedEntityRequest {
+    let mut request = BatchedEntityRequest::new();
+    request.header.mut_or_insert_default().country = country.to_owned();
+    request.entity_request = uris
+        .iter()
+        .map(|uri| {
+            let mut entity = EntityRequest::new();
+            entity.entity_uri = uri.to_uri().unwrap_or_default();
+            entity.query.push(ExtensionQuery {
+                extension_kind: EnumOrUnknown::new(kind),
+                ..Default::default()
+            });
+            entity
+        })
+        .collect();
+    request
+}
+
+/// Pulls `(entity_uri, payload bytes)` pairs out of a batch response: only
+/// entries whose kind matches the request and whose per-entity status is 200
+/// OK count; per-entity failures (unresolvable/removed items) are skipped
+/// individually, never as a whole batch. Pure so the mapping is
+/// unit-testable.
+fn collect_extension_payloads(
+    response: &BatchedExtensionResponse,
+    kind: ExtensionKind,
+) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for array in &response.extended_metadata {
+        if array.extension_kind.enum_value_or(ExtensionKind::UNKNOWN_EXTENSION) != kind {
+            continue;
+        }
+        for entry in &array.extension_data {
+            if entry.header.status_code != 200 {
+                continue;
+            }
+            let Some(payload) = entry.extension_data.as_ref().map(|any| any.value.clone()) else {
+                continue;
+            };
+            out.push((entry.entity_uri.clone(), payload));
+        }
+    }
+    out
+}
+
+/// Posts one batch with retries: a failed POST is retried up to
+/// [`METADATA_RETRY_ATTEMPTS`] times with capped exponential backoff, and
+/// only then reported as an error (the caller skips that batch's items).
+/// Batches are posted sequentially so the endpoint never sees a burst.
+async fn fetch_extended_batch(
+    session: &Session,
+    uris: &[SpotifyUri],
+    kind: ExtensionKind,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let request = build_batched_request(uris, kind, &session.country());
+    let backoffs = backoff_sequence(
+        METADATA_RETRY_ATTEMPTS,
+        METADATA_BACKOFF_BASE_MS,
+        METADATA_BACKOFF_MAX_MS,
+    );
+    let mut attempt = 0usize;
+    loop {
+        match session.spclient().get_extended_metadata(request.clone()).await {
+            Ok(response) => return Ok(collect_extension_payloads(&response, kind)),
+            Err(error) => {
+                if attempt >= backoffs.len() {
+                    return Err(format!(
+                        "metadata batch of {} {kind:?} URIs failed after {} attempts: {error}",
+                        uris.len(),
+                        attempt + 1,
+                    ));
+                }
+                let backoff = backoffs[attempt];
+                eprintln!(
+                    "metadata batch of {} {kind:?} URIs failed ({error}); retrying in {backoff} ms (attempt {}/{})",
+                    uris.len(),
+                    attempt + 1,
+                    backoffs.len() + 1,
+                );
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Resolves extended-metadata entities (tracks, albums, ...) in batches of
+/// [`METADATA_BATCH_SIZE`]. URIs are deduplicated by id in first-appearance
+/// order; each batch is one POST; items missing from the response or failing
+/// per-entity resolution are skipped; a batch is skipped only after its
+/// retries with backoff are exhausted.
+async fn fetch_extended<'a, T>(
+    session: &Session,
+    uris: impl IntoIterator<Item = &'a SpotifyUri>,
+    kind: ExtensionKind,
+    parse: impl Fn(&str, &[u8]) -> Option<T>,
+) -> Vec<T> {
+    let unique = dedupe_uris(uris.into_iter());
+    let mut results: Vec<Option<T>> = (0..unique.len()).map(|_| None).collect();
+    for chunk in metadata_chunks(&unique, METADATA_BATCH_SIZE) {
+        match fetch_extended_batch(session, chunk, kind).await {
+            Ok(entries) => {
+                for (entity_uri, payload) in entries {
+                    let Some(index) = unique.iter().position(|uri| uri_of(uri) == entity_uri)
+                    else {
+                        continue;
+                    };
+                    results[index] = parse(&entity_uri, &payload);
+                }
+            }
+            Err(error) => {
+                // Only a fully retried batch failure skips its items.
+                eprintln!("skipping {count} unresolvable item(s): {error}", count = chunk.len());
+            }
+        }
+    }
+    results.into_iter().flatten().collect()
+}
+
+/// Parses one extended-metadata track payload into the protocol's `TrackRef`
+/// shape. Returns `None` for unparseable or non-track payloads.
+fn parse_track_payload(entity_uri: &str, payload: &[u8]) -> Option<TrackRef> {
+    let message = librespot_protocol::metadata::Track::parse_from_bytes(payload).ok()?;
+    let uri = SpotifyUri::from_uri(entity_uri).ok()?;
+    let track = Track::parse(&message, &uri).ok()?;
+    Some(track_ref(&track))
+}
+
+/// Parses one extended-metadata album payload into the protocol's `AlbumRef`
+/// shape. Returns `None` for unparseable or non-album payloads.
+fn parse_album_payload(entity_uri: &str, payload: &[u8]) -> Option<AlbumRef> {
+    let message = librespot_protocol::metadata::Album::parse_from_bytes(payload).ok()?;
+    let uri = SpotifyUri::from_uri(entity_uri).ok()?;
+    let album = Album::parse(&message, &uri).ok()?;
+    Some(album_ref(&album))
+}
+
+/// Resolves a batch of track URIs into `TrackRef`s via the extended-metadata
+/// endpoint: URIs are deduplicated by id (playlists repeat tracks), fetched
+/// in ~40-URI batches in first-appearance order, and items that fail to
+/// resolve (episodes, local files, removed tracks) are skipped. No per-item
+/// network calls: one POST per batch.
 pub async fn fetch_tracks<'a>(
     session: &Session,
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
 ) -> Vec<TrackRef> {
-    let mut seen = HashSet::new();
-    let unique: Vec<SpotifyUri> = uris
-        .into_iter()
-        .filter(|uri| seen.insert(id_of(uri)))
-        .cloned()
-        .collect();
-    iter(unique.into_iter().map(|uri| async move {
-        match Track::get(session, &uri).await {
-            Ok(track) => Some(track_ref(&track)),
-            Err(error) => {
-                eprintln!("skipping unresolvable item {uri}: {error}");
-                None
-            }
-        }
-    }))
-    .buffered(FETCH_CONCURRENCY)
-    .filter_map(|track| async move { track })
-    .collect()
-    .await
+    fetch_extended(session, uris, ExtensionKind::TRACK_V4, parse_track_payload).await
 }
 
 // ---------------------------------------------------------------------------
@@ -195,16 +385,22 @@ fn hex(bytes: &[u8]) -> String {
 /// Cover for a rootlist playlist: the raw `picture` file id (base64 bytes)
 /// maps 1:1 to the canonical `https://i.scdn.co/image/{hex}` URL and wins
 /// over ready-made `pictureSize` URLs (which may be mosaic-style crops).
+/// The protobuf-JSON bytes field is standard padded base64; URL-safe (and
+/// unpadded) spellings are accepted too so a server variant can never drop
+/// every cover.
 fn rootlist_cover(attributes: &RootlistAttributesJson) -> Option<String> {
     if let Some(picture) = attributes
         .picture
         .as_deref()
         .filter(|picture| !picture.is_empty())
     {
-        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(picture) {
-            if !bytes.is_empty() {
-                return Some(format!("{COVER_BASE}{}", hex(&bytes)));
-            }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(picture)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(picture))
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(picture))
+            .ok();
+        if let Some(bytes) = decoded.filter(|bytes| !bytes.is_empty()) {
+            return Some(format!("{COVER_BASE}{}", hex(&bytes)));
         }
     }
     attributes
@@ -335,26 +531,13 @@ pub async fn album_browse(
     })
 }
 
-/// Resolves a batch of album URIs into `AlbumRef`s, preserving order and
-/// skipping albums that fail to resolve.
+/// Resolves a batch of album URIs into `AlbumRef`s via the extended-metadata
+/// endpoint, preserving order and skipping albums that fail to resolve.
 async fn fetch_albums<'a>(
     session: &Session,
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
 ) -> Vec<AlbumRef> {
-    let unique: Vec<SpotifyUri> = uris.into_iter().cloned().collect();
-    iter(unique.into_iter().map(|uri| async move {
-        match Album::get(session, &uri).await {
-            Ok(album) => Some(album_ref(&album)),
-            Err(error) => {
-                eprintln!("skipping unresolvable album {uri}: {error}");
-                None
-            }
-        }
-    }))
-    .buffered(FETCH_CONCURRENCY)
-    .filter_map(|album| async move { album })
-    .collect()
-    .await
+    fetch_extended(session, uris, ExtensionKind::ALBUM_V4, parse_album_payload).await
 }
 
 /// Artist portrait, top tracks, and albums via the extended-metadata artist
@@ -583,11 +766,17 @@ fn artist_ref_from_hit(hit: &SearchArtistHitJson) -> ArtistRef {
 /// librespot-java's default preferred locale is "en".
 const SEARCH_LOCALE: &str = "en";
 
-/// Builds the searchview request path. `country` must be the session's
+/// Builds the searchview request URI. `country` must be the session's
 /// two-letter country code and `locale` a language tag: the searchview
-/// service answers 400 INVALID_ARGUMENT when either is empty (the query
-/// parameters mirror librespot-java's SearchManager, which fills both from
-/// the session).
+/// service answers 400 INVALID_ARGUMENT when either is empty. The URI
+/// mirrors librespot-java's `SearchManager` byte for byte (path
+/// `hm://searchview/km/v4/search/{q}` plus `entityVersion`, `limit`,
+/// `imageSize`, `catalogue`, `country`, `locale`, `username`), which is the
+/// request shape both working reference clients send over Mercury. Sending
+/// the same parameters over the HTTP spclient front door instead fails with
+/// 400 INVALID_ARGUMENT (the HTTP path also receives spclient's
+/// auto-appended `product`/`salt` query params, which the strict searchview
+/// transcoding rejects).
 pub fn search_endpoint(
     query: &str,
     limit: usize,
@@ -597,7 +786,7 @@ pub fn search_endpoint(
 ) -> String {
     let encoded = utf8_percent_encode(query.trim(), NON_ALPHANUMERIC);
     format!(
-        "/searchview/km/v4/search/{encoded}?entityVersion=2&limit={limit}&country={country}&locale={locale}&username={user}",
+        "hm://searchview/km/v4/search/{encoded}?entityVersion=2&limit={limit}&imageSize=&catalogue=&country={country}&locale={locale}&username={user}",
         limit = limit.clamp(1, MAX_SEARCH_LIMIT),
         country = utf8_percent_encode(country, NON_ALPHANUMERIC),
         locale = utf8_percent_encode(locale, NON_ALPHANUMERIC),
@@ -605,9 +794,12 @@ pub fn search_endpoint(
     )
 }
 
-/// Search via the spclient searchview endpoint. The response mapping is
-/// tolerant: any section the server leaves out (or names differently) simply
-/// yields an empty list.
+/// Search via the searchview service over Mercury (the transport both
+/// librespot-java and librespot-python use for this endpoint). Failures
+/// carry the gRPC status and, when present, the server's response body so
+/// the next iteration can read the exact rejection message. The response
+/// mapping is tolerant: any section the server leaves out (or names
+/// differently) simply yields an empty list.
 pub async fn search_browse(
     session: &Session,
     query: &str,
@@ -616,18 +808,41 @@ pub async fn search_browse(
     if query.trim().is_empty() {
         return Err("search query must not be empty".to_owned());
     }
-    let endpoint = search_endpoint(
+    let uri = search_endpoint(
         query,
         limit,
         &session.country(),
         SEARCH_LOCALE,
         &session.username(),
-    );    let body = session
-        .spclient()
-        .request_as_json(&Method::GET, &endpoint, None, None)
+    );
+    let response = session
+        .mercury()
+        .get(uri)
+        .map_err(|error| format!("search request failed: {error}"))?
         .await
         .map_err(|error| format!("search request failed: {error}"))?;
-    let parsed: SearchJson = serde_json::from_slice(&body)
+    if response.status_code != 200 {
+        let body = response
+            .payload
+            .first()
+            .and_then(|payload| String::from_utf8(payload.clone()).ok())
+            .filter(|body| !body.is_empty())
+            .map(|body| {
+                let mut body = body;
+                body.truncate(512);
+                format!(": {body}")
+            })
+            .unwrap_or_default();
+        return Err(format!(
+            "search request failed (status {}):{}",
+            response.status_code, body
+        ));
+    }
+    let body = response
+        .payload
+        .first()
+        .ok_or_else(|| "search returned no payload".to_owned())?;
+    let parsed: SearchJson = serde_json::from_slice(body)
         .map_err(|error| format!("unparseable search response: {error}"))?;
     Ok(crate::protocol::SearchBrowse {
         tracks: parsed.results.tracks.hits.iter().map(track_ref_from_hit).collect(),
@@ -909,6 +1124,17 @@ mod tests {
         );
         let empty = RootlistAttributesJson::default();
         assert_eq!(rootlist_cover(&empty), None);
+
+        // A URL-safe/unpadded spelling of the same file id still resolves
+        // (server variants must not drop every cover).
+        let url_safe = RootlistAttributesJson {
+            name: None,
+            picture: Some("EREREREREREREREREREREQ".to_owned()),
+            picture_size: Vec::new(),
+        };
+        let cover = rootlist_cover(&url_safe).unwrap();
+        assert!(cover.starts_with(COVER_BASE));
+        assert_eq!(cover.len(), COVER_BASE.len() + 32, "16 decoded bytes -> 32 hex chars");
     }
 
     #[test]
@@ -1032,13 +1258,16 @@ mod tests {
     #[test]
     fn search_endpoint_encodes_the_query_and_fills_session_values() {
         // The searchview service rejects empty country/locale with 400
-        // INVALID_ARGUMENT; the endpoint must always carry the session's
-        // two-letter country code and a locale (librespot-java fills both
-        // from the session the same way).
+        // INVALID_ARGUMENT; the URI must always carry the session's
+        // two-letter country code and a locale. The shape mirrors
+        // librespot-java's SearchManager exactly (Mercury `hm://` transport,
+        // entityVersion/limit/imageSize/catalogue/country/locale/username).
         let endpoint = search_endpoint("fire & ice?", 10, "US", "en", "alice");
-        assert!(endpoint.starts_with("/searchview/km/v4/search/fire%20%26%20ice%3F?"));
+        assert!(endpoint.starts_with("hm://searchview/km/v4/search/fire%20%26%20ice%3F?"));
         assert!(endpoint.contains("entityVersion=2"));
         assert!(endpoint.contains("&limit=10"));
+        assert!(endpoint.contains("&imageSize="));
+        assert!(endpoint.contains("&catalogue="));
         assert!(endpoint.contains("&country=US"));
         assert!(endpoint.contains("&locale=en"));
         assert!(endpoint.contains("&username=alice"));
@@ -1047,5 +1276,126 @@ mod tests {
         assert!(clamped.contains("&limit=50"));
         assert!(clamped.contains("&country=US"), "country must never be empty");
         assert!(clamped.contains("&locale=en"), "locale must never be empty");
+    }
+
+    #[test]
+    fn backoff_sequence_doubles_and_caps() {
+        assert_eq!(
+            backoff_sequence(3, 250, 2000),
+            vec![250, 500, 1000],
+            "base doubling"
+        );
+        assert_eq!(
+            backoff_sequence(4, 250, 2000),
+            vec![250, 500, 1000, 2000],
+            "capped at the maximum"
+        );
+        assert_eq!(backoff_sequence(0, 250, 2000), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn dedupe_uris_keeps_first_appearance_order() {
+        let a = SpotifyUri::from_uri("spotify:track:0123456789ABCDEFGHIJKL").unwrap();
+        let b = SpotifyUri::from_uri("spotify:track:1123456789ABCDEFGHIJKL").unwrap();
+        let c = SpotifyUri::from_uri("spotify:track:2123456789ABCDEFGHIJKL").unwrap();
+        let repeated = vec![&a, &b, &a, &c, &b];
+        let unique = dedupe_uris(repeated.into_iter());
+        assert_eq!(
+            unique.iter().map(uri_of).collect::<Vec<_>>(),
+            vec![
+                "spotify:track:0123456789ABCDEFGHIJKL",
+                "spotify:track:1123456789ABCDEFGHIJKL",
+                "spotify:track:2123456789ABCDEFGHIJKL",
+            ],
+            "first-appearance order, repeats dropped"
+        );
+    }
+
+    #[test]
+    fn metadata_chunks_split_at_batch_size() {
+        let uris: Vec<SpotifyUri> = (0..85)
+            .map(|i| {
+                let id = format!("{i:0>21}0");
+                SpotifyUri::from_uri(&format!("spotify:track:{id}")).unwrap()
+            })
+            .collect();
+        let chunks = metadata_chunks(&uris, 40);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 40);
+        assert_eq!(chunks[1].len(), 40);
+        assert_eq!(chunks[2].len(), 5);
+        assert_eq!(
+            metadata_chunks(&uris, 0).len(),
+            85,
+            "batch size clamps to 1: every URI gets its own batch"
+        );
+    }
+
+    #[test]
+    fn build_batched_request_carries_one_entity_per_uri_with_the_kind() {
+        let a = SpotifyUri::from_uri("spotify:track:0123456789ABCDEFGHIJKL").unwrap();
+        let b = SpotifyUri::from_uri("spotify:track:1123456789ABCDEFGHIJKL").unwrap();
+        let request = build_batched_request(&[a, b], ExtensionKind::TRACK_V4, "US");
+        assert_eq!(request.header.country, "US");
+        assert_eq!(request.entity_request.len(), 2);
+        assert_eq!(request.entity_request[0].entity_uri, "spotify:track:0123456789ABCDEFGHIJKL");
+        assert_eq!(request.entity_request[1].entity_uri, "spotify:track:1123456789ABCDEFGHIJKL");
+        assert_eq!(
+            request.entity_request[0].query[0].extension_kind.enum_value_or(ExtensionKind::UNKNOWN_EXTENSION),
+            ExtensionKind::TRACK_V4
+        );
+        assert_eq!(request.entity_request[1].query[0].extension_kind.enum_value_or(ExtensionKind::UNKNOWN_EXTENSION),
+            ExtensionKind::TRACK_V4);
+    }
+
+    #[test]
+    fn collect_extension_payloads_keeps_matching_200_entries_only() {
+        use librespot_protocol::extended_metadata::EntityExtensionDataArray;
+        use librespot_protocol::entity_extension_data::{EntityExtensionData, EntityExtensionDataHeader};
+        use protobuf::well_known_types::any::Any;
+
+        let mut ok = EntityExtensionData::new();
+        ok.entity_uri = "spotify:track:aaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        ok.header = protobuf::MessageField::some(EntityExtensionDataHeader {
+            status_code: 200,
+            ..Default::default()
+        });
+        ok.extension_data = protobuf::MessageField::some(Any {
+            type_url: "type.googleapis.com/spotify.metadata.Track".to_owned(),
+            value: vec![0xAA, 0xBB],
+            ..Default::default()
+        });
+
+        let mut not_found = EntityExtensionData::new();
+        not_found.entity_uri = "spotify:track:bbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        not_found.header = protobuf::MessageField::some(EntityExtensionDataHeader {
+            status_code: 404,
+            ..Default::default()
+        });
+
+        let mut no_payload = EntityExtensionData::new();
+        no_payload.entity_uri = "spotify:track:cccccccccccccccccccccc".to_owned();
+        no_payload.header = protobuf::MessageField::some(EntityExtensionDataHeader {
+            status_code: 200,
+            ..Default::default()
+        });
+
+        let mut track_array = EntityExtensionDataArray::new();
+        track_array.extension_kind = EnumOrUnknown::new(ExtensionKind::TRACK_V4);
+        track_array.extension_data = vec![ok.clone(), not_found, no_payload];
+
+        let mut album_array = EntityExtensionDataArray::new();
+        album_array.extension_kind = EnumOrUnknown::new(ExtensionKind::ALBUM_V4);
+        album_array.extension_data = vec![ok];
+
+        let response = BatchedExtensionResponse {
+            extended_metadata: vec![track_array, album_array],
+            ..Default::default()
+        };
+
+        let entries = collect_extension_payloads(&response, ExtensionKind::TRACK_V4);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "spotify:track:aaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(entries[0].1, vec![0xAA, 0xBB]);
     }
 }

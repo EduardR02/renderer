@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use librespot_core::SpotifyUri;
 use librespot_core::cache::Cache;
+use librespot_metadata::Metadata;
 use librespot_playback::mixer::{Mixer, softmixer::SoftMixer};
 use librespot_playback::player::{Player, PlayerEvent};
 use tokio::sync::mpsc;
@@ -11,13 +12,8 @@ use crate::auth::{
     PendingAuth, PlaybackHandles, complete_oauth, connect_cached, percent_to_volume,
     prepare_oauth,
 };
-use crate::browse;
-use crate::edits;
 use crate::io::ProtocolWriter;
-use crate::protocol::{
-    AlbumBrowse, ArtistBrowse, AuthState, BrowseResponse, Command, PlaylistBrowse, PlaylistRef,
-    RepeatMode, Response, SearchBrowse, StateEvent, TrackRef,
-};
+use crate::protocol::{AuthState, BrowseResponse, Command, RepeatMode, Response, StateEvent, TrackRef};
 use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
@@ -471,10 +467,12 @@ impl Engine {
         })
     }
 
-    /// The live session for browse commands: browsing only needs the
-    /// authenticated session (unlike playback commands, no player yet).
-    fn browse_session(&self) -> Result<&librespot_core::Session, String> {
-        self.session.as_ref().ok_or_else(|| match self.state.auth_state {
+    /// An owned clone of the live session for browse/edit work: browsing
+    /// only needs the authenticated session (unlike playback commands, no
+    /// player yet). The clone is handed to spawned browse tasks so the
+    /// command loop never blocks on network resolution.
+    pub fn browse_session_clone(&self) -> Result<librespot_core::Session, String> {
+        self.session.clone().ok_or_else(|| match self.state.auth_state {
             AuthState::Authenticating => "Spotify authentication is still in progress".to_owned(),
             AuthState::NeedsLogin => {
                 "Spotify login is required; use the Log in button in Settings".to_owned()
@@ -488,74 +486,32 @@ impl Engine {
         })
     }
 
-    pub async fn browse_playlists(&mut self, length: usize) -> Result<Vec<PlaylistRef>, String> {
-        let session = self.browse_session()?;
-        browse::playlists_browse(session, length).await
-    }
-
-    pub async fn browse_playlist(&mut self, id: &str) -> Result<PlaylistBrowse, String> {
-        let session = self.browse_session()?;
-        browse::playlist_browse(session, id).await
-    }
-
-    pub async fn browse_album(&mut self, id: &str) -> Result<AlbumBrowse, String> {
-        let session = self.browse_session()?;
-        browse::album_browse(session, id).await
-    }
-
-    pub async fn browse_artist(&mut self, id: &str) -> Result<ArtistBrowse, String> {
-        let session = self.browse_session()?;
-        browse::artist_browse(session, id).await
-    }
-
-    pub async fn browse_search(&mut self, query: &str, limit: usize) -> Result<SearchBrowse, String> {
-        let session = self.browse_session()?;
-        browse::search_browse(session, query, limit).await
-    }
-
-    /// Playlist edits run on the same spclient session as browsing; like
-    /// browse commands they need no player.
-    pub async fn edit_create_playlist(&mut self, name: &str) -> Result<PlaylistRef, String> {
-        let session = self.browse_session()?;
-        edits::create_playlist(session, name).await
-    }
-
-    pub async fn edit_rename_playlist(&mut self, id: &str, name: &str) -> Result<(), String> {
-        let session = self.browse_session()?;
-        edits::rename_playlist(session, id, name).await
-    }
-
-    pub async fn edit_delete_playlist(&mut self, id: &str) -> Result<(), String> {
-        let session = self.browse_session()?;
-        edits::delete_playlist(session, id).await
-    }
-
-    pub async fn edit_add_playlist_tracks(
-        &mut self,
-        id: &str,
-        uris: &[String],
-    ) -> Result<(), String> {
-        let session = self.browse_session()?;
-        edits::add_tracks(session, id, uris).await
-    }
-
-    pub async fn edit_remove_playlist_tracks(
-        &mut self,
-        id: &str,
-        uris: &[String],
-    ) -> Result<(), String> {
-        let session = self.browse_session()?;
-        edits::remove_tracks(session, id, uris).await
-    }
-
-    pub async fn edit_reorder_playlist_tracks(
-        &mut self,
-        id: &str,
-        from: usize,
-        to: usize,
-    ) -> Result<(), String> {
-        let session = self.browse_session()?;
-        edits::reorder_tracks(session, id, from, to).await
+    /// Best-effort eviction of a track's cached audio files, run off the
+    /// command loop. A failed load can leave (or find) a corrupt/truncated
+    /// cache entry — "end of stream" Symphonia failures — and evicting the
+    /// entry makes the next attempt a clean refetch. All file ids the track
+    /// exposes are removed (the player may have picked any format).
+    fn evict_track_audio_cache(&self, track_uri: SpotifyUri) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let Some(cache) = session.cache().cloned() else {
+            return;
+        };
+        let uri_text = track_uri.to_uri().unwrap_or_default();
+        tokio::spawn(async move {
+            let Ok(parsed) = SpotifyUri::from_uri(&uri_text) else {
+                return;
+            };
+            let Ok(track) = librespot_metadata::Track::get(&session, &parsed).await else {
+                return;
+            };
+            for file_id in track.files.values() {
+                if let Err(error) = cache.remove_file(*file_id) {
+                    eprintln!("could not evict cached audio file {file_id}: {error}");
+                }
+            }
+        });
     }
 
     pub fn on_player_signal(&mut self, signal: PlayerSignal) -> bool {
@@ -1022,6 +978,13 @@ impl Engine {
             } if self.is_current_event(play_request_id, &track_id) => {
                 self.state.playing = false;
                 self.state.error = Some(format!("Spotify track is unavailable: {track_id}"));
+                // A failed load may be a corrupt/truncated audio-cache entry
+                // (Symphonia "end of stream"): evict every cached file for
+                // this track so the next attempt refetches cleanly. librespot
+                // already removes-and-refetches once for cached open
+                // failures; this extends the same cleanup to any load
+                // failure the engine observes.
+                self.evict_track_audio_cache(track_id);
                 true
             }
             PlayerEvent::Stopped {

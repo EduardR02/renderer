@@ -47,8 +47,22 @@ constexpr COLORREF kAccent = RGB(0x4D, 0xC9, 0x73);
 constexpr COLORREF kAccentHot = RGB(0x65, 0xD8, 0x87);
 constexpr COLORREF kAccentText = RGB(0x08, 0x17, 0x0D);
 constexpr COLORREF kSelect = RGB(0x25, 0x28, 0x2C);
+constexpr COLORREF kActiveRow = RGB(0x17, 0x27, 0x1C);
 constexpr COLORREF kTrack = RGB(0x43, 0x46, 0x4B);
 constexpr wchar_t kHotProp[] = L"SRO.ControlHot";
+constexpr wchar_t kEditFocusProp[] = L"SRO.EditFocus";
+// Backdrop color behind a subclassed edit (the parent surface its rounded
+// corners blend into), set at creation via SetPropW.
+constexpr wchar_t kEditBackdropProp[] = L"SRO.EditBackdrop";
+
+// Windows hides focus indicators until the user navigates with the keyboard
+// (SPI_GETKEYBOARDCUES, the same mechanism UxTheme uses). Focus rings on
+// buttons, sliders, and list rows follow it so mouse users never see them.
+bool KeyboardCuesEnabled() {
+  BOOL cues = FALSE;
+  return ::SystemParametersInfoW(SPI_GETKEYBOARDCUES, 0, &cues, 0) != FALSE &&
+         cues != FALSE;
+}
 
 // Antialiased GDI+ replacements for GDI region/pen primitives. GDI+ draws
 // with real antialiasing, so rounded fills and 1px borders stay smooth at
@@ -183,7 +197,10 @@ struct CoverCtx {
 // go (same margins, same vertical centering). Enter in the main search box
 // submits through the search button — the same path as clicking it. The rail
 // filter already applies per keystroke, so Enter there falls through to the
-// default edit behavior.
+// default edit behavior. The boxes themselves are pills (rounded outline on
+// the outer rect, accent while focused) painted entirely in WM_NCPAINT; the
+// app's message loop must not let IsDialogMessage consume Enter before it
+// reaches this subclass (see SearchEnterBypassesDialogNavigation).
 
 // Vertical inset per side for the client rect of a tall single-line edit.
 // Native single-line edits anchor their text, caret, and cue banner to a
@@ -234,21 +251,52 @@ LRESULT CALLBACK EditSubclass(HWND control, UINT message, WPARAM wparam,
     return 0;
   }
   if (message == WM_NCPAINT) {
-    // The shrunken client leaves non-client bands above and below the text
-    // line inside the border; fill them with the edit background so the box
-    // stays a solid color, then let the default proc draw the border.
+    // The whole window rect (border + the non-client bands above and below
+    // the centered text line) is painted as a smooth pill: backdrop color
+    // behind the rounded corners, then the edit fill and a 1px outline that
+    // turns accent while the box has focus. No default border is drawn, so
+    // the outline is exactly this pill.
     RECT window{};
     ::GetWindowRect(control, &window);
+    const int width = window.right - window.left;
+    const int height = window.bottom - window.top;
     HDC dc = ::GetWindowDC(control);
-    RECT rc{0, 0, window.right - window.left, window.bottom - window.top};
-    HBRUSH background = ::CreateSolidBrush(kEdit);
-    ::FillRect(dc, &rc, background);
-    ::DeleteObject(background);
+    COLORREF backdrop = kPanel;
+    HANDLE backdropProp = ::GetPropW(control, kEditBackdropProp);
+    if (backdropProp)
+      backdrop = static_cast<COLORREF>(reinterpret_cast<INT_PTR>(backdropProp));
+    RECT full{0, 0, width, height};
+    HBRUSH backdropBrush = ::CreateSolidBrush(backdrop);
+    ::FillRect(dc, &full, backdropBrush);
+    ::DeleteObject(backdropBrush);
+    const bool focused = ::GetPropW(control, kEditFocusProp) != nullptr;
+    const int radius = std::min(width, height) / 2;
+    RECT pill{1, 1, width - 1, height - 1};
+    {
+      Gdiplus::Graphics graphics(dc);
+      FillRoundedRectGp(graphics, pill, radius, kEdit);
+      StrokeRoundedRectGp(graphics, pill, radius,
+                          focused ? kAccent : kBorder, 1.0f);
+    }
     ::ReleaseDC(control, dc);
-    return ::DefWindowProcW(control, message, wparam, lparam);
+    return 0;
   }
-  if (message == WM_NCDESTROY)
+  if (message == WM_SETFOCUS || message == WM_KILLFOCUS) {
+    if (message == WM_SETFOCUS)
+      ::SetPropW(control, kEditFocusProp, reinterpret_cast<HANDLE>(1));
+    else
+      ::RemovePropW(control, kEditFocusProp);
+    // Focus changes the pill outline (non-client), which InvalidateRect
+    // alone never repaints.
+    ::RedrawWindow(control, nullptr, nullptr,
+                   RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN);
+    return 0;
+  }
+  if (message == WM_NCDESTROY) {
+    ::RemovePropW(control, kEditFocusProp);
+    ::RemovePropW(control, kEditBackdropProp);
     ::RemoveWindowSubclass(control, EditSubclass, 1);
+  }
   return ::DefSubclassProc(control, message, wparam, lparam);
 }
 
@@ -397,6 +445,51 @@ LRESULT CALLBACK ListSubclass(HWND control, UINT message, WPARAM wparam, LPARAM 
   return ::DefSubclassProc(control, message, wparam, lparam);
 }
 
+// The playlist rail is an owner-draw listbox; hover state (like the song
+// lists) uses the same track-mouse/leave pattern, but hit testing goes
+// through LB_ITEMFROMPOINT, not LVM_HITTEST. The rail scrolls smoothly
+// because the listbox is double-buffered (WS_EX_COMPOSITED, the listbox
+// counterpart of the song lists' LVS_EX_DOUBLEBUFFER).
+LRESULT CALLBACK RailListSubclass(HWND control, UINT message, WPARAM wparam,
+                                  LPARAM lparam, UINT_PTR, DWORD_PTR) {
+  if (message == WM_MOUSEMOVE) {
+    POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+    LONG hit = static_cast<LONG>(
+        ::SendMessageW(control, LB_ITEMFROMPOINT, 0,
+                       reinterpret_cast<LPARAM>(&pt)));
+    // HIWORD is nonzero when the point is outside the client area; a
+    // missing item (LB_ERR) also reads as LOWORD == 0xFFFF.
+    const LONG low = hit & 0xFFFF;
+    int index = (hit & 0xFFFF0000) || low == 0xFFFF
+                    ? -1
+                    : static_cast<int>(low);
+    int previous = static_cast<int>(
+        reinterpret_cast<INT_PTR>(::GetPropW(control, kListHoverProp))) - 1;
+    if (index != previous) {
+      ::SetPropW(control, kListHoverProp,
+                 reinterpret_cast<HANDLE>(static_cast<INT_PTR>(index + 1)));
+      auto invalidateRow = [control](int row) {
+        if (row < 0) return;
+        RECT rc{};
+        if (::SendMessageW(control, LB_GETITEMRECT, row,
+                           reinterpret_cast<LPARAM>(&rc)) != LB_ERR)
+          ::InvalidateRect(control, &rc, FALSE);
+      };
+      invalidateRow(previous);
+      invalidateRow(index);
+    }
+    TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, control, 0};
+    ::TrackMouseEvent(&track);
+  } else if (message == WM_MOUSELEAVE) {
+    ::RemovePropW(control, kListHoverProp);
+    ::InvalidateRect(control, nullptr, FALSE);
+  } else if (message == WM_NCDESTROY) {
+    ::RemovePropW(control, kListHoverProp);
+    ::RemoveWindowSubclass(control, RailListSubclass, 1);
+  }
+  return ::DefSubclassProc(control, message, wparam, lparam);
+}
+
 struct SliderContext {
   int minimum = 0;
   int maximum = 100;
@@ -502,8 +595,10 @@ LRESULT CALLBACK SliderProc(HWND control, UINT message, WPARAM wparam, LPARAM lp
       int next = context->position;
       if (wparam == VK_LEFT || wparam == VK_DOWN) next -= step;
       else if (wparam == VK_RIGHT || wparam == VK_UP) next += step;
-      else if (wparam == VK_PRIOR) next += std::max(1, span / 10);
-      else if (wparam == VK_NEXT) next -= std::max(1, span / 10);
+      // Horizontal sliders: Page Up moves toward the minimum, Page Down
+      // toward the maximum (the old mapping was backwards).
+      else if (wparam == VK_PRIOR) next -= std::max(1, span / 10);
+      else if (wparam == VK_NEXT) next += std::max(1, span / 10);
       else if (wparam == VK_HOME) next = context->minimum;
       else if (wparam == VK_END) next = context->maximum;
       else return ::DefWindowProcW(control, message, wparam, lparam);
@@ -515,8 +610,8 @@ LRESULT CALLBACK SliderProc(HWND control, UINT message, WPARAM wparam, LPARAM lp
     }
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
-      // Focus changes nothing visually on sliders (no outline by design);
-      // fall through so focus state itself is still processed.
+      // The focus ring below appears/disappears with keyboard focus.
+      ::InvalidateRect(control, nullptr, FALSE);
       return ::DefWindowProcW(control, message, wparam, lparam);
     case WM_ENABLE:
       ::InvalidateRect(control, nullptr, FALSE);
@@ -555,6 +650,12 @@ LRESULT CALLBACK SliderProc(HWND control, UINT message, WPARAM wparam, LPARAM lp
                    thumbX + thumbRadius + 1, centerY + thumbRadius + 1};
         FillEllipseGp(graphics, thumb,
                       ::IsWindowEnabled(control) ? kText : kDisabled);
+        if (::GetFocus() == control && KeyboardCuesEnabled()) {
+          RECT focus{1, 1, rect.right - 1, rect.bottom - 1};
+          StrokeRoundedRectGp(graphics, focus,
+                              std::max(6, ::MulDiv(8, dpi, 96)), kAccent,
+                              1.0f);
+        }
       }
       ::EndPaint(control, &paint);
       return 0;
@@ -711,6 +812,10 @@ std::optional<std::wstring> MainWindow::PromptText(HWND owner, const std::wstrin
       WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
       scale(22), scale(46), width - scale(60), scale(40), dialog, nullptr, hinst_,
       nullptr);
+  // The prompt dialog paints kPanel; the pill's rounded corners blend into
+  // that same color.
+  ::SetPropW(context.edit, kEditBackdropProp,
+             reinterpret_cast<HANDLE>(static_cast<INT_PTR>(kPanel)));
   ::SendMessageW(context.edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                  MAKELPARAM(scale(10), scale(10)));
   context.accept = ::CreateWindowExW(
@@ -957,7 +1062,7 @@ void MainWindow::RebuildPlaylistRail() {
       selectedRow = static_cast<int>(i);
   ::SendMessageW(playlistList_, LB_SETCURSEL, selectedRow, 0);
   ::SendMessageW(playlistList_, WM_SETREDRAW, TRUE, 0);
-  ::InvalidateRect(playlistList_, nullptr, TRUE);
+  ::InvalidateRect(playlistList_, nullptr, FALSE);
   // Fetch covers for the visible playlists through the existing artwork
   // machinery; rows fall back to seeded tiles until art arrives. Dedup via
   // the same requested-set as the track lists.
@@ -1065,9 +1170,9 @@ void MainWindow::UpdateWorkspaceHeader() {
     else
       meta += std::to_wstring(minutes) + L" min";
   }
-  ::SetWindowTextW(workspaceTypeLbl_, type.c_str());
-  ::SetWindowTextW(middleLabel_, workspaceTitle_.c_str());
-  ::SetWindowTextW(workspaceMetaLbl_, meta.c_str());
+  SetTextIfChanged(workspaceTypeLbl_, type.c_str());
+  SetTextIfChanged(middleLabel_, workspaceTitle_.c_str());
+  SetTextIfChanged(workspaceMetaLbl_, meta.c_str());
   const BOOL playlist = collectionKind_ == CollectionKind::Playlist;
   ::ShowWindow(renPlBtn_,
                workspaceKind_ == WorkspaceKind::Collection && playlist
@@ -1093,7 +1198,7 @@ void MainWindow::UpdateWorkspaceArtwork(const std::string& url) {
         context->img = found->second->Clone();
     }
   }
-  ::InvalidateRect(workspaceCover_, nullptr, TRUE);
+  ::InvalidateRect(workspaceCover_, nullptr, FALSE);
   if (app_ && !url.empty() && (!context || !context->img))
     app_->OnTrackArtworkNeeded(url);
 }
@@ -1146,13 +1251,17 @@ void MainWindow::CreateChildren() {
     ::SetWindowSubclass(list, ListSubclass, 1, 0);
     return list;
   };
-  auto makeEdit = [this](int id) {
+  auto makeEdit = [this](int id, COLORREF backdrop) {
     HWND edit = ::CreateWindowExW(
         0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_BORDER |
             ES_AUTOHSCROLL,
         0, 0, 10, 10, hwnd_,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hinst_, nullptr);
+    // The pill's rounded corners blend into this backdrop color (the parent
+    // surface behind the box).
+    ::SetPropW(edit, kEditBackdropProp,
+               reinterpret_cast<HANDLE>(static_cast<INT_PTR>(backdrop)));
     // Interior margins must scale with DPI so typed text lines up with the
     // cue banner (both are rendered by the edit control itself).
     int margin = ::MulDiv(12, dpi_, 96);
@@ -1170,19 +1279,23 @@ void MainWindow::CreateChildren() {
 
   brandLbl_ = makeStatic(L"SpotifyRenderer", CID_BRAND);
   libraryGroupLbl_ = makeStatic(L"YOUR LIBRARY", CID_LIBRARY_GROUP);
-  playlistFilterEdit_ = makeEdit(CID_PLAYLIST_FILTER);
+  playlistFilterEdit_ = makeEdit(CID_PLAYLIST_FILTER, kSidebar);
   playlistList_ = ::CreateWindowExW(
-      0, L"LISTBOX", L"",
+      WS_EX_COMPOSITED, L"LISTBOX", L"",
       WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_VSCROLL |
           LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS |
           LBS_NOINTEGRALHEIGHT,
       0, 0, 10, 10, hwnd_,
       reinterpret_cast<HMENU>(static_cast<INT_PTR>(CID_PLAYLIST_LIST)), hinst_,
       nullptr);
+  // WS_EX_COMPOSITED double-buffers the rail (the listbox counterpart of the
+  // song lists' LVS_EX_DOUBLEBUFFER): wheel scrolling repaints rows into a
+  // memory DC instead of flashing the sidebar behind them.
+  ::SetWindowSubclass(playlistList_, RailListSubclass, 1, 0);
   newPlBtn_ = makeButton(L"Create playlist", CID_NEWPL_BTN);
   settingsBtn_ = makeButton(L"Settings", CID_SETTINGS_BTN);
 
-  searchEdit_ = makeEdit(CID_SEARCH_EDIT);
+  searchEdit_ = makeEdit(CID_SEARCH_EDIT, kBg);
   searchBtn_ = makeButton(L"Search", CID_SEARCH_BTN);
   resultsLabel_ = makeStatic(L"SEARCH RESULTS", CID_RESULTS_LABEL);
   resultsList_ = makeList(CID_RESULTS_LIST);
@@ -1311,6 +1424,31 @@ void MainWindow::CreateChildren() {
   SetDarkTheme();
   SetPlayback({});
   UpdateWorkspaceHeader();
+  ArrangeTabOrder();
+}
+
+// Child z-order doubles as IsDialogMessage's tab order, and controls are
+// created in paint-first order, so the default sequence jumps from the rail
+// to the transport and lands on Back only after the volume slider. Reorder z
+// so Tab walks the visible layout top-to-bottom, left-to-right: top bar
+// (search), rail, collection header/actions, track list, transport, then
+// Settings session controls. Layout keeps siblings apart (no overlap), so
+// the reorder is paint-neutral.
+void MainWindow::ArrangeTabOrder() {
+  HWND order[] = {
+      searchEdit_,   searchBtn_,    playlistFilterEdit_, playlistList_,
+      newPlBtn_,     settingsBtn_,  backBtn_,            renPlBtn_,
+      delPlBtn_,     tracksList_,   seekBar_,            shuffleBtn_,
+      prevBtn_,      playBtn_,      nextBtn_,            repeatBtn_,
+      volumeBar_,    loginBtn_,     logoutBtn_};
+  HWND previous = HWND_TOP;
+  for (HWND control : order) {
+    if (!control) continue;
+    ::SetWindowPos(control, previous, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                       SWP_NOOWNERZORDER | SWP_NOREDRAW);
+    previous = control;
+  }
 }
 
 void MainWindow::Layout() {
@@ -1321,8 +1459,20 @@ void MainWindow::Layout() {
   const int height = client.bottom;
   auto scale = [this](int value) { return ::MulDiv(value, dpi_, 96); };
   auto move = [](HWND control, int x, int y, int w, int h) {
-    if (control)
-      ::MoveWindow(control, x, y, std::max(0, w), std::max(0, h), TRUE);
+    if (!control) return;
+    // Layout runs on every workspace switch and WM_SIZE (including resize
+    // drags); skipping windows whose geometry did not change avoids the
+    // synchronous per-control repaint storm that flickered the seek bar and
+    // the rail on unrelated updates.
+    RECT current{};
+    if (!::GetWindowRect(control, &current)) return;
+    HWND parent = ::GetParent(control);
+    POINT origin{current.left, current.top};
+    if (parent) ::ScreenToClient(parent, &origin);
+    if (origin.x == x && origin.y == y &&
+        current.right - current.left == w && current.bottom - current.top == h)
+      return;
+    ::MoveWindow(control, x, y, std::max(0, w), std::max(0, h), TRUE);
   };
 
   const int sidebarWidth = scale(238);
@@ -1492,16 +1642,13 @@ void MainWindow::Layout() {
   ::SendMessageW(tracksList_, LVM_SETCOLUMNWIDTH, 0,
                  std::max(0, static_cast<int>(listRect.right) - scale(8)));
   // Parent invalidation never repaints children, so controls whose visual
-  // state can change without their text/size changing (owner-drawn icon
-  // buttons, custom sliders) are invalidated explicitly here. This is what
-  // repaints the transport buttons after a startup enable flip and the
-  // playlist header buttons on a workspace switch.
-  HWND repaintNow[] = {newPlBtn_, renPlBtn_, delPlBtn_, prevBtn_, playBtn_,
-                       nextBtn_, shuffleBtn_, repeatBtn_, seekBar_,
-                       volumeBar_};
-  for (HWND control : repaintNow)
-    if (control) ::InvalidateRect(control, nullptr, FALSE);
-  ::InvalidateRect(hwnd_, nullptr, TRUE);
+  // state can change without their text/size changing are invalidated
+  // explicitly here. The transport buttons and sliders repaint through
+  // SetPlayback's change tracking; only the settings button's active
+  // highlight flips purely on a workspace switch. (Moving/hiding children
+  // invalidates the parent background regions they vacate automatically, so
+  // no full-window invalidate is needed.)
+  if (settingsBtn_) ::InvalidateRect(settingsBtn_, nullptr, FALSE);
 }
 
 LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
@@ -1512,18 +1659,32 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
     if (draw->itemID == static_cast<UINT>(-1)) return TRUE;
     const bool selected = (draw->itemState & ODS_SELECTED) != 0;
     const bool disabled = (draw->itemState & ODS_DISABLED) != 0;
-    HBRUSH background =
-        ::CreateSolidBrush(selected ? kSelect : kSidebar);
-    ::FillRect(draw->hDC, &draw->rcItem, background);
-    ::DeleteObject(background);
+    const int hover = DecodeHoverIndex(reinterpret_cast<INT_PTR>(
+        ::GetPropW(draw->hwndItem, kListHoverProp)));
+    const bool hot = hover == static_cast<int>(draw->itemID);
     auto scale = [this](int value) { return ::MulDiv(value, dpi_, 96); };
+    // Full-row base in the sidebar color, then a rounded highlight for the
+    // selected (kSelect) and hovered (kControl) rows so the rail matches the
+    // song lists' pill aesthetic instead of a hard full-width band.
+    HBRUSH base = ::CreateSolidBrush(kSidebar);
+    ::FillRect(draw->hDC, &draw->rcItem, base);
+    ::DeleteObject(base);
+    if (selected || hot) {
+      RECT highlight = draw->rcItem;
+      ::InflateRect(&highlight, -scale(3), -scale(3));
+      Gdiplus::Graphics graphics(draw->hDC);
+      FillRoundedRectGp(graphics, highlight, scale(8),
+                        selected ? kSelect : kControl);
+    }
     RECT iconRect = draw->rcItem;
-    iconRect.left += scale(2);
+    iconRect.left += scale(6);
     iconRect.right = iconRect.left + scale(32);
+    const COLORREF rowForeground =
+        disabled ? kDisabled : (selected || hot ? kText : kDim);
     if (draw->itemID == 0) {
       // The Queue entry is not a playlist; it keeps its library glyph.
       DrawFluentIcon(draw->hDC, iconRect, fontIcon16_,
-                     selected ? kAccent : kDim, FluentIcon::Queue);
+                     selected ? kAccent : rowForeground, FluentIcon::Queue);
     } else {
       // Playlist rows show the playlist cover art from the shared artwork
       // cache; until art arrives (or when a playlist has none) a seeded tile
@@ -1565,23 +1726,22 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
           graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
           FillRoundedRectGp(graphics, iconRect, scale(6), tile);
         }
-        DrawFluentIcon(draw->hDC, iconRect, fontIcon16_,
-                       selected ? kText : kDim, FluentIcon::Playlist);
+        DrawFluentIcon(draw->hDC, iconRect, fontIcon16_, rowForeground,
+                       FluentIcon::Playlist);
       }
     }
     wchar_t text[512] = {};
     ::SendMessageW(draw->hwndItem, LB_GETTEXT, draw->itemID,
                    reinterpret_cast<LPARAM>(text));
     RECT textRect = draw->rcItem;
-    textRect.left += scale(38);
+    textRect.left += scale(44);
     textRect.right -= scale(8);
     ::SetBkMode(draw->hDC, TRANSPARENT);
-    ::SetTextColor(draw->hDC,
-                   disabled ? kDisabled : (selected ? kText : kDim));
+    ::SetTextColor(draw->hDC, rowForeground);
     ::DrawTextW(draw->hDC, text, -1, &textRect,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
                     DT_NOPREFIX);
-    if (draw->itemState & ODS_FOCUS) {
+    if ((draw->itemState & ODS_FOCUS) && KeyboardCuesEnabled()) {
       RECT focus = draw->rcItem;
       ::InflateRect(&focus, -scale(2), -scale(2));
       ::DrawFocusRect(draw->hDC, &focus);
@@ -1633,6 +1793,10 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
     background = hot ? kControlHot : kControl;
   }
   if (pushed && !disabled) background = active ? kControl : kPanel;
+  // The focused button's outline turns accent (matching the edit pills);
+  // only while keyboard cues are on, so plain mouse use never shows rings.
+  const bool focused =
+      !disabled && ::GetFocus() == draw->hwndItem && KeyboardCuesEnabled();
   int radius = ::MulDiv(icon ? 18 : 8, dpi_, 96);
   if (icon) {
     // Icon buttons are circular: clamp the radius to half the smaller side
@@ -1655,10 +1819,11 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
     Gdiplus::Graphics graphics(draw->hDC);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     FillRoundedRectGp(graphics, draw->rcItem, radius, background);
-    if (draw->CtlID != CID_PLAY_BTN) {
+    if (draw->CtlID != CID_PLAY_BTN || focused) {
       graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
       StrokeRoundedRectGp(graphics, draw->rcItem, radius,
-                          disabled ? kBorderSoft : kBorder, 1.0f);
+                          focused ? kAccent : (disabled ? kBorderSoft : kBorder),
+                          1.0f);
     }
   }
   COLORREF foreground =
@@ -1769,6 +1934,18 @@ const ListRow* MainWindow::RowAt(HWND list, int index) const {
   return &rows[index];
 }
 
+void MainWindow::InvalidateRowsForUri(HWND list,
+                                      const std::vector<ListRow>& rows,
+                                      const std::string& uri) {
+  if (!list || uri.empty()) return;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    if (!RowMatchesCurrentUri(rows[i], uri)) continue;
+    RECT row{};
+    if (ListView_GetItemRect(list, static_cast<int>(i), &row, LVIR_BOUNDS))
+      ::InvalidateRect(list, &row, FALSE);
+  }
+}
+
 COLORREF MainWindow::ButtonBaseColor(HWND control) const {
   if (!hwnd_ || !control) return kPanel;
   RECT parent{};
@@ -1799,7 +1976,7 @@ void MainWindow::SetListMessage(HWND list, const std::wstring& title,
   ::SendMessageW(list, LVM_DELETEALLITEMS, 0, 0);
   std::wstring accessible = title + L". " + detail;
   ::SetWindowTextW(list, accessible.c_str());
-  ::InvalidateRect(list, nullptr, TRUE);
+  ::InvalidateRect(list, nullptr, FALSE);
 }
 
 void MainWindow::BeginNestedCollection(CollectionKind kind,
@@ -1908,7 +2085,8 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
           FillRoundedRectGp(graphics, glyph, scale(12), kControl);
         }
         DrawFluentIcon(dc, glyph, fontIcon24_, kAccent,
-                       FluentIcon::Queue);
+                       list == resultsList_ ? FluentIcon::Search
+                                            : FluentIcon::Queue);
         RECT titleRect{client.left + scale(18), glyph.bottom + scale(10),
                        client.right - scale(18), glyph.bottom + scale(32)};
         HGDIOBJ oldFont = ::SelectObject(dc, fontRowTitle_);
@@ -1942,12 +2120,19 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
     UINT itemState =
         ListView_GetItemState(list, index, LVIS_SELECTED | LVIS_FOCUSED);
     bool selected = (itemState & LVIS_SELECTED) != 0;
-    bool focused = (itemState & LVIS_FOCUSED) != 0;
+    // LVIS_FOCUSED sticks to the row after the list loses focus; the accent
+    // outline is a keyboard indicator, so it shows only while the list
+    // actually has focus (and keyboard cues are on).
+    bool focused = (itemState & LVIS_FOCUSED) != 0 &&
+                   ::GetFocus() == list && KeyboardCuesEnabled();
     int hover = DecodeHoverIndex(
         reinterpret_cast<INT_PTR>(::GetPropW(list, kListHoverProp)));
     bool hot = hover == index;
-    HBRUSH background =
-        ::CreateSolidBrush(selected ? kSelect : (hot ? kControl : kPanel));
+    // The row of the engine's current track is highlighted independently of
+    // the selection: it follows playback (next/prev/shuffle), not clicks.
+    const bool active = RowMatchesCurrentUri(*row, playback_.current_uri);
+    HBRUSH background = ::CreateSolidBrush(
+        active ? kActiveRow : (selected ? kSelect : (hot ? kControl : kPanel)));
     ::FillRect(dc, &item, background);
     ::DeleteObject(background);
 
@@ -1956,7 +2141,7 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
     HBRUSH separatorBrush = ::CreateSolidBrush(kBorderSoft);
     ::FillRect(dc, &separator, separatorBrush);
     ::DeleteObject(separatorBrush);
-    if (selected) {
+    if (selected || active) {
       RECT accent{item.left, item.top + scale(7), item.left + scale(3),
                   item.bottom - scale(7)};
       HBRUSH accentBrush = ::CreateSolidBrush(kAccent);
@@ -2002,11 +2187,14 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
         FillRoundedRectGp(graphics, artworkRect, scale(7), tile);
       }
       DrawFluentIcon(dc, artworkRect, fontIcon24_,
-                     selected ? kText : kDim, FluentIcon::Album);
+                     active ? kAccent : (selected ? kText : kDim),
+                     FluentIcon::Album);
     }
 
     // Hover-revealed play button overlaid on the artwork tile for tracks.
-    // Clicking the tile plays the row's context from this index.
+    // On the row of the current track it reflects playback (pause glyph
+    // while playing) and clicking it toggles pause/resume instead of
+    // restarting the context.
     if (row->kind == ListRowKind::Track && hot) {
       const int buttonSize = std::max(26, scale(30));
       RECT play{(artworkRect.left + artworkRect.right - buttonSize) / 2,
@@ -2018,7 +2206,10 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         FillEllipseGp(graphics, play, kAccent);
       }
-      DrawFluentIcon(dc, play, fontIcon16_, kAccentText, FluentIcon::Play);
+      const FluentIcon glyph =
+          active ? (playback_.playing ? FluentIcon::Pause : FluentIcon::Play)
+                 : FluentIcon::Play;
+      DrawFluentIcon(dc, play, fontIcon16_, kAccentText, glyph);
     }
 
     const bool track = row->kind == ListRowKind::Track;
@@ -2030,14 +2221,14 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
         track ? scale(kRowDurationWidthDip) : 0;
     ::SetBkMode(dc, TRANSPARENT);
     HGDIOBJ oldFont = ::SelectObject(dc, fontSmall_);
-    ::SetTextColor(dc, selected ? kText : kDim);
+    ::SetTextColor(dc, active ? kAccent : (selected ? kText : kDim));
     RECT eyebrow{textLeft, item.top + scale(5), textRight,
                  item.top + scale(18)};
     ::DrawTextW(dc, row->eyebrow.c_str(), -1, &eyebrow,
                 DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
     ::SelectObject(dc, fontRowTitle_);
-    ::SetTextColor(dc, kText);
+    ::SetTextColor(dc, active ? kAccent : kText);
     RECT title{textLeft, item.top + scale(17),
                textRight - durationWidth - (durationWidth ? scale(12) : 0),
                item.top + scale(39)};
@@ -2048,16 +2239,18 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
       RECT duration{textRight - durationWidth, item.top + scale(17), textRight,
                     item.top + scale(39)};
       ::SelectObject(dc, fontList_);
-      ::SetTextColor(dc, selected ? kText : kDim);
+      ::SetTextColor(dc, active ? kAccent : (selected ? kText : kDim));
       ::DrawTextW(dc, row->duration.c_str(), -1, &duration,
                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
       RECT overflow{actionLeft, item.top, item.right, item.bottom};
-      ::SetTextColor(dc, selected || hot ? kText : kDim);
+      ::SetTextColor(dc, active ? kAccent
+                                : (selected || hot ? kText : kDim));
       DrawFluentIcon(dc, overflow, fontIcon16_,
-                     selected || hot ? kText : kDim, FluentIcon::More);
+                     active ? kAccent : (selected || hot ? kText : kDim),
+                     FluentIcon::More);
     }
     ::SelectObject(dc, fontList_);
-    ::SetTextColor(dc, selected || hot ? kText : kDim);
+    ::SetTextColor(dc, active ? kAccent : (selected || hot ? kText : kDim));
     RECT detail{textLeft, item.top + scale(40), textRight,
                 item.bottom - scale(5)};
     ::DrawTextW(dc, row->detail.c_str(), -1, &detail,
@@ -2085,14 +2278,19 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
         if (row->kind == ListRowKind::Track &&
             RowTileHit(click->ptAction.x, click->ptAction.y, item.left,
                        item.top, static_cast<int>(dpi_))) {
-          // Same activation path as double-click / Enter: play the full
-          // context starting at this row. The flag keeps the follow-up
-          // NM_DBLCLK from replaying the same row.
+          // The flag keeps the follow-up NM_DBLCLK from replaying the same
+          // row. Clicking the current track's tile toggles pause/resume
+          // (its glyph shows pause while playing); any other row plays the
+          // full context starting at this row.
           suppressNextDoubleActivate_ = true;
           ListView_SetItemState(list, click->iItem,
                                 LVIS_SELECTED | LVIS_FOCUSED,
                                 LVIS_SELECTED | LVIS_FOCUSED);
-          ActivateSelection(list);
+          if (RowMatchesCurrentUri(*row, playback_.current_uri)) {
+            if (app_) app_->OnTogglePlay();
+          } else {
+            ActivateSelection(list);
+          }
           return 0;
         }
       } else {
@@ -2261,7 +2459,7 @@ LRESULT CALLBACK MainWindow::CoverProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
       }
       free(path);
-      ::InvalidateRect(h, nullptr, TRUE);
+      ::InvalidateRect(h, nullptr, FALSE);
       return 0;
     }
     case WM_PAINT: {
@@ -2530,6 +2728,11 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
           self->app_->OnTrayShow();
           return 0;
         case IDM_TRAY_SETTINGS:
+          // The window may be hidden/minimized; show it before switching
+          // workspaces so the Settings page is actually visible.
+          self->Show(true);
+          ::ShowWindow(h, SW_RESTORE);
+          ::SetForegroundWindow(h);
           self->ShowWorkspace(WorkspaceKind::Settings);
           return 0;
         case IDM_TRAY_EXIT:
@@ -2675,7 +2878,7 @@ void MainWindow::FillList(HWND list, const std::vector<ListRow>& rows) {
                    reinterpret_cast<LPARAM>(&item));
   }
   ::SendMessageW(list, WM_SETREDRAW, TRUE, 0);
-  ::InvalidateRect(list, nullptr, TRUE);
+  ::InvalidateRect(list, nullptr, FALSE);
 }
 
 void MainWindow::SetSearchResults(const SearchResult& result) {
@@ -2809,9 +3012,21 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
   // timer-driven updates repaint controls only when their visuals change.
   const bool shuffleChanged = playback_.shuffle != playback.shuffle;
   const bool repeatChanged = playback_.repeat != playback.repeat;
+  const bool volumeChanged =
+      playback_.volume_percent != playback.volume_percent;
   const bool playingChanged = playback_.playing != playback.playing;
   const bool readyChanged = playback_.ready != playback.ready;
+  const bool uriChanged = playback_.current_uri != playback.current_uri;
+  const std::string previousUri = playback_.current_uri;
   playback_ = playback;
+  if (uriChanged) {
+    // The active-row highlight (and its pause toggle) follows the engine's
+    // current track; repaint only the rows it moved between, not the lists.
+    InvalidateRowsForUri(resultsList_, searchRows_, previousUri);
+    InvalidateRowsForUri(tracksList_, middleRows_, previousUri);
+    InvalidateRowsForUri(resultsList_, searchRows_, playback_.current_uri);
+    InvalidateRowsForUri(tracksList_, middleRows_, playback_.current_uri);
+  }
   const TrackRef* track = nullptr;
   if (playback.current_index >= 0 &&
       playback.current_index < static_cast<int>(playback.queue.size()))
@@ -2830,9 +3045,9 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
     ::SetWindowTextW(shuffleBtn_,
                      playback.shuffle ? L"Shuffle on" : L"Shuffle off");
     ::InvalidateRect(shuffleBtn_, nullptr, FALSE);
+    SetTooltipText(shuffleBtn_, playback.shuffle ? L"Shuffle: on"
+                                                 : L"Shuffle: off");
   }
-  SetTooltipText(shuffleBtn_, playback.shuffle ? L"Shuffle: on"
-                                               : L"Shuffle: off");
   std::wstring repeat = L"Repeat off";
   std::wstring repeatTip = L"Repeat: off";
   if (playback.repeat == "context") {
@@ -2846,15 +3061,23 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
   if (repeatChanged) {
     ::SetWindowTextW(repeatBtn_, repeat.c_str());
     ::InvalidateRect(repeatBtn_, nullptr, FALSE);
+    SetTooltipText(repeatBtn_, repeatTip);
   }
-  SetTooltipText(repeatBtn_, repeatTip);
 
   const BOOL available = playback.ready ? TRUE : FALSE;
-  ::EnableWindow(prevBtn_, available);
-  ::EnableWindow(playBtn_, available);
-  ::EnableWindow(nextBtn_, available);
-  ::EnableWindow(shuffleBtn_, available);
-  ::EnableWindow(repeatBtn_, available);
+  // EnableWindow on an already-enabled/disabled window still repaints the
+  // control, and this runs on every engine state event and 4 Hz position
+  // tick — flip only real changes so transport and sliders stop repainting
+  // in an invalidate storm.
+  auto setEnabled = [](HWND control, BOOL enabled) {
+    if (control && ::IsWindowEnabled(control) != enabled)
+      ::EnableWindow(control, enabled);
+  };
+  setEnabled(prevBtn_, available);
+  setEnabled(playBtn_, available);
+  setEnabled(nextBtn_, available);
+  setEnabled(shuffleBtn_, available);
+  setEnabled(repeatBtn_, available);
   // EnableWindow only repaints a button while the window is visible; an
   // enable flip that happens before the first Show (startup, or an engine
   // state event during teardown) leaves the stale disabled rendering on
@@ -2869,8 +3092,8 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
   // Session controls: Log in exactly when the engine publishes a fresh
   // authorize URL, Log out while a session is live (both disabled while a
   // flow is in flight, so no double-submit).
-  ::EnableWindow(loginBtn_, LoginButtonEnabled(playback) ? TRUE : FALSE);
-  ::EnableWindow(logoutBtn_, LogoutButtonEnabled(playback) ? TRUE : FALSE);
+  setEnabled(loginBtn_, LoginButtonEnabled(playback) ? TRUE : FALSE);
+  setEnabled(logoutBtn_, LogoutButtonEnabled(playback) ? TRUE : FALSE);
   if (playingChanged) {
     ::SetWindowTextW(playBtn_, playback.playing ? L"Pause" : L"Play");
     ::InvalidateRect(playBtn_, nullptr, FALSE);
@@ -2884,20 +3107,37 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
   ::SendMessageW(seekBar_, TBM_SETRANGEMAX, TRUE, std::max(1, duration));
   if (!seekDragging_)
     ::SendMessageW(seekBar_, TBM_SETPOS, TRUE, position);
-  ::EnableWindow(seekBar_, playback.ready && duration > 0);
+  setEnabled(seekBar_, playback.ready && duration > 0);
   if (!seekDragging_)
     SetTextIfChanged(elapsedLbl_, FormatTime(position).c_str());
   SetTextIfChanged(durationLbl_, FormatTime(duration).c_str());
 
-  ::EnableWindow(volumeBar_, available);
+  setEnabled(volumeBar_, available);
   if (!volumeDragging_) {
     const int volume = std::clamp(playback.volume_percent, 0, 100);
     ::SendMessageW(volumeBar_, TBM_SETPOS, TRUE, volume);
     SetTextIfChanged(volumeLbl_,
                      (std::to_wstring(volume) + L"%").c_str());
-    SetTooltipText(volumeBar_, L"Playback volume: " +
-                                   std::to_wstring(volume) + L"%");
+    if (volumeChanged)
+      SetTooltipText(volumeBar_, L"Playback volume: " +
+                                     std::to_wstring(volume) + L"%");
   }
+}
+
+void MainWindow::SetPlaybackPosition(int64_t positionMs) {
+  if (!hwnd_ || !seekBar_ || !elapsedLbl_) return;
+  playback_.position_ms = positionMs;
+  if (seekDragging_) return;
+  const int duration = static_cast<int>(std::clamp<int64_t>(
+      playback_.duration_ms, 0, std::numeric_limits<int>::max()));
+  const int position = static_cast<int>(
+      std::clamp<int64_t>(positionMs, 0, static_cast<int64_t>(duration)));
+  ::SendMessageW(seekBar_, TBM_SETPOS, TRUE, position);
+  SetTextIfChanged(elapsedLbl_, FormatTime(position).c_str());
+}
+
+void MainWindow::FocusSearch() {
+  if (searchEdit_) ::SetFocus(searchEdit_);
 }
 
 void MainWindow::SetStatus(const std::wstring& text) {

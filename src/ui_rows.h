@@ -25,6 +25,10 @@ struct ListRow {
   std::wstring accessibleText;
   uint32_t artworkSeed = 0;
   std::string artworkUrl;
+  // Spotify uri of the underlying item; used to match the engine's
+  // current_uri so the playing row can be highlighted and its play button
+  // can toggle pause/resume.
+  std::string uri;
 };
 
 // Row geometry in DIPs, shared by painting and hit testing.
@@ -84,6 +88,7 @@ inline ListRow MakeTrackRow(const TrackRef& track, size_t ordinal = 0) {
                        album + L". Duration: " + row.duration;
   row.artworkUrl = track.cover_url;
   row.artworkSeed = RowArtworkSeed(row.artworkUrl, row.title);
+  row.uri = track.uri;
   return row;
 }
 
@@ -98,6 +103,7 @@ inline ListRow MakeAlbumRow(const AlbumRef& album) {
   row.accessibleText = row.title + L". Album by " + artists;
   row.artworkUrl = album.cover_url;
   row.artworkSeed = RowArtworkSeed(row.artworkUrl, row.title);
+  row.uri = album.uri;
   return row;
 }
 
@@ -110,6 +116,7 @@ inline ListRow MakeArtistRow(const ArtistRef& artist) {
   row.accessibleText = row.title + L". Artist. Open artist page.";
   row.artworkUrl = artist.cover_url;
   row.artworkSeed = RowArtworkSeed(row.artworkUrl, row.title);
+  row.uri = artist.uri;
   return row;
 }
 
@@ -193,6 +200,31 @@ inline std::string RailRowArtworkUrl(
   const PlaylistRef* playlist =
       RailPlaylistForRow(playlists, filteredPlaylistIndices, rowIndex);
   return playlist ? playlist->cover_url : std::string();
+}
+
+// True when the row is the engine's current track: it must be a track row
+// (albums/artists never highlight as playing) with a non-empty uri matching
+// current_uri. This is the single decision point for the active-row
+// highlight AND the row play button (toggle pause/resume instead of
+// restarting the context).
+inline bool RowMatchesCurrentUri(const ListRow& row,
+                                 const std::string& currentUri) {
+  return row.kind == ListRowKind::Track && !currentUri.empty() &&
+         !row.uri.empty() && row.uri == currentUri;
+}
+
+// The main window's message loop runs every key through IsDialogMessageW for
+// dialog-style navigation (Tab, arrows). IsDialogMessage consumes VK_RETURN
+// even though the main window has no default pushbutton, so Enter typed in
+// the search box never reaches the edit's own subclass, which is what routes
+// it to the Search button (the same WM_COMMAND as clicking it). Messages for
+// which this returns true must skip dialog navigation and go straight to
+// TranslateMessage/DispatchMessage.
+inline bool SearchEnterBypassesDialogNavigation(const MSG& message) {
+  return message.message == WM_KEYDOWN && message.wParam == VK_RETURN &&
+         message.hwnd != nullptr &&
+         EditRoleForControl(static_cast<int>(::GetDlgCtrlID(message.hwnd))) ==
+             EditRole::Search;
 }
 
 }  // namespace sr

@@ -28,6 +28,10 @@ class MainWindow {
   HWND hwnd() const { return hwnd_; }
   void SetSearchResults(const SearchResult& result);
   void SetPlayback(const PlaybackEngineState& playback);
+  // Timer-driven position projection: updates only the seek bar and elapsed
+  // label without copying the whole playback state (queue included) at 4 Hz.
+  void SetPlaybackPosition(int64_t positionMs);
+  void FocusSearch();
   void SetEngineStatus(const std::wstring& text);
   void SetCacheUsage(const std::wstring& text);
   void Show(bool show);
@@ -74,6 +78,7 @@ class MainWindow {
   };
 
   void CreateChildren();
+  void ArrangeTabOrder();
   void Layout();
   void ApplyFonts();
   void SetDarkTheme();
@@ -96,6 +101,11 @@ class MainWindow {
   void SetControlGroupVisible(const std::vector<HWND>& controls, bool visible);
   void ActivateSelection(HWND list);
   void RequestArtwork(const std::vector<ListRow>& rows);
+  // Repaints every row of `list` whose uri matches, so the active-row
+  // highlight (and its pause toggle) follows the engine's current track
+  // without repainting the whole list.
+  void InvalidateRowsForUri(HWND list, const std::vector<ListRow>& rows,
+                            const std::string& uri);
   const ListRow* RowAt(HWND list, int index) const;
   COLORREF ButtonBaseColor(HWND control) const;
 

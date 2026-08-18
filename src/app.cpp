@@ -324,6 +324,18 @@ int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
     return 2;
   }
   hwnd_ = window_.hwnd();
+  // The handlers (IDC_ACC_*) already exist in WM_COMMAND; without the table
+  // the accelerators were dead. Ctrl+F focuses search, Ctrl+N creates a
+  // playlist, F5 refreshes, and the media key toggles play/pause (no
+  // modifier, so nothing fires while typing in the edits).
+  ACCEL accelerators[] = {
+      {FVIRTKEY | FCONTROL, 'F', IDC_ACC_SEARCH},
+      {FVIRTKEY | FCONTROL, 'N', IDC_ACC_NEW_PLAYLIST},
+      {FVIRTKEY, VK_F5, IDC_ACC_REFRESH},
+      {FVIRTKEY, VK_MEDIA_PLAY_PAUSE, IDC_ACC_PLAY_PAUSE},
+  };
+  accelerators_ = ::CreateAcceleratorTableW(
+      accelerators, static_cast<int>(_countof(accelerators)));
   tray_.Create(hwnd_, L"SpotifyRenderer — local engine starting");
   if (options_.demo) {
     window_.SetDemo();
@@ -335,6 +347,7 @@ int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
   window_.Show(true);
   ::ShowWindow(hwnd_, options_.smoke ? SW_SHOWNOACTIVATE : show);
   ::UpdateWindow(hwnd_);
+  if (!options_.smoke) window_.FocusSearch();
   StartTimers();
   if (options_.smoke || options_.demo)
     LOG_INFO(std::string("isolated ") +
@@ -345,6 +358,12 @@ int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
   while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
     if ((!accelerators_ ||
          !::TranslateAcceleratorW(hwnd_, accelerators_, &message)) &&
+        // IsDialogMessage consumes VK_RETURN even though the main window has
+        // no default pushbutton, which would swallow Enter typed in the
+        // search box before the edit's subclass can submit it (the same
+        // WM_COMMAND as clicking Search). Send those keys straight to the
+        // edit instead; all other dialog navigation is unchanged.
+        !SearchEnterBypassesDialogNavigation(message) &&
         !::IsDialogMessageW(hwnd_, &message)) {
       ::TranslateMessage(&message);
       ::DispatchMessageW(&message);
@@ -411,6 +430,10 @@ void Application::Shutdown() {
   shutting_down_ = true;
   engine_restart_pending_ = false;
   StopTimers();
+  if (accelerators_) {
+    ::DestroyAcceleratorTable(accelerators_);
+    accelerators_ = nullptr;
+  }
   delayed_api_tasks_.Clear();
   artwork_tasks_.DiscardPending();
   api_tasks_.Stop();
@@ -1552,7 +1575,9 @@ void Application::OnTimer(UINT id) {
       projector_.Current(::GetTickCount64(), playback_.duration_ms);
   if (projected != playback_.position_ms) {
     playback_.position_ms = projected;
-    UpdatePlaybackUi();
+    // Position-only path: no full playback-state copy (the queue alone is
+    // hundreds of strings) on every 250 ms tick.
+    window_.SetPlaybackPosition(projected);
   }
 }
 

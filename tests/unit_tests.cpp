@@ -243,6 +243,30 @@ TEST_CASE("track list cache entries go stale after their ttl") {
   CHECK(cache.Size() == 0);  // stale entry evicted on access
 }
 
+TEST_CASE("track list cache revisits serve the identical playlist content") {
+  // The browse_playlist flow keys the cache as "p:"+id; a revisit after the
+  // first fetch must resolve from the cache with the exact tracks and edit
+  // revision, without any engine round-trip.
+  TrackListCache cache(20, std::chrono::minutes(10));
+  CachedTrackList fetched{std::vector<TrackRef>{ExampleTrack(), ExampleTrack()},
+                          "revision-1"};
+  cache.Put("p:0123456789ABCDEFGHIJKL", fetched);
+  CachedTrackList revisit;
+  REQUIRE(cache.Get("p:0123456789ABCDEFGHIJKL", &revisit));
+  CHECK(revisit.snapshot_id == "revision-1");
+  REQUIRE(revisit.tracks.size() == fetched.tracks.size());
+  for (size_t i = 0; i < fetched.tracks.size(); ++i) {
+    CHECK(revisit.tracks[i].id == fetched.tracks[i].id);
+    CHECK(revisit.tracks[i].name == fetched.tracks[i].name);
+    CHECK(revisit.tracks[i].uri == fetched.tracks[i].uri);
+  }
+  // Album revisits use their own key namespace.
+  cache.Put("a:album-id", fetched);
+  CachedTrackList albumRevisit;
+  REQUIRE(cache.Get("a:album-id", &albumRevisit));
+  CHECK(albumRevisit.tracks.size() == 2);
+}
+
 TEST_CASE("track list cache invalidate and clear drop entries") {
   TrackListCache cache(4, std::chrono::minutes(10));
   CachedTrackList list{std::vector<TrackRef>{ExampleTrack()}, ""};
@@ -307,6 +331,45 @@ TEST_CASE("ui rows: track rows carry ordinal eyebrow and formatted duration") {
   CHECK(empty.title == L"Untitled track");
   CHECK(empty.duration == L"—");
   CHECK(empty.detail == L"Unknown artist  ·  Unknown album");
+}
+
+TEST_CASE("ui rows: row factories carry the item uri for playback matching") {
+  // The active-row highlight and the row play button (pause toggle) match on
+  // uri, so every row kind must expose the uri of the item it renders.
+  TrackRef track = ExampleTrack();
+  CHECK(MakeTrackRow(track).uri == track.uri);
+  AlbumRef album;
+  album.uri = "spotify:album:xyz";
+  CHECK(MakeAlbumRow(album).uri == "spotify:album:xyz");
+  ArtistRef artist;
+  artist.uri = "spotify:artist:xyz";
+  CHECK(MakeArtistRow(artist).uri == "spotify:artist:xyz");
+}
+
+TEST_CASE("ui rows: active row matches the engine current uri only for track rows") {
+  TrackRef track = ExampleTrack();
+  const ListRow trackRow = MakeTrackRow(track);
+  CHECK(RowMatchesCurrentUri(trackRow, track.uri));
+
+  // A different track or no current track never highlights the row.
+  CHECK_FALSE(RowMatchesCurrentUri(trackRow, ""));
+  CHECK_FALSE(RowMatchesCurrentUri(trackRow, "spotify:track:other"));
+  TrackRef other = ExampleTrack();
+  other.uri = "spotify:track:other";
+  CHECK_FALSE(RowMatchesCurrentUri(MakeTrackRow(other), track.uri));
+
+  // Albums and artists never highlight as playing even with a matching uri.
+  AlbumRef album;
+  album.uri = track.uri;
+  CHECK_FALSE(RowMatchesCurrentUri(MakeAlbumRow(album), track.uri));
+  ArtistRef artist;
+  artist.uri = track.uri;
+  CHECK_FALSE(RowMatchesCurrentUri(MakeArtistRow(artist), track.uri));
+
+  // Rows without a uri (unresolvable track) can never be the current track.
+  TrackRef missingUri = ExampleTrack();
+  missingUri.uri.clear();
+  CHECK_FALSE(RowMatchesCurrentUri(MakeTrackRow(missingUri), track.uri));
 }
 
 TEST_CASE("ui rows: album and artist rows keep stable kinds and artwork") {
@@ -614,6 +677,63 @@ TEST_CASE("ui rows: search enter routing targets only the main search edit") {
   CHECK(EditRoleForControl(999) == EditRole::Other);
   CHECK(EditRoleForControl(kSearchEditControlId + 1) == EditRole::Other);
   CHECK_FALSE(EditRoleForControl(kPlaylistFilterEditControlId) == EditRole::Search);
+}
+
+TEST_CASE("ui rows: search-enter bypasses dialog navigation only for the search edit") {
+  // The main window's IsDialogMessage consumes VK_RETURN even without a
+  // default pushbutton; the loop must send Enter straight to the search
+  // edit's subclass (which routes it to the Search button). Every other
+  // message keeps the normal dialog-navigation path.
+  MSG message{};
+  message.message = WM_KEYDOWN;
+  message.wParam = VK_RETURN;
+  CHECK_FALSE(SearchEnterBypassesDialogNavigation(message));  // no hwnd
+
+  const wchar_t* className = L"SROEnterRoutingTestWnd";
+  WNDCLASSEXW wc{};
+  wc.cbSize = sizeof(wc);
+  wc.lpfnWndProc = ::DefWindowProcW;
+  wc.hInstance = ::GetModuleHandleW(nullptr);
+  wc.lpszClassName = className;
+  ::RegisterClassExW(&wc);
+  HWND parent = ::CreateWindowExW(0, className, L"", WS_OVERLAPPEDWINDOW,
+                                  0, 0, 200, 200, nullptr, nullptr,
+                                  wc.hInstance, nullptr);
+  REQUIRE(parent != nullptr);
+  auto makeEdit = [&](int id) {
+    return ::CreateWindowExW(
+        0, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 100, 24,
+        parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+        wc.hInstance, nullptr);
+  };
+  HWND searchEdit = makeEdit(kSearchEditControlId);
+  HWND filterEdit = makeEdit(kPlaylistFilterEditControlId);
+  REQUIRE(searchEdit != nullptr);
+  REQUIRE(filterEdit != nullptr);
+
+  MSG enter{};
+  enter.hwnd = searchEdit;
+  enter.message = WM_KEYDOWN;
+  enter.wParam = VK_RETURN;
+  CHECK(SearchEnterBypassesDialogNavigation(enter));
+
+  // The rail filter's Enter is left to the default edit behavior.
+  enter.hwnd = filterEdit;
+  CHECK_FALSE(SearchEnterBypassesDialogNavigation(enter));
+
+  // Only the VK_RETURN keydown is routed; chars and other keys are not.
+  enter.hwnd = searchEdit;
+  enter.message = WM_CHAR;
+  CHECK_FALSE(SearchEnterBypassesDialogNavigation(enter));
+  enter.message = WM_KEYDOWN;
+  enter.wParam = VK_SPACE;
+  CHECK_FALSE(SearchEnterBypassesDialogNavigation(enter));
+
+  ::DestroyWindow(searchEdit);
+  ::DestroyWindow(filterEdit);
+  ::DestroyWindow(parent);
+  ::UnregisterClassW(className, wc.hInstance);
 }
 
 TEST_CASE("needs_login state events map the authorize URL") {

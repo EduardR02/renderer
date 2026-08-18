@@ -15,12 +15,47 @@ use engine::{AuthSignal, Engine, PlayerSignal};
 use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
-use protocol::{Command, Response};
+use protocol::{AlbumBrowse, ArtistBrowse, Command, PlaylistBrowse, PlaylistRef, Response, SearchBrowse};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 const AUDIO_CACHE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 const POSITION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A completed network round-trip (browse or playlist edit) produced off the
+/// command loop. The loop turns it into a protocol response; request ids are
+/// correlated by the UI, so out-of-order completion is safe.
+enum BrowseOutcome {
+    Playlists {
+        request_id: String,
+        result: Result<Vec<PlaylistRef>, String>,
+    },
+    Playlist {
+        request_id: String,
+        result: Result<PlaylistBrowse, String>,
+    },
+    Album {
+        request_id: String,
+        result: Result<AlbumBrowse, String>,
+    },
+    Artist {
+        request_id: String,
+        result: Result<ArtistBrowse, String>,
+    },
+    Search {
+        request_id: String,
+        result: Result<SearchBrowse, String>,
+    },
+    CreatePlaylist {
+        request_id: String,
+        result: Result<PlaylistRef, String>,
+    },
+    VoidEdit {
+        request_id: String,
+        kind: &'static str,
+        result: Result<(), String>,
+    },
+}
 
 /// Audio fetch tuning at engine startup (before any playback):
 /// `read_ahead_during_playback` shrinks the streaming buffer from the
@@ -100,6 +135,7 @@ async fn run(
     let (input_sender, mut input_receiver) = mpsc::unbounded_channel();
     let (auth_sender, mut auth_receiver) = mpsc::unbounded_channel::<AuthSignal>();
     let (player_sender, mut player_receiver) = mpsc::unbounded_channel::<PlayerSignal>();
+    let (browse_sender, mut browse_receiver) = mpsc::unbounded_channel::<BrowseOutcome>();
     io::spawn_input_reader(input_sender);
 
     configure_audio_fetch();
@@ -129,49 +165,168 @@ async fn run(
                                 engine.shutdown();
                                 break;
                             }
+                            // Browse and edit commands run their network work
+                            // off the loop: the session clone is handed to a
+                            // spawned task whose outcome is dispatched from
+                            // the browse_receiver arm below. Playback
+                            // commands (volume/pause/seek/next/previous)
+                            // therefore stay prompt even while a slow browse
+                            // is in flight. When no session is available the
+                            // error is answered immediately through the same
+                            // outcome channel.
                             Command::BrowsePlaylists { length } => {
-                                let result = engine.browse_playlists(length).await;
-                                engine.send_browse_response(&request_id, "browse_playlists", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::playlists_browse(&session, length).await;
+                                            let _ = sender.send(BrowseOutcome::Playlists { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Playlists { request_id, result: Err(error) });
+                                    }
+                                }
                             }
                             Command::BrowsePlaylist { id } => {
-                                let result = engine.browse_playlist(&id).await;
-                                engine.send_browse_response(&request_id, "browse_playlist", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::playlist_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::Playlist { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Playlist { request_id, result: Err(error) });
+                                    }
+                                }
                             }
                             Command::BrowseAlbum { id } => {
-                                let result = engine.browse_album(&id).await;
-                                engine.send_browse_response(&request_id, "browse_album", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::album_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::Album { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Album { request_id, result: Err(error) });
+                                    }
+                                }
                             }
                             Command::BrowseArtist { id } => {
-                                let result = engine.browse_artist(&id).await;
-                                engine.send_browse_response(&request_id, "browse_artist", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::artist_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::Artist { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Artist { request_id, result: Err(error) });
+                                    }
+                                }
                             }
                             Command::BrowseSearch { query, limit } => {
-                                let result = engine.browse_search(&query, limit).await;
-                                engine.send_browse_response(&request_id, "browse_search", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::search_browse(&session, &query, limit).await;
+                                            let _ = sender.send(BrowseOutcome::Search { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Search { request_id, result: Err(error) });
+                                    }
+                                }
                             }
                             Command::EditCreatePlaylist { name } => {
-                                let result = engine.edit_create_playlist(&name).await;
-                                engine.send_browse_response(&request_id, "edit_create_playlist", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = edits::create_playlist(&session, &name).await;
+                                            let _ = sender.send(BrowseOutcome::CreatePlaylist { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::CreatePlaylist { request_id, result: Err(error) });
+                                    }
+                                }
                             }
                             Command::EditRenamePlaylist { id, name } => {
-                                let result = engine.edit_rename_playlist(&id, &name).await;
-                                engine.send_edit_response(&request_id, "edit_rename_playlist", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = edits::rename_playlist(&session, &id, &name).await;
+                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_rename_playlist", result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_rename_playlist", result: Err(error) });
+                                    }
+                                }
                             }
                             Command::EditDeletePlaylist { id } => {
-                                let result = engine.edit_delete_playlist(&id).await;
-                                engine.send_edit_response(&request_id, "edit_delete_playlist", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = edits::delete_playlist(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_delete_playlist", result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_delete_playlist", result: Err(error) });
+                                    }
+                                }
                             }
                             Command::EditAddPlaylistTracks { id, uris } => {
-                                let result = engine.edit_add_playlist_tracks(&id, &uris).await;
-                                engine.send_edit_response(&request_id, "edit_add_playlist_tracks", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = edits::add_tracks(&session, &id, &uris).await;
+                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_add_playlist_tracks", result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_add_playlist_tracks", result: Err(error) });
+                                    }
+                                }
                             }
                             Command::EditRemovePlaylistTracks { id, uris } => {
-                                let result = engine.edit_remove_playlist_tracks(&id, &uris).await;
-                                engine.send_edit_response(&request_id, "edit_remove_playlist_tracks", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = edits::remove_tracks(&session, &id, &uris).await;
+                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_remove_playlist_tracks", result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_remove_playlist_tracks", result: Err(error) });
+                                    }
+                                }
                             }
                             Command::EditReorderPlaylistTracks { id, from, to } => {
-                                let result = engine.edit_reorder_playlist_tracks(&id, from, to).await;
-                                engine.send_edit_response(&request_id, "edit_reorder_playlist_tracks", &result)?;
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = edits::reorder_tracks(&session, &id, from, to).await;
+                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_reorder_playlist_tracks", result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_reorder_playlist_tracks", result: Err(error) });
+                                    }
+                                }
                             }
                             command => {
                                 let result = engine.process_command(command, &auth_sender).await;
@@ -210,6 +365,33 @@ async fn run(
                     }
                 }
             }
+            outcome = browse_receiver.recv() => {
+                if let Some(outcome) = outcome {
+                    match outcome {
+                        BrowseOutcome::Playlists { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_playlists", &result)?;
+                        }
+                        BrowseOutcome::Playlist { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_playlist", &result)?;
+                        }
+                        BrowseOutcome::Album { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_album", &result)?;
+                        }
+                        BrowseOutcome::Artist { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_artist", &result)?;
+                        }
+                        BrowseOutcome::Search { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_search", &result)?;
+                        }
+                        BrowseOutcome::CreatePlaylist { request_id, result } => {
+                            engine.send_browse_response(&request_id, "edit_create_playlist", &result)?;
+                        }
+                        BrowseOutcome::VoidEdit { request_id, kind, result } => {
+                            engine.send_edit_response(&request_id, kind, &result)?;
+                        }
+                    }
+                }
+            }
             _ = position_heartbeat.tick() => {
                 if engine.tick_position() {
                     engine.emit_state()?;
@@ -231,6 +413,48 @@ fn parse_arguments(arguments: Vec<OsString>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Marker-file version of the audio cache layout. When the marker is absent
+/// or stale, every cached audio file is dropped once (a one-time cleanup of
+/// corrupt/truncated entries from earlier builds, which decode-fail with
+/// Symphonia "end of stream" and wedge next/prev/shuffle) and the new layout
+/// is recorded.
+const AUDIO_CACHE_VERSION: &str = "2";
+
+/// Brings the audio cache directory up to the current layout version: on a
+/// version change the directory is wiped (files and subdirectories) except
+/// for the marker itself, then the marker is (re)written. Idempotent and
+/// cheap on steady-state starts.
+fn version_audio_cache(state_directory: &std::path::Path) -> Result<(), String> {
+    let audio = state_directory.join("audio");
+    std::fs::create_dir_all(&audio)
+        .map_err(|error| format!("could not create audio cache directory: {error}"))?;
+    let marker = audio.join("cache-version");
+    let expected = format!("{AUDIO_CACHE_VERSION}\n");
+    if std::fs::read_to_string(&marker).ok().as_deref() != Some(expected.as_str()) {
+        for entry in std::fs::read_dir(&audio)
+            .map_err(|error| format!("could not read audio cache directory: {error}"))?
+            .flatten()
+        {
+            let path = entry.path();
+            if path == marker {
+                continue;
+            }
+            let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            let result = if is_directory {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if let Err(error) = result {
+                eprintln!("could not clear stale audio cache entry {}: {error}", path.display());
+            }
+        }
+        std::fs::write(&marker, expected)
+            .map_err(|error| format!("could not write the audio cache version marker: {error}"))?;
+    }
+    Ok(())
+}
+
 fn create_state(
     state_directory: &std::path::Path,
 ) -> Result<(Cache, PathBuf, PathBuf), String> {
@@ -242,6 +466,7 @@ fn create_state(
     let temporary = state_directory.join("tmp");
     std::fs::create_dir_all(&temporary)
         .map_err(|error| format!("could not create temporary directory: {error}"))?;
+    version_audio_cache(state_directory)?;
     let cache = Cache::new(
         Some(credentials),
         Some(volume),
@@ -255,4 +480,69 @@ fn create_state(
         .join("credentials")
         .join("credentials.json");
     Ok((cache, temporary, credentials_file))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    struct ScratchDir {
+        directory: PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "sr_engine_cache_test_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0)
+            ));
+            Self { directory }
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn audio_cache_version_bump_clears_stale_entries_once() {
+        let scratch = ScratchDir::new();
+        // An old build's layout: corrupt audio files plus a format
+        // subdirectory, and no version marker.
+        let audio = scratch.directory.join("audio");
+        fs::create_dir_all(audio.join("ab")).expect("fixture subdir");
+        fs::write(audio.join("ab").join("deadbeef"), b"truncated").expect("fixture file");
+        fs::write(audio.join("0123456789abcdef"), b"junk").expect("fixture file");
+
+        version_audio_cache(&scratch.directory).expect("version bump succeeds");
+        assert!(!audio.join("0123456789abcdef").exists(), "stale file cleared");
+        assert!(!audio.join("ab").exists(), "stale subdirectory cleared");
+        assert_eq!(
+            fs::read_to_string(audio.join("cache-version")).expect("marker written"),
+            format!("{AUDIO_CACHE_VERSION}\n")
+        );
+
+        // Steady state: a matching marker leaves new entries untouched.
+        fs::write(audio.join("fresh-entry"), b"data").expect("fresh entry");
+        version_audio_cache(&scratch.directory).expect("steady-state start");
+        assert!(audio.join("fresh-entry").exists(), "fresh entries survive");
+
+        // A later layout version clears everything again (one-time per bump).
+        fs::write(audio.join("cache-version"), "1\n").expect("stale marker");
+        version_audio_cache(&scratch.directory).expect("second bump");
+        assert!(!audio.join("fresh-entry").exists(), "old-layout entries cleared");
+        assert_eq!(
+            fs::read_to_string(audio.join("cache-version")).expect("marker rewritten"),
+            format!("{AUDIO_CACHE_VERSION}\n")
+        );
+    }
 }
