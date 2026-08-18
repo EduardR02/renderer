@@ -1,5 +1,7 @@
+mod audio;
 mod auth;
 mod browse;
+mod edits;
 mod engine;
 mod io;
 mod protocol;
@@ -11,6 +13,7 @@ use std::time::Duration;
 
 use engine::{AuthSignal, Engine, PlayerSignal};
 use io::{Input, ProtocolWriter};
+use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use protocol::{Command, Response};
 use tokio::sync::mpsc;
@@ -18,6 +21,26 @@ use tokio::time::MissedTickBehavior;
 
 const AUDIO_CACHE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 const POSITION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Audio fetch tuning at engine startup (before any playback):
+/// `read_ahead_during_playback` shrinks the streaming buffer from the
+/// 5-second default to 2 seconds so play/pause/seek feel immediate, at the
+/// cost of less jitter headroom; `download_timeout` drops from the
+/// 8-second default to 3 seconds so a stalled stream is detected and
+/// retried quickly instead of starving silently.
+const AUDIO_READ_AHEAD_DURING_PLAYBACK: Duration = Duration::from_secs(2);
+const AUDIO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn configure_audio_fetch() {
+    let params = AudioFetchParams {
+        read_ahead_during_playback: AUDIO_READ_AHEAD_DURING_PLAYBACK,
+        download_timeout: AUDIO_DOWNLOAD_TIMEOUT,
+        ..AudioFetchParams::default()
+    };
+    // The process sets this exactly once at startup; a second call (tests)
+    // is a no-op by design.
+    let _ = AudioFetchParams::set(params);
+}
 
 fn main() -> ExitCode {
     let state_directory = match parse_arguments(std::env::args_os().skip(1).collect()) {
@@ -79,6 +102,8 @@ async fn run(
     let (player_sender, mut player_receiver) = mpsc::unbounded_channel::<PlayerSignal>();
     io::spawn_input_reader(input_sender);
 
+    configure_audio_fetch();
+
     let mut engine = Engine::new(
         writer,
         cache,
@@ -124,14 +149,33 @@ async fn run(
                                 let result = engine.browse_search(&query, limit).await;
                                 engine.send_browse_response(&request_id, "browse_search", &result)?;
                             }
+                            Command::EditCreatePlaylist { name } => {
+                                let result = engine.edit_create_playlist(&name).await;
+                                engine.send_browse_response(&request_id, "edit_create_playlist", &result)?;
+                            }
+                            Command::EditRenamePlaylist { id, name } => {
+                                let result = engine.edit_rename_playlist(&id, &name).await;
+                                engine.send_edit_response(&request_id, "edit_rename_playlist", &result)?;
+                            }
+                            Command::EditDeletePlaylist { id } => {
+                                let result = engine.edit_delete_playlist(&id).await;
+                                engine.send_edit_response(&request_id, "edit_delete_playlist", &result)?;
+                            }
+                            Command::EditAddPlaylistTracks { id, uris } => {
+                                let result = engine.edit_add_playlist_tracks(&id, &uris).await;
+                                engine.send_edit_response(&request_id, "edit_add_playlist_tracks", &result)?;
+                            }
+                            Command::EditRemovePlaylistTracks { id, uris } => {
+                                let result = engine.edit_remove_playlist_tracks(&id, &uris).await;
+                                engine.send_edit_response(&request_id, "edit_remove_playlist_tracks", &result)?;
+                            }
+                            Command::EditReorderPlaylistTracks { id, from, to } => {
+                                let result = engine.edit_reorder_playlist_tracks(&id, from, to).await;
+                                engine.send_edit_response(&request_id, "edit_reorder_playlist_tracks", &result)?;
+                            }
                             command => {
-                                let mint_token = matches!(&command, Command::WebApiToken);
                                 let result = engine.process_command(command, &auth_sender).await;
-                                if mint_token {
-                                    engine.send_web_token_response(&request_id, &result)?;
-                                } else {
-                                    engine.send_response(&request_id, &result)?;
-                                }
+                                engine.send_response(&request_id, &result)?;
                                 if matches!(result, Ok(true)) {
                                     engine.emit_state()?;
                                 }

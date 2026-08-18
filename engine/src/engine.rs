@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use librespot_core::SpotifyUri;
 use librespot_core::cache::Cache;
@@ -12,27 +12,17 @@ use crate::auth::{
     prepare_oauth,
 };
 use crate::browse;
+use crate::edits;
 use crate::io::ProtocolWriter;
 use crate::protocol::{
     AlbumBrowse, ArtistBrowse, AuthState, BrowseResponse, Command, PlaylistBrowse, PlaylistRef,
-    RepeatMode, Response, SearchBrowse, StateEvent, TrackRef, WebApiTokenResponse,
+    RepeatMode, Response, SearchBrowse, StateEvent, TrackRef,
 };
 use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
 /// restart window (OnPrevious in app.cpp) so both sides agree.
 const PREVIOUS_RESTART_THRESHOLD_MS: u32 = 3_000;
-
-/// Web API tokens are refreshed this far ahead of their real expiry so a
-/// request issued near the boundary never races server-side revocation.
-const WEB_TOKEN_SKEW: Duration = Duration::from_secs(60);
-
-/// An engine-minted login5 token plus its local expiry anchor.
-struct CachedWebToken {
-    token_type: String,
-    access_token: String,
-    expires_at: Instant,
-}
 
 pub struct Engine {
     writer: ProtocolWriter,
@@ -57,9 +47,6 @@ pub struct Engine {
     /// `needs_login` state; `login` consumes it so the UI opens exactly the
     /// URL the flow listens for. Regenerated per attempt.
     pending_auth: Option<PendingAuth>,
-    /// Cached login5-minted Web API token, refreshed with skew by
-    /// [`Engine::web_api_token`].
-    web_token: Option<CachedWebToken>,
 }
 
 struct PlaybackState {
@@ -139,7 +126,6 @@ impl Engine {
             generation: 0,
             auth_running: false,
             pending_auth: None,
-            web_token: None,
         }
     }
 
@@ -350,9 +336,6 @@ impl Engine {
                 self.player = Some(handles.player);
                 self.mixer = Some(handles.mixer);
                 self.session = Some(handles.session);
-                // A new session must never serve tokens minted for the old
-                // one (the account may have changed); drop the cache.
-                self.web_token = None;
                 let mut events = handles.events;
                 tokio::spawn(async move {
                     while let Some(event) = events.recv().await {
@@ -389,9 +372,6 @@ impl Engine {
             }
             return Ok(true);
         }
-        if matches!(&command, Command::WebApiToken) {
-            return self.web_api_token().await;
-        }
         if matches!(&command, Command::Login) {
             return self.login(auth_sender);
         }
@@ -402,14 +382,19 @@ impl Engine {
         match command {
             Command::Status
             | Command::Shutdown
-            | Command::WebApiToken
             | Command::Login
             | Command::Logout
             | Command::BrowsePlaylists { .. }
             | Command::BrowsePlaylist { .. }
             | Command::BrowseAlbum { .. }
             | Command::BrowseArtist { .. }
-            | Command::BrowseSearch { .. } => unreachable!(),
+            | Command::BrowseSearch { .. }
+            | Command::EditCreatePlaylist { .. }
+            | Command::EditRenamePlaylist { .. }
+            | Command::EditDeletePlaylist { .. }
+            | Command::EditAddPlaylistTracks { .. }
+            | Command::EditRemovePlaylistTracks { .. }
+            | Command::EditReorderPlaylistTracks { .. } => unreachable!(),
             Command::PlayQueue {
                 queue,
                 index,
@@ -427,76 +412,6 @@ impl Engine {
             Command::RemoveQueue { index } => self.remove_queue(index),
             Command::MoveQueue { from, to } => self.move_queue(from, to),
         }
-    }
-
-    /// Serves the cached login5-minted Web API token, re-minting through
-    /// `session.login5().auth_token()` when the cached token is within
-    /// `WEB_TOKEN_SKEW` of expiry. The token itself is never logged; failure
-    /// messages carry only the login5 error text.
-    async fn web_api_token(&mut self) -> Result<bool, String> {
-        let now = Instant::now();
-        if let Some(cached) = &self.web_token {
-            if web_token_is_fresh(cached.expires_at, now) {
-                return Ok(true);
-            }
-        }
-        let session = self.session.as_ref().ok_or_else(|| match self.state.auth_state {
-            AuthState::Authenticating => "Spotify authentication is still in progress".to_owned(),
-            AuthState::NeedsLogin => {
-                "Spotify login is required; use the Log in button in Settings".to_owned()
-            }
-            AuthState::Error => self
-                .state
-                .error
-                .clone()
-                .unwrap_or_else(|| "Spotify authentication failed".to_owned()),
-            AuthState::Ready => "the Spotify session is unavailable".to_owned(),
-        })?;
-        let token = session
-            .login5()
-            .auth_token()
-            .await
-            .map_err(|error| format!("could not mint a Spotify Web API token: {error}"))?;
-        self.web_token = Some(CachedWebToken {
-            token_type: token.token_type,
-            access_token: token.access_token,
-            expires_at: now + token.expires_in,
-        });
-        Ok(true)
-    }
-
-    /// Payload for a successful `web_api_token` response: the cached token
-    /// plus the skew-adjusted remaining lifetime in seconds (never zero).
-    pub fn web_token_payload(&self) -> Option<(&str, &str, u64)> {
-        self.web_token.as_ref().map(|cached| {
-            (
-                cached.token_type.as_str(),
-                cached.access_token.as_str(),
-                web_token_expires_in(cached.expires_at, Instant::now()),
-            )
-        })
-    }
-
-    /// Sends the dedicated `web_api_token` response: token fields only on
-    /// success, error text only on failure.
-    pub fn send_web_token_response(
-        &self,
-        request_id: &str,
-        result: &Result<bool, String>,
-    ) -> Result<(), String> {
-        let (token_type, access_token, expires_in) = match (result, self.web_token_payload()) {
-            (Ok(_), Some(payload)) => (Some(payload.0), Some(payload.1), Some(payload.2)),
-            _ => (None, None, None),
-        };
-        self.writer.send(&WebApiTokenResponse {
-            kind: "web_api_token",
-            request_id,
-            ok: result.is_ok(),
-            error: result.as_ref().err().map(String::as_str),
-            token_type,
-            access_token,
-            expires_in,
-        })
     }
 
     pub fn send_response(
@@ -531,6 +446,28 @@ impl Engine {
             ok,
             error,
             data,
+        })
+    }
+
+    /// Sends an `edit_*` response for a void edit: `ok`/`error` only, with
+    /// no `data` payload on success (the UI routes these like browse
+    /// responses but has nothing to parse).
+    pub fn send_edit_response(
+        &self,
+        request_id: &str,
+        kind: &'static str,
+        result: &Result<(), String>,
+    ) -> Result<(), String> {
+        let (ok, error) = match result {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error.as_str())),
+        };
+        self.writer.send(&BrowseResponse::<()> {
+            kind,
+            request_id,
+            ok,
+            error,
+            data: None,
         })
     }
 
@@ -574,6 +511,51 @@ impl Engine {
     pub async fn browse_search(&mut self, query: &str, limit: usize) -> Result<SearchBrowse, String> {
         let session = self.browse_session()?;
         browse::search_browse(session, query, limit).await
+    }
+
+    /// Playlist edits run on the same spclient session as browsing; like
+    /// browse commands they need no player.
+    pub async fn edit_create_playlist(&mut self, name: &str) -> Result<PlaylistRef, String> {
+        let session = self.browse_session()?;
+        edits::create_playlist(session, name).await
+    }
+
+    pub async fn edit_rename_playlist(&mut self, id: &str, name: &str) -> Result<(), String> {
+        let session = self.browse_session()?;
+        edits::rename_playlist(session, id, name).await
+    }
+
+    pub async fn edit_delete_playlist(&mut self, id: &str) -> Result<(), String> {
+        let session = self.browse_session()?;
+        edits::delete_playlist(session, id).await
+    }
+
+    pub async fn edit_add_playlist_tracks(
+        &mut self,
+        id: &str,
+        uris: &[String],
+    ) -> Result<(), String> {
+        let session = self.browse_session()?;
+        edits::add_tracks(session, id, uris).await
+    }
+
+    pub async fn edit_remove_playlist_tracks(
+        &mut self,
+        id: &str,
+        uris: &[String],
+    ) -> Result<(), String> {
+        let session = self.browse_session()?;
+        edits::remove_tracks(session, id, uris).await
+    }
+
+    pub async fn edit_reorder_playlist_tracks(
+        &mut self,
+        id: &str,
+        from: usize,
+        to: usize,
+    ) -> Result<(), String> {
+        let session = self.browse_session()?;
+        edits::reorder_tracks(session, id, from, to).await
     }
 
     pub fn on_player_signal(&mut self, signal: PlayerSignal) -> bool {
@@ -1072,30 +1054,11 @@ impl Engine {
         }
         self.play_request_id = None;
         self.mixer = None;
-        self.web_token = None;
         if let Some(session) = self.session.take() {
             session.shutdown();
         }
     }
 }
-
-/// A cached token is still safe to serve when its remaining lifetime exceeds
-/// the skew, so the consumer always receives a token that outlives a slow
-/// request.
-fn web_token_is_fresh(expires_at: Instant, now: Instant) -> bool {
-    now + WEB_TOKEN_SKEW < expires_at
-}
-
-/// Skew-adjusted remaining lifetime reported to the UI in seconds. Never
-/// zero, so a just-minted short-lived token still counts as usable.
-fn web_token_expires_in(expires_at: Instant, now: Instant) -> u64 {
-    expires_at
-        .saturating_duration_since(now)
-        .saturating_sub(WEB_TOKEN_SKEW)
-        .as_secs()
-        .max(1)
-}
-
 
 fn parse_track_uri(track: &TrackRef) -> Result<SpotifyUri, String> {
     let uri = SpotifyUri::from_uri(&track.uri)
@@ -1136,14 +1099,14 @@ fn remap_current_index_after_move(current: usize, from: usize, to: usize) -> usi
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
 
     use librespot_core::SpotifyUri;
     use librespot_playback::player::PlayerEvent;
     use super::{
-        remap_current_index_after_move, sequential_next_index, web_token_expires_in,
-        web_token_is_fresh, AuthSignal, Engine, PlaybackState, PlayerSignal,
+        remap_current_index_after_move, sequential_next_index, AuthSignal, Engine, PlaybackState,
+        PlayerSignal,
     };
     use crate::io::ProtocolWriter;
     use crate::protocol::{RepeatMode, TrackRef};
@@ -1372,29 +1335,6 @@ mod tests {
         assert_eq!(remap_current_index_after_move(2, 4, 1), 3);
         assert_eq!(remap_current_index_after_move(2, 0, 1), 2);
         assert_eq!(remap_current_index_after_move(2, 3, 4), 2);
-    }
-
-    #[test]
-    fn web_token_cache_serves_only_tokens_that_outlive_the_skew() {
-        let expires_at = Instant::now() + Duration::from_secs(120);
-        assert!(web_token_is_fresh(expires_at, Instant::now()));
-        assert!(!web_token_is_fresh(
-            expires_at,
-            Instant::now() + Duration::from_secs(61)
-        ));
-    }
-
-    #[test]
-    fn web_token_lifetime_applies_skew_and_never_reports_zero() {
-        let now = Instant::now();
-        assert_eq!(
-            web_token_expires_in(now + Duration::from_secs(3600), now),
-            3600 - 60
-        );
-        // A token already inside the skew window (which would trigger a
-        // re-mint) still reports a positive lifetime rather than zero.
-        assert_eq!(web_token_expires_in(now + Duration::from_secs(30), now), 1);
-        assert_eq!(web_token_expires_in(now + Duration::from_secs(61), now), 1);
     }
 
     /// A scratch state directory with a `credentials.json` already written

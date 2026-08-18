@@ -112,9 +112,6 @@ class DelayedTaskQueue {
   NowFn now_;
 };
 
-// Rate-limit (429/503) auto-retry cap per API task: bounded so a persistent
-// limit can never spin forever; the final failure is shown to the user.
-inline constexpr int kMaxApiRetries = 3;
 // Playlist-library fetch size for the engine browse_playlists round-trip.
 inline constexpr int kPlaylistFetchLength = 500;
 
@@ -233,15 +230,7 @@ class Application {
   void StartTimers();
   void StopTimers();
 
-  std::string GetAccessToken();
-  bool RefreshToken(int timeoutMs = 20000);
-  void HandleApiError(const std::string& message, int status, int retryAfter,
-                      const std::wstring& context);
-  // Retryable-error handling + startup orchestration (RateLimitFix wave):
-  // bounded 429/503 auto-retry with visible status, lazy paced playlist
-  // pagination, and the on-disk playlist library cache. Engine protocol,
-  // token minting, and the Settings login/logout surface are owned by the
-  // LoginLogout wave; do not overlap those members.
+  void HandleApiError(const std::string& message, const std::wstring& context);
   void ScheduleDelayedApiTask(int delaySeconds, std::function<void()> task);
   bool LoadPlaylistCache();
   void SavePlaylistCache();
@@ -284,10 +273,6 @@ class Application {
   HINSTANCE instance_ = nullptr;
   HWND hwnd_ = nullptr;
   HACCEL accelerators_ = nullptr;
-  std::optional<WebApiTokenProvider> web_token_;
-
-  std::shared_ptr<HttpClient> api_http_;
-  std::unique_ptr<SpotifyApi> api_;
   PlaybackEngineClient engine_;
   PlaybackEngineState playback_;
   PositionProjector projector_;
@@ -319,74 +304,29 @@ class Application {
 
   template <typename T>
   void PostTask(std::function<T()> work, std::function<void(T)> onSuccess,
-                std::function<void(std::string, int, int)> onError);
-  // Bounded 429/503 auto-retry variant; see definition below.
-  template <typename T>
-  void PostTaskWithRetries(std::function<T()> work,
-                           std::function<void(T)> onSuccess,
-                           std::function<void(std::string, int, int)> onError,
-                           int retriesLeft);
+                std::function<void(std::string)> onError);
 };
 
+// Runs `work` on the serial API queue (engine browse/edit round-trips are
+// blocking, so they never run on the UI thread) and delivers the result or
+// the error text on the UI thread.
 template <typename T>
 void Application::PostTask(std::function<T()> work,
                            std::function<void(T)> onSuccess,
-                           std::function<void(std::string, int, int)> onError) {
-  if (options_.smoke || options_.demo || !api_) return;
-  PostTaskWithRetries(std::move(work), std::move(onSuccess), std::move(onError),
-                      kMaxApiRetries);
-}
-
-// Runs `work` on the serial API queue. Retryable rate limits (429/503, the
-// response was rejected so re-running is safe) are retried up to `retriesLeft`
-// times with exponential backoff honoring Retry-After; each wait is visible
-// as a status line and does not block the queue. After the cap, or for any
-// other failure, the error is delivered to `onError` on the UI thread.
-template <typename T>
-void Application::PostTaskWithRetries(
-    std::function<T()> work, std::function<void(T)> onSuccess,
-    std::function<void(std::string, int, int)> onError, int retriesLeft) {
+                           std::function<void(std::string)> onError) {
+  if (options_.smoke || options_.demo) return;
   api_tasks_.Post([this, work = std::move(work), onSuccess = std::move(onSuccess),
-                   onError = std::move(onError), retriesLeft]() mutable {
+                   onError = std::move(onError)]() mutable {
     try {
       T result = work();
       PostUi([onSuccess = std::move(onSuccess),
               result = std::move(result)]() mutable {
         onSuccess(std::move(result));
       });
-    } catch (const ApiError& error) {
-      const std::string message = error.what();
-      const int status = error.status;
-      const int retryAfter = error.retry_after;
-      if ((status == 429 || status == 503) && retriesLeft > 0 &&
-          !shutting_down_) {
-        const int wait = static_cast<int>(
-            ComputeBackoffDelay(kMaxApiRetries - retriesLeft, retryAfter));
-        PostUi([this, work = std::move(work), onSuccess = std::move(onSuccess),
-                onError = std::move(onError), message, wait,
-                retriesLeft]() mutable {
-          window_.SetStatus(
-              L"Spotify is rate-limiting requests — retrying automatically "
-              L"in " +
-              std::to_wstring(wait) + L" s.");
-          ScheduleDelayedApiTask(
-              wait, [this, work = std::move(work),
-                     onSuccess = std::move(onSuccess),
-                     onError = std::move(onError), retriesLeft]() mutable {
-                PostTaskWithRetries(std::move(work), std::move(onSuccess),
-                                    std::move(onError), retriesLeft - 1);
-              });
-        });
-        return;
-      }
-      PostUi([onError = std::move(onError), message, status,
-              retryAfter]() mutable {
-        onError(std::move(message), status, retryAfter);
-      });
     } catch (const std::exception& error) {
       const std::string message = error.what();
       PostUi([onError = std::move(onError), message]() mutable {
-        onError(std::move(message), 0, 0);
+        onError(std::move(message));
       });
     }
   });

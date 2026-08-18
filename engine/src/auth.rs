@@ -8,7 +8,6 @@ use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
 use librespot_core::Session;
-use librespot_playback::audio_backend;
 use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig};
@@ -247,12 +246,12 @@ async fn create_playback(session: Session, cache: Cache) -> Result<PlaybackHandl
     let cached_volume = cache.volume().unwrap_or(u16::MAX / 2);
     mixer.set_volume(cached_volume);
 
-    let backend = audio_backend::find(Some("rodio".to_owned()))
-        .ok_or_else(|| "the rodio audio backend is not compiled in".to_owned())?;
     let (audio_ready_tx, audio_ready_rx) = std_mpsc::sync_channel(1);
     let config = player_config();
     let player = Player::new(config, session.clone(), mixer.get_soft_volume(), move || {
-        let sink = backend(None, AudioFormat::S16);
+        // Custom immediate-stop rodio sink: pause/stop must not drain the
+        // buffered queue (~0.5 s of audio) before silencing the output.
+        let sink = crate::audio::open_default_sink(AudioFormat::S16);
         let _ = audio_ready_tx.send(());
         sink
     });

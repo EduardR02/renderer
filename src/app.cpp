@@ -357,14 +357,6 @@ int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
 void Application::InitCore() {
   if (!paths::EnsureDirs()) return;
   log::Init(paths::LogFile());
-  web_token_.emplace(
-      [this](WebApiToken* token, std::string* error, int timeoutMs) {
-        return engine_.RequestWebApiToken(token, error, timeoutMs);
-      });
-  api_http_ = std::make_shared<HttpClient>("https://api.spotify.com");
-  api_ = std::make_unique<SpotifyApi>(
-      api_http_, [this] { return GetAccessToken(); },
-      [this](int timeout) { return RefreshToken(timeout); });
   api_tasks_.Start();
   artwork_tasks_.Start();
 }
@@ -425,8 +417,6 @@ void Application::Shutdown() {
   artwork_tasks_.Stop();
   engine_.Shutdown();
   tray_.Destroy();
-  api_.reset();
-  api_http_.reset();
   if (window_.hwnd()) window_.Destroy();
   hwnd_ = nullptr;
   if (gdiplus_token_) {
@@ -465,35 +455,10 @@ void Application::PostUi(std::function<void()> function) {
     delete heap;
 }
 
-std::string Application::GetAccessToken() {
-  if (!web_token_) throw std::runtime_error("Web API access is unavailable");
-  return web_token_->GetAccessToken();
-}
-
-bool Application::RefreshToken(int timeoutMs) {
-  if (!web_token_) return false;
-  return web_token_->Refresh(timeoutMs);
-}
-
-void Application::HandleApiError(const std::string& message, int status,
-                                 int retryAfter,
+void Application::HandleApiError(const std::string& message,
                                  const std::wstring& context) {
-  LOG_ERROR(WideToUtf8(context) + ": " + message +
-            (status ? " (HTTP " + std::to_string(status) + ")" : ""));
-  if (status == 401) {
-    // The engine could not re-mint a valid Web API token, so the underlying
-    // Spotify session is gone: the user must sign in again through the
-    // playback engine. This is never a rate-limit condition.
-    window_.SetStatus(
-        L"Spotify session expired — sign in again in the local playback "
-        L"engine (Settings) to reconnect.");
-    return;
-  }
-  std::wstring text = context + L": " + Utf8ToWide(message);
-  if ((status == 429 || status == 503) && retryAfter > 0)
-    text += L"; Spotify suggests waiting " + std::to_wstring(retryAfter) +
-            L" s before retrying";
-  window_.SetStatus(text);
+  LOG_ERROR(WideToUtf8(context) + ": " + message);
+  window_.SetStatus(context + L": " + Utf8ToWide(message));
 }
 
 
@@ -517,8 +482,8 @@ void Application::OnSearch(const std::string& query) {
         window_.SetSearchResults(result);
         window_.SetStatus(L"Search complete");
       },
-      [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Search");
+      [this](std::string message) {
+        HandleApiError(message, L"Search");
       });
 }
 
@@ -549,8 +514,8 @@ void Application::OnSearchActivate(int item) {
           middle_mode_ = MiddleMode::ArtistTracks;
           window_.SetArtistPage(artist, tracks);
         },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Artist top tracks");
+      [this](std::string message) {
+        HandleApiError(message, L"Artist top tracks");
         });
   }
 }
@@ -607,8 +572,8 @@ void Application::OnSearchContext(UINT command, int item) {
           middle_mode_ = MiddleMode::ArtistTracks;
           window_.SetArtistPage(artist, tracks);
         },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Artist top tracks");
+      [this](std::string message) {
+        HandleApiError(message, L"Artist top tracks");
         });
   }
 }
@@ -628,15 +593,18 @@ void Application::OnAddToPlaylist(int playlistIndex) {
   const std::string uri = window_.search().tracks[trackIndex].uri;
   PostTask<bool>(
       [this, playlist, uri] {
-        api_->AddTracksToPlaylist(playlist, {uri});
+        std::string error;
+        if (!engine_.EditAddPlaylistTracks(playlist, {uri}, &error))
+          throw std::runtime_error(error.empty() ? "add to playlist failed"
+                                                 : error);
         return true;
       },
       [this, playlist](bool) {
         track_cache_.Invalidate("p:" + playlist);
         window_.SetStatus(L"Added to playlist");
       },
-      [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Add to playlist");
+      [this](std::string message) {
+        HandleApiError(message, L"Add to playlist");
       });
 }
 
@@ -753,23 +721,26 @@ void Application::OnMiddleContext(UINT command, int index) {
           middle_mode_ = MiddleMode::ArtistTracks;
           window_.SetArtistPage(artist, tracks);
         },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Artist top tracks");
+      [this](std::string message) {
+        HandleApiError(message, L"Artist top tracks");
         });
   } else if (middle_mode_ == MiddleMode::Playlist &&
              command == IDM_CTX_MIDDLE_REMOVE) {
     PostTask<bool>(
         [this, uri = track.uri] {
-          api_->RemoveTracksFromPlaylist(current_playlist_id_, {uri},
-                                         current_playlist_snapshot_);
+          std::string error;
+          if (!engine_.EditRemovePlaylistTracks(current_playlist_id_, {uri},
+                                                &error))
+            throw std::runtime_error(error.empty() ? "remove track failed"
+                                                    : error);
           return true;
         },
         [this](bool) {
           track_cache_.Invalidate("p:" + current_playlist_id_);
           RequestPlaylistTracks(current_playlist_id_);
         },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Remove track");
+      [this](std::string message) {
+        HandleApiError(message, L"Remove track");
         });
   } else if (middle_mode_ == MiddleMode::Playlist &&
              (command == IDM_CTX_MIDDLE_UP ||
@@ -778,16 +749,19 @@ void Application::OnMiddleContext(UINT command, int index) {
     if (destination < 0 || destination > static_cast<int>(tracks.size())) return;
     PostTask<bool>(
         [this, index, destination] {
-          api_->ReorderPlaylistTracks(current_playlist_id_, index, destination,
-                                      1, current_playlist_snapshot_);
+          std::string error;
+          if (!engine_.EditReorderPlaylistTracks(current_playlist_id_, index,
+                                                 destination, &error))
+            throw std::runtime_error(error.empty() ? "reorder playlist failed"
+                                                   : error);
           return true;
         },
         [this](bool) {
           track_cache_.Invalidate("p:" + current_playlist_id_);
           RequestPlaylistTracks(current_playlist_id_);
         },
-        [this](std::string message, int status, int retry) {
-          HandleApiError(message, status, retry, L"Reorder playlist");
+      [this](std::string message) {
+        HandleApiError(message, L"Reorder playlist");
         });
   }
 }
@@ -804,14 +778,16 @@ void Application::OnNewPlaylist() {
   if (!name || Trim(WideToUtf8(*name)).empty()) return;
   PostTask<PlaylistRef>(
       [this, value = WideToUtf8(*name)] {
-        if (me_id_.empty())
-          throw std::runtime_error(
-              "sign in with Spotify in Settings before creating playlists");
-        return api_->CreatePlaylist(me_id_, value);
+        PlaylistRef playlist;
+        std::string error;
+        if (!engine_.EditCreatePlaylist(value, &playlist, &error))
+          throw std::runtime_error(error.empty() ? "create playlist failed"
+                                                 : error);
+        return playlist;
       },
       [this](PlaylistRef) { RefreshPlaylists(true); },
-      [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Create playlist");
+      [this](std::string message) {
+        HandleApiError(message, L"Create playlist");
       });
 }
 
@@ -823,12 +799,15 @@ void Application::OnRenamePlaylist() {
   if (!name || Trim(WideToUtf8(*name)).empty()) return;
   PostTask<bool>(
       [this, id = playlists_[index].id, value = WideToUtf8(*name)] {
-        api_->RenamePlaylist(id, value);
+        std::string error;
+        if (!engine_.EditRenamePlaylist(id, value, &error))
+          throw std::runtime_error(error.empty() ? "rename playlist failed"
+                                                 : error);
         return true;
       },
       [this](bool) { RefreshPlaylists(true); },
-      [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Rename playlist");
+      [this](std::string message) {
+        HandleApiError(message, L"Rename playlist");
       });
 }
 
@@ -840,7 +819,10 @@ void Application::OnDeletePlaylist() {
     return;
   PostTask<bool>(
       [this, id = playlists_[index].id] {
-        api_->DeletePlaylist(id);
+        std::string error;
+        if (!engine_.EditDeletePlaylist(id, &error))
+          throw std::runtime_error(error.empty() ? "delete playlist failed"
+                                                 : error);
         return true;
       },
       [this, id = playlists_[index].id](bool) {
@@ -849,8 +831,8 @@ void Application::OnDeletePlaylist() {
         RefreshPlaylists(true);
         RefreshQueue();
       },
-      [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Delete playlist");
+      [this](std::string message) {
+        HandleApiError(message, L"Delete playlist");
       });
 }
 
@@ -1270,8 +1252,8 @@ void Application::FetchPlaylists() {
         window_.SetPlaylists(playlists_);
         SavePlaylistCache();
       },
-      [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Playlists");
+      [this](std::string message) {
+        HandleApiError(message, L"Playlists");
       });
 }
 
@@ -1391,8 +1373,8 @@ void Application::RequestPlaylistTracks(const std::string& id) {
         ShowPlaylistTracks(id, cached);
         track_cache_.Put("p:" + id, std::move(cached));
       },
-      [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Playlist tracks");
+      [this](std::string message) {
+        HandleApiError(message, L"Playlist tracks");
       });
 }
 
@@ -1435,8 +1417,8 @@ void Application::OpenAlbumTracks(const AlbumRef& album) {
         window_.SetMiddleTracks(cached.tracks);
         track_cache_.Put("a:" + album.id, std::move(cached));
       },
-      [this](std::string message, int status, int retry) {
-        HandleApiError(message, status, retry, L"Album tracks");
+      [this](std::string message) {
+        HandleApiError(message, L"Album tracks");
       });
 }
 

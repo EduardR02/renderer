@@ -84,8 +84,17 @@ void BuildRoundedPath(Gdiplus::GraphicsPath& path, const RECT& rect,
   path.CloseFigure();
 }
 
+// Standard antialiasing setup for every custom shape: real AA plus
+// half-pixel alignment so 1px strokes and edges land crisply on the pixel
+// grid instead of blurring across two rows/columns.
+void PrepareShape(Gdiplus::Graphics& graphics) {
+  graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+  graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+}
+
 void FillRoundedRectGp(Gdiplus::Graphics& graphics, const RECT& rect,
                        int radius, COLORREF color) {
+  PrepareShape(graphics);
   Gdiplus::SolidBrush brush(GpColor(color));
   Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate);
   BuildRoundedPath(path, rect, radius);
@@ -94,6 +103,7 @@ void FillRoundedRectGp(Gdiplus::Graphics& graphics, const RECT& rect,
 
 void StrokeRoundedRectGp(Gdiplus::Graphics& graphics, const RECT& rect,
                          int radius, COLORREF color, float width) {
+  PrepareShape(graphics);
   Gdiplus::Pen pen(GpColor(color), width);
   Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate);
   BuildRoundedPath(path, rect, radius);
@@ -102,6 +112,7 @@ void StrokeRoundedRectGp(Gdiplus::Graphics& graphics, const RECT& rect,
 
 void FillEllipseGp(Gdiplus::Graphics& graphics, const RECT& bounds,
                    COLORREF color) {
+  PrepareShape(graphics);
   Gdiplus::SolidBrush brush(GpColor(color));
   graphics.FillEllipse(&brush, static_cast<float>(bounds.left),
                        static_cast<float>(bounds.top),
@@ -173,6 +184,33 @@ struct CoverCtx {
 // submits through the search button — the same path as clicking it. The rail
 // filter already applies per keystroke, so Enter there falls through to the
 // default edit behavior.
+
+// Vertical inset per side for the client rect of a tall single-line edit.
+// Native single-line edits anchor their text, caret, and cue banner to a
+// font-derived format rectangle at the top of the client area; EM_SETRECT
+// and EM_SETMARGINS top/bottom are both no-ops for single-line controls. The
+// window keeps its full size (and border), but WM_NCCALCSIZE shrinks the
+// client by this inset on each side so the text line lands on the window's
+// vertical center.
+int EditVerticalPad(HWND control) {
+  // The window height (not the shrunken client) defines the box; the client
+  // rect already reflects any earlier WM_NCCALCSIZE adjustment.
+  RECT window{};
+  ::GetWindowRect(control, &window);
+  HDC dc = ::GetDC(control);
+  HFONT font = reinterpret_cast<HFONT>(
+      ::SendMessageW(control, WM_GETFONT, 0, 0));
+  HGDIOBJ old =
+      ::SelectObject(dc, font ? font : ::GetStockObject(DEFAULT_GUI_FONT));
+  TEXTMETRICW metrics{};
+  ::GetTextMetricsW(dc, &metrics);
+  ::SelectObject(dc, old);
+  ::ReleaseDC(control, dc);
+  const int lineHeight = metrics.tmHeight + metrics.tmExternalLeading;
+  // The format rectangle reserves 2px above and below the line.
+  return EditCenteringInset(window.bottom - window.top, lineHeight + 4);
+}
+
 LRESULT CALLBACK EditSubclass(HWND control, UINT message, WPARAM wparam,
                               LPARAM lparam, UINT_PTR, DWORD_PTR) {
   if (message == WM_KEYDOWN && wparam == VK_RETURN &&
@@ -181,6 +219,33 @@ LRESULT CALLBACK EditSubclass(HWND control, UINT message, WPARAM wparam,
     ::SendMessageW(parent, WM_COMMAND,
                    MAKEWPARAM(CID_SEARCH_BTN, BN_CLICKED), 0);
     return 0;
+  }
+  if (message == WM_NCCALCSIZE) {
+    const int pad = EditVerticalPad(control);
+    if (wparam) {
+      auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lparam);
+      params->rgrc[0].top += pad;
+      params->rgrc[0].bottom -= pad;
+    } else if (lparam) {
+      auto* rect = reinterpret_cast<RECT*>(lparam);
+      rect->top += pad;
+      rect->bottom -= pad;
+    }
+    return 0;
+  }
+  if (message == WM_NCPAINT) {
+    // The shrunken client leaves non-client bands above and below the text
+    // line inside the border; fill them with the edit background so the box
+    // stays a solid color, then let the default proc draw the border.
+    RECT window{};
+    ::GetWindowRect(control, &window);
+    HDC dc = ::GetWindowDC(control);
+    RECT rc{0, 0, window.right - window.left, window.bottom - window.top};
+    HBRUSH background = ::CreateSolidBrush(kEdit);
+    ::FillRect(dc, &rc, background);
+    ::DeleteObject(background);
+    ::ReleaseDC(control, dc);
+    return ::DefWindowProcW(control, message, wparam, lparam);
   }
   if (message == WM_NCDESTROY)
     ::RemoveWindowSubclass(control, EditSubclass, 1);
@@ -662,6 +727,12 @@ std::optional<std::wstring> MainWindow::PromptText(HWND owner, const std::wstrin
   ::SetWindowSubclass(context.cancel, ButtonSubclass, 1, 0);
   ::SendMessageW(dialog, DM_SETDEFID, IDOK, 0);
   ::SendMessageW(context.edit, WM_SETFONT, reinterpret_cast<WPARAM>(context.font), TRUE);
+  // Same vertical-centering treatment as the app's search/filter edits
+  // (tall single-line edits anchor text and caret at the top otherwise).
+  ::SetWindowSubclass(context.edit, EditSubclass, 1, 0);
+  ::SetWindowPos(context.edit, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                     SWP_FRAMECHANGED);
   ::SendMessageW(context.accept, WM_SETFONT, reinterpret_cast<WPARAM>(context.font), TRUE);
   ::SendMessageW(context.cancel, WM_SETFONT, reinterpret_cast<WPARAM>(context.font), TRUE);
   ::SendMessageW(context.edit, EM_SETSEL, 0, -1);
@@ -1266,8 +1337,8 @@ void MainWindow::Layout() {
   const int searchX = workspaceX + (workspaceWidth - searchWidth) / 2;
 
   move(brandLbl_, railPad, scale(15), sidebarWidth - 2 * railPad, scale(30));
-  move(libraryGroupLbl_, railPad, scale(60), sidebarWidth - 2 * railPad,
-       scale(18));
+  move(libraryGroupLbl_, railPad, scale(60),
+       LabelWidthBefore(railPad, sidebarWidth - railPad - scale(32)), scale(18));
   move(newPlBtn_, sidebarWidth - railPad - scale(32), scale(52), scale(32),
        scale(32));
   move(playlistFilterEdit_, railPad, scale(86),
@@ -1281,6 +1352,15 @@ void MainWindow::Layout() {
   move(searchEdit_, searchX, scale(14), searchWidth - scale(42), scale(38));
   move(searchBtn_, searchX + searchWidth - scale(38), scale(14), scale(38),
        scale(38));
+  // MoveWindow does not re-run WM_NCCALCSIZE for child windows, and the
+  // single-line edits need it to recenter their client area (and with it the
+  // text, caret, and cue banner) inside the taller box.
+  for (HWND edit : {searchEdit_, playlistFilterEdit_}) {
+    if (edit)
+      ::SetWindowPos(edit, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                         SWP_FRAMECHANGED);
+  }
 
   const bool collection = workspaceKind_ == WorkspaceKind::Collection;
   const bool search = workspaceKind_ == WorkspaceKind::Search;
@@ -1306,12 +1386,17 @@ void MainWindow::Layout() {
     move(workspaceCover_, workspaceX + scale(18), headerTop, coverSize,
          coverSize);
     const int textX = workspaceX + scale(18) + coverSize + scale(20);
+    // The title and meta labels must end before the Rename/Delete buttons:
+    // overlapping siblings with WS_CLIPSIBLINGS each exclude the other's
+    // region from their paint, so the shared band stays unpainted and the
+    // buttons render cut off until an interaction repaints them.
+    const int labelWidth =
+        LabelWidthBefore(textX, workspaceRight - scale(92));
     move(workspaceTypeLbl_, textX, headerTop + scale(3),
          workspaceRight - textX - scale(104), scale(18));
-    move(middleLabel_, textX, headerTop + scale(25),
-         workspaceRight - textX - scale(20), scale(42));
-    move(workspaceMetaLbl_, textX, headerTop + scale(77),
-         workspaceRight - textX - scale(20), scale(24));
+    move(middleLabel_, textX, headerTop + scale(25), labelWidth, scale(42));
+    move(workspaceMetaLbl_, textX, headerTop + scale(77), labelWidth,
+         scale(24));
     move(renPlBtn_, workspaceRight - scale(92), headerTop + scale(12),
          scale(34), scale(34));
     move(delPlBtn_, workspaceRight - scale(50), headerTop + scale(12),
@@ -1406,6 +1491,16 @@ void MainWindow::Layout() {
   ::GetClientRect(tracksList_, &listRect);
   ::SendMessageW(tracksList_, LVM_SETCOLUMNWIDTH, 0,
                  std::max(0, static_cast<int>(listRect.right) - scale(8)));
+  // Parent invalidation never repaints children, so controls whose visual
+  // state can change without their text/size changing (owner-drawn icon
+  // buttons, custom sliders) are invalidated explicitly here. This is what
+  // repaints the transport buttons after a startup enable flip and the
+  // playlist header buttons on a workspace switch.
+  HWND repaintNow[] = {newPlBtn_, renPlBtn_, delPlBtn_, prevBtn_, playBtn_,
+                       nextBtn_, shuffleBtn_, repeatBtn_, seekBar_,
+                       volumeBar_};
+  for (HWND control : repaintNow)
+    if (control) ::InvalidateRect(control, nullptr, FALSE);
   ::InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
@@ -1538,7 +1633,17 @@ LRESULT MainWindow::OnDrawItem(WPARAM, LPARAM lParam) {
     background = hot ? kControlHot : kControl;
   }
   if (pushed && !disabled) background = active ? kControl : kPanel;
-  const int radius = ::MulDiv(icon ? 18 : 8, dpi_, 96);
+  int radius = ::MulDiv(icon ? 18 : 8, dpi_, 96);
+  if (icon) {
+    // Icon buttons are circular: clamp the radius to half the smaller side
+    // so a 38px button (play, back, search, settings) becomes a true circle
+    // instead of a rounded rect with 2px flat segments at top and bottom.
+    const int half = (std::min(draw->rcItem.right - draw->rcItem.left,
+                               draw->rcItem.bottom - draw->rcItem.top) +
+                      1) /
+                     2;
+    radius = std::min(radius, half);
+  }
   // Clear the whole item rect first so the rounded fill never leaves stale
   // corner pixels behind when the button's surroundings change. (The
   // "obscuring rectangle on load" was a sibling paint stomping the buttons:
@@ -1960,17 +2065,12 @@ LRESULT MainWindow::OnNotify(WPARAM, LPARAM lParam) {
     ::SelectObject(dc, oldFont);
 
     if (focused) {
+      // GDI RoundRect has no antialiasing and looks jagged at 1px; the
+      // rounded-path stroke renders the same outline smoothly.
       RECT focus = item;
       ::InflateRect(&focus, -scale(2), -scale(2));
-      HPEN focusPen = ::CreatePen(PS_SOLID, 1, kAccent);
-      HGDIOBJ oldFocusPen = ::SelectObject(dc, focusPen);
-      HGDIOBJ oldFocusBrush =
-          ::SelectObject(dc, ::GetStockObject(NULL_BRUSH));
-      ::RoundRect(dc, focus.left, focus.top, focus.right - 1,
-                  focus.bottom - 1, scale(8), scale(8));
-      ::SelectObject(dc, oldFocusBrush);
-      ::SelectObject(dc, oldFocusPen);
-      ::DeleteObject(focusPen);
+      Gdiplus::Graphics graphics(dc);
+      StrokeRoundedRectGp(graphics, focus, scale(8), kAccent, 1.0f);
     }
     return CDRF_SKIPDEFAULT;
   }
@@ -2710,6 +2810,7 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
   const bool shuffleChanged = playback_.shuffle != playback.shuffle;
   const bool repeatChanged = playback_.repeat != playback.repeat;
   const bool playingChanged = playback_.playing != playback.playing;
+  const bool readyChanged = playback_.ready != playback.ready;
   playback_ = playback;
   const TrackRef* track = nullptr;
   if (playback.current_index >= 0 &&
@@ -2754,6 +2855,17 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
   ::EnableWindow(nextBtn_, available);
   ::EnableWindow(shuffleBtn_, available);
   ::EnableWindow(repeatBtn_, available);
+  // EnableWindow only repaints a button while the window is visible; an
+  // enable flip that happens before the first Show (startup, or an engine
+  // state event during teardown) leaves the stale disabled rendering on
+  // screen until the next interaction. Repaint explicitly so the very first
+  // visible frame already shows the enabled controls.
+  if (readyChanged) {
+    HWND transport[] = {prevBtn_, playBtn_, nextBtn_, shuffleBtn_,
+                        repeatBtn_, seekBar_, volumeBar_};
+    for (HWND control : transport)
+      if (control) ::InvalidateRect(control, nullptr, TRUE);
+  }
   // Session controls: Log in exactly when the engine publishes a fresh
   // authorize URL, Log out while a session is live (both disabled while a
   // flow is in flight, so no double-submit).

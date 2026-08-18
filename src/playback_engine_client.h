@@ -62,14 +62,12 @@ inline bool LogoutButtonEnabled(const PlaybackEngineState& state) {
 }
 
 struct EngineMessage {
-  enum class Kind { Response, State, WebApiToken, Data } kind = Kind::Response;
+  enum class Kind { Response, State, Data } kind = Kind::Response;
   std::string request_id;
   bool ok = false;
   std::string error;
   PlaybackEngineState state;
-  // Present only on successful web_api_token responses.
-  WebApiToken token;
-  // The full response object for browse_* (spclient) responses; the browse
+  // The full response object for browse_*/edit_* (spclient) responses; the
   // accessors below parse their payloads from it.
   nlohmann::json data;
 };
@@ -137,15 +135,8 @@ class PlaybackEngineClient {
   // No-op when a session is already live or a flow is in flight.
   std::string TriggerLogin();
 
-  // Blocking engine round-trip that mints a Web API token (login5) from the
-  // engine's Spotify session. Returns false with `error` set when the engine
-  // is not running, the mint failed, the response was malformed, or the wait
-  // timed out. `timeoutMs` bounds the whole round-trip.
-  bool RequestWebApiToken(WebApiToken* out, std::string* error,
-                          int timeoutMs = 20000);
-
-  // Blocking browse round-trips served by the engine's spclient session
-  // (same protocol machinery as RequestWebApiToken). Each returns false with
+  // Blocking engine round-trips served by the engine's spclient session
+  // (same protocol machinery as RequestData). Each returns false with
   // `error` set on transport failure, engine rejection, malformed payload, or
   // timeout. Playlist/album/artist ids are the engine's Spotify ids.
   bool BrowsePlaylists(int length, std::vector<PlaylistRef>* out,
@@ -161,6 +152,25 @@ class PlaybackEngineClient {
   bool BrowseSearch(const std::string& query, int limit, SearchResult* out,
                     std::string* error, int timeoutMs = 20000);
 
+  // Playlist edits on the engine's spclient playlist4 session: these replace
+  // the Web API edit calls entirely. Revisions/checksums are fetched fresh by
+  // the engine per edit, so no snapshot id is passed. Errors are engine-side
+  // (spclient-native) text with no HTTP status.
+  bool EditCreatePlaylist(const std::string& name, PlaylistRef* out,
+                          std::string* error, int timeoutMs = 20000);
+  bool EditRenamePlaylist(const std::string& id, const std::string& name,
+                          std::string* error, int timeoutMs = 20000);
+  bool EditDeletePlaylist(const std::string& id, std::string* error,
+                          int timeoutMs = 20000);
+  bool EditAddPlaylistTracks(const std::string& id,
+                             const std::vector<std::string>& uris,
+                             std::string* error, int timeoutMs = 20000);
+  bool EditRemovePlaylistTracks(const std::string& id,
+                                const std::vector<std::string>& uris,
+                                std::string* error, int timeoutMs = 20000);
+  bool EditReorderPlaylistTracks(const std::string& id, int from, int to,
+                                 std::string* error, int timeoutMs = 20000);
+
  private:
   std::string Send(const std::string& type, nlohmann::json arguments = {});
   // Writes one line-protocol request under an explicit request id; throws
@@ -171,16 +181,15 @@ class PlaybackEngineClient {
   void ReportError(std::string message);
   void CloseHandles();
 
-  // One blocking round-trip: RequestWebApiToken and the browse_* methods
-  // register a waiter keyed by request id; the reader thread fills either the
-  // token (web_api_token) or the raw response object (browse_*) and wakes it.
+  // One blocking round-trip: the browse_*/edit_* methods register a waiter
+  // keyed by request id; the reader thread fills the raw response object and
+  // wakes it.
   struct Waiter {
     std::mutex mutex;
     std::condition_variable cv;
     bool done = false;
     bool ok = false;
     std::string error;
-    WebApiToken token;
     nlohmann::json data;
   };
 

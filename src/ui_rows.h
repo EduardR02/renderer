@@ -119,6 +119,27 @@ inline int DecodeHoverIndex(INT_PTR propValue) {
   return static_cast<int>(propValue) - 1;
 }
 
+// DIP-space width for a label whose right edge must end `gap` DIPs before a
+// sibling control starts at `siblingLeft`. Overlapping siblings are a real
+// paint hazard: with WS_CLIPSIBLINGS on both windows each one's update
+// region excludes the other's, so the shared band is painted by neither and
+// the covered control appears cut off until an interaction forces a repaint.
+inline int LabelWidthBefore(int textLeft, int siblingLeft, int gap = 8) {
+  return std::max(0, siblingLeft - gap - textLeft);
+}
+
+// Top (== bottom) inset in pixels for centering a text line of `lineHeight`
+// pixels inside a `clientHeight`-tall box. Used for tall single-line edit
+// controls: native edits anchor text, caret, and cue banner to a font-sized
+// format rectangle at the top of the client area (EM_SETRECT and top/bottom
+// EM_SETMARGINS are no-ops for single-line controls), so the client itself
+// is shrunk by this inset per side (WM_NCCALCSIZE) and everything centers
+// with it.
+inline int EditCenteringInset(int clientHeight, int lineHeight) {
+  if (clientHeight <= 0 || lineHeight <= 0) return 0;
+  return std::max(0, (clientHeight - lineHeight) / 2);
+}
+
 // True when (x, y) client coordinates land on a row's artwork tile; the tile
 // is the hover-play target. itemLeft/itemTop are the row bounds' origin.
 inline bool RowTileHit(int x, int y, int itemLeft, int itemTop, int dpi) {

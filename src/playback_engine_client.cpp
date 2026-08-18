@@ -185,28 +185,14 @@ EngineMessage ParseEngineMessage(const std::string& line) {
     message.error = StringField(value, "error");
     return message;
   }
-  if (type == "web_api_token") {
-    message.kind = EngineMessage::Kind::WebApiToken;
-    message.request_id = StringField(value, "request_id");
-    if (message.request_id.empty())
-      throw std::invalid_argument("web_api_token response has no request_id");
-    message.ok = BooleanField(value, "ok");
-    message.error = StringField(value, "error");
-    if (message.ok) {
-      message.token.token_type = StringField(value, "token_type");
-      message.token.access_token = StringField(value, "access_token");
-      message.token.expires_in = IntegerField(value, "expires_in");
-      if (message.token.access_token.empty() || message.token.expires_in <= 0)
-        throw std::invalid_argument(
-            "web_api_token response carries an invalid token");
-    }
-    message.data = std::move(value);
-    return message;
-  }
   if (type == "browse_playlists" || type == "browse_playlist" ||
       type == "browse_album" || type == "browse_artist" ||
-      type == "browse_search") {
-    // spclient browse response: the whole object is kept so the browse
+      type == "browse_search" || type == "edit_create_playlist" ||
+      type == "edit_rename_playlist" || type == "edit_delete_playlist" ||
+      type == "edit_add_playlist_tracks" ||
+      type == "edit_remove_playlist_tracks" ||
+      type == "edit_reorder_playlist_tracks") {
+    // spclient browse/edit response: the whole object is kept so the
     // accessors can parse their payloads (and validate their shapes).
     message.kind = EngineMessage::Kind::Data;
     message.request_id = StringField(value, "request_id");
@@ -408,8 +394,7 @@ void PlaybackEngineClient::Shutdown() {
     }
   }
   // The reader thread is about to end: fail every in-flight blocking
-  // round-trip (RequestWebApiToken, browse_*) so callers never stall
-  // shutdown.
+  // round-trip (browse_*/edit_*) so callers never stall shutdown.
   std::unordered_map<std::string, std::shared_ptr<Waiter>> waiters;
   {
     std::lock_guard<std::mutex> lock(waiter_mutex_);
@@ -543,22 +528,6 @@ void PlaybackEngineClient::WriteRequest(const std::string& requestId,
     }
     offset += written;
   }
-}
-
-bool PlaybackEngineClient::RequestWebApiToken(WebApiToken* out,
-                                              std::string* error,
-                                              int timeoutMs) {
-  if (!out) {
-    if (error) *error = "token output is required";
-    return false;
-  }
-  nlohmann::json data;
-  if (!RequestData("web_api_token", {}, &data, error, timeoutMs)) return false;
-  // ParseEngineMessage already validated the token fields of the response.
-  out->token_type = StringField(data, "token_type");
-  out->access_token = StringField(data, "access_token");
-  out->expires_in = IntegerField(data, "expires_in");
-  return true;
 }
 
 bool PlaybackEngineClient::RequestData(const std::string& type,
@@ -797,6 +766,123 @@ bool PlaybackEngineClient::BrowseSearch(const std::string& query, int limit,
   return true;
 }
 
+bool PlaybackEngineClient::EditCreatePlaylist(const std::string& name,
+                                              PlaylistRef* out,
+                                              std::string* error,
+                                              int timeoutMs) {
+  if (!out) {
+    if (error) *error = "playlist output is required";
+    return false;
+  }
+  if (Trim(name).empty()) {
+    if (error) *error = "playlist name is required";
+    return false;
+  }
+  nlohmann::json data;
+  const bool ok =
+      RequestData("edit_create_playlist", {{"name", name}}, &data, error,
+                  timeoutMs);
+  if (!ok) return false;
+  try {
+    auto payload = data.find("data");
+    if (payload == data.end() || !payload->is_object()) {
+      if (error) *error = "create playlist response has no playlist data";
+      return false;
+    }
+    *out = PlaylistRefFromEngineJson(*payload);
+    return true;
+  } catch (const std::exception& exception) {
+    if (error)
+      *error = std::string("malformed browse response: ") + exception.what();
+    return false;
+  }
+}
+
+bool PlaybackEngineClient::EditRenamePlaylist(const std::string& id,
+                                              const std::string& name,
+                                              std::string* error,
+                                              int timeoutMs) {
+  if (id.empty()) {
+    if (error) *error = "playlist id is required";
+    return false;
+  }
+  if (Trim(name).empty()) {
+    if (error) *error = "playlist name is required";
+    return false;
+  }
+  nlohmann::json data;
+  return RequestData("edit_rename_playlist", {{"id", id}, {"name", name}},
+                     &data, error, timeoutMs);
+}
+
+bool PlaybackEngineClient::EditDeletePlaylist(const std::string& id,
+                                              std::string* error,
+                                              int timeoutMs) {
+  if (id.empty()) {
+    if (error) *error = "playlist id is required";
+    return false;
+  }
+  nlohmann::json data;
+  return RequestData("edit_delete_playlist", {{"id", id}}, &data, error,
+                     timeoutMs);
+}
+
+bool PlaybackEngineClient::EditAddPlaylistTracks(
+    const std::string& id, const std::vector<std::string>& uris,
+    std::string* error, int timeoutMs) {
+  if (id.empty()) {
+    if (error) *error = "playlist id is required";
+    return false;
+  }
+  if (uris.empty()) {
+    if (error) *error = "at least one track URI is required";
+    return false;
+  }
+  for (const auto& uri : uris) {
+    if (Trim(uri).empty()) {
+      if (error) *error = "track URIs must not be empty";
+      return false;
+    }
+  }
+  nlohmann::json data;
+  return RequestData("edit_add_playlist_tracks",
+                     {{"id", id}, {"uris", uris}}, &data, error, timeoutMs);
+}
+
+bool PlaybackEngineClient::EditRemovePlaylistTracks(
+    const std::string& id, const std::vector<std::string>& uris,
+    std::string* error, int timeoutMs) {
+  if (id.empty()) {
+    if (error) *error = "playlist id is required";
+    return false;
+  }
+  if (uris.empty()) {
+    if (error) *error = "at least one track URI is required";
+    return false;
+  }
+  nlohmann::json data;
+  return RequestData("edit_remove_playlist_tracks",
+                     {{"id", id}, {"uris", uris}}, &data, error, timeoutMs);
+}
+
+bool PlaybackEngineClient::EditReorderPlaylistTracks(const std::string& id,
+                                                     int from, int to,
+                                                     std::string* error,
+                                                     int timeoutMs) {
+  if (id.empty()) {
+    if (error) *error = "playlist id is required";
+    return false;
+  }
+  if (from < 0 || to < 0) {
+    if (error) *error = "playlist indices cannot be negative";
+    return false;
+  }
+  nlohmann::json data;
+  return RequestData("edit_reorder_playlist_tracks",
+                     {{"id", id}, {"from", from}, {"to", to}}, &data, error,
+                     timeoutMs);
+}
+
 void PlaybackEngineClient::ReaderLoop() {
   std::string pending;
   char buffer[4096];
@@ -836,8 +922,7 @@ void PlaybackEngineClient::ReaderLoop() {
             ReportError("playback engine returned an unknown request_id");
             continue;
           }
-          if (message.kind == EngineMessage::Kind::WebApiToken ||
-              message.kind == EngineMessage::Kind::Data) {
+          if (message.kind == EngineMessage::Kind::Data) {
             std::shared_ptr<Waiter> waiter;
             {
               std::lock_guard<std::mutex> lock(waiter_mutex_);
@@ -853,8 +938,6 @@ void PlaybackEngineClient::ReaderLoop() {
               waiter->ok = message.ok;
               if (message.ok) {
                 waiter->data = std::move(message.data);
-                if (message.kind == EngineMessage::Kind::WebApiToken)
-                  waiter->token = std::move(message.token);
               } else {
                 waiter->error = std::move(message.error);
               }

@@ -257,84 +257,6 @@ TEST_CASE("track list cache invalidate and clear drop entries") {
   CHECK_FALSE(cache.Get("a:b", &out));
 }
 
-TEST_CASE("web_api_token message maps minted tokens without a process") {
-  EngineMessage message = ParseEngineMessage(
-      R"({"type":"web_api_token","request_id":"77","ok":true,"token_type":"Bearer","access_token":"tok-abc","expires_in":3540})");
-  CHECK(message.kind == EngineMessage::Kind::WebApiToken);
-  CHECK(message.request_id == "77");
-  CHECK(message.ok);
-  CHECK(message.token.token_type == "Bearer");
-  CHECK(message.token.access_token == "tok-abc");
-  CHECK(message.token.expires_in == 3540);
-  CHECK(message.error.empty());
-}
-
-TEST_CASE("web_api_token error responses carry the failure without token fields") {
-  EngineMessage message = ParseEngineMessage(
-      R"({"type":"web_api_token","request_id":"78","ok":false,"error":"could not mint a Spotify Web API token: unavailable"})");
-  CHECK_FALSE(message.ok);
-  CHECK(message.error == "could not mint a Spotify Web API token: unavailable");
-  CHECK(message.token.access_token.empty());
-}
-
-TEST_CASE("web_api_token messages reject malformed token payloads") {
-  CHECK_THROWS_AS(ParseEngineMessage(R"({"type":"web_api_token","request_id":"79","ok":true,"token_type":"Bearer","access_token":"","expires_in":3600})"),
-                  std::invalid_argument);
-  CHECK_THROWS_AS(ParseEngineMessage(R"({"type":"web_api_token","request_id":"80","ok":true,"token_type":"Bearer","access_token":"tok","expires_in":0})"),
-                  std::invalid_argument);
-  CHECK_THROWS_AS(
-      ParseEngineMessage(R"({"type":"web_api_token","ok":true})"),
-      std::invalid_argument);
-}
-
-TEST_CASE("web_api_token provider reuses fresh tokens and refreshes on expiry") {
-  auto now = std::make_shared<int64_t>(1'000'000);
-  int mints = 0;
-  WebApiTokenProvider provider(
-      [&](WebApiToken* token, std::string*, int) {
-        ++mints;
-        token->token_type = "Bearer";
-        token->access_token = "token-" + std::to_string(mints);
-        token->expires_in = 3600;
-        return true;
-      },
-      [now] { return *now; });
-  CHECK(provider.GetAccessToken() == "token-1");
-  CHECK(provider.GetAccessToken() == "token-1");  // cached
-  CHECK(mints == 1);
-  *now += 3599;  // still inside the reported lifetime
-  CHECK(provider.GetAccessToken() == "token-1");
-  *now += 2;  // past expiry: the next call must re-mint
-  CHECK(provider.GetAccessToken() == "token-2");
-  CHECK(mints == 2);
-}
-
-TEST_CASE("web_api_token provider forced refresh mints a new token") {
-  int mints = 0;
-  WebApiTokenProvider provider([&](WebApiToken* token, std::string*, int) {
-    token->access_token = "token-" + std::to_string(++mints);
-    token->expires_in = 3600;
-    return true;
-  });
-  CHECK(provider.GetAccessToken() == "token-1");
-  CHECK(provider.Refresh());
-  CHECK(provider.GetAccessToken() == "token-2");
-  CHECK(mints == 2);
-}
-
-TEST_CASE("web_api_token provider surfaces engine mint failures") {
-  int calls = 0;
-  WebApiTokenProvider provider([&](WebApiToken*, std::string* error, int) {
-    ++calls;
-    if (error) *error = "engine says no";
-    return false;
-  });
-  CHECK_THROWS_WITH_AS(provider.GetAccessToken(), "engine says no",
-                       std::runtime_error);
-  CHECK_FALSE(provider.Refresh());
-  CHECK(calls == 2);
-}
-
 TEST_CASE("audio cache usage sums files under engine audio cache directory") {
   const auto temp =
       std::filesystem::temp_directory_path() /
@@ -627,86 +549,34 @@ TEST_CASE("ui rows: rail artwork maps rows through the filtered playlist indices
   CHECK_FALSE(RowArtworkSeed(third.cover_url, Utf8ToWide(third.name)) == 0);
 }
 
-TEST_CASE("retry-after header parses seconds and HTTP dates") {
-  // Plain delta seconds (RFC 7231).
-  CHECK(ParseRetryAfterSeconds("", 0) == 0);
-  CHECK(ParseRetryAfterSeconds("35", 0) == 35);
-  CHECK(ParseRetryAfterSeconds(" 12 ", 0) == 12);
-  CHECK(ParseRetryAfterSeconds("0", 0) == 0);
-  // HTTP-date: the wait is the remaining time until that moment (1994-11-06
-  // 08:49:37 UTC = unix 784111777).
-  CHECK(ParseRetryAfterSeconds("Sun, 06 Nov 1994 08:49:37 GMT", 784111777) == 0);
-  CHECK(ParseRetryAfterSeconds("Sun, 06 Nov 1994 08:49:37 GMT", 784111757) == 20);
-  // RFC 850 format with a two-digit year.
-  CHECK(ParseRetryAfterSeconds("Sunday, 06-Nov-94 08:49:37 GMT", 784111757) == 20);
-  // asctime format.
-  CHECK(ParseRetryAfterSeconds("Sun Nov  6 08:49:37 1994", 784111757) == 20);
-  CHECK(ParseRetryAfterSeconds("Sun Nov  6 08:49:37 1994", 784111777) == 0);
-  // Unparseable headers never produce a wait.
-  CHECK(ParseRetryAfterSeconds("garbage", 0) == 0);
-  CHECK(ParseRetryAfterSeconds("Thu, 32 Feb 2020 00:00:00 GMT", 1'000'000) == 0);
+TEST_CASE("ui rows: label width ends before an overlapping sibling control") {
+  // The workspace title/meta labels must stop 8 DIPs before the Rename
+  // button (siblingLeft); overlapping siblings with WS_CLIPSIBLINGS leave
+  // the shared band unpainted, cutting the covered control off.
+  CHECK(LabelWidthBefore(400, 1120) == 712);   // default 8px gap
+  CHECK(LabelWidthBefore(400, 1120, 0) == 720);
+  CHECK(LabelWidthBefore(400, 1120, 16) == 704);
+  // A sibling that starts left of the text cannot leave room: clamp to 0.
+  CHECK(LabelWidthBefore(1120, 400) == 0);
+  CHECK(LabelWidthBefore(500, 480) == 0);
+  // Exact-fit sibling leaves exactly the gap.
+  CHECK(LabelWidthBefore(400, 400, 8) == 0);
+  CHECK(LabelWidthBefore(392, 400, 8) == 0);
+  CHECK(LabelWidthBefore(391, 400, 8) == 1);
 }
 
-TEST_CASE("backoff doubles exponentially within jitter bounds") {
-  const auto fixed = [](double value) {
-    return [value] { return value; };
-  };
-  // rng 0.5 lands in the middle of each band: 1, 2, 3, 6, ...
-  CHECK(ComputeBackoffDelay(0, 0, fixed(0.5)) == 1);
-  CHECK(ComputeBackoffDelay(1, 0, fixed(0.5)) == 2);
-  CHECK(ComputeBackoffDelay(2, 0, fixed(0.5)) == 3);
-  CHECK(ComputeBackoffDelay(3, 0, fixed(0.5)) == 6);
-  // rng 0 and 1 pin the [base/2, base] floor and ceiling.
-  CHECK(ComputeBackoffDelay(0, 0, fixed(0.0)) == 1);
-  CHECK(ComputeBackoffDelay(0, 0, fixed(1.0)) == 1);
-  CHECK(ComputeBackoffDelay(2, 0, fixed(0.0)) == 2);
-  CHECK(ComputeBackoffDelay(2, 0, fixed(1.0)) == 4);
-  CHECK(ComputeBackoffDelay(3, 0, fixed(1.0)) == 8);
-}
-
-TEST_CASE("backoff honors retry-after and caps the wait") {
-  const auto fixed = [](double value) {
-    return [value] { return value; };
-  };
-  // A Retry-After hint dominates the exponential schedule.
-  CHECK(ComputeBackoffDelay(0, 35, fixed(0.5)) == 35);
-  CHECK(ComputeBackoffDelay(3, 35, fixed(1.0)) == 35);  // base 8 < 35
-  // The exponential term wins when it exceeds the hint; base caps at 60.
-  CHECK(ComputeBackoffDelay(6, 2, fixed(1.0)) == 60);
-  CHECK(ComputeBackoffDelay(6, 2, fixed(0.0)) == 30);
-  CHECK(ComputeBackoffDelay(9, 0, fixed(1.0)) == 60);
-  // Hard ceiling: never wait longer than 300 s per retry.
-  CHECK(ComputeBackoffDelay(0, 400, fixed(0.5)) == 300);
-  // A missing hint still schedules a minimum wait, never zero.
-  CHECK(ComputeBackoffDelay(0, 0, fixed(0.5)) >= 1);
-}
-
-TEST_CASE("web_api_token provider shares one in-flight mint across racing callers") {
-  auto now = std::make_shared<int64_t>(1'000'000);
-  std::atomic<int> mints{0};
-  WebApiTokenProvider provider(
-      [&](WebApiToken* token, std::string*, int) {
-        ++mints;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));  // hold the mint open
-        token->token_type = "Bearer";
-        token->access_token = "token-race";
-        token->expires_in = 3600;
-        return true;
-      },
-      [now] { return *now; });
-  constexpr int kCallers = 8;
-  std::vector<std::string> results(kCallers);
-  std::vector<std::thread> threads;
-  for (int i = 0; i < kCallers; ++i) {
-    threads.emplace_back([&provider, &results, i] {
-      results[i] = provider.GetAccessToken();
-    });
-  }
-  for (auto& thread : threads) thread.join();
-  CHECK(mints.load() == 1);  // every waiter shared the in-flight mint
-  for (const std::string& token : results) CHECK(token == "token-race");
-  CHECK(provider.GetAccessToken() == "token-race");  // still cached
-  CHECK(mints.load() == 1);
+TEST_CASE("ui rows: edit centering inset recenters text and cue banner") {
+  // 38px edit with a ~21px line height: inset centers the line.
+  CHECK(EditCenteringInset(38, 21) == 8);
+  // Odd heights bias the extra pixel to the bottom inset (integer divide).
+  CHECK(EditCenteringInset(39, 21) == 9);
+  // A line taller than the control leaves no room: inset clamps to 0.
+  CHECK(EditCenteringInset(20, 21) == 0);
+  CHECK(EditCenteringInset(21, 21) == 0);
+  // Degenerate inputs never produce a negative inset.
+  CHECK(EditCenteringInset(0, 21) == 0);
+  CHECK(EditCenteringInset(38, 0) == 0);
+  CHECK(EditCenteringInset(-4, 21) == 0);
 }
 
 TEST_CASE("delayed api task queue runs due work in deadline order, one at a time") {
@@ -1058,6 +928,48 @@ TEST_CASE("browse model conversion tolerates absent optional fields") {
   CHECK_THROWS_AS(PlaylistRefFromEngineJson(json::array()), std::invalid_argument);
   CHECK_THROWS_AS(AlbumRefFromEngineJson(json::array()), std::invalid_argument);
   CHECK_THROWS_AS(ArtistRefFromEngineJson(json::array()), std::invalid_argument);
+}
+
+TEST_CASE("edit_* responses parse as data messages and errors carry text") {
+  EngineMessage create = ParseEngineMessage(
+      R"({"type":"edit_create_playlist","request_id":"90","ok":true,"data":{"id":"pl-new","uri":"spotify:playlist:pl-new","name":"Road Trip","owner_id":"alice","owner_name":"","track_count":0}})");
+  CHECK(create.kind == EngineMessage::Kind::Data);
+  CHECK(create.ok);
+  const PlaylistRef playlist = PlaylistRefFromEngineJson(create.data["data"]);
+  CHECK(playlist.id == "pl-new");
+  CHECK(playlist.name == "Road Trip");
+  CHECK(playlist.tracks_total == 0);
+
+  EngineMessage rename = ParseEngineMessage(
+      R"({"type":"edit_rename_playlist","request_id":"91","ok":false,"error":"playlist change failed: stale revision"})");
+  CHECK(rename.kind == EngineMessage::Kind::Data);
+  CHECK_FALSE(rename.ok);
+  CHECK(rename.error == "playlist change failed: stale revision");
+  CHECK(rename.data.find("data") == rename.data.end());
+}
+
+TEST_CASE("edit command request shapes match the engine line protocol") {
+  const json create = BuildEngineRequest(
+      "r1", "edit_create_playlist", {{"name", "Road Trip"}});
+  CHECK(create["type"] == "edit_create_playlist");
+  CHECK(create["name"] == "Road Trip");
+
+  const json rename = BuildEngineRequest(
+      "r2", "edit_rename_playlist", {{"id", "pl1"}, {"name", "Renamed"}});
+  CHECK(rename["id"] == "pl1");
+  CHECK(rename["name"] == "Renamed");
+
+  const json remove = BuildEngineRequest(
+      "r3", "edit_remove_playlist_tracks",
+      {{"id", "pl1"}, {"uris", json::array({"spotify:track:abc"})}});
+  CHECK(remove["type"] == "edit_remove_playlist_tracks");
+  CHECK(remove["uris"][0] == "spotify:track:abc");
+
+  const json reorder = BuildEngineRequest(
+      "r4", "edit_reorder_playlist_tracks",
+      {{"id", "pl1"}, {"from", 3}, {"to", 1}});
+  CHECK(reorder["from"] == 3);
+  CHECK(reorder["to"] == 1);
 }
 
 }  // namespace

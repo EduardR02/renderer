@@ -15,7 +15,6 @@ add_library(sr_core STATIC
   src/log.cpp
   src/playback_engine_client.cpp
   src/http.cpp
-  src/spotify_api.cpp
   src/tray.cpp
   src/ui_main.cpp
   src/app.cpp

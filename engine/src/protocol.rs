@@ -73,10 +73,6 @@ pub enum Command {
         to: usize,
     },
     Shutdown,
-    /// Mints (or returns a cached) Web API access token via login5 so the UI
-    /// can browse without its own OAuth app. Responded to with
-    /// [`WebApiTokenResponse`].
-    WebApiToken,
     /// User playlist library via the spclient rootlist (first `length`
     /// entries). Responded to with a `browse_playlists` message.
     BrowsePlaylists {
@@ -102,6 +98,44 @@ pub enum Command {
     BrowseSearch {
         query: String,
         limit: usize,
+    },
+    /// Creates a playlist via the spclient playlist4 create endpoint and adds
+    /// it to the user's rootlist. Responded to with an `edit_create_playlist`
+    /// message carrying the new playlist's [`PlaylistRef`].
+    EditCreatePlaylist {
+        name: String,
+    },
+    /// Renames a playlist via a playlist4 UPDATE_LIST_ATTRIBUTES change.
+    /// Responded to with an `edit_rename_playlist` message.
+    EditRenamePlaylist {
+        id: String,
+        name: String,
+    },
+    /// Unfollows (removes) a playlist from the user's rootlist via a rootlist
+    /// REM change. Responded to with an `edit_delete_playlist` message.
+    EditDeletePlaylist {
+        id: String,
+    },
+    /// Appends tracks to a playlist via a playlist4 ADD change. Responded to
+    /// with an `edit_add_playlist_tracks` message.
+    EditAddPlaylistTracks {
+        id: String,
+        uris: Vec<String>,
+    },
+    /// Removes tracks by URI from a playlist via a playlist4 REM change
+    /// (`items_as_key`). Responded to with an `edit_remove_playlist_tracks`
+    /// message.
+    EditRemovePlaylistTracks {
+        id: String,
+        uris: Vec<String>,
+    },
+    /// Moves one track to the position `to` (insert before `to`, Web API
+    /// reorder semantics) via a playlist4 MOV change. Responded to with an
+    /// `edit_reorder_playlist_tracks` message.
+    EditReorderPlaylistTracks {
+        id: String,
+        from: usize,
+        to: usize,
     },
     /// Clears the cached credentials and tears the session down; the engine
     /// immediately reports `needs_login` (with a fresh authorize URL).
@@ -140,25 +174,6 @@ pub struct Response<'a> {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<&'a str>,
-}
-
-/// Response for [`Command::WebApiToken`]: carries the engine-minted login5
-/// token on success (token fields are omitted on failure). `expires_in` is
-/// the skew-adjusted remaining lifetime in seconds.
-#[derive(Serialize)]
-pub struct WebApiTokenResponse<'a> {
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    pub request_id: &'a str,
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_type: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_in: Option<u64>,
 }
 
 /// Playlist reference inside browse responses. `owner_id` is the owning
@@ -295,67 +310,79 @@ mod tests {
     use serde_json::json;
 
     use super::{AuthState, BrowseResponse, Command, PlaylistRef, RepeatMode, Request, Response,
-                SearchBrowse, StateEvent, TrackRef, WebApiTokenResponse};
+                SearchBrowse, StateEvent, TrackRef};
 
     #[test]
-    fn web_api_token_command_deserializes_from_the_line_protocol() {
-        let request: Request = serde_json::from_value(json!({
-            "request_id": "request-7",
-            "type": "web_api_token",
+    fn edit_commands_deserialize_from_the_line_protocol() {
+        let create: Request = serde_json::from_value(json!({
+            "request_id": "request-16",
+            "type": "edit_create_playlist",
+            "name": "Road Trip",
         }))
         .unwrap();
-        assert_eq!(request.request_id, "request-7");
-        assert!(matches!(request.command, Command::WebApiToken));
-    }
+        assert!(matches!(
+            create.command,
+            Command::EditCreatePlaylist { ref name } if name == "Road Trip"
+        ));
 
-    #[test]
-    fn web_api_token_response_serializes_the_token_contract() {
-        let success = serde_json::to_value(WebApiTokenResponse {
-            kind: "web_api_token",
-            request_id: "request-7",
-            ok: true,
-            error: None,
-            token_type: Some("Bearer"),
-            access_token: Some("access-token-value"),
-            expires_in: Some(3540),
-        })
+        let rename: Request = serde_json::from_value(json!({
+            "request_id": "request-17",
+            "type": "edit_rename_playlist",
+            "id": "0123456789ABCDEFGHIJKL",
+            "name": "Renamed",
+        }))
         .unwrap();
-        assert_eq!(
-            success,
-            json!({
-                "type": "web_api_token",
-                "request_id": "request-7",
-                "ok": true,
-                "token_type": "Bearer",
-                "access_token": "access-token-value",
-                "expires_in": 3540
-            })
-        );
-    }
+        assert!(matches!(
+            rename.command,
+            Command::EditRenamePlaylist { ref id, ref name }
+                if id == "0123456789ABCDEFGHIJKL" && name == "Renamed"
+        ));
 
-    #[test]
-    fn web_api_token_response_omits_token_fields_on_error() {
-        let failure = serde_json::to_value(WebApiTokenResponse {
-            kind: "web_api_token",
-            request_id: "request-8",
-            ok: false,
-            error: Some("could not mint a Spotify Web API token: unavailable"),
-            token_type: None,
-            access_token: None,
-            expires_in: None,
-        })
+        let delete: Request = serde_json::from_value(json!({
+            "request_id": "request-18",
+            "type": "edit_delete_playlist",
+            "id": "0123456789ABCDEFGHIJKL",
+        }))
         .unwrap();
-        assert_eq!(
-            failure,
-            json!({
-                "type": "web_api_token",
-                "request_id": "request-8",
-                "ok": false,
-                "error": "could not mint a Spotify Web API token: unavailable"
-            })
-        );
-    }
+        assert!(matches!(delete.command, Command::EditDeletePlaylist { .. }));
 
+        let add: Request = serde_json::from_value(json!({
+            "request_id": "request-19",
+            "type": "edit_add_playlist_tracks",
+            "id": "0123456789ABCDEFGHIJKL",
+            "uris": ["spotify:track:2abcdefghijklmnopqrstu"],
+        }))
+        .unwrap();
+        assert!(matches!(
+            add.command,
+            Command::EditAddPlaylistTracks { ref uris, .. } if uris == &["spotify:track:2abcdefghijklmnopqrstu".to_owned()]
+        ));
+
+        let remove: Request = serde_json::from_value(json!({
+            "request_id": "request-20",
+            "type": "edit_remove_playlist_tracks",
+            "id": "0123456789ABCDEFGHIJKL",
+            "uris": [],
+        }))
+        .unwrap();
+        assert!(matches!(
+            remove.command,
+            Command::EditRemovePlaylistTracks { uris, .. } if uris.is_empty()
+        ));
+
+        let reorder: Request = serde_json::from_value(json!({
+            "request_id": "request-21",
+            "type": "edit_reorder_playlist_tracks",
+            "id": "0123456789ABCDEFGHIJKL",
+            "from": 3,
+            "to": 1,
+        }))
+        .unwrap();
+        assert!(matches!(
+            reorder.command,
+            Command::EditReorderPlaylistTracks { from: 3, to: 1, .. }
+        ));
+    }
 
     #[test]
     fn response_serialization_omits_absent_errors_and_preserves_failures() {

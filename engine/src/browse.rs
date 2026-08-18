@@ -4,17 +4,22 @@
 //! (login5 Bearer auth + automatic client token), so no developer Web API
 //! client id is involved.
 //!
-//! Response-mapping notes (flagged for live verification):
+//! Response-mapping notes:
 //! - Rootlist: `/playlist/v2/user/{user}/rootlist` answered as
 //!   protobuf-JSON with `contents.items`/`contents.metaItems` parallel
 //!   arrays (shape cross-checked against other spclient clients). The
 //!   rootlist carries owner usernames but no owner display names, so
-//!   `owner_name` is empty there.
+//!   `owner_name` is empty there. Playlist covers come from the raw
+//!   `attributes.picture` file id (base64 bytes -> `https://i.scdn.co/image/
+//!   {hex}`), with ready-made `pictureSize` URLs as fallback.
 //! - Search: `/searchview/km/v4/search/{q}` answered as protobuf-JSON with
-//!   `results.tracks|albums|artists.hits` (field names assumed from the
-//!   official client's protobuf-JSON mapping and still unverified). Parsing
-//!   is deliberately tolerant: unknown/missing fields degrade to empty
-//!   strings, zeros, and empty lists instead of failing the whole browse.
+//!   `results.tracks|albums|artists.hits`. The query parameters follow
+//!   librespot-java's SearchManager: `entityVersion=2` and — critically —
+//!   non-empty `country` (from the session) and `locale` values; the
+//!   searchview service rejects requests with empty `country`/`locale` with
+//!   a 400 INVALID_ARGUMENT. Parsing stays tolerant: unknown/missing fields
+//!   degrade to empty strings, zeros, and empty lists instead of failing the
+//!   whole browse.
 
 use std::collections::HashSet;
 
@@ -187,25 +192,27 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Cover for a rootlist playlist: ready-made `pictureSize` URLs win over the
-/// raw base64 picture file id.
+/// Cover for a rootlist playlist: the raw `picture` file id (base64 bytes)
+/// maps 1:1 to the canonical `https://i.scdn.co/image/{hex}` URL and wins
+/// over ready-made `pictureSize` URLs (which may be mosaic-style crops).
 fn rootlist_cover(attributes: &RootlistAttributesJson) -> Option<String> {
-    if let Some(url) = attributes
+    if let Some(picture) = attributes
+        .picture
+        .as_deref()
+        .filter(|picture| !picture.is_empty())
+    {
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(picture) {
+            if !bytes.is_empty() {
+                return Some(format!("{COVER_BASE}{}", hex(&bytes)));
+            }
+        }
+    }
+    attributes
         .picture_size
         .iter()
         .find_map(|size| size.url.as_deref())
         .filter(|url| !url.is_empty())
-    {
-        return Some(url.to_owned());
-    }
-    let picture = attributes.picture.as_deref()?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(picture)
-        .ok()?;
-    if bytes.is_empty() {
-        return None;
-    }
-    Some(format!("{COVER_BASE}{}", hex(&bytes)))
+        .map(str::to_owned)
 }
 
 /// Converts one aligned `items[i]`/`metaItems[i]` pair into a `PlaylistRef`.
@@ -572,6 +579,32 @@ fn artist_ref_from_hit(hit: &SearchArtistHitJson) -> ArtistRef {
     }
 }
 
+/// Locale sent to searchview; the engine session carries no user locale, and
+/// librespot-java's default preferred locale is "en".
+const SEARCH_LOCALE: &str = "en";
+
+/// Builds the searchview request path. `country` must be the session's
+/// two-letter country code and `locale` a language tag: the searchview
+/// service answers 400 INVALID_ARGUMENT when either is empty (the query
+/// parameters mirror librespot-java's SearchManager, which fills both from
+/// the session).
+pub fn search_endpoint(
+    query: &str,
+    limit: usize,
+    country: &str,
+    locale: &str,
+    username: &str,
+) -> String {
+    let encoded = utf8_percent_encode(query.trim(), NON_ALPHANUMERIC);
+    format!(
+        "/searchview/km/v4/search/{encoded}?entityVersion=2&limit={limit}&country={country}&locale={locale}&username={user}",
+        limit = limit.clamp(1, MAX_SEARCH_LIMIT),
+        country = utf8_percent_encode(country, NON_ALPHANUMERIC),
+        locale = utf8_percent_encode(locale, NON_ALPHANUMERIC),
+        user = username,
+    )
+}
+
 /// Search via the spclient searchview endpoint. The response mapping is
 /// tolerant: any section the server leaves out (or names differently) simply
 /// yields an empty list.
@@ -583,13 +616,13 @@ pub async fn search_browse(
     if query.trim().is_empty() {
         return Err("search query must not be empty".to_owned());
     }
-    let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
-    let encoded = utf8_percent_encode(query.trim(), NON_ALPHANUMERIC);
-    let endpoint = format!(
-        "/searchview/km/v4/search/{encoded}?entityVersion=2&limit={limit}&country=&locale=&username={user}",
-        user = session.username(),
-    );
-    let body = session
+    let endpoint = search_endpoint(
+        query,
+        limit,
+        &session.country(),
+        SEARCH_LOCALE,
+        &session.username(),
+    );    let body = session
         .spclient()
         .request_as_json(&Method::GET, &endpoint, None, None)
         .await
@@ -835,6 +868,50 @@ mod tests {
     }
 
     #[test]
+    fn rootlist_cover_prefers_the_picture_file_id_over_picture_size_urls() {
+        // Both present: the raw picture (base64 file id -> i.scdn.co hex)
+        // wins; a pictureSize URL is only the fallback.
+        let both = RootlistAttributesJson {
+            name: None,
+            picture: Some("EREREREREREREREREREREQ==".to_owned()),
+            picture_size: vec![PictureSizeJson {
+                url: Some("https://mosaic.scdn.co/640/abc".to_owned()),
+            }],
+        };
+        let cover = rootlist_cover(&both).unwrap();
+        assert!(cover.starts_with(COVER_BASE));
+        assert_eq!(cover.len(), COVER_BASE.len() + 32, "16 decoded bytes -> 32 hex chars");
+
+        // No picture: the ready-made URL is used.
+        let url_only = RootlistAttributesJson {
+            name: None,
+            picture: None,
+            picture_size: vec![PictureSizeJson {
+                url: Some("https://i.scdn.co/image/ab67616d0000b2730123456789abcdef01234567".to_owned()),
+            }],
+        };
+        assert_eq!(
+            rootlist_cover(&url_only).as_deref(),
+            Some("https://i.scdn.co/image/ab67616d0000b2730123456789abcdef01234567")
+        );
+
+        // Undecodable or empty picture data degrades to the fallback / None.
+        let garbage = RootlistAttributesJson {
+            name: None,
+            picture: Some("!!!not-base64!!!".to_owned()),
+            picture_size: vec![PictureSizeJson {
+                url: Some("https://mosaic.scdn.co/640/abc".to_owned()),
+            }],
+        };
+        assert_eq!(
+            rootlist_cover(&garbage).as_deref(),
+            Some("https://mosaic.scdn.co/640/abc")
+        );
+        let empty = RootlistAttributesJson::default();
+        assert_eq!(rootlist_cover(&empty), None);
+    }
+
+    #[test]
     fn rootlist_skips_non_playlist_rows_and_missing_meta() {
         let body = r#"{
             "contents": {
@@ -953,12 +1030,22 @@ mod tests {
     }
 
     #[test]
-    fn search_endpoint_encodes_the_query_and_clamps_the_limit() {
-        // The endpoint builder lives inside `search_browse`; exercise the
-        // encoding of a query that must not leak raw path characters.
-        let encoded = utf8_percent_encode("fire & ice?", NON_ALPHANUMERIC).to_string();
-        assert_eq!(encoded, "fire%20%26%20ice%3F");
-        assert_eq!(50usize.clamp(1, MAX_SEARCH_LIMIT), 50);
-        assert_eq!(5000usize.clamp(1, MAX_SEARCH_LIMIT), MAX_SEARCH_LIMIT);
+    fn search_endpoint_encodes_the_query_and_fills_session_values() {
+        // The searchview service rejects empty country/locale with 400
+        // INVALID_ARGUMENT; the endpoint must always carry the session's
+        // two-letter country code and a locale (librespot-java fills both
+        // from the session the same way).
+        let endpoint = search_endpoint("fire & ice?", 10, "US", "en", "alice");
+        assert!(endpoint.starts_with("/searchview/km/v4/search/fire%20%26%20ice%3F?"));
+        assert!(endpoint.contains("entityVersion=2"));
+        assert!(endpoint.contains("&limit=10"));
+        assert!(endpoint.contains("&country=US"));
+        assert!(endpoint.contains("&locale=en"));
+        assert!(endpoint.contains("&username=alice"));
+
+        let clamped = search_endpoint("q", 5000, "US", "en", "alice");
+        assert!(clamped.contains("&limit=50"));
+        assert!(clamped.contains("&country=US"), "country must never be empty");
+        assert!(clamped.contains("&locale=en"), "locale must never be empty");
     }
 }
