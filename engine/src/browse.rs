@@ -41,6 +41,7 @@ use std::collections::HashSet;
 
 use base64::Engine as _;
 use http::Method;
+use librespot_core::error::ErrorKind;
 use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
 use librespot_protocol::extended_metadata::{
@@ -70,6 +71,17 @@ const METADATA_RETRY_ATTEMPTS: usize = 3;
 /// milliseconds and doubling up to [`METADATA_BACKOFF_MAX_MS`].
 const METADATA_BACKOFF_BASE_MS: u64 = 250;
 const METADATA_BACKOFF_MAX_MS: u64 = 2_000;
+
+/// Retries after the first attempt when a browse request fails: the spclient
+/// front door answers transient 5xx (502/503) and the metadata/search
+/// services sit behind the same proxy/CDN layer, so a bounded retry absorbs
+/// them before an error reaches the UI. Same capped exponential schedule as
+/// the metadata batches; the whole cycle (3 retries, at most 1750 ms of
+/// sleep) fits comfortably inside the UI's 20-second browse round-trip
+/// timeout.
+const BROWSE_RETRY_ATTEMPTS: usize = 3;
+const BROWSE_BACKOFF_BASE_MS: u64 = 250;
+const BROWSE_BACKOFF_MAX_MS: u64 = 2_000;
 
 /// Upper bounds mirroring the endpoints' practical limits; larger requests
 /// are clamped instead of refused.
@@ -143,6 +155,31 @@ fn backoff_sequence(attempts: usize, base_ms: u64, max_ms: u64) -> Vec<u64> {
     (0..attempts)
         .map(|attempt| (base_ms << attempt).min(max_ms))
         .collect()
+}
+
+/// Extracts the HTTP status code when a librespot error wraps an
+/// `HttpClientError::StatusCode` — the shape unmapped server statuses such
+/// as 502 Bad Gateway take (reported under [`ErrorKind::Unknown`]).
+fn http_status_of(error: &librespot_core::Error) -> Option<u16> {
+    use librespot_core::http_client::HttpClientError;
+    match error.error.downcast_ref::<HttpClientError>() {
+        Some(HttpClientError::StatusCode(code)) => Some(code.as_u16()),
+        None => None,
+    }
+}
+
+/// Whether a failed browse round-trip is transient and worth a bounded
+/// retry: network/timeout failures (`Unavailable`, `DeadlineExceeded`) and
+/// HTTP server errors (5xx — including 502, which librespot's status
+/// mapping leaves as `Unknown` wrapping the status). Client errors (4xx)
+/// and other kinds are permanent and fail fast. `status` is the HTTP status
+/// when the error wraps one. Pure so the retry decision is unit-testable.
+fn browse_error_is_transient(kind: ErrorKind, status: Option<u16>) -> bool {
+    match kind {
+        ErrorKind::Unavailable | ErrorKind::DeadlineExceeded => true,
+        ErrorKind::Unknown => status.is_some_and(|code| (500..=599).contains(&code)),
+        _ => false,
+    }
 }
 
 /// Deduplicates URIs by entity id, keeping first-appearance order
@@ -436,18 +473,52 @@ fn playlist_ref_from_rootlist(
     })
 }
 
-/// The user's playlist library from the spclient rootlist endpoint.
+/// The user's playlist library from the spclient rootlist endpoint. The GET
+/// is retried with the bounded capped-exponential schedule: the spclient
+/// front door answers transient 502/503s that a retry absorbs before the
+/// error reaches the UI (librespot's own HTTP retry only covers
+/// network-level failures, never 5xx responses). The final failure carries
+/// the method/path (the session's own account username, not a credential)
+/// and the last error, which embeds the HTTP status.
 pub async fn playlists_browse(session: &Session, length: usize) -> Result<Vec<PlaylistRef>, String> {
     let length = length.clamp(1, MAX_PLAYLISTS);
     let endpoint = format!(
         "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from=0&length={length}",
         user = session.username(),
     );
-    let body = session
-        .spclient()
-        .request_as_json(&Method::GET, &endpoint, None, None)
-        .await
-        .map_err(|error| format!("rootlist request failed: {error}"))?;
+    let backoffs = backoff_sequence(
+        BROWSE_RETRY_ATTEMPTS,
+        BROWSE_BACKOFF_BASE_MS,
+        BROWSE_BACKOFF_MAX_MS,
+    );
+    let mut attempt = 0usize;
+    let body = loop {
+        match session
+            .spclient()
+            .request_as_json(&Method::GET, &endpoint, None, None)
+            .await
+        {
+            Ok(body) => break body,
+            Err(error) => {
+                if !browse_error_is_transient(error.kind, http_status_of(&error))
+                    || attempt >= backoffs.len()
+                {
+                    return Err(format!(
+                        "rootlist request failed: GET {endpoint} after {} attempts (last error: {error})",
+                        attempt + 1,
+                    ));
+                }
+                let backoff = backoffs[attempt];
+                eprintln!(
+                    "rootlist request GET {endpoint} failed ({error}); retrying in {backoff} ms (attempt {}/{})",
+                    attempt + 1,
+                    backoffs.len() + 1,
+                );
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+        }
+    };
     let parsed: RootlistJson = serde_json::from_slice(&body)
         .map_err(|error| format!("unparseable rootlist response: {error}"))?;
     let contents = parsed.contents.unwrap_or_default();
@@ -468,15 +539,53 @@ fn playlist_uri(id: &str) -> Result<SpotifyUri, String> {
         .map_err(|error| format!("invalid playlist id: {error}"))
 }
 
+/// Fetches one metadata entity with the bounded retry/backoff schedule:
+/// librespot's `Metadata::get` is a single Mercury round-trip with no retry
+/// of its own, so a transient server-side failure (reported as
+/// `Unavailable`) would otherwise fail the whole browse.
+async fn metadata_get<T: Metadata>(
+    session: &Session,
+    uri: &SpotifyUri,
+    kind: &str,
+) -> Result<T, String> {
+    let backoffs = backoff_sequence(
+        BROWSE_RETRY_ATTEMPTS,
+        BROWSE_BACKOFF_BASE_MS,
+        BROWSE_BACKOFF_MAX_MS,
+    );
+    let mut attempt = 0usize;
+    loop {
+        match T::get(session, uri).await {
+            Ok(item) => return Ok(item),
+            Err(error) => {
+                if !browse_error_is_transient(error.kind, http_status_of(&error))
+                    || attempt >= backoffs.len()
+                {
+                    return Err(format!(
+                        "{kind} fetch of {uri} failed after {} attempts (last error: {error})",
+                        attempt + 1,
+                    ));
+                }
+                let backoff = backoffs[attempt];
+                eprintln!(
+                    "{kind} fetch of {uri} failed ({error}); retrying in {backoff} ms (attempt {}/{})",
+                    attempt + 1,
+                    backoffs.len() + 1,
+                );
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Playlist header and tracks via the spclient playlist4 endpoint.
 pub async fn playlist_browse(
     session: &Session,
     id: &str,
 ) -> Result<crate::protocol::PlaylistBrowse, String> {
     let uri = playlist_uri(id)?;
-    let playlist = Playlist::get(session, &uri)
-        .await
-        .map_err(|error| format!("playlist fetch failed: {error}"))?;
+    let playlist: Playlist = metadata_get(session, &uri, "playlist").await?;
     let (owner_id, owner_name) = match &playlist.id {
         SpotifyUri::Playlist { user, .. } => (
             user.clone().unwrap_or_default(),
@@ -517,9 +626,7 @@ pub async fn album_browse(
 ) -> Result<crate::protocol::AlbumBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}"))
         .map_err(|error| format!("invalid album id: {error}"))?;
-    let album = Album::get(session, &uri)
-        .await
-        .map_err(|error| format!("album fetch failed: {error}"))?;
+    let album: Album = metadata_get(session, &uri, "album").await?;
     let tracks = fetch_tracks(session, album.tracks()).await;
     Ok(crate::protocol::AlbumBrowse {
         id: id_of(&album.id),
@@ -548,9 +655,7 @@ pub async fn artist_browse(
 ) -> Result<crate::protocol::ArtistBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
         .map_err(|error| format!("invalid artist id: {error}"))?;
-    let artist = Artist::get(session, &uri)
-        .await
-        .map_err(|error| format!("artist fetch failed: {error}"))?;
+    let artist: Artist = metadata_get(session, &uri, "artist").await?;
     let top_tracks = artist.top_tracks.for_country(&session.country());
     let top_tracks = fetch_tracks(session, top_tracks.iter()).await;
     let albums = fetch_albums(session, artist.albums_current()).await;
@@ -815,12 +920,58 @@ pub async fn search_browse(
         SEARCH_LOCALE,
         &session.username(),
     );
-    let response = session
-        .mercury()
-        .get(uri)
-        .map_err(|error| format!("search request failed: {error}"))?
-        .await
-        .map_err(|error| format!("search request failed: {error}"))?;
+    // The Mercury round-trip is retried with the bounded backoff schedule:
+    // transport failures (librespot reports Mercury errors as `Unavailable`)
+    // and server-side status codes (gRPC-style 4 deadline / 13 internal /
+    // 14 unavailable) are transient; client errors such as 400
+    // INVALID_ARGUMENT fail fast.
+    let backoffs = backoff_sequence(
+        BROWSE_RETRY_ATTEMPTS,
+        BROWSE_BACKOFF_BASE_MS,
+        BROWSE_BACKOFF_MAX_MS,
+    );
+    let mut attempt = 0usize;
+    let response = loop {
+        let response = match session.mercury().get(&uri) {
+            Ok(request) => match request.await {
+                Ok(response) => response,
+                Err(error) => {
+                    if !browse_error_is_transient(error.kind, http_status_of(&error))
+                        || attempt >= backoffs.len()
+                    {
+                        return Err(format!(
+                            "search request failed: {uri} after {} attempts (last error: {error})",
+                            attempt + 1,
+                        ));
+                    }
+                    let backoff = backoffs[attempt];
+                    eprintln!(
+                        "search request {uri} failed ({error}); retrying in {backoff} ms (attempt {}/{})",
+                        attempt + 1,
+                        backoffs.len() + 1,
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    attempt += 1;
+                    continue;
+                }
+            },
+            Err(error) => return Err(format!("search request failed: {error}")),
+        };
+        let transient = response.status_code != 200
+            && matches!(response.status_code, 4 | 13 | 14);
+        if !transient || attempt >= backoffs.len() {
+            break response;
+        }
+        let backoff = backoffs[attempt];
+        eprintln!(
+            "search request {uri} failed (status {}); retrying in {backoff} ms (attempt {}/{})",
+            response.status_code,
+            attempt + 1,
+            backoffs.len() + 1,
+        );
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
+        attempt += 1;
+    };
     if response.status_code != 200 {
         let body = response
             .payload
@@ -834,8 +985,10 @@ pub async fn search_browse(
             })
             .unwrap_or_default();
         return Err(format!(
-            "search request failed (status {}):{}",
-            response.status_code, body
+            "search request failed: {uri} after {} attempt(s) (status {}):{}",
+            attempt + 1,
+            response.status_code,
+            body
         ));
     }
     let body = response
@@ -1291,6 +1444,50 @@ mod tests {
             "capped at the maximum"
         );
         assert_eq!(backoff_sequence(0, 250, 2000), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn browse_error_is_transient_only_retries_server_side_failures() {
+        use librespot_core::error::ErrorKind;
+        // Network/timeout failures are always transient (librespot maps
+        // Mercury errors and 500/503 to `Unavailable`).
+        assert!(browse_error_is_transient(ErrorKind::Unavailable, None));
+        assert!(browse_error_is_transient(ErrorKind::DeadlineExceeded, None));
+        // 5xx HTTP statuses are transient: 500/503 arrive as `Unavailable`,
+        // and unmapped ones like 502 Bad Gateway arrive as `Unknown`
+        // wrapping the status.
+        assert!(browse_error_is_transient(ErrorKind::Unknown, Some(502)));
+        assert!(browse_error_is_transient(ErrorKind::Unknown, Some(503)));
+        assert!(browse_error_is_transient(ErrorKind::Unavailable, Some(503)));
+        // Client errors (4xx) and non-HTTP `Unknown`s are permanent.
+        assert!(!browse_error_is_transient(ErrorKind::Unknown, Some(400)));
+        assert!(!browse_error_is_transient(ErrorKind::Unknown, None));
+        assert!(!browse_error_is_transient(ErrorKind::NotFound, None));
+        assert!(!browse_error_is_transient(ErrorKind::ResourceExhausted, None));
+        assert!(!browse_error_is_transient(ErrorKind::InvalidArgument, None));
+    }
+
+    #[test]
+    fn browse_retry_schedule_is_bounded_and_fits_the_ui_timeout() {
+        // The whole rootlist/metadata/search retry cycle must stay well
+        // inside the UI's 20-second browse round-trip timeout
+        // (playback_engine_client.h default timeoutMs).
+        let backoffs = backoff_sequence(
+            BROWSE_RETRY_ATTEMPTS,
+            BROWSE_BACKOFF_BASE_MS,
+            BROWSE_BACKOFF_MAX_MS,
+        );
+        assert_eq!(backoffs.len(), BROWSE_RETRY_ATTEMPTS);
+        assert_eq!(backoffs, vec![250, 500, 1000]);
+        let total_sleep_ms: u64 = backoffs.iter().sum();
+        assert!(
+            total_sleep_ms < 20_000,
+            "bounded retries must not blow the UI round-trip timeout"
+        );
+        assert!(
+            BROWSE_BACKOFF_BASE_MS <= BROWSE_BACKOFF_MAX_MS,
+            "backoff must never regress to a decreasing schedule"
+        );
     }
 
     #[test]

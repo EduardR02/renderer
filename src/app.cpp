@@ -220,6 +220,31 @@ std::wstring CacheUsageText(uint64_t bytes) {
 
 }  // namespace
 
+// Capped exponential backoff (seconds) for retry `attempt` (0-based) of the
+// playlist-library refetch: 5, 10, 20, 40, 60, 60, ... Pure so the schedule
+// is unit-testable.
+int PlaylistRetryDelaySeconds(int attempt) {
+  if (attempt < 0) attempt = 0;
+  const int64_t delay =
+      static_cast<int64_t>(kPlaylistRetryBaseSeconds)
+      << std::min<int64_t>(attempt, 32);
+  return static_cast<int>(
+      std::min<int64_t>(delay, kPlaylistRetryMaxSeconds));
+}
+
+// Stale on-disk copies serve the library only after the fresh fetch already
+// failed; otherwise they are skipped so the refetch actually runs.
+PlaylistCacheUse ClassifyPlaylistCache(int64_t fetchedAtUnixSeconds,
+                                       int64_t nowUnixSeconds,
+                                       int64_t ttlMinutes,
+                                       bool fetchFailed) {
+  const bool fresh =
+      nowUnixSeconds - fetchedAtUnixSeconds <
+      static_cast<int64_t>(ttlMinutes) * 60;
+  if (fresh) return PlaylistCacheUse::Fresh;
+  return fetchFailed ? PlaylistCacheUse::StaleFallback : PlaylistCacheUse::None;
+}
+
 TrackListCache::TrackListCache(size_t capacity, Clock::duration ttl, NowFn now)
     : capacity_(std::max<size_t>(capacity, 1)),
       ttl_(ttl),
@@ -1269,6 +1294,7 @@ void Application::FetchPlaylists() {
         return list;
       },
       [this](std::vector<PlaylistRef> list) {
+        playlist_retry_attempts_ = 0;
         playlists_ = std::move(list);
         if (!playlists_fetched_at_.has_value())
           playlists_fetched_at_ = std::chrono::steady_clock::now();
@@ -1276,7 +1302,28 @@ void Application::FetchPlaylists() {
         SavePlaylistCache();
       },
       [this](std::string message) {
-        HandleApiError(message, L"Playlists");
+        // A failed fresh fetch must not leave the library empty on startup:
+        // serve the on-disk copy even when stale, then retry in the
+        // background with capped exponential backoff so a transient
+        // engine-side 502/503 heals without user action. The in-memory
+        // library is never downgraded by an older disk copy.
+        const bool fell_back = playlists_.empty() && LoadPlaylistCache(true);
+        if (fell_back)
+          LOG_INFO("playlist library loaded from cache (stale fallback, " +
+                   std::to_string(playlists_.size()) + " playlists)");
+        if (playlist_retry_attempts_ >= kPlaylistRetryMaxAttempts) {
+          // Give up: log and surface the failure (the cached library, when
+          // present, stays visible).
+          HandleApiError(message, L"Playlists");
+          return;
+        }
+        LOG_ERROR("Playlists: " + message);
+        const int delay = PlaylistRetryDelaySeconds(playlist_retry_attempts_);
+        ++playlist_retry_attempts_;
+        window_.SetStatus(
+            fell_back ? L"Playlists unavailable - showing cached copy, retrying"
+                      : L"Playlists unavailable - retrying");
+        ScheduleDelayedApiTask(delay, [this] { FetchPlaylists(); });
       });
 }
 
@@ -1308,7 +1355,7 @@ void Application::SavePlaylistCache() {
   paths::AtomicWriteOwnedFile(file, doc.dump());
 }
 
-bool Application::LoadPlaylistCache() {
+bool Application::LoadPlaylistCache(bool allowStale) {
   if (options_.smoke || options_.demo) return false;
   const std::wstring file = paths::PlaylistListCacheFile();
   if (file.empty() ||
@@ -1326,9 +1373,13 @@ bool Application::LoadPlaylistCache() {
     if (version == doc.end() || *version != 1) return false;
     const auto fetched = doc.find("fetched_at");
     if (fetched == doc.end() || !fetched->is_number_integer()) return false;
-    if (NowUnixSeconds() - fetched->get<int64_t>() >=
-        static_cast<int64_t>(kPlaylistListTtl.count()) * 60)
-      return false;  // stale: refetch instead
+    // A stale cache serves the library only as a fallback once the fresh
+    // fetch has failed (the caller retries in the background); otherwise it
+    // is skipped so the refetch actually runs.
+    if (ClassifyPlaylistCache(fetched->get<int64_t>(), NowUnixSeconds(),
+                              kPlaylistListTtl.count(), allowStale) ==
+        PlaylistCacheUse::None)
+      return false;
     const auto me = doc.find("me_id");
     if (me != doc.end() && me->is_string())
       me_id_ = me->get<std::string>();

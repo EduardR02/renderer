@@ -115,6 +115,36 @@ class DelayedTaskQueue {
 // Playlist-library fetch size for the engine browse_playlists round-trip.
 inline constexpr int kPlaylistFetchLength = 500;
 
+// Retry schedule for a failed playlist-library fetch: the first retry waits
+// `kPlaylistRetryBaseSeconds`, doubling per attempt up to
+// `kPlaylistRetryMaxSeconds`; after `kPlaylistRetryMaxAttempts` failures the
+// error is surfaced as final. Retries run on the UI-timer-drained
+// DelayedTaskQueue, so the engine never sees a burst.
+inline constexpr int kPlaylistRetryBaseSeconds = 5;
+inline constexpr int kPlaylistRetryMaxSeconds = 60;
+inline constexpr int kPlaylistRetryMaxAttempts = 5;
+
+// Capped exponential backoff (seconds) for retry `attempt` (0-based) of the
+// playlist-library refetch. Pure so the schedule is unit-testable.
+int PlaylistRetryDelaySeconds(int attempt);
+
+// What the on-disk playlist cache may serve:
+enum class PlaylistCacheUse {
+  None,           // absent/unusable, or stale with a fresh fetch pending
+  Fresh,          // within TTL: usable without any fetch
+  StaleFallback,  // stale, usable only because the fresh fetch already failed
+};
+
+// Classifies the on-disk playlist cache for the startup/refresh path:
+// `fetchFailed` is true when the fresh engine browse already failed; only
+// then may a stale cache serve the library (shown immediately, with a
+// background retry scheduled behind it). Pure so the startup decision is
+// unit-testable.
+PlaylistCacheUse ClassifyPlaylistCache(int64_t fetchedAtUnixSeconds,
+                                       int64_t nowUnixSeconds,
+                                       int64_t ttlMinutes,
+                                       bool fetchFailed);
+
 struct RunOptions {
   bool smoke = false;
   int smokeSeconds = 6;
@@ -232,10 +262,16 @@ class Application {
 
   void HandleApiError(const std::string& message, const std::wstring& context);
   void ScheduleDelayedApiTask(int delaySeconds, std::function<void()> task);
-  bool LoadPlaylistCache();
+  // Loads the on-disk playlist library cache into playlists_ and shows it.
+  // `allowStale` permits serving an expired copy as a fallback after the
+  // fresh fetch failed (the caller schedules the background refetch);
+  // without it a stale cache is skipped so the refetch actually runs.
+  bool LoadPlaylistCache(bool allowStale = false);
   void SavePlaylistCache();
   // Fetches the whole playlist library in one engine browse_playlists
-  // round-trip (spclient rootlist; no Web API pagination).
+  // round-trip (spclient rootlist; no Web API pagination). On failure the
+  // stale on-disk cache is served immediately (never an empty library) and
+  // the fetch is retried in the background with capped exponential backoff.
   void FetchPlaylists();
 
   void PlayTracks(const std::vector<TrackRef>& tracks, int index);
@@ -292,6 +328,9 @@ class Application {
   ULONGLONG last_recovery_attempt_tick_ = 0;
   ULONG_PTR gdiplus_token_ = 0;
   std::vector<PlaylistRef> playlists_;
+  // Failed playlist-library fetches retried so far (reset on success); the
+  // retry backoff doubles per attempt up to the cap in FetchPlaylists.
+  int playlist_retry_attempts_ = 0;
   std::string me_id_;
   std::string last_cover_url_;
   std::string current_playlist_id_;

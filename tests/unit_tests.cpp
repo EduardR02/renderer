@@ -1092,5 +1092,43 @@ TEST_CASE("edit command request shapes match the engine line protocol") {
   CHECK(reorder["to"] == 1);
 }
 
+TEST_CASE("playlist cache serves fresh always, stale only as fetch fallback") {
+  const int64_t now = 1'800'000'000;
+  // Fresh (within the 10-minute TTL): usable with or without a fetch.
+  CHECK(ClassifyPlaylistCache(now - 60, now, 10, false) ==
+        PlaylistCacheUse::Fresh);
+  CHECK(ClassifyPlaylistCache(now - 599, now, 10, false) ==
+        PlaylistCacheUse::Fresh);
+  CHECK(ClassifyPlaylistCache(now - 60, now, 10, true) ==
+        PlaylistCacheUse::Fresh);
+  // Exactly at the TTL boundary it is stale.
+  CHECK(ClassifyPlaylistCache(now - 600, now, 10, false) ==
+        PlaylistCacheUse::None);
+  // Stale: usable only as the post-failure fallback, never to skip a fetch.
+  CHECK(ClassifyPlaylistCache(now - 600, now, 10, true) ==
+        PlaylistCacheUse::StaleFallback);
+  CHECK(ClassifyPlaylistCache(now - 86'400, now, 10, true) ==
+        PlaylistCacheUse::StaleFallback);
+  CHECK(ClassifyPlaylistCache(now - 86'400, now, 10, false) ==
+        PlaylistCacheUse::None);
+  // Clock skew (fetched timestamp in the future) counts as fresh.
+  CHECK(ClassifyPlaylistCache(now + 120, now, 10, false) ==
+        PlaylistCacheUse::Fresh);
+}
+
+TEST_CASE("playlist refetch backoff doubles, caps, and stays bounded") {
+  CHECK(PlaylistRetryDelaySeconds(0) == 5);
+  CHECK(PlaylistRetryDelaySeconds(1) == 10);
+  CHECK(PlaylistRetryDelaySeconds(2) == 20);
+  CHECK(PlaylistRetryDelaySeconds(3) == 40);
+  CHECK(PlaylistRetryDelaySeconds(4) == 60);
+  CHECK(PlaylistRetryDelaySeconds(5) == 60);
+  // Large/negative attempts stay clamped (no shift overflow, no regression).
+  CHECK(PlaylistRetryDelaySeconds(40) == 60);
+  CHECK(PlaylistRetryDelaySeconds(-1) == 5);
+  CHECK(kPlaylistRetryMaxAttempts >= 1);
+  CHECK(kPlaylistRetryBaseSeconds <= kPlaylistRetryMaxSeconds);
+}
+
 }  // namespace
 }  // namespace sr
