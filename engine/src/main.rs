@@ -57,24 +57,50 @@ enum BrowseOutcome {
     },
 }
 
-/// Audio fetch tuning at engine startup (before any playback):
+/// Audio fetch tuning at engine startup (before any playback).
+///
 /// `read_ahead_during_playback` shrinks the streaming buffer from the
-/// 5-second default to 2 seconds so play/pause/seek feel immediate, at the
-/// cost of less jitter headroom; `download_timeout` drops from the
-/// 8-second default to 3 seconds so a stalled stream is detected and
-/// retried quickly instead of starving silently.
-const AUDIO_READ_AHEAD_DURING_PLAYBACK: Duration = Duration::from_secs(2);
+/// 5-second default so play/pause/seek feel immediate, at the cost of
+/// jitter headroom. It is the operative knob for audible stalls: once a
+/// CDN range fetch fails (observed: hyper `IncompleteMessage` / DataLoss
+/// mid-body connection drops, librespot-audio receive_data), the player's
+/// blocked read is woken and the range re-requested, but the playout
+/// buffer drains while the retry cycle (failure detection + reconnect +
+/// refill, typically 0.5-3 s) runs. 2 seconds underran before the retry
+/// landed (audible ~2-5 s control/playback stalls); 3 seconds covers a
+/// full retry cycle, so a single fast-failing fetch no longer goes
+/// audible. The buffer is only used to cover jitter: it does not delay
+/// initial playback start (the first packet read is served by the
+/// initial 64 KiB fetch) and only adds ~one round trip to seek landings.
+///
+/// `download_timeout` drops from the 8-second default so a *silently*
+/// stalled stream (accepted connection that never delivers) is detected
+/// and surfaced quickly. It is intentionally NOT raised along with the
+/// read-ahead: the observed failure mode fails fast (connection reset,
+/// `IncompleteMessage`), which never reaches this timeout — every failed
+/// range request notifies the waiting reader and re-arms the window, so
+/// retries are not serialized through it. A longer timeout would only
+/// delay the give-up on dead-hang connections, where 3 seconds is
+/// already generous (any delivered chunk re-arms the window; 64 KiB at
+/// 320 kbps arrives in ~1.6 s).
+const AUDIO_READ_AHEAD_DURING_PLAYBACK: Duration = Duration::from_secs(3);
 const AUDIO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
-fn configure_audio_fetch() {
-    let params = AudioFetchParams {
+/// The tuned [`AudioFetchParams`]. Pure so tests can pin the tuning
+/// values; the process-wide `OnceLock` is only touched by
+/// [`configure_audio_fetch`].
+fn audio_fetch_params() -> AudioFetchParams {
+    AudioFetchParams {
         read_ahead_during_playback: AUDIO_READ_AHEAD_DURING_PLAYBACK,
         download_timeout: AUDIO_DOWNLOAD_TIMEOUT,
         ..AudioFetchParams::default()
-    };
+    }
+}
+
+fn configure_audio_fetch() {
     // The process sets this exactly once at startup; a second call (tests)
     // is a no-op by design.
-    let _ = AudioFetchParams::set(params);
+    let _ = AudioFetchParams::set(audio_fetch_params());
 }
 
 fn main() -> ExitCode {
@@ -543,6 +569,52 @@ mod tests {
         assert_eq!(
             fs::read_to_string(audio.join("cache-version")).expect("marker rewritten"),
             format!("{AUDIO_CACHE_VERSION}\n")
+        );
+    }
+
+    #[test]
+    fn audio_cache_marker_is_matched_exactly_not_prefixwise() {
+        let scratch = ScratchDir::new();
+        // The marker is compared with exact content (`"2\n"`), so any
+        // deviation — no trailing newline, CRLF, extra text — counts as a
+        // different layout and wipes the cache. The engine always writes the
+        // exact form, so this only fires if something else touched the file;
+        // wiping is the safe failure mode (worst case: one refetch).
+        let audio = scratch.directory.join("audio");
+        fs::create_dir_all(&audio).expect("fixture dir");
+        fs::write(audio.join("cache-version"), AUDIO_CACHE_VERSION).expect("no-newline marker");
+        fs::write(audio.join("fresh-entry"), b"data").expect("fixture entry");
+
+        version_audio_cache(&scratch.directory).expect("mismatched marker wipes");
+        assert!(
+            !audio.join("fresh-entry").exists(),
+            "a no-newline marker must be treated as stale"
+        );
+        assert_eq!(
+            fs::read_to_string(audio.join("cache-version")).expect("marker rewritten"),
+            format!("{AUDIO_CACHE_VERSION}\n")
+        );
+    }
+
+    #[test]
+    fn audio_fetch_params_pin_the_tuned_headroom_and_timeout() {
+        let params = audio_fetch_params();
+        // Tuning decision (see AUDIO_READ_AHEAD_DURING_PLAYBACK): the buffer
+        // must cover one full fetch-failure retry cycle (fast-failing CDN
+        // errors, observed as hyper IncompleteMessage/DataLoss) or the
+        // underrun becomes an audible multi-second stall.
+        assert_eq!(
+            params.read_ahead_during_playback,
+            Duration::from_secs(3),
+            "buffer headroom covers a fetch retry cycle"
+        );
+        // The timeout only caps *silent* stalls: fast failures re-arm the
+        // wait window via the download-status condvar, so they never reach
+        // it, and a shorter give-up is strictly better for dead hangs.
+        assert_eq!(
+            params.download_timeout,
+            Duration::from_secs(3),
+            "dead-hang detection must stay quick"
         );
     }
 }
