@@ -57,6 +57,82 @@ int64_t PositionProjector::Current(ULONGLONG nowTick,
 
 namespace {
 
+// Engine state field names used by PlaybackStateReconciler. They match the
+// engine protocol field names so both sides stay easy to map.
+constexpr const char* kOverridePlaying = "playing";
+constexpr const char* kOverridePosition = "position_ms";
+constexpr const char* kOverrideDuration = "duration_ms";
+constexpr const char* kOverrideVolume = "volume";
+constexpr const char* kOverrideShuffle = "shuffle";
+constexpr const char* kOverrideRepeat = "repeat";
+constexpr const char* kOverrideCurrentIndex = "current_index";
+constexpr const char* kOverrideCurrentUri = "current_uri";
+constexpr const char* kOverrideQueue = "queue";
+
+void CopyField(const std::string& field, const PlaybackEngineState& from,
+               PlaybackEngineState* to) {
+  if (field == kOverridePlaying)
+    to->playing = from.playing;
+  else if (field == kOverridePosition)
+    to->position_ms = from.position_ms;
+  else if (field == kOverrideDuration)
+    to->duration_ms = from.duration_ms;
+  else if (field == kOverrideVolume)
+    to->volume_percent = from.volume_percent;
+  else if (field == kOverrideShuffle)
+    to->shuffle = from.shuffle;
+  else if (field == kOverrideRepeat)
+    to->repeat = from.repeat;
+  else if (field == kOverrideCurrentIndex)
+    to->current_index = from.current_index;
+  else if (field == kOverrideCurrentUri)
+    to->current_uri = from.current_uri;
+  else if (field == kOverrideQueue)
+    to->queue = from.queue;
+}
+
+}  // namespace
+
+void PlaybackStateReconciler::SetOverride(const std::string& field,
+                                          const std::string& requestId) {
+  if (requestId.empty())
+    fields_.erase(field);
+  else
+    fields_[field] = requestId;
+}
+
+void PlaybackStateReconciler::Confirm(const std::string& requestId) {
+  for (auto it = fields_.begin(); it != fields_.end();) {
+    if (it->second == requestId)
+      it = fields_.erase(it);
+    else
+      ++it;
+  }
+}
+
+bool PlaybackStateReconciler::Overridden(const std::string& field) const {
+  return fields_.count(field) != 0;
+}
+
+const std::unordered_map<std::string, std::string>&
+PlaybackStateReconciler::PendingFields() const {
+  return fields_;
+}
+
+void PlaybackStateReconciler::Reset() { fields_.clear(); }
+
+bool PlaybackStateReconciler::HasPending() const { return !fields_.empty(); }
+
+PlaybackEngineState ReconcileEngineState(PlaybackEngineState incoming,
+                                         const PlaybackEngineState& current,
+                                         const PlaybackStateReconciler& overrides) {
+  for (const auto& entry : overrides.PendingFields())
+    CopyField(entry.first, current, &incoming);
+  return incoming;
+}
+
+namespace {
+
 bool SameQueue(const std::vector<TrackRef>& left,
                const std::vector<TrackRef>& right) {
   if (left.size() != right.size()) return false;
@@ -262,6 +338,7 @@ void Application::InitCore() {
 }
 
 void Application::StartEngine() {
+  if (shutting_down_) return;
   std::string error;
   if (!engine_.Start(
           SiblingPlaybackEnginePath(), paths::EngineStateDir(),
@@ -274,6 +351,14 @@ void Application::StartEngine() {
           [this](std::string message) {
             PostUi([this, message = std::move(message)]() mutable {
               OnEngineError(std::move(message));
+            });
+          },
+          [this](const std::string& requestId, bool) {
+            PostUi([this, requestId]() mutable {
+              // The engine has acknowledged the command; the state event that
+              // follows it in the stream is authoritative, so the optimistic
+              // overrides for this request are released.
+              playback_overrides_.Confirm(requestId);
             });
           },
           [this](std::string message) {
@@ -299,6 +384,7 @@ void Application::StartEngine() {
 void Application::Shutdown() {
   if (shutting_down_) return;
   shutting_down_ = true;
+  engine_restart_pending_ = false;
   StopTimers();
   oauth_listener_.Stop();
   artwork_tasks_.DiscardPending();
@@ -604,7 +690,10 @@ void Application::OnSearchContext(UINT command, int item) {
     if (!EngineReady()) return;
     playback_.queue.push_back(track);
     RefreshQueue();
-    RunEngineCommand([this, track] { engine_.AddQueue(track); }, L"Add to queue");
+    const std::string requestId = RunEngineCommand(
+        [this, track] { return engine_.AddQueue(track); }, L"Add to queue");
+    if (!requestId.empty())
+      playback_overrides_.SetOverride(kOverrideQueue, requestId);
   } else if (command == IDM_CTX_OPEN_ALBUM && !track.album_id.empty()) {
     OpenAlbumTracks(AlbumRef{track.album_id, "spotify:album:" + track.album_id,
                              track.album_name, track.artist_names,
@@ -681,7 +770,10 @@ void Application::OnMiddleContext(UINT command, int index) {
     if (!EngineReady()) return;
     playback_.queue.push_back(track);
     RefreshQueue();
-    RunEngineCommand([this, track] { engine_.AddQueue(track); }, L"Add to queue");
+    const std::string requestId = RunEngineCommand(
+        [this, track] { return engine_.AddQueue(track); }, L"Add to queue");
+    if (!requestId.empty())
+      playback_overrides_.SetOverride(kOverrideQueue, requestId);
   } else if (middle_mode_ == MiddleMode::Queue &&
              command == IDM_CTX_MIDDLE_REMOVE) {
     if (!EngineReady()) return;
@@ -707,8 +799,11 @@ void Application::OnMiddleContext(UINT command, int index) {
     }
     UpdatePlaybackUi();
     RefreshQueue();
-    RunEngineCommand([this, index] { engine_.RemoveQueue(index); },
-                     L"Remove from queue");
+    const std::string requestId = RunEngineCommand(
+        [this, index] { return engine_.RemoveQueue(index); },
+        L"Remove from queue");
+    if (!requestId.empty())
+      playback_overrides_.SetOverride(kOverrideQueue, requestId);
   } else if (middle_mode_ == MiddleMode::Queue &&
              (command == IDM_CTX_MIDDLE_UP ||
               command == IDM_CTX_MIDDLE_DOWN)) {
@@ -730,9 +825,13 @@ void Application::OnMiddleContext(UINT command, int index) {
              destination <= playback_.current_index)
       ++playback_.current_index;
     RefreshQueue();
-    RunEngineCommand(
-        [this, index, destination] { engine_.MoveQueue(index, destination); },
+    const std::string requestId = RunEngineCommand(
+        [this, index, destination] {
+          return engine_.MoveQueue(index, destination);
+        },
         L"Move queue item");
+    if (!requestId.empty())
+      playback_overrides_.SetOverride(kOverrideQueue, requestId);
   } else if (command == IDM_CTX_OPEN_ALBUM && !track.album_id.empty()) {
     OpenAlbumTracks(AlbumRef{track.album_id, "spotify:album:" + track.album_id,
                              track.album_name, track.artist_names,
@@ -860,26 +959,47 @@ void Application::PlayTracks(const std::vector<TrackRef>& tracks, int index) {
   ResetProjectionBase();
   UpdatePlaybackUi();
   RefreshQueue();
-  RunEngineCommand(
-      [this, index] { engine_.PlayQueue(playback_.queue, index); },
+  const std::string requestId = RunEngineCommand(
+      [this, index] { return engine_.PlayQueue(playback_.queue, index); },
       L"Start playback");
+  if (!requestId.empty()) {
+    playback_overrides_.SetOverride(kOverrideQueue, requestId);
+    playback_overrides_.SetOverride(kOverrideCurrentIndex, requestId);
+    playback_overrides_.SetOverride(kOverrideCurrentUri, requestId);
+    playback_overrides_.SetOverride(kOverridePosition, requestId);
+    playback_overrides_.SetOverride(kOverrideDuration, requestId);
+    playback_overrides_.SetOverride(kOverridePlaying, requestId);
+  }
 }
 
-void Application::RunEngineCommand(const std::function<void()>& command,
-                                   const std::wstring& failureContext) {
-  if (options_.smoke || options_.demo) return;
+std::string Application::RunEngineCommand(
+    const std::function<std::string()>& command,
+    const std::wstring& failureContext) {
+  if (options_.smoke || options_.demo) return {};
   try {
-    command();
+    return command();
   } catch (const std::exception& error) {
     window_.SetStatus(failureContext + L": " + Utf8ToWide(error.what()));
+    return {};
   }
 }
 
 bool Application::EngineReady() {
   if (options_.demo) return true;
   if (playback_.ready && engine_.Running()) return true;
+  if (!engine_.Running()) {
+    window_.SetStatus(
+        L"Local playback engine is not running; it restarts automatically.");
+    ScheduleEngineRestart();
+    return false;
+  }
+  if (playback_.auth_state == EngineAuthState::Error) TryRecoverEngine();
   window_.SetStatus(
-      L"Local playback engine is not ready. Complete its browser sign-in or check Settings.");
+      engine_restart_pending_
+          ? L"Local playback engine is restarting; playback resumes "
+            L"automatically."
+          : L"Local playback engine is not ready. Complete its browser "
+            L"sign-in or check Settings.");
   return false;
 }
 
@@ -889,12 +1009,15 @@ void Application::OnTogglePlay() {
   playback_.playing = play;
   ResetProjectionBase();
   UpdatePlaybackUi();
-  RunEngineCommand([this, play] { play ? engine_.Play() : engine_.Pause(); },
-                   play ? L"Play" : L"Pause");
+  const std::string requestId =
+      RunEngineCommand([this, play] { return play ? engine_.Play() : engine_.Pause(); },
+                       play ? L"Play" : L"Pause");
+  if (!requestId.empty()) playback_overrides_.SetOverride(kOverridePlaying, requestId);
 }
 
 void Application::OnNext() {
   if (!EngineReady()) return;
+  bool advanced = false;
   if (!playback_.shuffle && playback_.current_index >= 0 &&
       playback_.current_index + 1 < static_cast<int>(playback_.queue.size())) {
     ++playback_.current_index;
@@ -903,16 +1026,28 @@ void Application::OnNext() {
     playback_.duration_ms =
         playback_.queue[playback_.current_index].duration_ms;
     playback_.playing = true;
+    advanced = true;
     ResetProjectionBase();
     UpdatePlaybackUi();
   }
-  RunEngineCommand([this] { engine_.Next(); }, L"Next");
+  const std::string requestId =
+      RunEngineCommand([this] { return engine_.Next(); }, L"Next");
+  if (!requestId.empty() && advanced) {
+    playback_overrides_.SetOverride(kOverrideCurrentIndex, requestId);
+    playback_overrides_.SetOverride(kOverrideCurrentUri, requestId);
+    playback_overrides_.SetOverride(kOverridePosition, requestId);
+    playback_overrides_.SetOverride(kOverrideDuration, requestId);
+    playback_overrides_.SetOverride(kOverridePlaying, requestId);
+  }
 }
 
 void Application::OnPrevious() {
   if (!EngineReady()) return;
+  bool restarted = false;
+  bool switched = false;
   if (playback_.position_ms > 3000) {
     playback_.position_ms = 0;
+    restarted = true;
     ResetProjectionBase();
     UpdatePlaybackUi();
   } else if (!playback_.shuffle && playback_.current_index > 0) {
@@ -922,10 +1057,23 @@ void Application::OnPrevious() {
     playback_.duration_ms =
         playback_.queue[playback_.current_index].duration_ms;
     playback_.playing = true;
+    switched = true;
     ResetProjectionBase();
     UpdatePlaybackUi();
   }
-  RunEngineCommand([this] { engine_.Previous(); }, L"Previous");
+  const std::string requestId =
+      RunEngineCommand([this] { return engine_.Previous(); }, L"Previous");
+  if (!requestId.empty()) {
+    if (switched) {
+      playback_overrides_.SetOverride(kOverrideCurrentIndex, requestId);
+      playback_overrides_.SetOverride(kOverrideCurrentUri, requestId);
+      playback_overrides_.SetOverride(kOverridePosition, requestId);
+      playback_overrides_.SetOverride(kOverrideDuration, requestId);
+      playback_overrides_.SetOverride(kOverridePlaying, requestId);
+    } else if (restarted) {
+      playback_overrides_.SetOverride(kOverridePosition, requestId);
+    }
+  }
 }
 
 void Application::OnSeekTo(int positionMs) {
@@ -934,15 +1082,22 @@ void Application::OnSeekTo(int positionMs) {
       std::clamp<int64_t>(positionMs, 0, playback_.duration_ms);
   ResetProjectionBase();
   UpdatePlaybackUi();
-  RunEngineCommand([this, positionMs] { engine_.Seek(positionMs); }, L"Seek");
+  const std::string requestId =
+      RunEngineCommand([this, positionMs] { return engine_.Seek(positionMs); },
+                       L"Seek");
+  if (!requestId.empty())
+    playback_overrides_.SetOverride(kOverridePosition, requestId);
 }
 
 void Application::OnSetVolumePercent(int volumePercent) {
   if (!EngineReady()) return;
   playback_.volume_percent = std::clamp(volumePercent, 0, 100);
   UpdatePlaybackUi();
-  RunEngineCommand(
-      [this, volumePercent] { engine_.SetVolume(volumePercent); }, L"Volume");
+  const std::string requestId = RunEngineCommand(
+      [this, volumePercent] { return engine_.SetVolume(volumePercent); },
+      L"Volume");
+  if (!requestId.empty())
+    playback_overrides_.SetOverride(kOverrideVolume, requestId);
 }
 
 void Application::OnToggleShuffle() {
@@ -950,8 +1105,11 @@ void Application::OnToggleShuffle() {
   playback_.shuffle = !playback_.shuffle;
   const bool enabled = playback_.shuffle;
   UpdatePlaybackUi();
-  RunEngineCommand([this, enabled] { engine_.SetShuffle(enabled); },
-                   L"Shuffle");
+  const std::string requestId =
+      RunEngineCommand([this, enabled] { return engine_.SetShuffle(enabled); },
+                       L"Shuffle");
+  if (!requestId.empty())
+    playback_overrides_.SetOverride(kOverrideShuffle, requestId);
 }
 
 void Application::OnCycleRepeat() {
@@ -961,16 +1119,26 @@ void Application::OnCycleRepeat() {
                          : playback_.repeat == "context" ? "track" : "off";
   const std::string mode = playback_.repeat;
   UpdatePlaybackUi();
-  RunEngineCommand([this, mode] { engine_.SetRepeat(mode); }, L"Repeat");
+  const std::string requestId =
+      RunEngineCommand([this, mode] { return engine_.SetRepeat(mode); },
+                       L"Repeat");
+  if (!requestId.empty())
+    playback_overrides_.SetOverride(kOverrideRepeat, requestId);
 }
 
 void Application::OnEngineState(PlaybackEngineState state) {
-  const bool queueChanged = !SameQueue(playback_.queue, state.queue);
+  // Fields with unconfirmed optimistic overrides keep their current values so
+  // stale pre-command events (heartbeat ticks, player transitions) cannot
+  // flicker the UI back; the post-command state after the response applies.
+  PlaybackEngineState reconciled =
+      ReconcileEngineState(std::move(state), playback_, playback_overrides_);
+  const bool queueChanged = !SameQueue(playback_.queue, reconciled.queue);
   const bool statusChanged =
-      playback_.ready != state.ready ||
-      playback_.auth_state != state.auth_state ||
-      playback_.error != state.error;
-  playback_ = std::move(state);
+      playback_.ready != reconciled.ready ||
+      playback_.auth_state != reconciled.auth_state ||
+      playback_.error != reconciled.error;
+  const bool becameReady = !playback_.ready && reconciled.ready;
+  playback_ = std::move(reconciled);
   ResetProjectionBase();
   UpdatePlaybackUi();
   if (queueChanged) RefreshQueue();
@@ -982,9 +1150,20 @@ void Application::OnEngineState(PlaybackEngineState state) {
     if (!playback_.error.empty()) {
       window_.SetStatus(L"Playback engine: " +
                         Utf8ToWide(playback_.error));
+      // The engine marks its own player thread death as a recoverable error;
+      // retry through Status (re-authenticates with cached credentials) or
+      // respawn the process if the transport is gone.
+      if (!playback_.ready &&
+          playback_.auth_state == EngineAuthState::Error &&
+          playback_.error.find("stopped unexpectedly") != std::string::npos)
+        TryRecoverEngine();
     } else if (playback_.ready) {
       window_.SetStatus(L"Standalone playback engine ready at 320 kbps.");
     }
+  }
+  if (becameReady) {
+    engine_restart_attempts_ = 0;
+    if (restore_playback_pending_) RestorePlaybackAfterRespawn();
   }
 }
 
@@ -1007,10 +1186,81 @@ void Application::OnEngineError(std::string error) {
   playback_.ready = false;
   playback_.auth_state = EngineAuthState::Error;
   playback_.error = std::move(error);
+  // The pipe is gone: in-flight commands can never be confirmed, so their
+  // optimistic overrides must not stick around.
+  playback_overrides_.Reset();
   projector_.Reset(playback_.position_ms, false, ::GetTickCount64());
   UpdatePlaybackUi();
   window_.SetEngineStatus(EngineStatusText());
-  window_.SetStatus(L"Playback engine: " + Utf8ToWide(playback_.error));
+  window_.SetStatus(
+      L"Playback engine stopped; restarting in a moment — playback resumes "
+      L"automatically.");
+  ScheduleEngineRestart();
+}
+
+void Application::TryRecoverEngine() {
+  const ULONGLONG now = ::GetTickCount64();
+  if (now - last_recovery_attempt_tick_ < 10000) return;
+  last_recovery_attempt_tick_ = now;
+  if (!engine_.Running()) {
+    ScheduleEngineRestart();
+    return;
+  }
+  try {
+    engine_.Status();
+  } catch (const std::exception&) {
+    ScheduleEngineRestart();
+  }
+}
+
+void Application::ScheduleEngineRestart() {
+  if (shutting_down_ || engine_restart_pending_) return;
+  // Remember what to restore once the respawned engine authenticates.
+  restore_playback_pending_ =
+      playback_.current_index >= 0 && !playback_.queue.empty();
+  ++engine_restart_attempts_;
+  const int64_t delaySeconds = std::min<int64_t>(
+      10, 1LL << std::min(engine_restart_attempts_, 4));
+  engine_restart_at_ =
+      std::chrono::steady_clock::now() + std::chrono::seconds(delaySeconds);
+  engine_restart_pending_ = true;
+  window_.SetEngineStatus(EngineStatusText());
+}
+
+void Application::RestorePlaybackAfterRespawn() {
+  restore_playback_pending_ = false;
+  const std::string volumeId =
+      RunEngineCommand([this] { return engine_.SetVolume(playback_.volume_percent); },
+                       L"Restore volume");
+  if (!volumeId.empty())
+    playback_overrides_.SetOverride(kOverrideVolume, volumeId);
+  const std::string shuffleId =
+      RunEngineCommand([this] { return engine_.SetShuffle(playback_.shuffle); },
+                       L"Restore shuffle");
+  if (!shuffleId.empty())
+    playback_overrides_.SetOverride(kOverrideShuffle, shuffleId);
+  const std::string repeatId =
+      RunEngineCommand([this] { return engine_.SetRepeat(playback_.repeat); },
+                       L"Restore repeat");
+  if (!repeatId.empty())
+    playback_overrides_.SetOverride(kOverrideRepeat, repeatId);
+  if (playback_.current_index >= 0 &&
+      playback_.current_index < static_cast<int>(playback_.queue.size())) {
+    const std::string playId = RunEngineCommand(
+        [this] {
+          return engine_.PlayQueue(playback_.queue, playback_.current_index,
+                                   playback_.position_ms);
+        },
+        L"Resume playback");
+    if (!playId.empty()) {
+      playback_overrides_.SetOverride(kOverrideQueue, playId);
+      playback_overrides_.SetOverride(kOverrideCurrentIndex, playId);
+      playback_overrides_.SetOverride(kOverrideCurrentUri, playId);
+      playback_overrides_.SetOverride(kOverridePosition, playId);
+      playback_overrides_.SetOverride(kOverrideDuration, playId);
+      playback_overrides_.SetOverride(kOverridePlaying, playId);
+    }
+  }
 }
 
 void Application::RefreshQueue() {
@@ -1180,7 +1430,8 @@ void Application::OnRefreshAll() {
     OpenAlbumTracks(current_album_);
   RefreshQueue();
   if (engine_.Running())
-    RunEngineCommand([this] { engine_.Status(); }, L"Refresh engine status");
+    RunEngineCommand([this] { return engine_.Status(); },
+                     L"Refresh engine status");
 }
 
 void Application::OnSettingsShown() {
@@ -1240,6 +1491,11 @@ void Application::OnTimer(UINT id) {
     return;
   }
   if (id != kPositionTimer) return;
+  if (engine_restart_pending_ &&
+      std::chrono::steady_clock::now() >= engine_restart_at_) {
+    engine_restart_pending_ = false;
+    StartEngine();
+  }
   const int64_t projected =
       projector_.Current(::GetTickCount64(), playback_.duration_ms);
   if (projected != playback_.position_ms) {

@@ -120,6 +120,39 @@ class PositionProjector {
   bool playing_ = false;
 };
 
+// Tracks which transport fields the UI has optimistically changed while their
+// engine commands are still in flight. Engine state events emitted before the
+// command was processed (heartbeat, player transitions) must not overwrite
+// these values; the override for a field is released when the response for the
+// owning request arrives, and the post-command state that immediately follows
+// it is authoritative. Latest intent wins: a newer command for the same field
+// simply takes over the override.
+class PlaybackStateReconciler {
+ public:
+  // Marks `field` as optimistically owned by `requestId`. An empty requestId
+  // clears the override. Field names are the engine state field names
+  // ("playing", "position_ms", "duration_ms", "volume", "shuffle", "repeat",
+  // "current_index", "current_uri", "queue").
+  void SetOverride(const std::string& field, const std::string& requestId);
+  // Releases overrides owned by `requestId`; fields taken over by a newer
+  // request stay overridden.
+  void Confirm(const std::string& requestId);
+  bool Overridden(const std::string& field) const;
+  // field -> owning request id; read-only view used by ReconcileEngineState.
+  const std::unordered_map<std::string, std::string>& PendingFields() const;
+  void Reset();
+  bool HasPending() const;
+
+ private:
+  std::unordered_map<std::string, std::string> fields_;
+};
+
+// Returns `incoming` with every field that still has an unconfirmed optimistic
+// override replaced by its value in `current`. Only apply the result.
+PlaybackEngineState ReconcileEngineState(PlaybackEngineState incoming,
+                                         const PlaybackEngineState& current,
+                                         const PlaybackStateReconciler& overrides);
+
 enum class MiddleMode { Queue, Playlist, ArtistTracks, AlbumTracks };
 
 class Application {
@@ -183,13 +216,26 @@ class Application {
                       const std::wstring& context);
 
   void PlayTracks(const std::vector<TrackRef>& tracks, int index);
-  void RunEngineCommand(const std::function<void()>& command,
-                        const std::wstring& failureContext);
+  // Runs an engine command; returns the request id the transport assigned (or
+  // empty when the command could not be sent). Callers register optimistic
+  // overrides keyed by that id.
+  std::string RunEngineCommand(const std::function<std::string()>& command,
+                               const std::wstring& failureContext);
   bool EngineReady();
   void OnEngineState(PlaybackEngineState state);
   void OnEngineError(std::string error);
   void OnEngineCommandError(std::string error);
   void ResetProjectionBase();
+  // Retries through the engine's own Status path (the engine re-authenticates
+  // with cached credentials after its player thread died). Cooldown-guarded;
+  // falls back to a process restart when the engine is gone.
+  void TryRecoverEngine();
+  // Schedules a respawn of the engine subprocess with exponential backoff.
+  // The next OnTimer tick past the deadline performs the actual restart.
+  void ScheduleEngineRestart();
+  // Re-sends queue/volume/shuffle/repeat after a respawned engine reports
+  // ready, so a transient engine failure does not lose playback.
+  void RestorePlaybackAfterRespawn();
   void RefreshQueue();
   void RefreshPlaylists(bool force = false);
   void RequestPlaylistTracks(const std::string& id);
@@ -215,6 +261,7 @@ class Application {
   PlaybackEngineClient engine_;
   PlaybackEngineState playback_;
   PositionProjector projector_;
+  PlaybackStateReconciler playback_overrides_;
   MainWindow window_;
   TrayIcon tray_;
   TaskQueue api_tasks_;
@@ -224,6 +271,11 @@ class Application {
   std::string pending_state_;
 
   bool shutting_down_ = false;
+  bool engine_restart_pending_ = false;
+  std::chrono::steady_clock::time_point engine_restart_at_{};
+  int engine_restart_attempts_ = 0;
+  bool restore_playback_pending_ = false;
+  ULONGLONG last_recovery_attempt_tick_ = 0;
   ULONG_PTR gdiplus_token_ = 0;
   std::vector<PlaylistRef> playlists_;
   std::string me_id_;

@@ -13,6 +13,11 @@ use crate::protocol::{
     AuthState, Command, RepeatMode, Response, StateEvent, TrackRef,
 };
 
+/// Pressing previous within this many milliseconds of a track start restarts
+/// the current track instead of switching tracks. Mirrors the UI's optimistic
+/// restart window (OnPrevious in app.cpp) so both sides agree.
+const PREVIOUS_RESTART_THRESHOLD_MS: u32 = 3_000;
+
 pub struct Engine {
     writer: ProtocolWriter,
     cache: Cache,
@@ -407,18 +412,7 @@ impl Engine {
             .state
             .current_index
             .ok_or_else(|| "the queue has no current track".to_owned())?;
-        if self.state.position_ms > 3_000 {
-            return self.seek(0);
-        }
-
-        let previous = self.history.pop().or_else(|| {
-            if !self.state.shuffle && current > 0 {
-                Some(current - 1)
-            } else {
-                None
-            }
-        });
-        if let Some(index) = previous {
+        if let Some(index) = self.previous_index() {
             if self.state.shuffle && !self.shuffle_pool.contains(&current) {
                 self.shuffle_pool.push(current);
             }
@@ -430,8 +424,32 @@ impl Engine {
             self.load_current(start_playing)?;
             Ok(true)
         } else {
+            // No earlier track (first track, or already restarting): seek the
+            // current track back to its beginning instead of erroring.
             self.seek(0)
         }
+    }
+
+    /// Decides which track `previous` should switch to. `Some(index)` names a
+    /// valid queue index; `None` means "restart the current track". The
+    /// position restart threshold matches the UI's 3-second restart window, so
+    /// the optimistic flip and the engine agree. History entries that no longer
+    /// index the queue (stale after a mutation) are dropped instead of
+    /// panicking.
+    fn previous_index(&mut self) -> Option<usize> {
+        if self.state.position_ms > PREVIOUS_RESTART_THRESHOLD_MS {
+            return None;
+        }
+        while let Some(index) = self.history.pop() {
+            if index < self.state.queue.len() {
+                return Some(index);
+            }
+        }
+        let current = self.state.current_index?;
+        if !self.state.shuffle && current > 0 && current <= self.state.queue.len() {
+            return Some(current - 1);
+        }
+        None
     }
 
     fn advance(&mut self, at_end: bool) -> Result<bool, String> {
@@ -567,7 +585,10 @@ impl Engine {
             .state
             .current_index
             .ok_or_else(|| "the queue has no current track".to_owned())?;
-        let uri = parse_track_uri(&self.state.queue[index])?;
+        let track = self.state.queue.get(index).ok_or_else(|| {
+            "the queue has no current track (index out of range)".to_owned()
+        })?;
+        let uri = parse_track_uri(track)?;
         let position_ms = self.state.position_ms;
         let next_uri = self
             .peek_next_index()
@@ -592,27 +613,29 @@ impl Engine {
 
     fn take_next_index(&mut self, at_end: bool) -> Option<usize> {
         let current = self.state.current_index?;
+        let queue_len = self.state.queue.len();
         if at_end && self.state.repeat == RepeatMode::Track {
-            return Some(current);
+            return (current < queue_len).then_some(current);
         }
         if self.state.shuffle {
             if self.shuffle_pool.is_empty() && self.state.repeat == RepeatMode::Context {
                 self.rebuild_shuffle_pool();
             }
-            return self.shuffle_pool.pop();
+            return self.shuffle_pool.pop().filter(|index| *index < queue_len);
         }
-        sequential_next_index(current, self.state.queue.len(), self.state.repeat)
+        sequential_next_index(current, queue_len, self.state.repeat)
     }
 
     fn peek_next_index(&self) -> Option<usize> {
         let current = self.state.current_index?;
+        let queue_len = self.state.queue.len();
         if self.state.repeat == RepeatMode::Track {
-            return Some(current);
+            return (current < queue_len).then_some(current);
         }
         if self.state.shuffle {
-            return self.shuffle_pool.last().copied();
+            return self.shuffle_pool.last().copied().filter(|index| *index < queue_len);
         }
-        sequential_next_index(current, self.state.queue.len(), self.state.repeat)
+        sequential_next_index(current, queue_len, self.state.repeat)
     }
 
     fn rebuild_shuffle_pool(&mut self) {
@@ -729,8 +752,10 @@ impl Engine {
         let Some(index) = self.state.current_index else {
             return false;
         };
-        uri.to_uri()
-            .is_ok_and(|value| value == self.state.queue[index].uri)
+        let Some(track) = self.state.queue.get(index) else {
+            return false;
+        };
+        uri.to_uri().is_ok_and(|value| value == track.uri)
     }
 
     fn shutdown_playback(&mut self) {
@@ -930,6 +955,74 @@ mod tests {
                 position_ms: 5_000,
             },
         }));
+    }
+
+    #[test]
+    fn previous_within_restart_window_restarts_the_current_track() {
+        // At the first track with no history, previous restarts in place:
+        // the engine reports no switch target (None) and never panics.
+        let mut engine = playing_engine();
+        engine.state.position_ms = 0;
+        assert_eq!(engine.previous_index(), None);
+
+        // Past the restart window the current track restarts too.
+        engine.state.position_ms = 5_000;
+        assert_eq!(engine.previous_index(), None);
+
+        // A track near its start but not first in the queue goes backwards.
+        engine.state.position_ms = 500;
+        engine.state.current_index = Some(1);
+        assert_eq!(engine.previous_index(), Some(0));
+    }
+
+    #[test]
+    fn previous_pops_history_with_bounds_guard() {
+        let mut engine = playing_engine();
+        engine.state.current_index = Some(1);
+        engine.history.push(0);
+        assert_eq!(engine.previous_index(), Some(0));
+
+        // Stale history entries (indices that no longer index the queue) are
+        // dropped instead of panicking; the fallback still applies.
+        engine.history.clear();
+        engine.history.push(99);
+        assert_eq!(engine.previous_index(), Some(0), "falls back to current - 1");
+        engine.state.current_index = Some(0);
+        engine.history.push(99);
+        assert_eq!(engine.previous_index(), None, "first track: restart in place");
+    }
+
+    #[test]
+    fn previous_without_a_player_errors_gracefully() {
+        let mut engine = playing_engine();
+        engine.state.position_ms = 0;
+        // No previous target -> seek(0) -> no player attached: the command must
+        // fail with an error, never panic or unwrap an empty queue.
+        assert!(engine.previous().is_err());
+        engine.state.current_index = None;
+        assert!(engine.previous().is_err());
+    }
+
+    #[test]
+    fn empty_queue_transport_commands_error_without_panicking() {
+        let mut engine = playing_engine();
+        engine.state.queue.clear();
+        engine.state.current_index = Some(0); // inconsistent state a bug could create
+        assert!(engine.previous().is_err());
+        assert!(engine.advance(false).is_err());
+        assert!(engine.load_current(true).is_err());
+        assert!(!engine.on_player_signal(PlayerSignal::Event {
+            generation: engine.generation,
+            event: PlayerEvent::Playing {
+                play_request_id: engine.play_request_id.unwrap_or(7),
+                track_id: track_uri(),
+                position_ms: 0,
+            },
+        }), "events for a missing queue index are ignored, not panicked");
+        engine.state.current_index = None;
+        assert!(engine.previous().is_err());
+        assert!(engine.advance(false).is_err());
+        assert!(engine.load_current(true).is_err());
     }
 
     #[test]

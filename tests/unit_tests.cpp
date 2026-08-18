@@ -401,5 +401,168 @@ TEST_CASE("ui rows: time formatting clamps negatives and pads seconds") {
   CHECK(FormatTime(4 * 60'000 + 3'000) == L"4:03");
 }
 
+TEST_CASE("engine state reconcile keeps unconfirmed optimistic overrides") {
+  PlaybackEngineState current;
+  current.playing = false;         // optimistic pause
+  current.position_ms = 42'000;    // optimistic seek target
+  current.volume_percent = 65;     // optimistic volume
+  current.current_index = 2;       // optimistic next
+  current.current_uri = "spotify:track:next";
+  current.duration_ms = 180'000;
+  current.queue.push_back(TrackRef{});
+  current.queue.push_back(TrackRef{});
+  current.queue.push_back(TrackRef{});
+  current.queue[2].uri = "spotify:track:next";
+
+  PlaybackStateReconciler overrides;
+  overrides.SetOverride("playing", "r1");
+  overrides.SetOverride("position_ms", "r1");
+  overrides.SetOverride("volume", "r2");
+  overrides.SetOverride("current_index", "r3");
+  overrides.SetOverride("current_uri", "r3");
+  overrides.SetOverride("duration_ms", "r3");
+  overrides.SetOverride("queue", "r3");
+
+  // A stale pre-command event: still playing, old position, old volume and an
+  // old queue/index. Only fields without a pending override may apply.
+  PlaybackEngineState stale;
+  stale.playing = true;
+  stale.position_ms = 41'500;
+  stale.volume_percent = 70;
+  stale.current_index = 0;
+  stale.current_uri = "spotify:track:old";
+  stale.duration_ms = 200'000;
+  stale.queue.push_back(TrackRef{});  // single old track
+
+  const PlaybackEngineState applied =
+      ReconcileEngineState(stale, current, overrides);
+  CHECK_FALSE(applied.playing);                 // optimistic pause kept
+  CHECK(applied.position_ms == 42'000);         // optimistic seek kept
+  CHECK(applied.volume_percent == 65);          // optimistic volume kept
+  CHECK(applied.current_index == 2);            // optimistic next kept
+  CHECK(applied.current_uri == "spotify:track:next");
+  CHECK(applied.duration_ms == 180'000);
+  REQUIRE(applied.queue.size() == 3);           // optimistic queue kept
+  CHECK(applied.queue[2].uri == "spotify:track:next");
+}
+
+TEST_CASE("engine state reconcile releases overrides on confirmation") {
+  PlaybackStateReconciler overrides;
+  overrides.SetOverride("playing", "r1");
+  overrides.SetOverride("position_ms", "r1");
+
+  PlaybackEngineState current;
+  current.playing = false;
+  current.position_ms = 42'000;
+
+  // The command response arrives: the immediately following state event is
+  // authoritative and must apply even if it differs from the optimistic UI.
+  overrides.Confirm("r1");
+  CHECK_FALSE(overrides.Overridden("playing"));
+  CHECK_FALSE(overrides.Overridden("position_ms"));
+
+  PlaybackEngineState authoritative;
+  authoritative.playing = false;
+  authoritative.position_ms = 41'900;  // decoder's actual seek result
+  const PlaybackEngineState applied =
+      ReconcileEngineState(authoritative, current, overrides);
+  CHECK_FALSE(applied.playing);
+  CHECK(applied.position_ms == 41'900);
+}
+
+TEST_CASE("engine state reconcile latest intent wins and empty id clears") {
+  PlaybackStateReconciler overrides;
+  overrides.SetOverride("playing", "r1");
+  overrides.SetOverride("playing", "r2");  // newer command takes over
+  CHECK(overrides.Overridden("playing"));
+
+  // The older command's response must not release the newer intent.
+  overrides.Confirm("r1");
+  CHECK(overrides.Overridden("playing"));
+  overrides.Confirm("r2");
+  CHECK_FALSE(overrides.Overridden("playing"));
+
+  // Clearing with an empty id releases the field.
+  overrides.SetOverride("playing", "r3");
+  CHECK(overrides.Overridden("playing"));
+  overrides.SetOverride("playing", "");
+  CHECK_FALSE(overrides.Overridden("playing"));
+  CHECK_FALSE(overrides.HasPending());
+}
+
+TEST_CASE("engine state reconcile never drops fields without overrides") {
+  PlaybackStateReconciler overrides;
+  PlaybackEngineState current;
+  current.volume_percent = 65;
+  current.shuffle = true;
+
+  PlaybackEngineState incoming;
+  incoming.ready = true;
+  incoming.volume_percent = 80;
+  incoming.shuffle = false;
+  incoming.repeat = "track";
+  incoming.playing = true;
+
+  const PlaybackEngineState applied =
+      ReconcileEngineState(incoming, current, overrides);
+  CHECK(applied.ready);
+  CHECK(applied.volume_percent == 80);
+  CHECK_FALSE(applied.shuffle);
+  CHECK(applied.repeat == "track");
+  CHECK(applied.playing);
+}
+
+TEST_CASE("ui rows: rail artwork maps rows through the filtered playlist indices") {
+  PlaylistRef first;
+  first.id = "p1";
+  first.name = "First";
+  first.cover_url = "https://i.scdn.co/image/p1";
+  PlaylistRef second;
+  second.id = "p2";
+  second.name = "Second";
+  second.cover_url = "https://i.scdn.co/image/p2";
+  PlaylistRef third;
+  third.id = "p3";
+  third.name = "Third";  // no cover art
+
+  // Row 0 is the Queue entry; rows 1..N are playlists in filtered order.
+  const std::vector<int> filtered = {0, 3, 1};  // Queue, Third, First
+  const std::vector<PlaylistRef> playlists = {first, second, third};
+  CHECK(RailPlaylistForRow(playlists, filtered, 0) == nullptr);
+  CHECK(RailRowArtworkUrl(playlists, filtered, 0).empty());
+  REQUIRE(RailPlaylistForRow(playlists, filtered, 1) != nullptr);
+  CHECK(RailPlaylistForRow(playlists, filtered, 1)->id == "p3");
+  CHECK(RailRowArtworkUrl(playlists, filtered, 1).empty());  // no art
+  REQUIRE(RailPlaylistForRow(playlists, filtered, 2) != nullptr);
+  CHECK(RailPlaylistForRow(playlists, filtered, 2)->id == "p1");
+  CHECK(RailRowArtworkUrl(playlists, filtered, 2) == first.cover_url);
+
+  // Out-of-range rows and rows past the filtered rail map nowhere.
+  CHECK(RailPlaylistForRow(playlists, filtered, 3) == nullptr);
+  CHECK(RailPlaylistForRow(playlists, filtered, -1) == nullptr);
+  CHECK(RailRowArtworkUrl(playlists, filtered, 3).empty());
+  // An empty rail (no playlists, not even Queue) still maps safely.
+  const std::vector<int> queueOnly = {0};
+  CHECK(RailPlaylistForRow(playlists, queueOnly, 1) == nullptr);
+  // The middle index is 1-based: row 1 with a plain filter maps to playlist 0.
+  const std::vector<int> unfiltered = {0, 1, 2, 3};
+  CHECK(RailPlaylistForRow(playlists, unfiltered, 1)->id == "p1");
+  CHECK(RailPlaylistForRow(playlists, unfiltered, 2)->id == "p2");
+  CHECK(RailPlaylistForRow(playlists, unfiltered, 3)->id == "p3");
+  // Row seeds stay deterministic per playlist for the fallback tile.
+  CHECK(RailPlaylistForRow(playlists, unfiltered, 3) != nullptr);
+  CHECK_FALSE(RowArtworkSeed(third.cover_url, Utf8ToWide(third.name)) == 0);
+}
+
+TEST_CASE("ui rows: search enter routing targets only the main search edit") {
+  // Enter in the main search box submits through the search button; the rail
+  // filter applies live per keystroke so Enter must never be routed there.
+  CHECK(EditRoleForControl(kSearchEditControlId) == EditRole::Search);
+  CHECK(EditRoleForControl(kPlaylistFilterEditControlId) == EditRole::Filter);
+  CHECK(EditRoleForControl(999) == EditRole::Other);
+  CHECK(EditRoleForControl(kSearchEditControlId + 1) == EditRole::Other);
+  CHECK_FALSE(EditRoleForControl(kPlaylistFilterEditControlId) == EditRole::Search);
+}
+
 }  // namespace
 }  // namespace sr

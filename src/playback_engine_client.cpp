@@ -178,6 +178,7 @@ bool PlaybackEngineClient::Start(const std::wstring& executable,
                                  const std::wstring& stateDirectory,
                                  const std::wstring& diagnosticLog,
                                  StateCallback onState, ErrorCallback onError,
+                                 ResponseCallback onResponse,
                                  CommandErrorCallback onCommandError,
                                  std::string* error) {
   Shutdown();
@@ -281,6 +282,7 @@ bool PlaybackEngineClient::Start(const std::wstring& executable,
     std::lock_guard<std::mutex> lock(callback_mutex_);
     on_state_ = std::move(onState);
     on_error_ = std::move(onError);
+    on_response_ = std::move(onResponse);
     on_command_error_ = std::move(onCommandError);
   }
   stopping_.store(false);
@@ -318,6 +320,7 @@ void PlaybackEngineClient::Shutdown() {
   std::lock_guard<std::mutex> lock(callback_mutex_);
   on_state_ = {};
   on_error_ = {};
+  on_response_ = {};
   on_command_error_ = {};
 }
 
@@ -451,15 +454,23 @@ void PlaybackEngineClient::ReaderLoop() {
           }
           if (!expected) {
             ReportError("playback engine returned an unknown request_id");
-          } else if (!message.ok) {
-            CommandErrorCallback callback;
+          } else {
+            ResponseCallback response;
             {
               std::lock_guard<std::mutex> lock(callback_mutex_);
-              callback = on_command_error_;
+              response = on_response_;
             }
-            if (callback)
-              callback(message.error.empty() ? "playback command failed"
-                                             : std::move(message.error));
+            if (response) response(message.request_id, message.ok);
+            if (!message.ok) {
+              CommandErrorCallback callback;
+              {
+                std::lock_guard<std::mutex> lock(callback_mutex_);
+                callback = on_command_error_;
+              }
+              if (callback)
+                callback(message.error.empty() ? "playback command failed"
+                                               : std::move(message.error));
+            }
           }
         }
       } catch (const std::exception& exception) {

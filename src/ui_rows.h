@@ -129,4 +129,49 @@ inline bool RowTileHit(int x, int y, int itemLeft, int itemTop, int dpi) {
   return x >= left && x < left + size && y >= top && y < top + size;
 }
 
+// Child-control ids of the subclassed edit boxes. They live here so the
+// Enter-routing contract is testable without windows; ui_main.cpp binds its
+// own control-id enum to these with static_asserts.
+constexpr int kSearchEditControlId = 101;
+constexpr int kPlaylistFilterEditControlId = 105;
+
+enum class EditRole { Search, Filter, Other };
+
+// Role of a subclassed edit: the main search box routes Enter to the search
+// button (identical to clicking it); the rail filter applies live per
+// keystroke so Enter must fall through to the default edit behavior.
+inline EditRole EditRoleForControl(int controlId) {
+  if (controlId == kSearchEditControlId) return EditRole::Search;
+  if (controlId == kPlaylistFilterEditControlId) return EditRole::Filter;
+  return EditRole::Other;
+}
+
+// Maps a playlist-rail row to its playlist. Row 0 is the Queue entry (never a
+// playlist); rows 1..N route through filteredPlaylistIndices_ (1-based middle
+// index) so the mapping survives filtering. Returns nullptr for the Queue row
+// and for any out-of-range row.
+inline const PlaylistRef* RailPlaylistForRow(
+    const std::vector<PlaylistRef>& playlists,
+    const std::vector<int>& filteredPlaylistIndices, int rowIndex) {
+  if (rowIndex <= 0 ||
+      static_cast<size_t>(rowIndex) >= filteredPlaylistIndices.size())
+    return nullptr;
+  const int middleIndex =
+      filteredPlaylistIndices[static_cast<size_t>(rowIndex)];
+  if (middleIndex <= 0 ||
+      static_cast<size_t>(middleIndex - 1) >= playlists.size())
+    return nullptr;
+  return &playlists[static_cast<size_t>(middleIndex - 1)];
+}
+
+// Cover artwork URL shown by a rail row: "" for the Queue row, playlists
+// without art, or rows that map nowhere.
+inline std::string RailRowArtworkUrl(
+    const std::vector<PlaylistRef>& playlists,
+    const std::vector<int>& filteredPlaylistIndices, int rowIndex) {
+  const PlaylistRef* playlist =
+      RailPlaylistForRow(playlists, filteredPlaylistIndices, rowIndex);
+  return playlist ? playlist->cover_url : std::string();
+}
+
 }  // namespace sr
