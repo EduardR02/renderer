@@ -7,7 +7,10 @@ use librespot_playback::mixer::{Mixer, softmixer::SoftMixer};
 use librespot_playback::player::{Player, PlayerEvent};
 use tokio::sync::mpsc;
 
-use crate::auth::{PlaybackHandles, authenticate, percent_to_volume};
+use crate::auth::{
+    PendingAuth, PlaybackHandles, complete_oauth, connect_cached, percent_to_volume,
+    prepare_oauth,
+};
 use crate::io::ProtocolWriter;
 use crate::protocol::{
     AuthState, Command, RepeatMode, Response, StateEvent, TrackRef, WebApiTokenResponse,
@@ -29,10 +32,13 @@ struct CachedWebToken {
 }
 
 pub struct Engine {
-
     writer: ProtocolWriter,
     cache: Cache,
     temporary_directory: std::path::PathBuf,
+    /// The app-owned `credentials.json` inside the cache, removed by
+    /// `logout`. Kept separately because librespot's `Cache` offers no
+    /// credential-removal API.
+    credentials_file: std::path::PathBuf,
     state: PlaybackState,
     player: Option<Arc<Player>>,
     mixer: Option<Arc<SoftMixer>>,
@@ -44,6 +50,10 @@ pub struct Engine {
     random_state: u64,
     generation: u64,
     auth_running: bool,
+    /// The prepared OAuth attempt whose authorize URL is published in
+    /// `needs_login` state; `login` consumes it so the UI opens exactly the
+    /// URL the flow listens for. Regenerated per attempt.
+    pending_auth: Option<PendingAuth>,
     /// Cached login5-minted Web API token, refreshed with skew by
     /// [`Engine::web_api_token`].
     web_token: Option<CachedWebToken>,
@@ -52,6 +62,10 @@ pub struct Engine {
 struct PlaybackState {
     ready: bool,
     auth_state: AuthState,
+    /// OAuth authorize URL for the current/next login attempt; present in
+    /// `needs_login` (and `authenticating`) state events. See
+    /// [`StateEvent::auth_url`].
+    auth_url: Option<String>,
     playing: bool,
     position_ms: u32,
     duration_ms: u32,
@@ -85,6 +99,7 @@ impl Engine {
         writer: ProtocolWriter,
         cache: Cache,
         temporary_directory: std::path::PathBuf,
+        credentials_file: std::path::PathBuf,
     ) -> Self {
         let random_state = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -95,9 +110,11 @@ impl Engine {
             writer,
             cache,
             temporary_directory,
+            credentials_file,
             state: PlaybackState {
                 ready: false,
                 auth_state: AuthState::Authenticating,
+                auth_url: None,
                 playing: false,
                 position_ms: 0,
                 duration_ms: 0,
@@ -118,6 +135,7 @@ impl Engine {
             random_state,
             generation: 0,
             auth_running: false,
+            pending_auth: None,
             web_token: None,
         }
     }
@@ -136,6 +154,7 @@ impl Engine {
             kind: "state",
             ready: self.state.ready,
             auth_state: self.state.auth_state,
+            auth_url: self.state.auth_url.as_deref(),
             playing: self.state.playing,
             position_ms: self.state.position_ms,
             duration_ms: self.state.duration_ms,
@@ -188,12 +207,121 @@ impl Engine {
         self.state.auth_state = AuthState::Authenticating;
         self.state.playing = false;
         self.state.error = None;
+        if self.cache.credentials().is_none() {
+            // No cached credentials: wait for an explicit login command so the
+            // UI can present the authorize URL (a browser flow must never be
+            // started behind the user's back or left waiting unattended).
+            self.auth_running = false;
+            self.enter_needs_login();
+            return;
+        }
         let cache = self.cache.clone();
         let temporary_directory = self.temporary_directory.clone();
         tokio::spawn(async move {
-            let result = authenticate(cache, temporary_directory).await;
+            let result = connect_cached(cache, temporary_directory).await;
             let _ = sender.send(AuthSignal::Complete { generation, result });
         });
+    }
+
+    /// Transitions to `NeedsLogin`: tears down playback, clears the playback
+    /// state, and prepares a fresh OAuth attempt whose authorize URL is
+    /// published in state events for the UI's Log in button. The URL is
+    /// regenerated every time the engine enters this state.
+    fn enter_needs_login(&mut self) {
+        self.shutdown_playback();
+        self.state.ready = false;
+        self.state.auth_state = AuthState::NeedsLogin;
+        self.state.playing = false;
+        self.state.position_ms = 0;
+        self.state.duration_ms = 0;
+        self.state.current_index = None;
+        self.state.queue.clear();
+        self.shuffle_pool.clear();
+        self.history.clear();
+        self.state.error = None;
+        match prepare_oauth() {
+            Ok(pending) => {
+                self.state.auth_url = Some(pending.auth_url.clone());
+                self.pending_auth = Some(pending);
+            }
+            Err(error) => {
+                self.state.auth_url = None;
+                self.state.error = Some(error);
+            }
+        }
+    }
+
+    /// Starts the OAuth flow on demand, consuming the prepared attempt so the
+    /// flow listens for exactly the authorize URL the UI opened. No-op while a
+    /// session is live (`Ready`) or a flow is already running.
+    pub fn login(&mut self, auth_sender: &mpsc::UnboundedSender<AuthSignal>) -> Result<bool, String> {
+        if self.state.auth_state == AuthState::Ready {
+            return Ok(true);
+        }
+        if self.auth_running {
+            return Ok(true);
+        }
+        let pending = self.begin_login_flow()?;
+        let generation = self.generation;
+        let auth_sender = auth_sender.clone();
+        let cache = self.cache.clone();
+        let temporary_directory = self.temporary_directory.clone();
+        tokio::spawn(async move {
+            let result = complete_oauth(cache, temporary_directory, pending).await;
+            let _ = auth_sender.send(AuthSignal::Complete { generation, result });
+        });
+        Ok(true)
+    }
+
+    /// State half of [`Engine::login`]: consumes (or prepares) the OAuth
+    /// attempt and marks the engine `Authenticating`. Split out so the
+    /// transition is unit-testable without spawning a live flow.
+    fn begin_login_flow(&mut self) -> Result<PendingAuth, String> {
+        let pending = match self.pending_auth.take() {
+            Some(pending) => pending,
+            None => prepare_oauth()?,
+        };
+        self.shutdown_playback();
+        self.auth_running = true;
+        self.generation = self.generation.wrapping_add(1);
+        self.state.ready = false;
+        self.state.auth_state = AuthState::Authenticating;
+        self.state.playing = false;
+        self.state.error = None;
+        self.state.auth_url = Some(pending.auth_url.clone());
+        Ok(pending)
+    }
+
+    /// Clears the cached credentials and tears the session down; the state
+    /// flips to `NeedsLogin` with a fresh authorize URL so re-login works
+    /// without a restart. Idempotent: safe when no session or credentials
+    /// exist.
+    pub fn logout(&mut self) -> Result<bool, String> {
+        // Invalidate any in-flight authentication attempt: its completion
+        // signal must not resurrect a session after an explicit logout.
+        self.auth_running = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.enter_needs_login();
+        if let Err(error) = self.clear_cached_credentials() {
+            eprintln!("could not clear cached Spotify credentials: {error}");
+            self.state.error = Some(format!("could not clear cached credentials: {error}"));
+        }
+        Ok(true)
+    }
+
+    /// Removes the app-owned `credentials.json`; a missing file is already
+    /// logged out. librespot's `Cache` has no removal API, so the file is
+    /// removed directly.
+    fn clear_cached_credentials(&self) -> Result<(), String> {
+        let path = &self.credentials_file;
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        }
     }
 
     pub fn on_auth_signal(
@@ -212,6 +340,9 @@ impl Engine {
                 self.state.auth_state = AuthState::Ready;
                 self.state.volume = handles.volume_percent;
                 self.state.error = None;
+                // The attempt is spent: the URL it published no longer applies.
+                self.state.auth_url = None;
+                self.pending_auth = None;
                 self.player = Some(handles.player);
                 self.mixer = Some(handles.mixer);
                 self.session = Some(handles.session);
@@ -234,11 +365,9 @@ impl Engine {
             }
             Err(error) => {
                 eprintln!("Spotify playback authentication failed: {error}");
-                self.state.ready = false;
-                self.state.auth_state = AuthState::Error;
-                self.state.playing = false;
-                // No usable session: any cached web token is stale.
-                self.web_token = None;
+                // A failed login returns to needs_login with a fresh URL so
+                // the user can retry with the Log in button.
+                self.enter_needs_login();
                 self.state.error = Some(error);
                 true
             }
@@ -259,9 +388,19 @@ impl Engine {
         if matches!(&command, Command::WebApiToken) {
             return self.web_api_token().await;
         }
+        if matches!(&command, Command::Login) {
+            return self.login(auth_sender);
+        }
+        if matches!(&command, Command::Logout) {
+            return self.logout();
+        }
         self.ensure_ready()?;
         match command {
-            Command::Status | Command::Shutdown | Command::WebApiToken => unreachable!(),
+            Command::Status
+            | Command::Shutdown
+            | Command::WebApiToken
+            | Command::Login
+            | Command::Logout => unreachable!(),
             Command::PlayQueue {
                 queue,
                 index,
@@ -294,6 +433,9 @@ impl Engine {
         }
         let session = self.session.as_ref().ok_or_else(|| match self.state.auth_state {
             AuthState::Authenticating => "Spotify authentication is still in progress".to_owned(),
+            AuthState::NeedsLogin => {
+                "Spotify login is required; use the Log in button in Settings".to_owned()
+            }
             AuthState::Error => self
                 .state
                 .error
@@ -403,6 +545,9 @@ impl Engine {
         } else {
             Err(match self.state.auth_state {
                 AuthState::Authenticating => "Spotify authentication is still in progress".to_owned(),
+                AuthState::NeedsLogin => {
+                    "Spotify login is required; use the Log in button in Settings".to_owned()
+                }
                 AuthState::Error => self
                     .state
                     .error
@@ -925,7 +1070,7 @@ mod tests {
     use librespot_playback::player::PlayerEvent;
     use super::{
         remap_current_index_after_move, sequential_next_index, web_token_expires_in,
-        web_token_is_fresh, Engine, PlaybackState, PlayerSignal,
+        web_token_is_fresh, AuthSignal, Engine, PlaybackState, PlayerSignal,
     };
     use crate::io::ProtocolWriter;
     use crate::protocol::{RepeatMode, TrackRef};
@@ -940,7 +1085,7 @@ mod tests {
         )
         .expect("cache with no paths");
         (
-            Engine::new(writer, cache, PathBuf::new()),
+            Engine::new(writer, cache, PathBuf::new(), PathBuf::new()),
             buffer,
         )
     }
@@ -960,6 +1105,7 @@ mod tests {
         PlaybackState {
             ready: true,
             auth_state: crate::protocol::AuthState::Ready,
+            auth_url: None,
             playing: false,
             position_ms: 0,
             duration_ms,
@@ -1176,5 +1322,222 @@ mod tests {
         // re-mint) still reports a positive lifetime rather than zero.
         assert_eq!(web_token_expires_in(now + Duration::from_secs(30), now), 1);
         assert_eq!(web_token_expires_in(now + Duration::from_secs(61), now), 1);
+    }
+
+    /// A scratch state directory with a `credentials.json` already written
+    /// (any content: logout only removes the file). Removed on drop.
+    struct CredentialsFixture {
+        directory: PathBuf,
+    }
+
+    impl CredentialsFixture {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "sr_engine_logout_test_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let credentials_dir = directory.join("credentials");
+            std::fs::create_dir_all(&credentials_dir).expect("fixture credentials dir");
+            std::fs::write(
+                credentials_dir.join("credentials.json"),
+                "{\"username\":\"test-user\"}",
+            )
+            .expect("fixture credentials file");
+            Self { directory }
+        }
+
+        fn credentials_file(&self) -> PathBuf {
+            self.directory.join("credentials").join("credentials.json")
+        }
+
+        fn credentials_exist(&self) -> bool {
+            self.credentials_file().exists()
+        }
+    }
+
+    impl Drop for CredentialsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn logout_clears_cached_credentials_and_emits_needs_login_with_auth_url() {
+        let fixture = CredentialsFixture::new();
+        let (mut engine, buffer) = {
+            let (writer, buffer) = ProtocolWriter::capture();
+            let cache = librespot_core::cache::Cache::new(
+                Some(fixture.directory.join("credentials")),
+                Some(fixture.directory.join("volume")),
+                None::<PathBuf>,
+                None,
+            )
+            .expect("cache with credentials path");
+            (
+                Engine::new(writer, cache, PathBuf::new(), fixture.credentials_file()),
+                buffer,
+            )
+        };
+        // A live session: playback state that logout must tear down.
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+
+        assert!(engine.logout().expect("logout succeeds"));
+        assert!(engine.state.auth_state == crate::protocol::AuthState::NeedsLogin);
+        assert!(!engine.state.ready);
+        assert!(!engine.state.playing);
+        assert!(engine.state.current_index.is_none());
+        assert!(engine.state.queue.is_empty());
+        let published_url = engine.state.auth_url.clone().expect("auth url published");
+        assert!(published_url.starts_with("https://accounts.spotify.com/authorize?"));
+        assert!(!fixture.credentials_exist(), "credentials file must be removed");
+
+        engine.emit_state().expect("state emits");
+        let line = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            std::mem::take(&mut *bytes)
+        };
+        let value: serde_json::Value = serde_json::from_slice(&line).expect("state json");
+        assert_eq!(value["auth_state"], "needs_login");
+        assert_eq!(value["ready"], false);
+        assert_eq!(value["auth_url"], published_url);
+    }
+
+    #[test]
+    fn logout_is_idempotent_when_credentials_are_already_cleared() {
+        let fixture = CredentialsFixture::new();
+        let (writer, _) = ProtocolWriter::capture();
+        let cache = librespot_core::cache::Cache::new(
+            Some(fixture.directory.join("credentials")),
+            None::<PathBuf>,
+            None::<PathBuf>,
+            None,
+        )
+        .expect("cache");
+        let mut engine =
+            Engine::new(writer, cache, PathBuf::new(), fixture.credentials_file());
+        assert!(engine.logout().expect("first logout"));
+        assert!(!fixture.credentials_exist());
+        assert!(engine.logout().expect("second logout is a no-op"));
+        assert!(engine.state.auth_state == crate::protocol::AuthState::NeedsLogin);
+    }
+
+    #[test]
+    fn startup_without_cached_credentials_enters_needs_login_without_a_flow() {
+        let (mut engine, buffer) = test_engine(); // cache has no credentials
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        engine.start_authentication(sender);
+        assert!(!engine.auth_running, "no implicit flow may start");
+        assert!(engine.state.auth_state == crate::protocol::AuthState::NeedsLogin);
+        assert!(engine.state.auth_url.is_some());
+
+        engine.emit_state().expect("state emits");
+        let line = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            std::mem::take(&mut *bytes)
+        };
+        let value: serde_json::Value = serde_json::from_slice(&line).expect("state json");
+        assert_eq!(value["auth_state"], "needs_login");
+        assert!(value["auth_url"].as_str().is_some_and(|url| {
+            url.starts_with("https://accounts.spotify.com/authorize?")
+        }));
+    }
+
+    #[test]
+    fn login_is_a_noop_while_a_session_is_live() {
+        let mut engine = playing_engine(); // ready with a player-less state
+        engine.state.auth_state = crate::protocol::AuthState::Ready;
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        assert!(engine.login(&sender).expect("login no-ops when authenticated"));
+        assert!(!engine.auth_running);
+        assert!(engine.state.auth_state == crate::protocol::AuthState::Ready);
+    }
+
+    #[test]
+    fn login_is_a_noop_while_a_flow_is_already_running() {
+        let mut engine = test_engine().0;
+        engine.auth_running = true;
+        engine.state.auth_state = crate::protocol::AuthState::Authenticating;
+        engine.state.auth_url = Some("https://accounts.spotify.com/authorize?running".to_owned());
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        assert!(engine.login(&sender).expect("login no-ops while authenticating"));
+        assert!(engine.auth_running);
+        assert_eq!(
+            engine.state.auth_url.as_deref(),
+            Some("https://accounts.spotify.com/authorize?running"),
+            "an in-flight attempt keeps its URL"
+        );
+    }
+
+    #[test]
+    fn begin_login_flow_consumes_the_published_attempt_and_marks_authenticating() {
+        let mut engine = test_engine().0;
+        engine.enter_needs_login();
+        let published = engine
+            .state
+            .auth_url
+            .clone()
+            .expect("needs_login publishes a url");
+        let pending = engine.begin_login_flow().expect("flow begins");
+        assert_eq!(pending.auth_url, published, "the flow must use the published URL");
+        assert!(engine.state.auth_state == crate::protocol::AuthState::Authenticating);
+        assert!(engine.auth_running);
+        assert_eq!(engine.state.auth_url.as_deref(), Some(published.as_str()));
+        assert!(engine.pending_auth.is_none());
+    }
+
+    #[test]
+    fn begin_login_flow_prepares_a_fresh_attempt_when_none_is_pending() {
+        let mut engine = test_engine().0;
+        engine.state.auth_state = crate::protocol::AuthState::NeedsLogin;
+        let pending = engine.begin_login_flow().expect("flow begins");
+        assert!(pending.auth_url.starts_with("https://accounts.spotify.com/authorize?"));
+        assert!(engine.state.auth_state == crate::protocol::AuthState::Authenticating);
+        assert_eq!(engine.state.auth_url.as_deref(), Some(pending.auth_url.as_str()));
+    }
+
+    #[test]
+    fn failed_auth_signal_returns_to_needs_login_with_a_fresh_url() {
+        let mut engine = test_engine().0;
+        engine.state.auth_state = crate::protocol::AuthState::Authenticating;
+        engine.state.auth_url = Some("https://accounts.spotify.com/authorize?first".to_owned());
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        assert!(engine.on_auth_signal(
+            AuthSignal::Complete {
+                generation: engine.generation,
+                result: Err("Spotify authentication failed: test".to_owned()),
+            },
+            sender,
+        ));
+        assert!(engine.state.auth_state == crate::protocol::AuthState::NeedsLogin);
+        assert!(!engine.state.ready);
+        assert!(!engine.auth_running);
+        let retry_url = engine.state.auth_url.clone().expect("retry url published");
+        assert_ne!(
+            retry_url, "https://accounts.spotify.com/authorize?first",
+            "a retry must regenerate the URL"
+        );
+        assert!(engine.state.error.as_deref().is_some_and(|error| {
+            error.contains("Spotify authentication failed")
+        }));
+    }
+
+    #[test]
+    fn state_events_omit_auth_url_when_no_attempt_is_pending() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.auth_url = None;
+        engine.emit_state().expect("state emits");
+        let line = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            std::mem::take(&mut *bytes)
+        };
+        let value: serde_json::Value = serde_json::from_slice(&line).expect("state json");
+        assert!(value.get("auth_url").is_none(), "auth_url must be omitted");
+        assert_eq!(value["auth_state"], "ready");
     }
 }

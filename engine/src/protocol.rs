@@ -77,6 +77,13 @@ pub enum Command {
     /// can browse without its own OAuth app. Responded to with
     /// [`WebApiTokenResponse`].
     WebApiToken,
+    /// Clears the cached credentials and tears the session down; the engine
+    /// immediately reports `needs_login` (with a fresh authorize URL).
+    Logout,
+    /// Starts the OAuth flow on demand, using the authorize URL the engine
+    /// published in its `needs_login` state. No-op while a session is live or
+    /// a flow is already running.
+    Login,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -89,9 +96,12 @@ pub enum RepeatMode {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum AuthState {
     Authenticating,
+    /// No usable session and no flow in flight: the UI must present the
+    /// [`StateEvent::auth_url`] authorize link (Log in) to start one.
+    NeedsLogin,
     Ready,
     Error,
 }
@@ -131,6 +141,11 @@ pub struct StateEvent<'a> {
     pub kind: &'static str,
     pub ready: bool,
     pub auth_state: AuthState,
+    /// Spotify OAuth authorize URL for the current/next login attempt. Set
+    /// while the engine is `NeedsLogin` (waiting for the UI to open it) and
+    /// while the flow it started is `Authenticating`; regenerated per attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<&'a str>,
     pub playing: bool,
     pub position_ms: u32,
     pub duration_ms: u32,
@@ -257,6 +272,7 @@ mod tests {
             kind: "state",
             ready: true,
             auth_state: AuthState::Ready,
+            auth_url: None,
             playing: true,
             position_ms: 7_500,
             duration_ms: 123_456,
@@ -278,5 +294,50 @@ mod tests {
         assert_eq!(state["queue"][0]["artist_names"], json!(["Artist"]));
         assert_eq!(state["queue"][0]["duration_ms"], 123_456);
         assert!(state["error"].is_null());
+        // The authorize URL is only present while a login attempt is pending.
+        assert!(state["auth_url"].is_null());
+    }
+
+    #[test]
+    fn needs_login_state_carries_the_oauth_authorize_url() {
+        let state = serde_json::to_value(StateEvent {
+            kind: "state",
+            ready: false,
+            auth_state: AuthState::NeedsLogin,
+            auth_url: Some("https://accounts.spotify.com/authorize?state=abc"),
+            playing: false,
+            position_ms: 0,
+            duration_ms: 0,
+            volume: 50,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            current_index: None,
+            current_uri: None,
+            queue: &[],
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(state["auth_state"], "needs_login");
+        assert_eq!(
+            state["auth_url"],
+            "https://accounts.spotify.com/authorize?state=abc"
+        );
+    }
+
+    #[test]
+    fn login_and_logout_commands_deserialize_from_the_line_protocol() {
+        let login: Request = serde_json::from_value(json!({
+            "request_id": "request-9",
+            "type": "login",
+        }))
+        .unwrap();
+        assert!(matches!(login.command, Command::Login));
+
+        let logout: Request = serde_json::from_value(json!({
+            "request_id": "request-10",
+            "type": "logout",
+        }))
+        .unwrap();
+        assert!(matches!(logout.command, Command::Logout));
     }
 }

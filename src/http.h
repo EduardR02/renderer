@@ -11,7 +11,8 @@ namespace sr {
 struct HttpResponse {
   long status = 0;
   std::string body;        // raw bytes (may be binary for image downloads)
-  std::string retry_after; // seconds, from the Retry-After header ("" if absent)
+  std::string retry_after;  // raw Retry-After header value ("" if absent);
+                            // parse with ParseRetryAfterSeconds
   bool succeeded = false;  // transport-level success (status may still be 4xx/5xx)
   std::string error;
 };

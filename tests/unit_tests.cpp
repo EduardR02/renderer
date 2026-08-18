@@ -1,11 +1,15 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -623,6 +627,115 @@ TEST_CASE("ui rows: rail artwork maps rows through the filtered playlist indices
   CHECK_FALSE(RowArtworkSeed(third.cover_url, Utf8ToWide(third.name)) == 0);
 }
 
+TEST_CASE("retry-after header parses seconds and HTTP dates") {
+  // Plain delta seconds (RFC 7231).
+  CHECK(ParseRetryAfterSeconds("", 0) == 0);
+  CHECK(ParseRetryAfterSeconds("35", 0) == 35);
+  CHECK(ParseRetryAfterSeconds(" 12 ", 0) == 12);
+  CHECK(ParseRetryAfterSeconds("0", 0) == 0);
+  // HTTP-date: the wait is the remaining time until that moment (1994-11-06
+  // 08:49:37 UTC = unix 784111777).
+  CHECK(ParseRetryAfterSeconds("Sun, 06 Nov 1994 08:49:37 GMT", 784111777) == 0);
+  CHECK(ParseRetryAfterSeconds("Sun, 06 Nov 1994 08:49:37 GMT", 784111757) == 20);
+  // RFC 850 format with a two-digit year.
+  CHECK(ParseRetryAfterSeconds("Sunday, 06-Nov-94 08:49:37 GMT", 784111757) == 20);
+  // asctime format.
+  CHECK(ParseRetryAfterSeconds("Sun Nov  6 08:49:37 1994", 784111757) == 20);
+  CHECK(ParseRetryAfterSeconds("Sun Nov  6 08:49:37 1994", 784111777) == 0);
+  // Unparseable headers never produce a wait.
+  CHECK(ParseRetryAfterSeconds("garbage", 0) == 0);
+  CHECK(ParseRetryAfterSeconds("Thu, 32 Feb 2020 00:00:00 GMT", 1'000'000) == 0);
+}
+
+TEST_CASE("backoff doubles exponentially within jitter bounds") {
+  const auto fixed = [](double value) {
+    return [value] { return value; };
+  };
+  // rng 0.5 lands in the middle of each band: 1, 2, 3, 6, ...
+  CHECK(ComputeBackoffDelay(0, 0, fixed(0.5)) == 1);
+  CHECK(ComputeBackoffDelay(1, 0, fixed(0.5)) == 2);
+  CHECK(ComputeBackoffDelay(2, 0, fixed(0.5)) == 3);
+  CHECK(ComputeBackoffDelay(3, 0, fixed(0.5)) == 6);
+  // rng 0 and 1 pin the [base/2, base] floor and ceiling.
+  CHECK(ComputeBackoffDelay(0, 0, fixed(0.0)) == 1);
+  CHECK(ComputeBackoffDelay(0, 0, fixed(1.0)) == 1);
+  CHECK(ComputeBackoffDelay(2, 0, fixed(0.0)) == 2);
+  CHECK(ComputeBackoffDelay(2, 0, fixed(1.0)) == 4);
+  CHECK(ComputeBackoffDelay(3, 0, fixed(1.0)) == 8);
+}
+
+TEST_CASE("backoff honors retry-after and caps the wait") {
+  const auto fixed = [](double value) {
+    return [value] { return value; };
+  };
+  // A Retry-After hint dominates the exponential schedule.
+  CHECK(ComputeBackoffDelay(0, 35, fixed(0.5)) == 35);
+  CHECK(ComputeBackoffDelay(3, 35, fixed(1.0)) == 35);  // base 8 < 35
+  // The exponential term wins when it exceeds the hint; base caps at 60.
+  CHECK(ComputeBackoffDelay(6, 2, fixed(1.0)) == 60);
+  CHECK(ComputeBackoffDelay(6, 2, fixed(0.0)) == 30);
+  CHECK(ComputeBackoffDelay(9, 0, fixed(1.0)) == 60);
+  // Hard ceiling: never wait longer than 300 s per retry.
+  CHECK(ComputeBackoffDelay(0, 400, fixed(0.5)) == 300);
+  // A missing hint still schedules a minimum wait, never zero.
+  CHECK(ComputeBackoffDelay(0, 0, fixed(0.5)) >= 1);
+}
+
+TEST_CASE("web_api_token provider shares one in-flight mint across racing callers") {
+  auto now = std::make_shared<int64_t>(1'000'000);
+  std::atomic<int> mints{0};
+  WebApiTokenProvider provider(
+      [&](WebApiToken* token, std::string*, int) {
+        ++mints;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));  // hold the mint open
+        token->token_type = "Bearer";
+        token->access_token = "token-race";
+        token->expires_in = 3600;
+        return true;
+      },
+      [now] { return *now; });
+  constexpr int kCallers = 8;
+  std::vector<std::string> results(kCallers);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kCallers; ++i) {
+    threads.emplace_back([&provider, &results, i] {
+      results[i] = provider.GetAccessToken();
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  CHECK(mints.load() == 1);  // every waiter shared the in-flight mint
+  for (const std::string& token : results) CHECK(token == "token-race");
+  CHECK(provider.GetAccessToken() == "token-race");  // still cached
+  CHECK(mints.load() == 1);
+}
+
+TEST_CASE("delayed api task queue runs due work in deadline order, one at a time") {
+  using Clock = DelayedTaskQueue::Clock;
+  auto base = std::make_shared<Clock::time_point>(Clock::now());
+  DelayedTaskQueue queue([base] { return *base; });
+  std::vector<std::string> ran;
+  const auto dispatch = [&](std::function<void()> task) {
+    task();
+    ran.push_back("run");
+  };
+  // Scheduled out of deadline order; the queue must reorder.
+  queue.Schedule(10, [&] { ran.push_back("a"); });
+  queue.Schedule(2, [&] { ran.push_back("b"); });
+  queue.Schedule(10, [&] { ran.push_back("c"); });
+  CHECK(queue.Size() == 3);
+  CHECK(queue.RunDue(*base + std::chrono::seconds(1), dispatch) == 0);
+  CHECK(queue.RunDue(*base + std::chrono::seconds(2), dispatch) == 1);
+  CHECK(ran == std::vector<std::string>({"b", "run"}));
+  // Same-deadline tasks keep schedule order (FIFO ties).
+  CHECK(queue.RunDue(*base + std::chrono::seconds(10), dispatch) == 2);
+  CHECK(ran == std::vector<std::string>({"b", "run", "a", "run", "c", "run"}));
+  CHECK(queue.Empty());
+  queue.Schedule(5, [&] { ran.push_back("d"); });
+  queue.Clear();
+  CHECK(queue.Size() == 0);
+  CHECK(queue.Empty());
+}
+
 TEST_CASE("ui rows: search enter routing targets only the main search edit") {
   // Enter in the main search box submits through the search button; the rail
   // filter applies live per keystroke so Enter must never be routed there.
@@ -631,6 +744,93 @@ TEST_CASE("ui rows: search enter routing targets only the main search edit") {
   CHECK(EditRoleForControl(999) == EditRole::Other);
   CHECK(EditRoleForControl(kSearchEditControlId + 1) == EditRole::Other);
   CHECK_FALSE(EditRoleForControl(kPlaylistFilterEditControlId) == EditRole::Search);
+}
+
+TEST_CASE("needs_login state events map the authorize URL") {
+  const json line = {
+      {"type", "state"},
+      {"ready", false},
+      {"auth_state", "needs_login"},
+      {"auth_url", "https://accounts.spotify.com/authorize?state=abc"},
+      {"playing", false},
+      {"position_ms", 0},
+      {"duration_ms", 0},
+      {"volume", 50},
+      {"shuffle", false},
+      {"repeat", "off"},
+      {"current_index", -1},
+      {"current_uri", ""},
+      {"queue", json::array()},
+      {"error", nullptr},
+  };
+  const EngineMessage message = ParseEngineMessage(line.dump());
+  REQUIRE(message.kind == EngineMessage::Kind::State);
+  CHECK_FALSE(message.state.ready);
+  CHECK(message.state.auth_state == EngineAuthState::NeedsLogin);
+  CHECK(message.state.auth_url ==
+        "https://accounts.spotify.com/authorize?state=abc");
+}
+
+TEST_CASE("state events without an authorize URL map to an empty one") {
+  const json line = {
+      {"type", "state"},
+      {"ready", true},
+      {"auth_state", "ready"},
+      {"playing", false},
+      {"position_ms", 0},
+      {"duration_ms", 0},
+      {"volume", 50},
+      {"shuffle", false},
+      {"repeat", "off"},
+      {"current_index", -1},
+      {"current_uri", ""},
+      {"queue", json::array()},
+      {"error", nullptr},
+  };
+  const EngineMessage message = ParseEngineMessage(line.dump());
+  CHECK(message.state.auth_state == EngineAuthState::Ready);
+  CHECK(message.state.auth_url.empty());
+  // Unknown auth states degrade to Authenticating (safe local default).
+  json unknown = line;
+  unknown["auth_state"] = "waiting";
+  CHECK(ParseEngineMessage(unknown.dump()).state.auth_state ==
+        EngineAuthState::Authenticating);
+}
+
+TEST_CASE("session button enablement maps from engine auth state") {
+  PlaybackEngineState state;
+  // Fresh engine: no session, no flow -> only Log in is actionable.
+  state.auth_state = EngineAuthState::NeedsLogin;
+  state.ready = false;
+  CHECK(LoginButtonEnabled(state));
+  CHECK_FALSE(LogoutButtonEnabled(state));
+
+  // Live session -> Log out only.
+  state.auth_state = EngineAuthState::Ready;
+  state.ready = true;
+  CHECK_FALSE(LoginButtonEnabled(state));
+  CHECK(LogoutButtonEnabled(state));
+
+  // Ready flag and state must agree: a torn-down engine is never logged out.
+  state.auth_state = EngineAuthState::Ready;
+  state.ready = false;
+  CHECK_FALSE(LogoutButtonEnabled(state));
+
+  // Flow in flight / degraded engine: neither action (no double-submit).
+  state.auth_state = EngineAuthState::Authenticating;
+  state.ready = false;
+  CHECK_FALSE(LoginButtonEnabled(state));
+  CHECK_FALSE(LogoutButtonEnabled(state));
+  state.auth_state = EngineAuthState::Error;
+  CHECK_FALSE(LoginButtonEnabled(state));
+  CHECK_FALSE(LogoutButtonEnabled(state));
+}
+
+TEST_CASE("login and logout requests use the line protocol command types") {
+  const json login = BuildEngineRequest("50", "login");
+  CHECK((login == json{{"request_id", "50"}, {"type", "login"}}));
+  const json logout = BuildEngineRequest("51", "logout");
+  CHECK((logout == json{{"request_id", "51"}, {"type", "logout"}}));
 }
 
 }  // namespace

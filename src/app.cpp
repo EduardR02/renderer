@@ -6,14 +6,20 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <utility>
+
+#include <nlohmann/json.hpp>
 
 #include "app_paths.h"
 #include "log.h"
 #include "util.h"
 
 namespace sr {
+using nlohmann::json;
+
 namespace {
 
 constexpr UINT kSmokeTimer = 1;
@@ -259,6 +265,39 @@ void TrackListCache::Clear() {
 size_t TrackListCache::Size() const { return order_.size(); }
 
 
+DelayedTaskQueue::DelayedTaskQueue(NowFn now) : now_(std::move(now)) {}
+
+void DelayedTaskQueue::Schedule(int delaySeconds, std::function<void()> task) {
+  if (!task) return;
+  const TimePoint due =
+      now_() + std::chrono::seconds(std::max(0, delaySeconds));
+  pending_.push_back({due, std::move(task)});
+  // Keep deadlines ordered (stable, so same-deadline tasks stay FIFO).
+  std::stable_sort(pending_.begin(), pending_.end(),
+                   [](const auto& left, const auto& right) {
+                     return left.first < right.first;
+                   });
+}
+
+int DelayedTaskQueue::RunDue(
+    TimePoint now, const std::function<void(std::function<void()>)>& dispatch) {
+  int dispatched = 0;
+  while (!pending_.empty() && pending_.front().first <= now) {
+    std::function<void()> task = std::move(pending_.front().second);
+    pending_.pop_front();
+    if (dispatch) dispatch(std::move(task));
+    ++dispatched;
+  }
+  return dispatched;
+}
+
+void DelayedTaskQueue::Clear() { pending_.clear(); }
+
+bool DelayedTaskQueue::Empty() const { return pending_.empty(); }
+
+size_t DelayedTaskQueue::Size() const { return pending_.size(); }
+
+
 Application::~Application() { Shutdown(); }
 
 int Application::Run(HINSTANCE instance, int show, const RunOptions& options) {
@@ -369,7 +408,8 @@ void Application::StartEngine() {
                       Utf8ToWide(error));
   } else {
     window_.SetStatus(
-        L"Local playback engine is starting; complete its browser sign-in if prompted.");
+        L"Local playback engine is starting; open Settings to sign in with "
+        L"Spotify if needed.");
     window_.SetEngineStatus(EngineStatusText());
   }
 }
@@ -379,6 +419,7 @@ void Application::Shutdown() {
   shutting_down_ = true;
   engine_restart_pending_ = false;
   StopTimers();
+  delayed_api_tasks_.Clear();
   artwork_tasks_.DiscardPending();
   api_tasks_.Stop();
   artwork_tasks_.Stop();
@@ -438,9 +479,19 @@ void Application::HandleApiError(const std::string& message, int status,
                                  const std::wstring& context) {
   LOG_ERROR(WideToUtf8(context) + ": " + message +
             (status ? " (HTTP " + std::to_string(status) + ")" : ""));
+  if (status == 401) {
+    // The engine could not re-mint a valid Web API token, so the underlying
+    // Spotify session is gone: the user must sign in again through the
+    // playback engine. This is never a rate-limit condition.
+    window_.SetStatus(
+        L"Spotify session expired — sign in again in the local playback "
+        L"engine (Settings) to reconnect.");
+    return;
+  }
   std::wstring text = context + L": " + Utf8ToWide(message);
-  if (status == 429 && retryAfter > 0)
-    text += L"; retry after " + std::to_wstring(retryAfter) + L" seconds";
+  if ((status == 429 || status == 503) && retryAfter > 0)
+    text += L"; Spotify suggests waiting " + std::to_wstring(retryAfter) +
+            L" s before retrying";
   window_.SetStatus(text);
 }
 
@@ -950,6 +1001,48 @@ void Application::OnCycleRepeat() {
     playback_overrides_.SetOverride(kOverrideRepeat, requestId);
 }
 
+void Application::OnLogin() {
+  if (options_.smoke || options_.demo) return;
+  // The Log in button is enabled exactly while the engine holds a fresh
+  // authorize URL; anything else is a double-submit or a stale click.
+  if (playback_.auth_state != EngineAuthState::NeedsLogin) return;
+  if (playback_.auth_url.empty()) {
+    window_.SetStatus(
+        L"Spotify login is not ready yet; try again in a moment.");
+    return;
+  }
+  // Open the authorize URL first (the user needs seconds to complete the
+  // sign-in; the engine binds its loopback callback right after), then start
+  // the flow. The engine regenerates the URL per attempt, so the URL shown
+  // here is exactly the one its listener accepts.
+  const HINSTANCE opened = ::ShellExecuteW(
+      nullptr, L"open", Utf8ToWide(playback_.auth_url).c_str(), nullptr,
+      nullptr, SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(opened) <= 32) {
+    window_.SetStatus(L"Could not open the Spotify sign-in page in your "
+                      L"browser (Windows error " +
+                      std::to_wstring(::GetLastError()) + L").");
+    return;
+  }
+  window_.SetStatus(L"Waiting for Spotify login... complete the sign-in in "
+                    L"the browser.");
+  RunEngineCommand([this] { return engine_.TriggerLogin(); },
+                   L"Spotify login");
+}
+
+void Application::OnLogout() {
+  if (options_.smoke || options_.demo) return;
+  if (!LogoutButtonEnabled(playback_)) return;
+  // Immediate action, no confirmation dialog: the engine clears the cached
+  // credentials and tears the session down; the needs_login state event it
+  // emits right after flips the Settings page and re-enables Log in.
+  // A stale respawn must never resurrect the session or its playback.
+  restore_playback_pending_ = false;
+  playback_overrides_.Reset();
+  window_.SetStatus(L"Signed out; Spotify login required.");
+  RunEngineCommand([this] { return engine_.Logout(); }, L"Spotify logout");
+}
+
 void Application::OnEngineState(PlaybackEngineState state) {
   // Fields with unconfirmed optimistic overrides keep their current values so
   // stale pre-command events (heartbeat ticks, player transitions) cannot
@@ -983,6 +1076,17 @@ void Application::OnEngineState(PlaybackEngineState state) {
         TryRecoverEngine();
     } else if (playback_.ready) {
       window_.SetStatus(L"Standalone playback engine ready at 320 kbps.");
+    } else if (playback_.auth_state == EngineAuthState::NeedsLogin) {
+      window_.SetStatus(
+          L"Spotify login required. Use Settings and Log in.");
+    } else if (playback_.auth_state == EngineAuthState::Authenticating) {
+      // A published authorize URL means the browser flow is running; the
+      // cached-credentials path needs no user action.
+      window_.SetStatus(
+          playback_.auth_url.empty()
+              ? L"Local playback engine is signing in with saved credentials."
+              : L"Waiting for Spotify login... complete the sign-in in the "
+                L"browser.");
     }
   }
   if (becameReady) {
@@ -1099,30 +1203,152 @@ void Application::RefreshQueue() {
 void Application::RefreshPlaylists(bool force) {
   if (!IsAuthed()) return;
   const auto now = std::chrono::steady_clock::now();
+  // Fresh in-memory copy (set by this run or loaded from disk below).
   if (!force && playlists_fetched_at_.has_value() && !playlists_.empty() &&
       now - *playlists_fetched_at_ < kPlaylistListTtl) {
     window_.SetPlaylists(playlists_);
     return;
   }
-  PostTask<std::vector<PlaylistRef>>(
-      [this] {
-        if (me_id_.empty()) {
+  // Relaunch fast path: a fresh on-disk copy of the library skips the
+  // startup /me + /me/playlists fetch entirely.
+  if (!force && LoadPlaylistCache()) return;
+  FetchPlaylistPage({}, 0);
+}
+
+void Application::FetchPlaylistPage(const std::string& nextPath,
+                                    int pageIndex) {
+  if (pageIndex < 0 || pageIndex >= kMaxPlaylistPages) return;
+  PostTask<PlaylistsPage>(
+      [this, nextPath] {
+        // The account id rides along on the first page so the startup path
+        // stays a single serialized request; a rate limit here cannot mask
+        // the playlist fetch.
+        if (nextPath.empty() && me_id_.empty()) {
           try {
             me_id_ = api_->GetMeId();
           } catch (const ApiError& error) {
             LOG_WARN(std::string("could not load account id: ") + error.what());
           }
         }
-        return api_->GetMyPlaylists();
+        return api_->GetMyPlaylistsPage(nextPath);
       },
-      [this](std::vector<PlaylistRef> playlists) {
-        playlists_ = std::move(playlists);
-        playlists_fetched_at_ = std::chrono::steady_clock::now();
+      [this, pageIndex](PlaylistsPage page) {
+        if (pageIndex == 0)
+          playlists_ = std::move(page.items);
+        else
+          playlists_.insert(playlists_.end(), page.items.begin(),
+                            page.items.end());
+        if (!playlists_fetched_at_.has_value())
+          playlists_fetched_at_ = std::chrono::steady_clock::now();
         window_.SetPlaylists(playlists_);
+        SavePlaylistCache();
+        if (!page.next_path.empty() && pageIndex + 1 < kMaxPlaylistPages) {
+          // Lazy pagination: remaining pages fetch one at a time, paced, so
+          // the startup burst is at most the first page.
+          ScheduleDelayedApiTask(
+              kPlaylistPageDelaySeconds,
+              [this, next = page.next_path, pageIndex] {
+                FetchPlaylistPage(next, pageIndex + 1);
+              });
+        }
       },
       [this](std::string message, int status, int retry) {
         HandleApiError(message, status, retry, L"Playlists");
       });
+}
+
+void Application::ScheduleDelayedApiTask(int delaySeconds,
+                                         std::function<void()> task) {
+  delayed_api_tasks_.Schedule(std::max(1, delaySeconds), std::move(task));
+}
+
+void Application::SavePlaylistCache() {
+  if (options_.smoke || options_.demo) return;
+  const std::wstring file = paths::PlaylistListCacheFile();
+  if (file.empty()) return;
+  json entries = json::array();
+  for (const PlaylistRef& playlist : playlists_) {
+    entries.push_back({{"id", playlist.id},
+                       {"uri", playlist.uri},
+                       {"name", playlist.name},
+                       {"owner", playlist.owner},
+                       {"owner_id", playlist.owner_id},
+                       {"cover_url", playlist.cover_url},
+                       {"collaborative", playlist.collaborative},
+                       {"tracks_total", playlist.tracks_total},
+                       {"snapshot_id", playlist.snapshot_id}});
+  }
+  const json doc = {{"version", 1},
+                    {"fetched_at", NowUnixSeconds()},
+                    {"me_id", me_id_},
+                    {"playlists", std::move(entries)}};
+  paths::AtomicWriteOwnedFile(file, doc.dump());
+}
+
+bool Application::LoadPlaylistCache() {
+  if (options_.smoke || options_.demo) return false;
+  const std::wstring file = paths::PlaylistListCacheFile();
+  if (file.empty() ||
+      ::GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES ||
+      !paths::IsSafeOwnedPath(file))
+    return false;
+  try {
+    std::ifstream stream(file, std::ios::binary);
+    if (!stream) return false;
+    std::string text((std::istreambuf_iterator<char>(stream)),
+                     std::istreambuf_iterator<char>());
+    const json doc = json::parse(text);
+    if (!doc.is_object()) return false;
+    const auto version = doc.find("version");
+    if (version == doc.end() || *version != 1) return false;
+    const auto fetched = doc.find("fetched_at");
+    if (fetched == doc.end() || !fetched->is_number_integer()) return false;
+    if (NowUnixSeconds() - fetched->get<int64_t>() >=
+        static_cast<int64_t>(kPlaylistListTtl.count()) * 60)
+      return false;  // stale: refetch instead
+    const auto me = doc.find("me_id");
+    if (me != doc.end() && me->is_string())
+      me_id_ = me->get<std::string>();
+    const auto list = doc.find("playlists");
+    if (list == doc.end() || !list->is_array()) return false;
+    std::vector<PlaylistRef> loaded;
+    for (const auto& entry : *list) {
+      if (!entry.is_object()) continue;
+      PlaylistRef playlist;
+      const auto str = [&entry](const char* key) {
+        const auto it = entry.find(key);
+        return it != entry.end() && it->is_string() ? it->get<std::string>()
+                                                    : std::string();
+      };
+      const auto integer = [&entry](const char* key) {
+        const auto it = entry.find(key);
+        return it != entry.end() && it->is_number_integer() ? it->get<int>()
+                                                            : 0;
+      };
+      const auto boolean = [&entry](const char* key) {
+        const auto it = entry.find(key);
+        return it != entry.end() && it->is_boolean() ? it->get<bool>() : false;
+      };
+      playlist.id = str("id");
+      playlist.uri = str("uri");
+      playlist.name = str("name");
+      playlist.owner = str("owner");
+      playlist.owner_id = str("owner_id");
+      playlist.cover_url = str("cover_url");
+      playlist.collaborative = boolean("collaborative");
+      playlist.tracks_total = integer("tracks_total");
+      playlist.snapshot_id = str("snapshot_id");
+      loaded.push_back(std::move(playlist));
+    }
+    playlists_ = std::move(loaded);
+    playlists_fetched_at_ = std::chrono::steady_clock::now();
+    window_.SetPlaylists(playlists_);
+    LOG_INFO("playlist library loaded from cache (" +
+             std::to_string(playlists_.size()) + " playlists)");
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
 }
 
 void Application::RequestPlaylistTracks(const std::string& id) {
@@ -1263,6 +1489,7 @@ void Application::UpdatePlaybackUi() {
 std::wstring Application::EngineStatusText() const {
   std::wstring auth = L"signing in";
   if (playback_.auth_state == EngineAuthState::Ready) auth = L"authenticated";
+  if (playback_.auth_state == EngineAuthState::NeedsLogin) auth = L"needs login";
   if (playback_.auth_state == EngineAuthState::Error) auth = L"error";
   std::wstring result = L"Standalone engine: " + auth +
                         L" · Ogg Vorbis 320 kbps · cache limit 1 GiB";
@@ -1305,6 +1532,12 @@ void Application::OnTimer(UINT id) {
     engine_restart_pending_ = false;
     StartEngine();
   }
+  // Rate-limit retries and lazy playlist pagination dispatch here, one task
+  // at a time onto the serial API queue.
+  delayed_api_tasks_.RunDue(std::chrono::steady_clock::now(),
+                            [this](std::function<void()> task) {
+                              api_tasks_.Post(std::move(task));
+                            });
   const int64_t projected =
       projector_.Current(::GetTickCount64(), playback_.duration_ms);
   if (projected != playback_.position_ms) {

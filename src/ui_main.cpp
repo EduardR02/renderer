@@ -153,6 +153,8 @@ enum {
   CID_ENGINE_GROUP,
   CID_ENGINE_GUIDE,
   CID_ENGINE_STATUS,
+  CID_LOGIN_BTN,
+  CID_LOGOUT_BTN,
   CID_CACHE_STATUS,
   CID_STATUS,
   CID_SETTINGS_TITLE,
@@ -791,7 +793,8 @@ void MainWindow::ApplyFonts() {
       prevBtn_,            playBtn_,             nextBtn_,
       shuffleBtn_,         repeatBtn_,           volumeLbl_,
       localControlsLbl_,   engineGroupLbl_,      engineGuideLbl_,
-      engineStatusLbl_,    cacheStatusLbl_,      statusLbl_,
+      engineStatusLbl_,    loginBtn_,            logoutBtn_,
+      cacheStatusLbl_,     statusLbl_,
       settingsTitle_,      settingsGuide_};
   for (HWND control : controls) setFont(control, fontUi_);
   setFont(resultsList_, fontList_);
@@ -1191,6 +1194,8 @@ void MainWindow::CreateChildren() {
   engineStatusLbl_ = makeStatic(
       L"Standalone engine: starting", CID_ENGINE_STATUS,
       SS_LEFT | SS_ENDELLIPSIS);
+  loginBtn_ = makeButton(L"Log in", CID_LOGIN_BTN);
+  logoutBtn_ = makeButton(L"Log out", CID_LOGOUT_BTN);
   cacheStatusLbl_ = makeStatic(
       L"Audio: Ogg Vorbis 320 kbps  ·  WASAPI  ·  cache limit 1 GiB",
       CID_CACHE_STATUS, SS_LEFT | SS_ENDELLIPSIS);
@@ -1219,6 +1224,8 @@ void MainWindow::CreateChildren() {
   AddTooltip(repeatBtn_, L"Change repeat mode");
   AddTooltip(seekBar_, L"Seek");
   AddTooltip(volumeBar_, L"Playback volume");
+  AddTooltip(loginBtn_, L"Open Spotify sign-in in your browser");
+  AddTooltip(logoutBtn_, L"Clear the saved sign-in and end the session");
 
   int rowHeight = ::MulDiv(64, dpi_, 96);
   rowHeightImageList_ = ::ImageList_Create(1, rowHeight, ILC_COLOR32, 1, 1);
@@ -1290,7 +1297,7 @@ void MainWindow::Layout() {
   SetControlGroupVisible({resultsLabel_, resultsList_}, search);
   SetControlGroupVisible(
       {settingsTitle_, settingsGuide_, engineGroupLbl_, engineGuideLbl_,
-       engineStatusLbl_, cacheStatusLbl_, statusLbl_},
+       engineStatusLbl_, loginBtn_, logoutBtn_, cacheStatusLbl_, statusLbl_},
       settings);
 
   if (collection) {
@@ -1343,7 +1350,9 @@ void MainWindow::Layout() {
     move(engineGroupLbl_, left, top + scale(110), innerWidth, scale(18));
     move(engineGuideLbl_, left, top + scale(138), innerWidth, scale(68));
     move(engineStatusLbl_, left, top + scale(226), innerWidth, scale(38));
-    move(cacheStatusLbl_, left, top + scale(276), innerWidth, scale(38));
+    move(loginBtn_, left, top + scale(266), scale(96), scale(34));
+    move(logoutBtn_, left + scale(108), top + scale(266), scale(96), scale(34));
+    move(cacheStatusLbl_, left, top + scale(316), innerWidth, scale(38));
   }
 
   // Status feedback stays visible in every workspace.
@@ -2399,6 +2408,12 @@ LRESULT CALLBACK MainWindow::WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case CID_REPEAT_BTN:
           self->app_->OnCycleRepeat();
           return 0;
+        case CID_LOGIN_BTN:
+          self->app_->OnLogin();
+          return 0;
+        case CID_LOGOUT_BTN:
+          self->app_->OnLogout();
+          return 0;
         case IDC_ACC_SEARCH:
           ::SetFocus(self->searchEdit_);
           return 0;
@@ -2739,6 +2754,11 @@ void MainWindow::SetPlayback(const PlaybackEngineState& playback) {
   ::EnableWindow(nextBtn_, available);
   ::EnableWindow(shuffleBtn_, available);
   ::EnableWindow(repeatBtn_, available);
+  // Session controls: Log in exactly when the engine publishes a fresh
+  // authorize URL, Log out while a session is live (both disabled while a
+  // flow is in flight, so no double-submit).
+  ::EnableWindow(loginBtn_, LoginButtonEnabled(playback) ? TRUE : FALSE);
+  ::EnableWindow(logoutBtn_, LogoutButtonEnabled(playback) ? TRUE : FALSE);
   if (playingChanged) {
     ::SetWindowTextW(playBtn_, playback.playing ? L"Pause" : L"Play");
     ::InvalidateRect(playBtn_, nullptr, FALSE);

@@ -20,11 +20,21 @@
 
 namespace sr {
 
-enum class EngineAuthState { Authenticating, Ready, Error };
+enum class EngineAuthState {
+  Authenticating,
+  // No usable session and no flow in flight: the Settings page presents the
+  // Log in button with the engine-published authorize URL.
+  NeedsLogin,
+  Ready,
+  Error,
+};
 
 struct PlaybackEngineState {
   bool ready = false;
   EngineAuthState auth_state = EngineAuthState::Authenticating;
+  // Spotify OAuth authorize URL for the current/next login attempt, present
+  // while the engine is NeedsLogin (and while the flow it started runs).
+  std::string auth_url;
   bool playing = false;
   int64_t position_ms = 0;
   int64_t duration_ms = 0;
@@ -36,6 +46,17 @@ struct PlaybackEngineState {
   std::vector<TrackRef> queue;
   std::string error;
 };
+
+// Settings-page session-control enablement, pure and testable: Log in is
+// actionable exactly while the engine waits for a fresh sign-in (it holds the
+// regenerate-per-attempt authorize URL); Log out while a session is live.
+// Both stay disabled while a flow is in flight so the UI cannot double-submit.
+inline bool LoginButtonEnabled(const PlaybackEngineState& state) {
+  return state.auth_state == EngineAuthState::NeedsLogin;
+}
+inline bool LogoutButtonEnabled(const PlaybackEngineState& state) {
+  return state.auth_state == EngineAuthState::Ready && state.ready;
+}
 
 struct EngineMessage {
   enum class Kind { Response, State, WebApiToken } kind = Kind::Response;
@@ -98,6 +119,14 @@ class PlaybackEngineClient {
   std::string AddQueue(const TrackRef& track);
   std::string RemoveQueue(int index);
   std::string MoveQueue(int from, int to);
+  // Clears the cached credentials and tears the session down; the engine
+  // immediately emits a needs_login state event carrying a fresh authorize
+  // URL, so re-login works without a restart.
+  std::string Logout();
+  // Starts the OAuth flow on demand. The engine publishes the authorize URL
+  // in its needs_login state first; the UI opens it, then sends this command.
+  // No-op when a session is already live or a flow is in flight.
+  std::string TriggerLogin();
 
   // Blocking engine round-trip that mints a Web API token (login5) from the
   // engine's Spotify session. Returns false with `error` set when the engine

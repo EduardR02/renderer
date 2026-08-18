@@ -6,9 +6,9 @@ SpotifyRenderer is a native Windows 11 Spotify browser, playlist editor, queue U
 
 1. Keep `SpotifyRenderer.exe` and `SpotifyPlaybackEngine.exe` in the same directory.
 2. Start `SpotifyRenderer.exe`.
-3. The playback engine opens a browser for its one-time Spotify sign-in. Its callback uses `http://127.0.0.1:5588/login`; that port must be available during sign-in.
+3. Open Settings and click **Log in**. The app opens Spotify's sign-in page in your browser; the engine's callback uses `http://127.0.0.1:5588/login`, so that port must be available during sign-in.
 
-One Spotify sign-in covers everything: the engine's session streams audio and mints Web API access tokens (login5) for search, library, albums, artists, artwork, and playlist editing. No Spotify developer app is required.
+One Spotify sign-in covers everything: the engine's session streams audio and mints Web API access tokens (login5) for search, library, albums, artists, artwork, and playlist editing. No Spotify developer app is required. When no cached credentials exist (first run or after **Log out**), the engine stays in `needs_login` and Settings shows the Log in button until you sign in. **Log out** clears the cached credentials immediately and ends the session without restarting the app.
 
 
 ## Playback
@@ -58,4 +58,4 @@ CMake builds the C++ executable and the Rust engine. The `package` target copies
 
 ## Tests
 
-`sr_tests` covers process-independent JSON protocol parsing (including the `web_api_token` contract), state mapping, complete track metadata, request correlation, engine-minted token refresh/expiry handling, and local queue command shapes. Engine integration itself is exercised by running the packaged pair; it requires an interactive Spotify sign-in and is not part of the unit test target.
+`sr_tests` covers process-independent JSON protocol parsing (including the `web_api_token` contract and the `login`/`logout` commands), state mapping (including `needs_login` with the OAuth authorize URL and the Settings button enablement mapping), complete track metadata, request correlation, engine-minted token refresh/expiry handling, and local queue command shapes. The Rust engine tests cover credential-cache clearing on logout, the needs-login state transition, and per-attempt authorize-URL regeneration. Engine integration itself is exercised by running the packaged pair; it requires an interactive Spotify sign-in and is not part of the unit test target.

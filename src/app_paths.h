@@ -22,6 +22,9 @@ std::wstring EngineLogFile();
 std::wstring LogFile();
 std::wstring CoverDir();
 std::wstring CoverFile(const std::string& cacheName);
+// App-owned serialized copy of the playlist library (rate-limit mitigation:
+// relaunches skip the startup fetch while this is fresh).
+std::wstring PlaylistListCacheFile();
 
 // The engine's audio cache directory (engine state dir + "audio"; matches the
 // path the engine builds in create_state).

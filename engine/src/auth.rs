@@ -1,19 +1,35 @@
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc as std_mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
 use librespot_core::Session;
-use librespot_oauth::OAuthClientBuilder;
 use librespot_playback::audio_backend;
 use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig};
 use librespot_playback::player::{Player, PlayerEventChannel};
+use oauth2::basic::BasicClient;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+};
+use url::Url;
 
+const OAUTH_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
+const OAUTH_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:5588/login";
 const OAUTH_SCOPES: &[&str] = &["streaming", "user-read-private"];
+const OAUTH_SUCCESS_MESSAGE: &str =
+    "SpotifyPlaybackEngine is authenticated. You can close this browser tab.";
+/// An abandoned login attempt (browser never redirected) must not wedge the
+/// engine in `Authenticating` forever; after this long the flow fails and the
+/// engine returns to `NeedsLogin` with a fresh URL.
+const OAUTH_LISTENER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct PlaybackHandles {
@@ -24,49 +40,188 @@ pub struct PlaybackHandles {
     pub volume_percent: u8,
 }
 
-pub async fn authenticate(
+/// A prepared OAuth authorization-code + PKCE attempt. The authorize URL is
+/// generated up front (fresh CSRF state and PKCE challenge per attempt) so the
+/// engine can publish it in its `needs_login` state before the flow runs; the
+/// client and verifier are kept so the `login` command completes the exact
+/// attempt whose URL the UI opened.
+pub struct PendingAuth {
+    client: BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>,
+    verifier: PkceCodeVerifier,
+    pub auth_url: String,
+}
+
+/// Builds a fresh OAuth attempt and its authorize URL. Pure local work: no
+/// network, no browser, no listener. Each call regenerates the URL (new CSRF
+/// state and PKCE challenge), satisfying "regenerated per attempt".
+pub fn prepare_oauth() -> Result<PendingAuth, String> {
+    let client = basic_client()?;
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+    let request_scopes: Vec<Scope> = OAUTH_SCOPES
+        .iter()
+        .map(|scope| Scope::new((*scope).to_owned()))
+        .collect();
+    let (auth_url, _csrf) = client
+        .authorize_url(CsrfToken::new_random)
+        .add_scopes(request_scopes)
+        .set_pkce_challenge(pkce_challenge)
+        .url();
+    Ok(PendingAuth {
+        client,
+        verifier: pkce_verifier,
+        auth_url: auth_url.to_string(),
+    })
+}
+
+/// Connects with the cached credentials (if any) and creates playback. Fails
+/// when no credentials are cached or they are rejected; the caller decides
+/// whether that means `NeedsLogin` (the flow is never started implicitly).
+pub async fn connect_cached(
     cache: Cache,
-    temporary_directory: std::path::PathBuf,
+    temporary_directory: PathBuf,
 ) -> Result<PlaybackHandles, String> {
+    let credentials = cache
+        .credentials()
+        .ok_or_else(|| "no cached Spotify credentials".to_owned())?;
     let mut session_config = SessionConfig::default();
     session_config.tmp_dir = temporary_directory;
-
-    if let Some(credentials) = cache.credentials() {
-        let session = Session::new(session_config.clone(), Some(cache.clone()));
-        match session.connect(credentials, false).await {
-            Ok(()) => return create_playback(session, cache).await,
-            Err(error) => {
-                eprintln!("cached Spotify credentials were rejected: {error}");
-                session.shutdown();
-            }
+    let session = Session::new(session_config, Some(cache.clone()));
+    match session.connect(credentials, false).await {
+        Ok(()) => create_playback(session, cache).await,
+        Err(error) => {
+            eprintln!("cached Spotify credentials were rejected: {error}");
+            session.shutdown();
+            Err(format!("cached Spotify credentials were rejected: {error}"))
         }
     }
+}
 
-    let client_id = session_config.client_id.clone();
-    let token = tokio::task::spawn_blocking(move || {
-        let client = OAuthClientBuilder::new(&client_id, OAUTH_REDIRECT_URI, OAUTH_SCOPES.to_vec())
-            .open_in_browser()
-            .with_custom_message(
-                "SpotifyPlaybackEngine is authenticated. You can close this browser tab.",
-            )
-            .build()
-            .map_err(|error| format!("could not initialize Spotify OAuth: {error}"))?;
-        client
-            .get_access_token()
-            .map_err(|error| format!("Spotify OAuth failed: {error}"))
-    })
-    .await
-    .map_err(|error| format!("Spotify OAuth worker failed: {error}"))??;
+/// Runs the OAuth flow for a prepared attempt: prints the authorize URL (the
+/// UI opens it), waits for the loopback callback, exchanges the code, connects
+/// the session, and creates playback.
+pub async fn complete_oauth(
+    cache: Cache,
+    temporary_directory: PathBuf,
+    pending: PendingAuth,
+) -> Result<PlaybackHandles, String> {
+    eprintln!("Browse to: {}", pending.auth_url);
+    let access_token = tokio::task::spawn_blocking(move || run_oauth_flow(pending))
+        .await
+        .map_err(|error| format!("Spotify OAuth worker failed: {error}"))??;
 
+    let mut session_config = SessionConfig::default();
+    session_config.tmp_dir = temporary_directory;
     let session = Session::new(session_config, Some(cache.clone()));
     if let Err(error) = session
-        .connect(Credentials::with_access_token(token.access_token), true)
+        .connect(Credentials::with_access_token(access_token), true)
         .await
     {
         session.shutdown();
         return Err(format!("Spotify authentication failed: {error}"));
     }
     create_playback(session, cache).await
+}
+
+/// Blocking OAuth half of [`complete_oauth`]: loopback listener + token
+/// exchange. Runs on the blocking pool so the async engine loop is never
+/// stalled by the callback wait.
+fn run_oauth_flow(pending: PendingAuth) -> Result<String, String> {
+    let code = wait_for_oauth_code()?;
+    let http_client = reqwest::blocking::Client::new();
+    let response = pending
+        .client
+        .exchange_code(code)
+        .set_pkce_verifier(pending.verifier)
+        .request(&http_client)
+        .map_err(|error| format!("Spotify OAuth token exchange failed: {error}"))?;
+    Ok(response.access_token().secret().to_string())
+}
+
+/// Waits for the browser redirect to `OAUTH_REDIRECT_URI` and returns the
+/// authorization code from its query string. The listener answers with the
+/// success page and terminates after the first callback, mirroring the
+/// librespot client; unlike it, a stalled attempt fails after
+/// [`OAUTH_LISTENER_TIMEOUT`] instead of blocking forever.
+fn wait_for_oauth_code() -> Result<AuthorizationCode, String> {
+    let address = oauth_listener_addr()?;
+    let listener = TcpListener::bind(address).map_err(|error| {
+        format!("could not bind the Spotify OAuth callback listener on {address}: {error}")
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("could not configure the OAuth callback listener: {error}"))?;
+    let deadline = Instant::now() + OAUTH_LISTENER_TIMEOUT;
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err("Spotify login timed out; click Log in to start again".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(format!("Spotify OAuth callback failed: {error}")),
+        }
+    };
+
+    let mut reader = BufReader::new(&stream);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .map_err(|error| format!("could not read the Spotify OAuth callback: {error}"))?;
+    let request_path = request_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "the Spotify OAuth callback carried no request path".to_owned())?;
+    let code = extract_oauth_code(request_path)?;
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+        OAUTH_SUCCESS_MESSAGE.len(),
+        OAUTH_SUCCESS_MESSAGE
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("could not answer the Spotify OAuth callback: {error}"))?;
+    Ok(code)
+}
+
+fn extract_oauth_code(request_path: &str) -> Result<AuthorizationCode, String> {
+    let redirect = format!("http://127.0.0.1{request_path}");
+    let url = Url::parse(&redirect)
+        .map_err(|error| format!("malformed Spotify OAuth callback: {error}"))?;
+    url.query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, code)| AuthorizationCode::new(code.into_owned()))
+        .ok_or_else(|| "the Spotify OAuth callback carried no authorization code".to_owned())
+}
+
+fn oauth_listener_addr() -> Result<SocketAddr, String> {
+    let url = Url::parse(OAUTH_REDIRECT_URI)
+        .map_err(|error| format!("invalid OAuth redirect URI: {error}"))?;
+    url.socket_addrs(|| None)
+        .ok()
+        .and_then(|mut addresses| addresses.pop())
+        .ok_or_else(|| format!("OAuth redirect URI has no listenable socket: {OAUTH_REDIRECT_URI}"))
+}
+
+fn basic_client(
+) -> Result<BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>, String>
+{
+    let client_id = SessionConfig::default().client_id;
+    Ok(BasicClient::new(ClientId::new(client_id))
+        .set_auth_uri(
+            AuthUrl::new(OAUTH_AUTHORIZE_URL.to_owned())
+                .map_err(|_| "invalid Spotify OAuth authorize URL".to_owned())?,
+        )
+        .set_token_uri(
+            TokenUrl::new(OAUTH_TOKEN_URL.to_owned())
+                .map_err(|_| "invalid Spotify OAuth token URL".to_owned())?,
+        )
+        .set_redirect_uri(
+            RedirectUrl::new(OAUTH_REDIRECT_URI.to_owned())
+                .map_err(|_| "invalid Spotify OAuth redirect URI".to_owned())?,
+        ))
 }
 
 /// Player configuration for the standalone engine.
@@ -139,7 +294,9 @@ fn volume_to_percent(volume: u16) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::player_config;
+    use super::{
+        extract_oauth_code, oauth_listener_addr, player_config, prepare_oauth, OAUTH_REDIRECT_URI,
+    };
 
     #[test]
     fn player_config_does_not_poll_position() {
@@ -147,5 +304,49 @@ mod tests {
         // position heartbeat while playing. librespot must not be configured
         // to stream a 250 ms PositionChanged event for the UI to poll.
         assert!(player_config().position_update_interval.is_none());
+    }
+
+    #[test]
+    fn prepared_oauth_attempt_carries_a_spotify_authorize_url() {
+        let attempt = prepare_oauth().expect("oauth attempt prepares without network");
+        assert!(
+            attempt
+                .auth_url
+                .starts_with("https://accounts.spotify.com/authorize?"),
+            "unexpected authorize URL: {}",
+            attempt.auth_url
+        );
+        assert!(attempt.auth_url.contains("code_challenge="));
+        assert!(attempt.auth_url.contains("state="));
+        assert!(attempt.auth_url.contains("redirect_uri="));
+        assert!(attempt.auth_url.contains("&scope=streaming"));
+    }
+
+    #[test]
+    fn each_prepared_attempt_regenerates_the_authorize_url() {
+        // A fresh CSRF state and PKCE challenge per attempt: re-login must
+        // never reuse a URL that a previous attempt (or its browser tab) saw.
+        let first = prepare_oauth().expect("first attempt");
+        let second = prepare_oauth().expect("second attempt");
+        assert_ne!(first.auth_url, second.auth_url);
+    }
+
+    #[test]
+    fn oauth_listener_addr_is_the_loopback_callback_port() {
+        let address = oauth_listener_addr().expect("redirect URI has a socket");
+        assert_eq!(address.to_string(), "127.0.0.1:5588");
+        assert!(OAUTH_REDIRECT_URI.contains("127.0.0.1:5588"));
+    }
+
+    #[test]
+    fn oauth_callback_code_extracts_from_the_redirect_path() {
+        let code = extract_oauth_code("/login?code=abc123&state=xyz")
+            .expect("code present");
+        assert_eq!(code.secret(), "abc123");
+        assert!(
+            extract_oauth_code("/login?error=access_denied").is_err(),
+            "a denied callback carries no code"
+        );
+        assert!(extract_oauth_code("/login").is_err());
     }
 }

@@ -242,6 +242,11 @@ std::wstring EngineLogFile() { return LogDir() + L"\\playback_engine.log"; }
 std::wstring LogFile() { return LogDir() + L"\\spotify_renderer.log"; }
 std::wstring CoverDir() { return Root() + L"\\covers"; }
 
+std::wstring PlaylistListCacheFile() {
+  auto path = Resolve(L"playlist_list.json");
+  return path ? *path : std::wstring();
+}
+
 std::wstring CoverFile(const std::string& cacheName) {
   std::wstring leaf;
   for (unsigned char c : cacheName) {

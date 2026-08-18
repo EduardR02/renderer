@@ -47,13 +47,40 @@ struct PlaylistRef {
   std::string snapshot_id;
 };
 
+// One page of the user's playlist library. `next_path` is the origin-relative
+// path of the next page ("" when this was the last page); callers fetch pages
+// one at a time so startup never bursts pagination.
+struct PlaylistsPage {
+  std::vector<PlaylistRef> items;
+  std::string next_path;
+  int total = 0;
+};
+
 
 struct ApiError : std::runtime_error {
   int status = 0;
-  int retry_after = 0;  // seconds from Retry-After (429), 0 if absent
+  int retry_after = 0;  // seconds from Retry-After (429/503), 0 if absent
   ApiError(int st, int retry, const std::string& msg)
       : std::runtime_error(msg), status(st), retry_after(retry) {}
 };
+
+// Parses a Retry-After header into whole seconds: either a plain delta
+// (RFC 7231) or an absolute HTTP-date (IMF-fixdate, RFC 850, or asctime).
+// Returns 0 when the header is absent or unparseable; dates in the past
+// clamp to 0. `nowUnixSeconds` anchors the HTTP-date delta (injectable for
+// tests). Network-free.
+int64_t ParseRetryAfterSeconds(const std::string& header, int64_t nowUnixSeconds);
+
+// Random value in [0,1), used as the jitter source for ComputeBackoffDelay.
+double RandomUnit();
+
+// Exponential backoff with jitter for retryable API errors, honoring a
+// Retry-After hint. `attempt` counts prior failures (0 = first retry): the
+// base delay doubles per attempt (1s, 2s, 4s, ...) capped at 60s, jittered
+// down to half, then raised to at least `retryAfterSeconds` and capped at
+// 300s. `rng` returns [0,1) and is injectable for tests; never returns 0.
+int64_t ComputeBackoffDelay(int attempt, int retryAfterSeconds,
+                            const std::function<double()>& rng = RandomUnit);
 
 // Engine-minted Web API access token (login5). `expires_in` is the remaining
 // lifetime in seconds with the engine's safety skew already deducted.
@@ -108,8 +135,10 @@ class SpotifyApi {
   std::vector<TrackRef> GetAlbumTracks(const std::string& albumId);
   std::string GetMeId();
 
-  // Playlists
-  std::vector<PlaylistRef> GetMyPlaylists();
+  // Playlists. GetMyPlaylistsPage fetches exactly one page (limit=50): pass
+  // the previous page's `next_path` to continue. Callers own pagination so
+  // the request rate stays under control.
+  PlaylistsPage GetMyPlaylistsPage(const std::string& nextPath = {});
   std::vector<TrackRef> GetPlaylistTracks(const std::string& playlistId,
                                           std::string* snapshotIdOut);
   PlaylistRef CreatePlaylist(const std::string& meId, const std::string& name);

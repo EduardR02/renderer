@@ -2,8 +2,11 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <nlohmann/json.hpp>
+#include <random>
+#include <vector>
 
 #include "util.h"
 
@@ -103,20 +106,137 @@ std::string AppendQuery(const std::string& path, const std::string& q) {
   return q.empty() ? path : (path + (path.find('?') == std::string::npos ? "?" : "&") + q);
 }
 
-int ParseRetryAfter(const std::string& s) {
-  if (s.empty()) return 0;
-  int v = atoi(s.c_str());
-  if (v < 1) return 1;
-  if (v > 3600) return 3600;
-  return v;
+constexpr const char* kMonthNames[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+int MonthFromName(const std::string& name) {
+  for (int m = 0; m < 12; ++m)
+    if (name == kMonthNames[m]) return m + 1;
+  return 0;
+}
+
+// Howard Hinnant's days-from-civil algorithm: days since 1970-01-01.
+int64_t DaysFromCivil(int64_t year, unsigned month, unsigned day) {
+  year -= month <= 2;
+  const int64_t era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(year - era * 400);
+  const unsigned doy =
+      (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+
+// Tokenizes an HTTP-date into whitespace/comma/hyphen-separated fields and
+// converts the recognized RFC 7231 shapes (IMF-fixdate, RFC 850, asctime) to
+// unix seconds. Returns 0 when nothing matches.
+int64_t HttpDateToUnixSeconds(const std::string& text) {
+  std::string normalized;
+  for (char c : text)
+    normalized.push_back((c == ',' || c == '-' || c == ' ') ? ' ' : c);
+  std::vector<std::string> tokens;
+  std::string current;
+  for (char c : normalized) {
+    if (c == ' ') {
+      if (!current.empty()) {
+        tokens.push_back(current);
+        current.clear();
+      }
+    } else {
+      current.push_back(c);
+    }
+  }
+  if (!current.empty()) tokens.push_back(current);
+  if (tokens.size() < 5) return 0;
+
+  // Shapes: IMF-fixdate "Sun, 06 Nov 1994 08:49:37 GMT"; RFC 850
+  // "Sunday, 06-Nov-94 08:49:37 GMT" (both: weekday + 5 fields); asctime
+  // "Sun Nov  6 08:49:37 1994" (weekday + 4 fields, month before day).
+  std::string day, month, year, time;
+  if (MonthFromName(tokens[1]) != 0) {
+    month = tokens[1];
+    day = tokens[2];
+    time = tokens[3];
+    year = tokens[4];
+  } else {
+    if (tokens.size() < 6) return 0;
+    day = tokens[1];
+    month = tokens[2];
+    year = tokens[3];
+    time = tokens[4];
+  }
+  if (MonthFromName(month) == 0 || day.empty() || time.empty() ||
+      year.empty() || day.find_first_not_of("0123456789") != std::string::npos ||
+      year.find_first_not_of("0123456789") != std::string::npos)
+    return 0;
+
+  int64_t parsedYear = atoll(year.c_str());
+  if (parsedYear < 100) parsedYear += parsedYear >= 70 ? 1900 : 2000;  // RFC 850
+  if (parsedYear < 1900 || parsedYear > 2100) return 0;
+
+  const int dom = atoi(day.c_str());
+  if (dom < 1 || dom > 31) return 0;
+
+  size_t firstColon = time.find(':');
+  size_t secondColon = time.find(':', firstColon + 1);
+  if (firstColon == std::string::npos || secondColon == std::string::npos)
+    return 0;
+  const int hour = atoi(time.substr(0, firstColon).c_str());
+  const int minute =
+      atoi(time.substr(firstColon + 1, secondColon - firstColon - 1).c_str());
+  const int second = atoi(time.substr(secondColon + 1).c_str());
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 ||
+      second > 60)
+    return 0;
+
+  return DaysFromCivil(parsedYear, static_cast<unsigned>(MonthFromName(month)),
+                       static_cast<unsigned>(dom)) *
+             86400 +
+         hour * 3600 + minute * 60 + second;
 }
 
 }  // namespace
+
+int64_t ParseRetryAfterSeconds(const std::string& header, int64_t nowUnixSeconds) {
+  std::string value = Trim(header);
+  if (value.empty()) return 0;
+  bool numeric = true;
+  for (char c : value) {
+    if (c < '0' || c > '9') {
+      numeric = false;
+      break;
+    }
+  }
+  if (numeric) return std::max<int64_t>(0, atoll(value.c_str()));
+  // Absolute HTTP-date: the wait is the remaining time until that moment.
+  const int64_t when = HttpDateToUnixSeconds(value);
+  if (when <= 0) return 0;
+  return std::max<int64_t>(0, when - nowUnixSeconds);
+}
+
+double RandomUnit() {
+  static thread_local std::mt19937_64 generator(std::random_device{}());
+  std::uniform_real_distribution<double> distribution(0.0, 1.0);
+  return distribution(generator);
+}
+
+int64_t ComputeBackoffDelay(int attempt, int retryAfterSeconds,
+                            const std::function<double()>& rng) {
+  const int clampedAttempt = std::max(0, attempt);
+  const double base = static_cast<double>(
+      std::min<int64_t>(int64_t{1} << std::min(clampedAttempt, 6), 60));
+  const double jitter = (rng ? rng() : RandomUnit()) * base / 2.0;
+  const double jittered = std::ceil(base / 2.0 + jitter);  // [base/2, base]
+  const double wait = std::max(jittered, static_cast<double>(std::max(0, retryAfterSeconds)));
+  return static_cast<int64_t>(std::min(wait, 300.0));
+}
 
 WebApiTokenProvider::WebApiTokenProvider(RequestFn request, ClockFn clock)
     : request_(std::move(request)), clock_(std::move(clock)) {}
 
 std::string WebApiTokenProvider::GetAccessToken() {
+  // The mutex is held across the whole engine round-trip, so a caller that
+  // races an in-flight mint blocks here and then reuses the minted token
+  // instead of minting again: one mint serves every concurrent caller.
   std::lock_guard<std::mutex> lock(mutex_);
   const int64_t now = clock_();
   if (!token_ || now >= expires_at_) {
@@ -128,6 +248,8 @@ std::string WebApiTokenProvider::GetAccessToken() {
                                    ? "could not mint a Spotify Web API token"
                                    : error);
     token_ = std::move(fresh);
+    // expires_in already includes the engine's safety skew; the token is
+    // reused until it actually expires (no per-request minting).
     expires_at_ = now + token_->expires_in;
   }
   return token_->access_token;
@@ -198,10 +320,14 @@ HttpResponse SpotifyApi::Authed(const std::string& method, const std::string& pa
 void SpotifyApi::EnsureOk(const HttpResponse& r, const std::string& what) {
   if (!r.succeeded) throw ApiError(0, 0, what + ": " + r.error);
   if (r.status == 204) return;
-  if (r.status == 429) {
-    throw ApiError(429, ParseRetryAfter(r.retry_after),
-                   what + ": rate limited" +
-                       (r.retry_after.empty() ? "" : " (Retry-After " + r.retry_after + "s)"));
+  if (r.status == 429 || r.status == 503) {
+    const int retryAfter = static_cast<int>(std::clamp<int64_t>(
+        ParseRetryAfterSeconds(r.retry_after, NowUnixSeconds()), 0, 3600));
+    const std::string detail =
+        r.status == 429 ? "rate limited" : "service unavailable";
+    throw ApiError(r.status, retryAfter,
+                   what + ": " + detail +
+                       (r.retry_after.empty() ? "" : " (Retry-After " + r.retry_after + ")"));
   }
   if (r.status >= 400) {
     std::string msg = what + ": HTTP " + std::to_string(r.status);
@@ -309,47 +435,46 @@ std::string SpotifyApi::GetMeId() {
   }
 }
 
-std::vector<PlaylistRef> SpotifyApi::GetMyPlaylists() {
-  std::vector<PlaylistRef> out;
-  std::string path = AppendQuery("/v1/me/playlists", "limit=50");
-  // Follow `next` so users with more than 50 playlists see the whole library;
-  // bounded so a malformed server cannot loop forever.
-  for (int page = 0; page < 8 && !path.empty(); ++page) {
-    HttpResponse r = Authed("GET", path);
-    EnsureOk(r, "playlists");
-    try {
-      json j = json::parse(r.body);
-      if (const json* items = JGet(j, "items")) {
-        for (const auto& p : *items) {
-          PlaylistRef pl;
-          pl.id = JStr(&p, "id");
-          pl.uri = JStr(&p, "uri");
-          pl.name = JStr(&p, "name");
-          const json* owner = JGet(p, "owner");
-          if (owner) {
-            pl.owner = JStr(owner, "display_name");
-            pl.owner_id = JStr(owner, "id");
-          }
-          const json* images = JGet(p, "images");
-          if (images && images->is_array() && !images->empty())
-            pl.cover_url = JStr(&images->front(), "url");
-          pl.collaborative = JBool(&p, "collaborative");
-          const json* tracks = JGet(p, "tracks");
-          if (tracks) pl.tracks_total = JInt(tracks, "total");
-          pl.snapshot_id = JStr(&p, "snapshot_id");
-          out.push_back(std::move(pl));
+PlaylistsPage SpotifyApi::GetMyPlaylistsPage(const std::string& nextPath) {
+  // Exactly one page per call: pagination is owned by the caller so the
+  // startup fetch never bursts multiple /me/playlists requests back-to-back.
+  const std::string path =
+      nextPath.empty() ? AppendQuery("/v1/me/playlists", "limit=50") : nextPath;
+  HttpResponse r = Authed("GET", path);
+  EnsureOk(r, "playlists");
+  PlaylistsPage out;
+  try {
+    json j = json::parse(r.body);
+    out.total = JInt(&j, "total");
+    if (const json* items = JGet(j, "items")) {
+      for (const auto& p : *items) {
+        PlaylistRef pl;
+        pl.id = JStr(&p, "id");
+        pl.uri = JStr(&p, "uri");
+        pl.name = JStr(&p, "name");
+        const json* owner = JGet(p, "owner");
+        if (owner) {
+          pl.owner = JStr(owner, "display_name");
+          pl.owner_id = JStr(owner, "id");
         }
+        const json* images = JGet(p, "images");
+        if (images && images->is_array() && !images->empty())
+          pl.cover_url = JStr(&images->front(), "url");
+        pl.collaborative = JBool(&p, "collaborative");
+        const json* tracks = JGet(p, "tracks");
+        if (tracks) pl.tracks_total = JInt(tracks, "total");
+        pl.snapshot_id = JStr(&p, "snapshot_id");
+        out.items.push_back(std::move(pl));
       }
-      path.clear();
-      const json* next = JGet(j, "next");
-      if (next && next->is_string() && !next->get<std::string>().empty()) {
-        const std::string nextUrl = next->get<std::string>();
-        const size_t apiPos = nextUrl.find("/v1/");
-        if (apiPos != std::string::npos) path = nextUrl.substr(apiPos);
-      }
-    } catch (...) {
-      throw ApiError(0, 0, "playlists: malformed response");
     }
+    const json* next = JGet(j, "next");
+    if (next && next->is_string() && !next->get<std::string>().empty()) {
+      const std::string nextUrl = next->get<std::string>();
+      const size_t apiPos = nextUrl.find("/v1/");
+      if (apiPos != std::string::npos) out.next_path = nextUrl.substr(apiPos);
+    }
+  } catch (...) {
+    throw ApiError(0, 0, "playlists: malformed response");
   }
   return out;
 }

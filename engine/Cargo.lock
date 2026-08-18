@@ -2527,11 +2527,13 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "librespot-core",
- "librespot-oauth",
  "librespot-playback",
+ "oauth2",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]

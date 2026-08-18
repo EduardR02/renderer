@@ -158,6 +158,7 @@ class MainWindow {
   HWND volumeLbl_ = nullptr, volumeBar_ = nullptr, localControlsLbl_ = nullptr;
   HWND engineGroupLbl_ = nullptr, engineGuideLbl_ = nullptr,
        engineStatusLbl_ = nullptr, cacheStatusLbl_ = nullptr;
+  HWND loginBtn_ = nullptr, logoutBtn_ = nullptr;
   HWND statusLbl_ = nullptr;
   HWND settingsTitle_ = nullptr, settingsGuide_ = nullptr;
   HWND tooltip_ = nullptr;

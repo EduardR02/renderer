@@ -37,7 +37,7 @@ fn main() -> ExitCode {
         .target(env_logger::Target::Stderr)
         .init();
 
-    let (cache, temporary_directory) = match create_state(&state_directory) {
+    let (cache, temporary_directory, credentials_file) = match create_state(&state_directory) {
         Ok(state) => state,
         Err(error) => {
             eprintln!("SpotifyPlaybackEngine: {error}");
@@ -51,7 +51,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = runtime.block_on(run(writer, cache, temporary_directory));
+    let result = runtime.block_on(run(
+        writer,
+        cache,
+        temporary_directory,
+        credentials_file,
+    ));
     runtime.shutdown_timeout(Duration::from_secs(1));
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -66,13 +71,19 @@ async fn run(
     writer: ProtocolWriter,
     cache: Cache,
     temporary_directory: PathBuf,
+    credentials_file: PathBuf,
 ) -> Result<(), String> {
     let (input_sender, mut input_receiver) = mpsc::unbounded_channel();
     let (auth_sender, mut auth_receiver) = mpsc::unbounded_channel::<AuthSignal>();
     let (player_sender, mut player_receiver) = mpsc::unbounded_channel::<PlayerSignal>();
     io::spawn_input_reader(input_sender);
 
-    let mut engine = Engine::new(writer, cache, temporary_directory);
+    let mut engine = Engine::new(
+        writer,
+        cache,
+        temporary_directory,
+        credentials_file,
+    );
     engine.start_authentication(auth_sender.clone());
     engine.emit_state()?;
 
@@ -151,7 +162,9 @@ fn parse_arguments(arguments: Vec<OsString>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn create_state(state_directory: &std::path::Path) -> Result<(Cache, PathBuf), String> {
+fn create_state(
+    state_directory: &std::path::Path,
+) -> Result<(Cache, PathBuf, PathBuf), String> {
     std::fs::create_dir_all(state_directory)
         .map_err(|error| format!("could not create state directory: {error}"))?;
     let credentials = state_directory.join("credentials");
@@ -167,5 +180,10 @@ fn create_state(state_directory: &std::path::Path) -> Result<(Cache, PathBuf), S
         Some(AUDIO_CACHE_LIMIT_BYTES),
     )
     .map_err(|error| format!("could not initialize the app-owned cache: {error}"))?;
-    Ok((cache, temporary))
+    // librespot stores credentials as credentials.json inside the credentials
+    // directory; `logout` removes it (Cache offers no removal API).
+    let credentials_file = state_directory
+        .join("credentials")
+        .join("credentials.json");
+    Ok((cache, temporary, credentials_file))
 }

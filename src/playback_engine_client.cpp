@@ -147,10 +147,13 @@ EngineMessage ParseEngineMessage(const std::string& line) {
   const std::string auth = StringField(value, "auth_state");
   if (auth == "ready")
     state.auth_state = EngineAuthState::Ready;
+  else if (auth == "needs_login")
+    state.auth_state = EngineAuthState::NeedsLogin;
   else if (auth == "error")
     state.auth_state = EngineAuthState::Error;
   else
     state.auth_state = EngineAuthState::Authenticating;
+  state.auth_url = StringField(value, "auth_url");
   state.playing = BooleanField(value, "playing");
   state.position_ms = std::max<int64_t>(0, IntegerField(value, "position_ms"));
   state.duration_ms = std::max<int64_t>(0, IntegerField(value, "duration_ms"));
@@ -418,6 +421,10 @@ std::string PlaybackEngineClient::MoveQueue(int from, int to) {
   if (from < 0 || to < 0) throw std::invalid_argument("queue indices cannot be negative");
   return Send("move_queue", {{"from", from}, {"to", to}});
 }
+
+std::string PlaybackEngineClient::Logout() { return Send("logout"); }
+
+std::string PlaybackEngineClient::TriggerLogin() { return Send("login"); }
 
 std::string PlaybackEngineClient::Send(const std::string& type,
                                        nlohmann::json arguments) {
