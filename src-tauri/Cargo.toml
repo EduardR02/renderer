@@ -12,7 +12,10 @@ edition = "2021"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "spotify_renderer_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop-only: `main.rs` links this as a plain Rust library. The scaffold's
+# `staticlib`/`cdylib` outputs exist for mobile and FFI consumers, and cost a
+# 142 MB static archive plus its link time on every build for nothing here.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
