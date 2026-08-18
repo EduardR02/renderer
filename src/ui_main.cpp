@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "app.h"
+#include "log.h"
 #include "messages.h"
 #include "util.h"
 
@@ -447,9 +448,7 @@ LRESULT CALLBACK ListSubclass(HWND control, UINT message, WPARAM wparam, LPARAM 
 
 // The playlist rail is an owner-draw listbox; hover state (like the song
 // lists) uses the same track-mouse/leave pattern, but hit testing goes
-// through LB_ITEMFROMPOINT, not LVM_HITTEST. The rail scrolls smoothly
-// because the listbox is double-buffered (WS_EX_COMPOSITED, the listbox
-// counterpart of the song lists' LVS_EX_DOUBLEBUFFER).
+// through LB_ITEMFROMPOINT, not LVM_HITTEST.
 LRESULT CALLBACK RailListSubclass(HWND control, UINT message, WPARAM wparam,
                                   LPARAM lparam, UINT_PTR, DWORD_PTR) {
   if (message == WM_MOUSEMOVE) {
@@ -1281,16 +1280,22 @@ void MainWindow::CreateChildren() {
   libraryGroupLbl_ = makeStatic(L"YOUR LIBRARY", CID_LIBRARY_GROUP);
   playlistFilterEdit_ = makeEdit(CID_PLAYLIST_FILTER, kSidebar);
   playlistList_ = ::CreateWindowExW(
-      WS_EX_COMPOSITED, L"LISTBOX", L"",
+      0, L"LISTBOX", L"",
       WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_VSCROLL |
           LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS |
           LBS_NOINTEGRALHEIGHT,
       0, 0, 10, 10, hwnd_,
       reinterpret_cast<HMENU>(static_cast<INT_PTR>(CID_PLAYLIST_LIST)), hinst_,
       nullptr);
-  // WS_EX_COMPOSITED double-buffers the rail (the listbox counterpart of the
-  // song lists' LVS_EX_DOUBLEBUFFER): wheel scrolling repaints rows into a
-  // memory DC instead of flashing the sidebar behind them.
+  // No WS_EX_COMPOSITED here, however tempting for flicker-free scrolling:
+  // the system rejects that style on a child window whose parent is not
+  // itself composited (CreateWindowExW fails with ERROR_INVALID_PARAMETER),
+  // which silently leaves the rail without a listbox at all. Owner-draw rows
+  // paint directly; the rail matched the app's look before the style was
+  // tried, and it does again without it.
+  if (!playlistList_)
+    LOG_ERROR("failed to create playlist rail listbox (error " +
+              std::to_string(::GetLastError()) + ")");
   ::SetWindowSubclass(playlistList_, RailListSubclass, 1, 0);
   newPlBtn_ = makeButton(L"Create playlist", CID_NEWPL_BTN);
   settingsBtn_ = makeButton(L"Settings", CID_SETTINGS_BTN);

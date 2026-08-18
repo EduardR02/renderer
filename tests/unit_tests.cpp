@@ -610,6 +610,18 @@ TEST_CASE("ui rows: rail artwork maps rows through the filtered playlist indices
   // Row seeds stay deterministic per playlist for the fallback tile.
   CHECK(RailPlaylistForRow(playlists, unfiltered, 3) != nullptr);
   CHECK_FALSE(RowArtworkSeed(third.cover_url, Utf8ToWide(third.name)) == 0);
+  // A stale filtered index past the end of the current library maps nowhere
+  // (the library can shrink between a filter pass and a repaint; the draw
+  // path must fall back to the seeded tile instead of reading out of range).
+  const std::vector<int> stale = {0, 7, 2};
+  CHECK(RailPlaylistForRow(playlists, stale, 1) == nullptr);
+  CHECK(RailRowArtworkUrl(playlists, stale, 1).empty());
+  CHECK(RailPlaylistForRow(playlists, stale, 2)->id == "p2");
+  // An empty library never maps any row to a playlist.
+  const std::vector<PlaylistRef> none;
+  CHECK(RailPlaylistForRow(none, filtered, 1) == nullptr);
+  CHECK(RailPlaylistForRow(none, unfiltered, 1) == nullptr);
+  CHECK(RailRowArtworkUrl(none, unfiltered, 1).empty());
 }
 
 TEST_CASE("ui rows: label width ends before an overlapping sibling control") {
