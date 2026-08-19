@@ -104,12 +104,19 @@ pub fn run() {
         })
         // cover://<sha1hex> serves cached cover art bytes to <img> tags.
         .register_uri_scheme_protocol("cover", |_context, request| {
-            let hex = format!(
-                "{}{}",
-                request.uri().host().unwrap_or(""),
-                request.uri().path().trim_start_matches('/')
-            );
-            covers::serve_cover(&hex)
+            // Windows serves custom schemes as `http://cover.localhost/<hex>`,
+            // where the hash is the path; elsewhere it stays `cover://<hex>`,
+            // where the hash is the host. Concatenating the two produced
+            // "cover.localhost<hex>" here, which matched no cached file — so
+            // cover art had never once resolved on Windows.
+            let uri = request.uri();
+            let path = uri.path().trim_start_matches('/');
+            let hex = if path.is_empty() {
+                uri.host().unwrap_or_default()
+            } else {
+                path
+            };
+            covers::serve_cover(hex)
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

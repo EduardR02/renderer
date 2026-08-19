@@ -1,7 +1,19 @@
 <script>
-  import { initEvents, route, api, playback, togglePlay, focusSearch, isLoggedOut } from "./lib/state.svelte.js";
+  import {
+    initEvents,
+    route,
+    api,
+    playback,
+    togglePlay,
+    focusSearch,
+    isLoggedOut,
+    goBack,
+    goForward,
+  } from "./lib/state.svelte.js";
+  import IconSprite from "./components/IconSprite.svelte";
   import Sidebar from "./components/Sidebar.svelte";
   import PlayerBar from "./components/PlayerBar.svelte";
+  import TopBar from "./components/TopBar.svelte";
   import LibraryView from "./views/LibraryView.svelte";
   import PlaylistView from "./views/PlaylistView.svelte";
   import AlbumView from "./views/AlbumView.svelte";
@@ -23,7 +35,7 @@
     else if (name === "artist" && id) api.browseArtist(id).catch(() => {});
   });
 
-  // Global keyboard shortcuts. Ignored while typing in inputs.
+  // Global shortcuts. Ignored while typing in inputs.
   $effect(() => {
     function onKey(e) {
       const t = e.target;
@@ -39,134 +51,96 @@
         focusSearch();
         return;
       }
+      if (e.altKey && e.key === "ArrowLeft") {
+        e.preventDefault();
+        goBack();
+        return;
+      }
+      if (e.altKey && e.key === "ArrowRight") {
+        e.preventDefault();
+        goForward();
+        return;
+      }
       if (typing) return;
       if (e.code === "Space") {
         e.preventDefault();
         togglePlay();
-        return;
+      }
+    }
+    // Mouse thumb buttons: desktop users expect these to navigate.
+    function onMouseUp(e) {
+      if (e.button === 3) {
+        e.preventDefault();
+        goBack();
+      } else if (e.button === 4) {
+        e.preventDefault();
+        goForward();
       }
     }
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
   });
 </script>
 
+<IconSprite />
+
 <div class="app">
-  <div class="row">
-    <Sidebar />
-    <main class="content">
-      {#if playback.auth_state === "authenticating"}
-        <div class="connecting-banner" role="status">
-          <span class="spinner" aria-hidden="true"></span>
-          <span>Connecting to Spotify…</span>
-        </div>
-      {/if}
+  <Sidebar />
+
+  <main class="pane">
+    <div class="scroll">
+      <TopBar />
 
       {#if playback.error}
         <div class="error-banner" role="alert">
           <span class="error-text">{playback.error}</span>
-          <button class="error-dismiss" title="Dismiss" onclick={() => (playback.error = null)}>
-            ✕
-          </button>
+          <button class="btn-icon" title="Dismiss" onclick={() => (playback.error = null)}>✕</button>
         </div>
       {/if}
 
       {#if isLoggedOut()}
         <LoginView />
-      {:else}
-        {#if route.name === "library"}
-          <LibraryView />
-        {:else if route.name === "search"}
-          <SearchView />
-        {:else if route.name === "playlist"}
-          <PlaylistView />
-        {:else if route.name === "album"}
-          <AlbumView />
-        {:else if route.name === "artist"}
-          <ArtistView />
-        {:else if route.name === "queue"}
-          <QueueView />
-        {:else if route.name === "settings"}
-          <SettingsView />
-        {/if}
+      {:else if route.name === "library"}
+        <LibraryView />
+      {:else if route.name === "search"}
+        <SearchView />
+      {:else if route.name === "playlist"}
+        <PlaylistView />
+      {:else if route.name === "album"}
+        <AlbumView />
+      {:else if route.name === "artist"}
+        <ArtistView />
+      {:else if route.name === "queue"}
+        <QueueView />
+      {:else if route.name === "settings"}
+        <SettingsView />
       {/if}
-    </main>
-  </div>
+    </div>
+  </main>
+
   <PlayerBar />
 </div>
 
 <style>
-  .app {
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-    background: var(--bg-base);
-  }
-  .row {
-    display: flex;
-    flex: 1;
-    min-height: 0;
-  }
-  .content {
-    position: relative;
-    flex: 1;
-    min-width: 0;
-    overflow-y: auto;
-    background: var(--bg-base);
-  }
-  .connecting-banner {
-    position: sticky;
-    top: 0;
-    z-index: 50;
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-4);
-    background: rgba(30, 215, 96, 0.12);
-    color: #1ed760;
-    font-size: var(--font-sm);
-  }
-  .spinner {
-    width: 13px;
-    height: 13px;
-    flex: none;
-    border-radius: var(--radius-full);
-    border: 2px solid rgba(30, 215, 96, 0.25);
-    border-top-color: #1ed760;
-    animation: spin 0.8s linear infinite;
-  }
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
   .error-banner {
-    position: sticky;
-    top: 0;
-    z-index: 50;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: var(--space-4);
-    padding: var(--space-2) var(--space-4);
-    background: rgba(241, 94, 108, 0.15);
-    color: #ffb3bb;
-    font-size: var(--font-sm);
+    gap: var(--s4);
+    margin: 0 var(--s6);
+    padding: var(--s2) var(--s3);
+    border-radius: var(--r2);
+    background: rgba(255, 107, 107, 0.12);
+    color: var(--danger);
+    font-size: var(--t-12);
   }
   .error-text {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .error-dismiss {
-    flex: none;
-    padding: 2px 6px;
-    border-radius: var(--radius-sm);
-    color: #ffb3bb;
-    transition: color var(--transition-fast), background-color var(--transition-fast);
-  }
-  .error-dismiss:hover {
-    color: #fff;
-    background: rgba(255, 255, 255, 0.1);
   }
 </style>

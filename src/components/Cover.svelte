@@ -1,59 +1,107 @@
 <script>
   import { resolveCoverUrl } from "../lib/state.svelte.js";
-  import Icon from "./Icon.svelte";
 
-  let { src, alt = "", rounded = 4, circle = false, iconSize = 28, style = "", class: cls = "" } =
-    $props();
+  /**
+   * Artwork in four tiers, falling back in order:
+   *
+   *   1. the entity's own cover
+   *   2. a 2x2 mosaic of four distinct album covers
+   *   3. a single cover, full-bleed, when fewer than four are distinct
+   *      (a 1x2 or L-shaped 3-up reads as broken, so we never draw one)
+   *   4. a generated identity tile keyed off the entity id
+   *
+   * Tier 4 is deterministic and needs no network, so the common case for a
+   * playlist — Spotify's rootlist carries no cover at all — paints instantly
+   * and still looks designed rather than absent.
+   */
+  let {
+    src = "",
+    srcs = [],
+    id = "",
+    name = "",
+    size = 48,
+    /**
+     * Stretch to the container instead of taking a pixel size. Card art is
+     * laid out with `position:absolute; inset:0`, which an explicit
+     * width/height would over-constrain, so those are omitted entirely.
+     * The container supplies `--tile` for the monogram scale.
+     */
+    fill = false,
+    lg = false,
+    circle = false,
+    raised = false,
+    class: cls = "",
+  } = $props();
 
-  let display = $state(null);
-  let failed = $state(false);
+  /** Distinct candidates for the mosaic, capped at the four cells. */
+  const pool = $derived([...new Set(srcs.filter(Boolean))].slice(0, 4));
+
+  /** Tier selection. `src` always wins: it is the entity's own artwork. */
+  const tier = $derived(src ? "single" : pool.length >= 4 ? "mosaic" : pool.length ? "single" : "gen");
+  const primary = $derived(src || pool[0] || "");
+
+  /**
+   * FNV-1a over the id, mapped onto the hue circle. Stable across restarts,
+   * so a playlist keeps the same colour identity for as long as it exists.
+   */
+  function hue(seed) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < seed.length; i++) {
+      h ^= seed.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h % 360;
+  }
+
+  const letter = $derived((name.trim()[0] ?? "?").toUpperCase());
+  const seedHue = $derived(hue(id || name));
+
+  /** Resolved `cover://` urls, indexed the same as the source list. */
+  let resolved = $state({});
 
   $effect(() => {
-    const s = src;
-    display = null;
-    failed = false;
-    if (!s) return;
-    resolveCoverUrl(s).then((u) => {
-      if (src !== s) return;
-      if (u) display = u;
-      else failed = true;
-    });
+    const wanted = tier === "mosaic" ? pool : primary ? [primary] : [];
+    for (const url of wanted) {
+      if (url in resolved) continue;
+      resolveCoverUrl(url).then((local) => {
+        if (local) resolved[url] = local;
+      });
+    }
   });
 
-  const radius = $derived(circle ? "50%" : `${rounded}px`);
+  const ready = $derived(tier === "mosaic" ? pool.every((u) => resolved[u]) : !!resolved[primary]);
 </script>
 
-<div class="cover {cls}" {style} style:border-radius={radius}>
-  {#if display && !failed}
-    <img src={display} alt={alt} loading="lazy" draggable="false" onerror={() => (failed = true)} />
-  {:else}
-    <div class="cover-fallback">
-      <Icon name="note" size={iconSize} />
-    </div>
-  {/if}
-</div>
-
-<style>
-  .cover {
-    position: relative;
-    overflow: hidden;
-    flex: none;
-    background: var(--bg-cover-fallback);
-  }
-  .cover img {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-  }
-  .cover-fallback {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #7a7a7a;
-  }
-</style>
+{#if tier !== "gen" && ready}
+  <span
+    class="art {cls}"
+    class:lg
+    class:circle
+    class:raised
+    class:mosaic={tier === "mosaic"}
+    style:width={fill ? null : `${size}px`}
+    style:height={fill ? null : `${size}px`}
+  >
+    {#if tier === "mosaic"}
+      {#each pool as url (url)}
+        <img src={resolved[url]} alt="" width={size / 2} height={size / 2} draggable="false" />
+      {/each}
+    {:else}
+      <img src={resolved[primary]} alt={name} width={size} height={size} draggable="false" />
+    {/if}
+  </span>
+{:else}
+  <span
+    class="art gen {cls}"
+    class:lg
+    class:circle
+    class:raised
+    style:width={fill ? null : `${size}px`}
+    style:height={fill ? null : `${size}px`}
+    style:--h={seedHue}
+    style:--tile={fill ? null : `${size}px`}
+    data-letter={letter}
+    role="img"
+    aria-label={name}
+  ></span>
+{/if}

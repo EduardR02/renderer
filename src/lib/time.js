@@ -18,3 +18,8 @@ export function formatDuration(ms) {
   if (h > 0) return m > 0 ? `${h} hr ${m} min` : `${h} hr`;
   return `${Math.max(1, m)} min`;
 }
+
+/** Summed duration of a track list, as "8 hr 12 min". */
+export function formatTotal(tracks) {
+  return formatDuration(tracks.reduce((sum, t) => sum + (t.duration_ms || 0), 0));
+}

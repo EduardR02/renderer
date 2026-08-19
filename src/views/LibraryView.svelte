@@ -1,33 +1,44 @@
 <script>
-  import { library, navigate } from "../lib/state.svelte.js";
+  import { library, navigate, playback } from "../lib/state.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
+
+  const greeting = $derived.by(() => {
+    const h = new Date().getHours();
+    if (h < 5) return "Good night";
+    if (h < 12) return "Good morning";
+    if (h < 18) return "Good afternoon";
+    return "Good evening";
+  });
 </script>
 
-<section class="page">
-  <header class="page-head">
-    <h1>Home</h1>
-    <p class="sub">Your playlists, right here.</p>
-  </header>
+<section class="view page">
+  <div style="padding:var(--s4) 0 var(--s6)">
+    <h1 class="page-title">{greeting}</h1>
+  </div>
 
   {#if library.length}
-    <div class="card-grid">
-      {#each library as pl (pl.id)}
-        <button class="card" onclick={() => navigate("playlist", pl.id)}>
-          <div class="card-cover">
-            <Cover src={pl.cover_url} alt={pl.name} rounded={4} />
-            <span class="card-play"><Icon name="play" size={20} /></span>
-          </div>
-          <span class="card-name">{pl.name}</span>
-          <span class="card-sub">{pl.owner ? `Playlist · ${pl.owner}` : "Playlist"}</span>
-        </button>
-      {/each}
+    <div class="section" style="margin-top:0">
+      <div class="section-head"><h2 class="section-title">Your library</h2></div>
+      <div class="grid">
+        {#each library as pl (pl.id)}
+          <button class="card" onclick={() => navigate("playlist", pl.id)}>
+            <span class="card-art">
+              <Cover src={pl.cover_url} id={pl.id} name={pl.name} fill lg />
+              <span class="card-play"><Icon name="play" size={15} /></span>
+            </span>
+            <span class="card-name">{pl.name}</span>
+            <span class="card-sub">
+              {pl.tracks_total ? `${pl.tracks_total} songs` : "Playlist"}
+            </span>
+          </button>
+        {/each}
+      </div>
     </div>
   {:else}
     <div class="empty">
-      <Icon name="library" size={40} />
       <p>No playlists yet.</p>
-      <p class="sub">Log in and your playlists will appear here.</p>
+      <p class="sub">They will appear here once your library loads.</p>
     </div>
   {/if}
 </section>

@@ -1,7 +1,12 @@
 <script>
   /**
-   * Custom pointer-driven slider used for seek and volume.
-   * Local value while dragging; `onCommit` fires on release (and on keyboard).
+   * Pointer-driven slider for seek and volume. Holds a local value while
+   * dragging and reports on release, so the playhead does not fight the drag.
+   *
+   * The fill is driven by `--p` (0..1) and animated with `transform: scaleX`
+   * rather than `width: %`. Width would force layout and paint on every
+   * playhead tick, forever, which is exactly the cost this app exists to
+   * avoid; a transform stays on the compositor.
    */
   let {
     min = 0,
@@ -10,24 +15,21 @@
     onCommit,
     label = "",
     step = null,
-    className = "",
+    kind = "seek",
     onDragStart = null,
     onDragChange = null,
   } = $props();
 
   let track = $state(null);
   let drag = $state(null);
-  let dragging = $derived(drag !== null);
-  let display = $derived(dragging ? drag : value);
-
-  const pct = $derived(max > min ? ((display - min) / (max - min)) * 100 : 0);
+  const display = $derived(drag !== null ? drag : value);
+  const p = $derived(max > min ? Math.min(1, Math.max(0, (display - min) / (max - min))) : 0);
 
   function fromClientX(x) {
     if (!track) return min;
     const r = track.getBoundingClientRect();
     if (r.width <= 0) return min;
-    const p = Math.min(1, Math.max(0, (x - r.left) / r.width));
-    return min + p * (max - min);
+    return min + Math.min(1, Math.max(0, (x - r.left) / r.width)) * (max - min);
   }
 
   function commit(v) {
@@ -47,7 +49,7 @@
     onDragChange?.(drag);
   }
 
-  function onPointerUp(e) {
+  function onPointerUp() {
     if (drag === null) return;
     const v = drag;
     drag = null;
@@ -72,9 +74,8 @@
   }
 </script>
 
-<div
-  class="slider {className}"
-  class:dragging
+<span
+  class={kind === "vol" ? "vol" : "rail-hit"}
   role="slider"
   tabindex="0"
   aria-label={label}
@@ -88,61 +89,10 @@
   onpointercancel={onPointerUp}
   onkeydown={onKeyDown}
 >
-  <div class="rail">
-    <div class="fill" style:width={pct + "%"}></div>
-    <div class="knob" style:left={pct + "%"}></div>
-  </div>
-</div>
-
-<style>
-  .slider {
-    position: relative;
-    display: flex;
-    align-items: center;
-    width: 100%;
-    height: 14px;
-    cursor: pointer;
-    touch-action: none;
-    outline: none;
-  }
-  .rail {
-    position: relative;
-    width: 100%;
-    height: 4px;
-    border-radius: var(--radius-full);
-    background: rgba(255, 255, 255, 0.25);
-    transition: height var(--transition-fast), background-color var(--transition-fast);
-  }
-  .slider:hover .rail,
-  .slider.dragging .rail {
-    height: 5px;
-    background: rgba(255, 255, 255, 0.35);
-  }
-  .slider:focus-visible .rail {
-    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.25);
-  }
-  .fill {
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    border-radius: inherit;
-    background: #fff;
-  }
-  .knob {
-    position: absolute;
-    top: 50%;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: #fff;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
-    transform: translate(-50%, -50%) scale(0);
-    transition: transform var(--transition-fast);
-  }
-  .slider:hover .knob,
-  .slider.dragging .knob,
-  .slider:focus-visible .knob {
-    transform: translate(-50%, -50%) scale(1);
-  }
-</style>
+  {#if kind === "vol"}
+    <span class="vol-rail"><span class="vol-fill" style:--p={p}></span></span>
+  {:else}
+    <span class="rail"><span class="rail-fill" style:--p={p}></span></span>
+    <span class="rail-knob" style:--pl="{p * 100}%"></span>
+  {/if}
+</span>

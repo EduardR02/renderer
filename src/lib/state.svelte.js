@@ -2,7 +2,7 @@
 /* App state — updated ONLY by Tauri events + command responses.       */
 /* All command wrappers use the exact Tauri contract names.            */
 /* ------------------------------------------------------------------ */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -10,16 +10,57 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 export const route = $state({ name: "library", id: null });
 
+/**
+ * Back/forward history as a plain stack plus a cursor. Deliberately not URL
+ * or hash routing: nothing here is addressable or shareable, so a stack is
+ * the entire feature and costs no dependency.
+ */
+const HISTORY_MAX = 50;
+const history = $state({ entries: [{ name: "library", id: null }], cursor: 0 });
+
+export function canGoBack() {
+  return history.cursor > 0;
+}
+
+export function canGoForward() {
+  return history.cursor < history.entries.length - 1;
+}
+
+/** Clears stale detail so the target view shows its loading state. */
+function clearStaleDetail(name) {
+  if (name === "playlist") detail.playlist = null;
+  if (name === "album") detail.album = null;
+  if (name === "artist") detail.artist = null;
+}
+
+function applyEntry(entry) {
+  route.name = entry.name;
+  route.id = entry.id;
+  clearStaleDetail(entry.name);
+}
+
 export function navigate(name, id = null) {
-  const same = route.name === name && route.id === id;
-  route.name = name;
-  route.id = id;
-  if (!same) {
-    // Clear stale detail so the target view shows its loading state.
-    if (name === "playlist") detail.playlist = null;
-    if (name === "album") detail.album = null;
-    if (name === "artist") detail.artist = null;
-  }
+  const current = history.entries[history.cursor];
+  if (current && current.name === name && current.id === id) return;
+  // Navigating from the middle of the stack starts a new branch, so anything
+  // ahead of the cursor is dropped.
+  history.entries.splice(history.cursor + 1);
+  history.entries.push({ name, id });
+  if (history.entries.length > HISTORY_MAX) history.entries.shift();
+  history.cursor = history.entries.length - 1;
+  applyEntry({ name, id });
+}
+
+export function goBack() {
+  if (!canGoBack()) return;
+  history.cursor -= 1;
+  applyEntry(history.entries[history.cursor]);
+}
+
+export function goForward() {
+  if (!canGoForward()) return;
+  history.cursor += 1;
+  applyEntry(history.entries[history.cursor]);
 }
 
 export const ui = $state({ searchFocusTick: 0 });
@@ -134,17 +175,32 @@ export function toggleLiked(uri) {
 const coverCache = new Map(); // remote url -> cover:// url
 const coverPending = new Map(); // remote url -> Promise<string|null>
 
+/**
+ * Turns the engine's `cover://<sha1>` into a URL the webview will actually
+ * fetch. A bare custom scheme is not one of them: Tauri exposes custom
+ * protocols as `http://<scheme>.localhost/<path>` on Windows and
+ * `<scheme>://localhost/<path>` elsewhere, and `convertFileSrc` is what picks
+ * the right shape. Handing `<img>` the raw `cover://` url fails silently on
+ * every platform, which is why cover art had never rendered.
+ */
+function toLocalUrl(coverUrl) {
+  if (!coverUrl) return null;
+  if (coverUrl.startsWith("http")) return coverUrl;
+  return convertFileSrc(coverUrl.replace(/^cover:\/\//, ""), "cover");
+}
+
 export async function resolveCoverUrl(url) {
   if (!url) return null;
-  if (url.startsWith("cover://")) return url;
+  if (url.startsWith("cover://") || url.startsWith("http://cover.")) return toLocalUrl(url);
   const hit = coverCache.get(url);
   if (hit) return hit;
   const inflight = coverPending.get(url);
   if (inflight) return inflight;
   const p = invoke("get_cover", { url })
     .then((u) => {
-      if (u) coverCache.set(url, u);
-      return u ?? null;
+      const local = toLocalUrl(u);
+      if (local) coverCache.set(url, local);
+      return local;
     })
     .catch(() => null)
     .finally(() => coverPending.delete(url));
