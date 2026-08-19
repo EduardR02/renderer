@@ -4,6 +4,7 @@ mod browse;
 mod edits;
 mod engine;
 mod io;
+mod resample;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -444,8 +445,16 @@ async fn run(
                 }
             }
             _ = position_heartbeat.tick() => {
-                if engine.tick_position() {
+                // Catches a session librespot invalidated on its own, which is
+                // otherwise invisible until a track refuses to load.
+                if engine.tick_session_health(&auth_sender) {
                     engine.emit_state()?;
+                }
+                if engine.tick_position() {
+                    // Scalar playhead sync: O(1) regardless of queue size.
+                    // Real changes (track, queue, volume, play/pause, ...)
+                    // still emit the full state through the other arms.
+                    engine.emit_position()?;
                 }
             }
         }
@@ -594,6 +603,7 @@ fn create_state(
     let temporary = state_directory.join("tmp");
     std::fs::create_dir_all(&temporary)
         .map_err(|error| format!("could not create temporary directory: {error}"))?;
+    sweep_temporary_directory(&temporary);
     version_audio_cache(state_directory)?;
     let cache = Cache::new(
         Some(credentials),
@@ -608,6 +618,41 @@ fn create_state(
         .join("credentials")
         .join("credentials.json");
     Ok((cache, temporary, credentials_file))
+}
+
+/// Deletes everything left in the download scratch directory.
+///
+/// librespot streams each track into a temporary file here and only moves it
+/// into the audio cache once it is complete, so anything abandoned part-way —
+/// a skip, a stall, a quit mid-fetch — stays behind forever. Nothing else
+/// removes them, and they do not count against the audio cache's size limit,
+/// so the directory grows without bound: 94 MB of orphans accumulated in two
+/// days of ordinary use on the reference machine, all of it invisible to `ls`
+/// because librespot names them `.tmpXXXXXX`.
+///
+/// Startup is the one moment this is unconditionally safe: the engine has not
+/// begun fetching, so every file present is by definition abandoned by a
+/// previous run. Failures are ignored — a file that cannot be removed is a
+/// wasted megabyte, not a reason to refuse to start.
+fn sweep_temporary_directory(temporary: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(temporary) else {
+        return;
+    };
+    let mut removed = 0u64;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+            bytes += size;
+        }
+    }
+    if removed > 0 {
+        eprintln!(
+            "cleared {removed} abandoned download(s) from the scratch directory ({:.1} MB)",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
 }
 
 #[cfg(test)]

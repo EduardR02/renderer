@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use crate::auth::{
     prepare_oauth,
 };
 use crate::io::ProtocolWriter;
-use spotify_playback_engine::protocol::{AuthState, BrowseResponse, Command, RepeatMode, Response, StateEvent, TrackRef};
+use spotify_playback_engine::protocol::{AuthState, BrowseResponse, Command, PositionEvent, RepeatMode, Response, StateEvent, TrackRef};
 use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
@@ -27,6 +28,41 @@ const PREVIOUS_RESTART_THRESHOLD_MS: u32 = 3_000;
 /// next/prev responsive; presses are delayed, never dropped. Natural
 /// end-of-track advances are not paced.
 const TRACK_CHANGE_MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// Failures from a rapid load burst are commonly key-service or network
+/// transient errors, not evidence that every involved cache entry is bad.
+/// Keep the burst window long enough to cover several paced changes.
+const TRACK_CHANGE_BURST_WINDOW: Duration = Duration::from_secs(2);
+const TRACK_CHANGE_BURST_MINIMUM: usize = 2;
+/// A second current-track load failure within this window is treated as part
+/// of the same transient burst. The first failure in a quiet period remains
+/// eligible for cache cleanup.
+///
+/// This is sized against how far apart *failures* land, not how far apart
+/// clicks land, and the two are nothing alike. A failing load takes seconds to
+/// give up: the audio key times out, librespot falls back to downloading, and
+/// the decoder waits out its own deadline. Measured across a real dead-session
+/// episode, consecutive `Unavailable` events arrived 6.5 s and 8.9 s apart —
+/// so the 2 s window this started at pruned itself empty between every pair,
+/// classified each failure as isolated, and evicted the cache for every track
+/// it touched. The window has to outlast the failure, not the gesture.
+const UNAVAILABLE_BURST_WINDOW: Duration = Duration::from_secs(30);
+
+/// How long to wait before the first automatic reconnect after the session
+/// dies, and the ceiling the wait doubles up to while reconnects keep failing.
+///
+/// librespot invalidates its own `Session` when the access-point connection
+/// drops (`session.rs`: the sender task's error arm calls `shutdown()`), which
+/// closes the channel manager every audio-key request travels over. Metadata
+/// does not go that way — `spclient` is plain HTTPS with its own pool — so the
+/// library, search and browse all keep working while playback is dead, and
+/// nothing surfaces the problem except tracks refusing to start. Nothing here
+/// used to notice, so the engine held the corpse until it was restarted.
+///
+/// The first attempt is quick because the common cause is a transient drop the
+/// reconnect will simply fix. The ceiling exists so a genuine outage is not
+/// hammered at heartbeat rate.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 pub struct Engine {
     writer: ProtocolWriter,
@@ -41,20 +77,42 @@ pub struct Engine {
     mixer: Option<Arc<SoftMixer>>,
     session: Option<librespot_core::Session>,
     play_request_id: Option<u64>,
+    /// Set when librespot reports `Unavailable` for the current load. The
+    /// player remains in librespot's failed `Loading` state unless it is
+    /// explicitly stopped; this flag makes the next Play command issue a
+    /// fresh load instead of sending `play` to a dead loader.
+    loading_failed: bool,
     position_anchor: Option<(u32, Instant)>,
     /// When the last command-driven track change (PlayQueue/Next/Previous)
     /// was dispatched, for pacing rapid presses (see
     /// [`TRACK_CHANGE_MIN_INTERVAL`]). `None` until the first change.
     last_track_change: Option<Instant>,
+    /// Actual current-track load starts seen recently. This complements the
+    /// 250 ms command pacing: when a failure arrives after a rapid sequence
+    /// of loads, cache eviction is unsafe because the failure may be a
+    /// clustered key/network rejection.
+    recent_track_changes: VecDeque<Instant>,
+    /// Current-track load failures seen recently. A later failure in the same
+    /// window is considered transient even when the user did not change
+    /// tracks between the failures.
+    recent_unavailable: VecDeque<Instant>,
+    /// Earliest time an automatic reconnect may be attempted, and how long to
+    /// wait after the next failure. `None` means "no reconnect is pending":
+    /// the session is healthy, or one is already running. See
+    /// [`Engine::tick_session_health`].
+    next_reconnect: Option<Instant>,
+    reconnect_backoff: Duration,
     shuffle_pool: Vec<usize>,
     history: Vec<usize>,
     random_state: u64,
     generation: u64,
-    /// A seek is mid-transition (the player was paused by [`Engine::seek`]
-    /// and its `Playing` event has not arrived yet). While set, the
-    /// transient `Paused` event that the seek's own pause produces is
-    /// suppressed so the UI never sees a play/pause blip on seek.
+    /// A seek is mid-transition (the player was paused by [`Engine::seek`]).
+    /// While set, the transient pause event from the seek is suppressed, and
+    /// a stale Playing event cannot override the seek's requested play/pause
+    /// intent.
     seek_in_flight: bool,
+    /// Whether the seek that set `seek_in_flight` was issued while playing.
+    seek_should_play: bool,
     auth_running: bool,
     /// The prepared OAuth attempt whose authorize URL is published in
     /// `needs_login` state; `login` consumes it so the UI opens exactly the
@@ -132,13 +190,19 @@ impl Engine {
             mixer: None,
             session: None,
             play_request_id: None,
+            loading_failed: false,
             position_anchor: None,
             last_track_change: None,
+            recent_track_changes: VecDeque::new(),
+            recent_unavailable: VecDeque::new(),
+            next_reconnect: None,
+            reconnect_backoff: RECONNECT_BACKOFF_MIN,
             shuffle_pool: Vec::new(),
             history: Vec::new(),
             random_state,
             generation: 0,
             seek_in_flight: false,
+            seek_should_play: false,
             auth_running: false,
             pending_auth: None,
         }
@@ -173,6 +237,21 @@ impl Engine {
         })
     }
 
+    /// Serializes only the playhead scalars the frontend projects and clamps
+    /// against — never the queue — for the 2-second position heartbeat.
+    /// [`Engine::emit_state`] stays reserved for real changes (track, queue,
+    /// volume, shuffle, repeat, duration, play/pause), so the steady-state
+    /// heartbeat cost is O(1) in queue length. The heartbeat is emitted only
+    /// while playing: paused positions are static and project from the last
+    /// full state.
+    pub fn emit_position(&self) -> Result<(), String> {
+        self.writer.send(&PositionEvent {
+            kind: "position",
+            position_ms: self.state.position_ms,
+            duration_ms: self.state.duration_ms,
+        })
+    }
+
     /// Records an authoritative playback position and re-anchors the drift
     /// projection at the current wall clock. Called on every player event and
     /// command that establishes a position (track change, play/pause, seek,
@@ -183,8 +262,10 @@ impl Engine {
     }
 
     /// Advances the reported position from the latest anchor and reports
-    /// whether a state event should be emitted. Emits at most once per call;
-    /// while paused the position is static and no event is produced.
+    /// whether a position heartbeat should be emitted (at most once per
+    /// call). While paused the position is static and no heartbeat is
+    /// produced: the frontend projects the frozen position from the last
+    /// full state.
     pub fn tick_position(&mut self) -> bool {
         if !self.state.playing {
             return false;
@@ -197,6 +278,59 @@ impl Engine {
         self.state.position_ms = anchor_position_ms
             .saturating_add(elapsed_ms)
             .min(self.state.duration_ms);
+        true
+    }
+
+    /// Notices a session librespot has invalidated underneath us and rebuilds
+    /// it, with backoff. Driven from the same heartbeat that advances the
+    /// playhead, so no extra timer is needed; the check is one `RwLock` read.
+    ///
+    /// Returns whether the engine's state changed and should be emitted.
+    ///
+    /// The failure this recovers from is silent by construction — see
+    /// [`RECONNECT_BACKOFF_MIN`]. Reconnecting also re-arms `Ready`, so the
+    /// frontend's existing "not ready" handling covers the gap without needing
+    /// to know a reconnect happened.
+    pub fn tick_session_health(
+        &mut self,
+        sender: &mpsc::UnboundedSender<AuthSignal>,
+    ) -> bool {
+        if self.auth_running {
+            return false;
+        }
+        let dead = self
+            .session
+            .as_ref()
+            .is_some_and(librespot_core::Session::is_invalid);
+        if !dead {
+            // A healthy session ends any backoff a previous outage built up.
+            self.next_reconnect = None;
+            self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
+            return false;
+        }
+
+        let now = Instant::now();
+        let Some(due) = self.next_reconnect else {
+            // First tick that sees the corpse: schedule, and tell the frontend
+            // playback is down rather than letting loads fail one by one.
+            self.next_reconnect = Some(now + self.reconnect_backoff);
+            self.state.ready = false;
+            self.state.playing = false;
+            self.state.error =
+                Some("the Spotify connection dropped; reconnecting".to_owned());
+            eprintln!("Spotify session went invalid; reconnecting");
+            return true;
+        };
+        if now < due {
+            return false;
+        }
+
+        self.reconnect_backoff = (self.reconnect_backoff * 2).min(RECONNECT_BACKOFF_MAX);
+        self.next_reconnect = Some(now + self.reconnect_backoff);
+        // `start_authentication` tears down the dead player and session, bumps
+        // the generation so their in-flight events are ignored, and reconnects
+        // from cached credentials.
+        self.start_authentication(sender.clone());
         true
     }
 
@@ -351,6 +485,10 @@ impl Engine {
                 self.player = Some(handles.player);
                 self.mixer = Some(handles.mixer);
                 self.session = Some(handles.session);
+                // A live session again: drop any reconnect schedule and reset
+                // the backoff so the next outage recovers quickly too.
+                self.next_reconnect = None;
+                self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
                 let mut events = handles.events;
                 tokio::spawn(async move {
                     while let Some(event) = events.recv().await {
@@ -374,6 +512,64 @@ impl Engine {
                 true
             }
         }
+    }
+
+    /// Removes timestamps older than a burst window without treating a clock
+    /// adjustment backwards as an expiration.
+    ///
+    /// The actual pacing contract is documented on [`Self::pace_track_change`].
+    fn prune_recent_times(times: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+        loop {
+            let expired = match times.front() {
+                Some(when) => now
+                    .checked_duration_since(*when)
+                    .is_some_and(|elapsed| elapsed > window),
+                None => false,
+            };
+            if !expired {
+                break;
+            }
+            times.pop_front();
+        }
+    }
+
+    /// Records a real player load rather than merely a button press. Keeping
+    /// this history lets the first failure in an already-observable rapid
+    /// load burst avoid destructive cache cleanup.
+    fn note_track_change(&mut self, now: Instant) {
+        Self::prune_recent_times(
+            &mut self.recent_track_changes,
+            now,
+            TRACK_CHANGE_BURST_WINDOW,
+        );
+        self.recent_track_changes.push_back(now);
+    }
+
+    /// Returns whether this failure belongs to a transient burst. A second
+    /// failure within the failure window is clustered even when the same
+    /// track was retried; two or more recent load starts also protect the
+    /// first failure observed after rapid clicks.
+    fn unavailable_is_clustered(&mut self, now: Instant) -> bool {
+        Self::prune_recent_times(
+            &mut self.recent_track_changes,
+            now,
+            TRACK_CHANGE_BURST_WINDOW,
+        );
+        Self::prune_recent_times(
+            &mut self.recent_unavailable,
+            now,
+            UNAVAILABLE_BURST_WINDOW,
+        );
+        let clustered = self.recent_unavailable.len() >= 1
+            || self.recent_track_changes.len() >= TRACK_CHANGE_BURST_MINIMUM;
+        self.recent_unavailable.push_back(now);
+        clustered
+    }
+
+    /// Successful playback ends the current failure burst. A later isolated
+    /// failure should again be eligible for corrupt-cache cleanup.
+    fn clear_unavailable_burst(&mut self) {
+        self.recent_unavailable.clear();
     }
 
     /// Waits out any remaining [`TRACK_CHANGE_MIN_INTERVAL`] since the last
@@ -573,6 +769,11 @@ impl Engine {
                         "the local audio player stopped unexpectedly; request status to retry"
                             .to_owned(),
                     );
+                    self.play_request_id = None;
+                    self.loading_failed = false;
+                    self.last_track_change = None;
+                    self.recent_track_changes.clear();
+                    self.recent_unavailable.clear();
                     self.player = None;
                     self.mixer = None;
                     if let Some(session) = self.session.take() {
@@ -642,6 +843,9 @@ impl Engine {
             self.history.clear();
             self.shuffle_pool.clear();
             self.state.error = None;
+            self.loading_failed = false;
+            self.recent_track_changes.clear();
+            self.recent_unavailable.clear();
             return Ok(true);
         }
         if index >= queue.len() {
@@ -667,8 +871,18 @@ impl Engine {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
-        if self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms {
-            self.state.position_ms = 0;
+        // A user play supersedes an in-flight seek transition. Keep the
+        // guard until its Playing event arrives so a queued Paused event from
+        // the seek cannot briefly undo the optimistic play.
+        if self.seek_in_flight {
+            self.seek_should_play = true;
+        }
+        if self.loading_failed
+            || (self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms)
+        {
+            if !self.loading_failed {
+                self.state.position_ms = 0;
+            }
             self.load_current(true)?;
         } else {
             self.player()?.play();
@@ -686,7 +900,13 @@ impl Engine {
         // A user pause supersedes any in-flight seek transition: its own
         // Paused event must be delivered, not suppressed.
         self.seek_in_flight = false;
-        self.player()?.pause();
+        self.seek_should_play = false;
+        // `Unavailable` stops the player below, so a later pause must not send
+        // `pause` to librespot's terminal Loading/Stopped state. Play will
+        // issue a fresh load when requested.
+        if !self.loading_failed {
+            self.player()?.pause();
+        }
         self.state.playing = false;
         self.update_position(self.state.position_ms);
         self.state.error = None;
@@ -698,20 +918,33 @@ impl Engine {
             return Err("the queue has no current track".to_owned());
         }
         let position = position_ms.min(self.state.duration_ms);
+        if self.loading_failed {
+            // The failed loader was stopped by the Unavailable handler. A
+            // seek is also a valid recovery request: load at the new offset
+            // while preserving the current play/pause intent.
+            let start_playing = self.state.playing;
+            self.update_position(position);
+            self.load_current(start_playing)?;
+            self.state.error = None;
+            return Ok(true);
+        }
         // Pause clears the rodio output queue instantly (the custom sink's
         // stop), seek while paused skips librespot's full read-ahead wait
-        // (preload_data_before_playback is a no-op in the Paused state),
-        // and play resumes the decoder at the new position — its blocking
-        // read fetches the target range itself, so the jump lands in
-        // roughly one network round trip instead of a drain of buffered
-        // audio plus a full 3-second-window fetch. The transient Paused
-        // event is suppressed while seek_in_flight is set; a user pause
-        // sent later clears the flag first and is handled normally.
+        // (preload_data_before_playback is a no-op in the Paused state).
+        // Capture the intent before pausing: a paused seek must remain paused,
+        // while a playing seek resumes at the target without a UI blip.
+        let was_playing = self.state.playing;
         self.seek_in_flight = true;
+        self.seek_should_play = was_playing;
         let player = self.player()?;
         player.pause();
         player.seek(position);
-        player.play();
+        if was_playing {
+            // Its blocking read fetches the target range itself, so the jump
+            // lands in roughly one network round trip instead of a drain of
+            // buffered audio plus a full 3-second-window fetch.
+            player.play();
+        }
         self.update_position(position);
         self.state.error = None;
         Ok(true)
@@ -913,7 +1146,13 @@ impl Engine {
             .peek_next_index()
             .and_then(|next| parse_track_uri(&self.state.queue[next]).ok());
         self.play_request_id = None;
-        let player = self.player()?;
+        self.seek_in_flight = false;
+        self.seek_should_play = false;
+        // Clone the Arc so the immutable borrow of `self.player` ends before
+        // the recovery bookkeeping below mutates the engine.
+        let player = Arc::clone(self.player()?);
+        self.loading_failed = false;
+        self.note_track_change(Instant::now());
         player.load(uri, start_playing, position_ms);
         if let Some(uri) = next_uri {
             player.preload(uri);
@@ -987,23 +1226,43 @@ impl Engine {
                 self.play_request_id = Some(play_request_id);
                 false
             }
+            PlayerEvent::Loading {
+                play_request_id,
+                track_id,
+                position_ms,
+            } if self.is_current_event(play_request_id, &track_id) => {
+                // A fresh load (including a retry after Unavailable) puts the
+                // engine back into an in-progress state. Keep the requested
+                // play/pause intent already held in `state.playing`.
+                self.loading_failed = false;
+                self.update_position(position_ms);
+                self.state.error = None;
+                true
+            }
+
             PlayerEvent::Playing {
                 play_request_id,
                 track_id,
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
-                // The seek's play() completed: its transient pause is over.
+                // A playing seek's play() completed: its transient pause is
+                // over. A stale Playing event after a paused seek must not
+                // turn that seek into an optimistic unpause.
+                let suppress_playing = self.seek_in_flight && !self.seek_should_play;
                 self.seek_in_flight = false;
-                self.state.playing = true;
+                self.seek_should_play = false;
+                self.loading_failed = false;
+                self.clear_unavailable_burst();
+                self.state.playing = !suppress_playing;
                 self.update_position(position_ms);
                 self.state.error = None;
                 true
             }
             // The Paused produced by a seek's own pause() is transient: the
-            // engine already reported playing=true and the seek target
-            // position; dropping it keeps the UI from blipping. A user
-            // pause clears seek_in_flight in Engine::pause before its event
-            // arrives, so a real pause is never swallowed.
+            // engine already reported the requested play/pause intent and
+            // target position, so dropping it keeps the UI from blipping. A
+            // user pause clears seek_in_flight in Engine::pause before its
+            // event arrives, so a real pause is never swallowed.
             PlayerEvent::Paused {
                 play_request_id,
                 track_id,
@@ -1014,6 +1273,8 @@ impl Engine {
                 track_id,
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
+                self.loading_failed = false;
+                self.clear_unavailable_burst();
                 self.state.playing = false;
                 self.update_position(position_ms);
                 true
@@ -1061,15 +1322,29 @@ impl Engine {
                 play_request_id,
                 track_id,
             } if self.is_current_event(play_request_id, &track_id) => {
+                let clustered = self.unavailable_is_clustered(Instant::now());
+                self.seek_in_flight = false;
+                self.seek_should_play = false;
+                self.loading_failed = true;
                 self.state.playing = false;
                 self.state.error = Some(format!("Spotify track is unavailable: {track_id}"));
-                // A failed load may be a corrupt/truncated audio-cache entry
-                // (Symphonia "end of stream"): evict every cached file for
-                // this track so the next attempt refetches cleanly. librespot
-                // already removes-and-refetches once for cached open
-                // failures; this extends the same cleanup to any load
-                // failure the engine observes.
-                self.evict_track_audio_cache(track_id);
+
+                // librespot leaves the failed loader in PlayerState::Loading
+                // after sending Unavailable. Stop it explicitly so a later
+                // Play can submit a fresh Load command instead of toggling
+                // start_playback on a terminated future.
+                if let Some(player) = &self.player {
+                    player.stop();
+                }
+
+                // An isolated failure can be a corrupt/truncated cache entry;
+                // librespot's decoder retry handles one cached format and
+                // this removes every format before the next user retry. Once
+                // failures cluster, preserve all cache files: key-service or
+                // network failures are not evidence of corruption.
+                if !clustered {
+                    self.evict_track_audio_cache(track_id);
+                }
                 true
             }
             PlayerEvent::Stopped {
@@ -1101,7 +1376,11 @@ impl Engine {
             player.stop();
         }
         self.play_request_id = None;
+        self.loading_failed = false;
         self.seek_in_flight = false;
+        self.seek_should_play = false;
+        self.recent_track_changes.clear();
+        self.recent_unavailable.clear();
         self.mixer = None;
         if let Some(session) = self.session.take() {
             session.shutdown();
@@ -1166,7 +1445,8 @@ mod tests {
     use librespot_playback::player::PlayerEvent;
     use super::{
         remap_current_index_after_move, sequential_next_index, track_change_wait, AuthSignal,
-        Engine, PlaybackState, PlayerSignal, TRACK_CHANGE_MIN_INTERVAL,
+        Engine, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
+        TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW,
     };
     use crate::io::ProtocolWriter;
     use spotify_playback_engine::protocol::{RepeatMode, TrackRef};
@@ -1243,6 +1523,213 @@ mod tests {
     }
 
     #[test]
+    fn paused_seek_ignores_a_stale_playing_event() {
+        let mut engine = playing_engine();
+        let uri = track_uri();
+        engine.state.playing = false;
+        engine.seek_in_flight = true;
+        engine.seek_should_play = false;
+
+        assert!(!engine.on_player_event(PlayerEvent::Paused {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: 41_000,
+        }));
+        assert!(!engine.state.playing, "the seek pause remains paused");
+
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: uri,
+            position_ms: 42_000,
+        }));
+        assert!(!engine.state.playing, "a paused seek must not unpause");
+        assert!(!engine.seek_in_flight);
+        assert!(!engine.seek_should_play);
+    }
+
+    #[test]
+    fn playing_seek_accepts_the_playing_event_after_pause() {
+        let mut engine = playing_engine();
+        let uri = track_uri();
+        engine.seek_in_flight = true;
+        engine.seek_should_play = true;
+
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: uri,
+            position_ms: 42_000,
+        }));
+        assert!(engine.state.playing);
+        assert_eq!(engine.state.position_ms, 42_000);
+        assert!(!engine.seek_in_flight);
+    }
+
+    #[test]
+    fn unavailable_recovery_rearms_a_fresh_loading_request() {
+        let mut engine = playing_engine();
+        let uri = track_uri();
+
+        assert!(engine.on_player_event(PlayerEvent::Unavailable {
+            play_request_id: 7,
+            track_id: uri.clone(),
+        }));
+        assert!(!engine.state.playing);
+        assert!(engine.loading_failed);
+        assert!(engine.state.error.is_some());
+
+        // A retry gets a new player request id, then Loading clears the
+        // failed-loader marker before playback begins.
+        assert!(!engine.on_player_event(PlayerEvent::PlayRequestIdChanged {
+            play_request_id: 8,
+        }));
+        assert!(engine.on_player_event(PlayerEvent::Loading {
+            play_request_id: 8,
+            track_id: uri.clone(),
+            position_ms: 0,
+        }));
+        assert!(!engine.loading_failed);
+        assert!(engine.state.error.is_none());
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 8,
+            track_id: uri,
+            position_ms: 0,
+        }));
+        assert!(engine.state.playing);
+    }
+
+    /// A dead session invalidated by librespot is otherwise silent, so the
+    /// heartbeat has to be the thing that notices. It must also not turn a
+    /// Spotify outage into a reconnect storm at heartbeat rate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_session_librespot_invalidated_is_noticed_and_reconnected_with_backoff() {
+        let (mut engine, _) = test_engine();
+        let session = librespot_core::Session::new(
+            librespot_core::SessionConfig::default(),
+            None,
+        );
+        // Exactly what librespot does to itself when the access point drops.
+        session.shutdown();
+        assert!(session.is_invalid());
+        engine.session = Some(session);
+        engine.state.ready = true;
+        let generation = engine.generation;
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        // First sight of the corpse reports it, rather than letting the user
+        // discover it one failed track at a time.
+        assert!(engine.tick_session_health(&sender));
+        assert!(!engine.state.ready);
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("reconnecting")),
+            "the dropped connection must be surfaced, got {:?}",
+            engine.state.error
+        );
+        assert_eq!(
+            engine.generation, generation,
+            "the first tick schedules a reconnect; it does not fire one"
+        );
+
+        // Heartbeats before the backoff expires must not attempt anything.
+        assert!(!engine.tick_session_health(&sender));
+        assert_eq!(engine.generation, generation);
+
+        // Once it is due, the reconnect runs. `start_authentication` bumps the
+        // generation so the dead session's in-flight events are ignored.
+        engine.next_reconnect = Some(Instant::now() - Duration::from_millis(1));
+        assert!(engine.tick_session_health(&sender));
+        assert_ne!(engine.generation, generation, "the reconnect must fire");
+
+        // ...and the wait grows, so an outage is not hammered every 2 s.
+        assert!(engine.reconnect_backoff > RECONNECT_BACKOFF_MIN);
+        assert!(engine.reconnect_backoff <= RECONNECT_BACKOFF_MAX);
+    }
+
+    /// A healthy session must cost nothing and must clear any backoff a past
+    /// outage built up, so the next drop is recovered from just as quickly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_healthy_session_schedules_no_reconnect() {
+        let (mut engine, _) = test_engine();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        engine.next_reconnect = Some(Instant::now());
+        engine.reconnect_backoff = RECONNECT_BACKOFF_MAX;
+
+        // No session at all is the pre-auth state, not a dead session.
+        assert!(!engine.tick_session_health(&sender));
+        assert!(engine.next_reconnect.is_none());
+        assert_eq!(engine.reconnect_backoff, RECONNECT_BACKOFF_MIN);
+
+        engine.session = Some(librespot_core::Session::new(
+            librespot_core::SessionConfig::default(),
+            None,
+        ));
+        engine.next_reconnect = Some(Instant::now());
+        assert!(!engine.tick_session_health(&sender));
+        assert!(engine.next_reconnect.is_none(), "a live session is not a corpse");
+    }
+
+    /// The regression that made the classifier inert: it was sized against how
+    /// fast a user clicks, but it is fed by how fast loads *fail*, which is
+    /// seconds slower. Measured gaps from a real dead-session episode were
+    /// 6.5 s and 8.9 s; at the old 2 s window every one of these looked
+    /// isolated and evicted the cache for a track that was fine.
+    #[test]
+    fn failures_at_the_observed_cadence_stay_clustered() {
+        let mut engine = playing_engine();
+        let start = Instant::now();
+
+        assert!(
+            !engine.unavailable_is_clustered(start),
+            "the first failure in a quiet period stays eligible for cleanup"
+        );
+        let second = start + Duration::from_millis(8_900);
+        assert!(
+            engine.unavailable_is_clustered(second),
+            "a failure 8.9 s later is the same outage, not a corrupt cache file"
+        );
+        assert!(
+            engine.unavailable_is_clustered(second + Duration::from_millis(6_500)),
+            "and so is the one after that"
+        );
+    }
+
+    #[test]
+    fn unavailable_burst_classifier_keeps_isolated_cleanup_eligible() {
+        let mut engine = playing_engine();
+        let start = Instant::now();
+
+        // One quiet load failure is eligible for the corrupt-cache cleanup.
+        engine.note_track_change(start);
+        assert!(!engine.unavailable_is_clustered(
+            start + Duration::from_millis(10)
+        ));
+
+        // A second failure shortly afterward is clustered, so valid cache
+        // files are preserved while the key/network burst settles.
+        assert!(engine.unavailable_is_clustered(
+            start + Duration::from_millis(20)
+        ));
+
+        // After both windows expire, cleanup is eligible again.
+        let quiet = start
+            + TRACK_CHANGE_BURST_WINDOW
+            .max(UNAVAILABLE_BURST_WINDOW)
+            + Duration::from_millis(25);
+        assert!(!engine.unavailable_is_clustered(quiet));
+
+        // Two paced load starts protect even the first failure observed after
+        // a rapid-click burst.
+        engine.note_track_change(quiet);
+        engine.note_track_change(quiet + Duration::from_millis(100));
+        assert!(engine.unavailable_is_clustered(
+            quiet + Duration::from_millis(200)
+        ));
+    }
+
+    #[test]
     fn transition_events_emit_state_lines_with_fresh_positions() {
         let (mut engine, buffer) = test_engine();
         engine.state = playback_state(240_000);
@@ -1292,6 +1779,35 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         assert!(engine.tick_position());
         assert_eq!(engine.state.position_ms, 30_000);
+    }
+
+    #[test]
+    fn heartbeat_emits_a_scalar_position_line_not_a_full_state() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.update_position(15_000);
+        assert!(engine.tick_position());
+        engine.emit_position().expect("position emits");
+
+        let line = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            std::mem::take(&mut *bytes)
+        };
+        let value: serde_json::Value = serde_json::from_slice(&line).expect("position json");
+        let object = value.as_object().expect("position is an object");
+        // `type` plus the two playhead scalars: a heartbeat never serializes
+        // the queue, so the steady-state cost is O(1) in queue length.
+        assert_eq!(object.len(), 3, "only type, position_ms and duration_ms");
+        assert_eq!(value["type"], "position");
+        assert_eq!(value["duration_ms"], 240_000);
+        let position_ms = value["position_ms"].as_u64().expect("scalar position");
+        assert!(
+            (15_000..16_000).contains(&position_ms),
+            "position projects from the anchor: {position_ms}"
+        );
+        assert!(!object.contains_key("queue"), "a heartbeat never carries the queue");
+        assert!(!object.contains_key("playing"), "a heartbeat carries no flags");
     }
 
     #[test]
