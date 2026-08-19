@@ -234,6 +234,13 @@ fn player_config() -> PlayerConfig {
         bitrate: Bitrate::Bitrate320,
         gapless: true,
         normalisation: false,
+        // librespot defaults this to a triangular ditherer, which only ever
+        // runs in its fixed-point conversions (`f64_to_s16` and friends). The
+        // sink takes the float path, where `Converter::f64_to_f32` is a plain
+        // cast and the ditherer is never consulted — but constructing one still
+        // logs "Converting with ditherer: tpdf", which reads like the audio is
+        // being dithered when nothing of the sort is happening.
+        ditherer: None,
         ..PlayerConfig::default()
     }
 }
@@ -256,7 +263,11 @@ async fn create_playback(session: Session, cache: Cache) -> Result<PlaybackHandl
     let player = Player::new(config, session.clone(), Box::new(NoOpVolume), move || {
         // Custom immediate-stop rodio sink: pause/stop must not drain the
         // buffered queue before silencing the output.
-        let sink = crate::audio::open_default_sink(AudioFormat::S16);
+        // F32, not S16: WASAPI's shared-mode engine is float internally, and
+        // the sink's own path is float end to end, so asking cpal for 16-bit
+        // would insert an undithered quantisation that nothing downstream
+        // wants. The device's mix format is what actually gets opened.
+        let sink = crate::audio::open_default_sink(AudioFormat::F32);
         crate::audio::set_sink_volume(cached_volume);
         let _ = audio_ready_tx.send(());
         sink

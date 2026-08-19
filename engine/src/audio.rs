@@ -12,7 +12,7 @@
 //!    pauses silence the output within one audio-buffer period.
 //! 2. [`SampleRing`]/[`LiveSource`]: the stock backend appends every decoded
 //!    packet to the sink as its own `rodio::Source`. That is the cause of a
-//!    measured playback-rate error; see "Playback rate" below.
+//!    measured playback-rate error; see "Playback rate and fidelity" below.
 //!
 //! Resume semantics: librespot's player resumes by calling `start()` and
 //! immediately re-feeding decoder packets, so the dropped buffer is rebuilt
@@ -22,25 +22,28 @@
 //! read-ahead settings. Track changes (gapless) never stop the sink, and a
 //! fresh `write` after `stop` refills the ring automatically.
 //!
-//! # Playback rate
+//! # Playback rate and fidelity
 //!
-//! The output device on the reference rig exposes only 48 kHz, so rodio
-//! resamples librespot's 44.1 kHz packets. rodio's mixer wraps its input in
-//! one `UniformSourceIterator`, which rebuilds its `SampleRateConverter` at
-//! every *span* boundary, and each rebuild costs a fraction of a frame
-//! (the converter primes on two input frames and drains its interpolation
-//! state when the span ends). Spans are not free-running: rodio's
-//! `SourcesQueueOutput::current_span_len` reports the current source's
-//! `size_hint`, and `SamplesBuffer::size_hint` returns the buffer's *full*
-//! length regardless of how much has been read, so appending one
-//! `SamplesBuffer` per decoded packet produces roughly one converter rebuild
-//! per packet.
+//! librespot decodes at 44.1 kHz, and the device rate is not negotiable: cpal
+//! opens WASAPI in shared mode only and does not set
+//! `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`, so `IsFormatSupported` accepts nothing
+//! but the rate Windows is configured for. On a machine set to 48 kHz — the
+//! common case — [`select_output_config`] cannot find 44.1 kHz to ask for, and
+//! every sample is resampled on the way out. Two separate defects came out of
+//! that: one in *how many* frames arrived, one in *what was in them*.
 //!
-//! This was measured on the reference rig itself, by instrumenting the graph
-//! with two counters — input frames handed to rodio, and output frames the
-//! device consumed — and differencing them between two interior marks (3 s and
-//! 23 s of audio) so start-up and drain effects cancel. The correct ratio is
-//! 48000/44100 = 1.0884354 output frames per input frame:
+//! ## Frame count
+//!
+//! rodio's mixer wraps its queue in one `UniformSourceIterator`, which rebuilds
+//! its `SampleRateConverter` at every *span* boundary, and each rebuild loses
+//! the converter's rational phase and treats the last input frame as a new
+//! endpoint. `SourcesQueueOutput` derives that span from the current source's
+//! `current_span_len` or `size_hint`, so appending every decoded packet as its
+//! own `SamplesBuffer` — what the stock backend does — makes every packet a
+//! span. Measured on the reference rig by instrumenting input frames handed to
+//! rodio against output frames the device consumed, differencing two interior
+//! marks (3 s and 23 s) so start-up and drain cancel, against the correct ratio
+//! 48000/44100 = 160/147:
 //!
 //! | samples per packet | ratio     | error    |
 //! |--------------------|-----------|----------|
@@ -50,33 +53,44 @@
 //! | 1628               | 1.0884514 | +0.0015% |
 //! | one long source    | 1.0884402 | +0.0004% |
 //!
-//! The error is a true, steady ratio error — the extra frames arrive at packet
-//! rate (~100-200/s), not in bursts — which is why re-aligning a recording
-//! anywhere never nulls and why playing it against the reference produces
-//! continuous phasing. It is not caused by any single mis-set rate: the stream
-//! opens at exactly 48 kHz, rodio's mixer is built from that same config, and
-//! 48000/44100 reduces to exactly 160/147. It is emergent from restarting the
-//! converter ~100-200 times a second.
+//! Spotify's Ogg Vorbis blocks arrive as 256-2048 interleaved samples per
+//! `write`, so the +0.223% (33.5 ms over 15 s) originally reported against the
+//! official client sits inside that range. [`LiveSource`] is the answer: one
+//! endless source, appended once, so decoder packets are not visible to rodio
+//! at all. What remained after that was a much smaller residue from rodio's own
+//! forced spans — about three frames in fifteen seconds.
 //!
-//! Spotify's Ogg Vorbis uses blocksizes 256/2048, so symphonia hands librespot
-//! 128-, 576-, or 1024-frame packets (256/1152/2048 samples) and `write` is
-//! called once per packet. The +0.223% (33.5 ms over 15 s) reported against
-//! the official client sits between the 368- and 912-sample rows, i.e. squarely
-//! inside that range. The exact figure depends on the short/long block mix of
-//! the material, which is why it is a range and not a single number.
+//! ## Sample values
 //!
-//! With one continuous source the ratio is 1.08844 and, importantly, no longer
-//! depends on packet size at all: 256-sample and 912-sample packets both
-//! measure +0.0004%.
+//! That residue is now zero, because rodio no longer resamples at all.
 //!
-//! The fix is to hand rodio a *single* long-lived source ([`LiveSource`]) fed
-//! through a bounded ring ([`SampleRing`]), so the converter keeps continuous
-//! state. Note that `current_span_len() == None` is not sufficient on its own:
-//! rodio's queue then falls back to `size_hint().0`, and the `Iterator`
-//! default of `0` makes it report its 512-sample `THRESHOLD` instead, which
-//! measures *worse* (+0.1294%) than per-packet appending. The span length is
-//! load-bearing, which is why [`LiveSource::size_hint`] reports
-//! [`RODIO_MAX_SPAN_SAMPLES`].
+//! `SampleRateConverter` is, in its own documentation's words, "simple linear
+//! interpolation for up-sampling": a straight line drawn between adjacent
+//! samples. It is a poor reconstruction of a band-limited signal, and its error
+//! grows with the square of frequency — invisible in the bass, severe in the
+//! treble. Measured against the analytically exact resampling of a tone (the
+//! same measurement the [`crate::resample`] tests make):
+//!
+//! | tone   | rodio linear | [`crate::resample`] |
+//! |--------|--------------|---------------------|
+//! | 100 Hz | -94.6 dB     | -133.5 dB           |
+//! | 1 kHz  | -54.6 dB     | -120.9 dB           |
+//! | 5 kHz  | -26.8 dB     | -118.8 dB           |
+//! | 10 kHz | -15.0 dB     | -115.8 dB           |
+//! | 15 kHz |  -8.5 dB     | -131.2 dB           |
+//!
+//! An error 15 dB below the music at 10 kHz is far louder than anything the
+//! 320 kbps bitrate choice is there to protect; it was the dominant artefact in
+//! the entire signal path. [`RodioSink::write`] therefore resamples to the
+//! device rate itself, through [`crate::resample`], before the samples reach the
+//! ring. [`LiveSource`] then reports the *device* rate, which sends both of
+//! rodio's converters down their `from == to` branches — exact pass-throughs
+//! that consume no priming frames. Nothing downstream touches the audio.
+//!
+//! This retires the frame-count problem by construction rather than by
+//! management: [`crate::resample`] tracks position as an exact rational, so the
+//! output frame count is determined for any input length and no longer depends
+//! on rodio's span behaviour.
 //!
 //! Ruled out while diagnosing this, recorded so it is not re-investigated:
 //! - *Queue underrun silence.* rodio's queue does splice in 512 samples of
@@ -115,7 +129,7 @@
 //! between `mem::replace(self, Invalid)` and the reassignment.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -126,12 +140,16 @@ use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
 
-/// The live rodio sink, registered by the player's sink factory so
-/// [`set_sink_volume`] can apply transport volume changes at the output
-/// mixer — instantly audible, including audio already queued in the sink.
-/// A weak handle: when the player drops its sink (stop/shutdown) the entry
-/// dies with it and volume changes become no-ops.
+use crate::resample::Resampler;
+
+/// The live rodio sink, registered on first playback so [`set_sink_volume`]
+/// can apply transport volume changes at the output mixer — instantly audible,
+/// including audio already queued in the sink. A weak handle: when the player
+/// drops its sink (stop/shutdown) the entry dies with it.
 static LIVE_SINK: Mutex<Weak<rodio::Sink>> = Mutex::new(Weak::new());
+/// Retained even before the rodio sink is connected, because auth restores the
+/// cached transport volume while the librespot sink is still logically Closed.
+static SINK_VOLUME: AtomicU16 = AtomicU16::new(u16::MAX);
 const LIVE_SINK_POISON_MSG: &str = "live rodio sink registry should not be poisoned";
 
 #[derive(Debug)]
@@ -194,25 +212,30 @@ impl From<cpal::SupportedStreamConfigsError> for RodioError {
 /// otherwise spin forever and wedge the player thread mid-track-change.
 const WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Decoded-audio write-ahead budget, in interleaved samples (~150 ms). This is
-/// the engine's *output* latency: every seek, volume change, and track switch
-/// waits for this much already-decoded audio to play out first, and the
-/// reported position leads the sound by the same amount. librespot's stock
-/// budget is ~0.5 s, which made pause/seek/volume/next feel half a second
-/// behind. Network stalls are covered separately by the audio-fetch read-ahead
-/// window (3 s), not by this ring, so keeping it small does not weaken stall
-/// protection.
-const WRITE_AHEAD_SAMPLES: usize =
-    SAMPLE_RATE as usize * NUM_CHANNELS as usize * 150 / 1000;
+/// Decoded-audio write-ahead budget, in milliseconds. This is the engine's
+/// *output* latency: every seek, volume change, and track switch waits for this
+/// much already-decoded audio to play out first, and the reported position
+/// leads the sound by the same amount. librespot's stock budget is ~0.5 s,
+/// which made pause/seek/volume/next feel half a second behind. Network stalls
+/// are covered separately by the audio-fetch read-ahead window (3 s), not by
+/// this ring, so keeping it small does not weaken stall protection.
+const WRITE_AHEAD_MS: usize = 150;
+
+/// [`WRITE_AHEAD_MS`] as interleaved samples at `rate`. The ring holds
+/// device-rate audio (the resampler runs before it), so the budget is derived
+/// from the rate that is actually queued rather than from librespot's.
+fn write_ahead_samples(rate: rodio::SampleRate) -> usize {
+    rate as usize * NUM_CHANNELS as usize * WRITE_AHEAD_MS / 1000
+}
 
 /// The largest span rodio will read before rebuilding its rate converter:
-/// `UniformSourceIterator::bootstrap` clamps the reported span with
-/// `.map(|x| x.min(32768))`. [`LiveSource`] reports this from `size_hint` so
-/// rodio always takes the longest span it is willing to take, which minimises
-/// converter rebuilds (see "Playback rate" above). Reporting less — including
-/// the `Iterator` default of `0`, which makes rodio's queue substitute its own
-/// 512-sample `THRESHOLD` — measurably increases drift.
-const RODIO_MAX_SPAN_SAMPLES: usize = 32_768;
+/// `UniformSourceIterator::bootstrap` clamps the queue's reported span with
+/// `.map(|x| x.min(32768))`. [`LiveSource`] reports it so rodio takes the
+/// longest span it is willing to take. It is only an efficiency knob now —
+/// with the source at the device rate, a rebuild neither drops nor
+/// interpolates a sample — but there is no reason to make rodio do the work
+/// more often than it must.
+const RODIO_SPAN_SAMPLES: usize = 32_768;
 
 /// rodio bootstraps the mixer's first span from an empty queue, whose
 /// `current` is a `rodio::source::Empty` claiming 1 channel at 48 kHz. That
@@ -236,6 +259,9 @@ const RODIO_BOOTSTRAP_SPAN_SAMPLES: usize = 512;
 /// (`Sink::append`'s `periodic_access` closure), so this adds no new class of
 /// contention.
 struct SampleRing {
+    /// Interleaved samples the ring will hold before [`SampleRing::push`]
+    /// blocks. See [`write_ahead_samples`].
+    capacity: usize,
     state: Mutex<RingState>,
     /// Signalled when the consumer frees space, and when [`SampleRing::clear`]
     /// empties the ring, so a blocked producer wakes promptly instead of
@@ -257,8 +283,9 @@ struct RingState {
 }
 
 impl SampleRing {
-    fn new() -> Arc<Self> {
+    fn new(capacity: usize) -> Arc<Self> {
         Arc::new(SampleRing {
+            capacity,
             state: Mutex::new(RingState {
                 packets: VecDeque::with_capacity(64),
                 queued_samples: 0,
@@ -289,7 +316,7 @@ impl SampleRing {
     fn push(&self, packet: Vec<f32>, timeout: Duration) -> Result<(), ()> {
         let deadline = Instant::now() + timeout;
         let mut state = self.lock();
-        while state.queued_samples >= WRITE_AHEAD_SAMPLES {
+        while state.queued_samples >= self.capacity {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(());
             };
@@ -331,8 +358,8 @@ impl SampleRing {
 /// The single `rodio::Source` the sink appends, for the lifetime of the sink.
 ///
 /// It never ends and never yields `None`: an empty ring produces silence, so
-/// rodio's queue is never asked for a next source and its converter keeps
-/// running with continuous state.
+/// rodio's queue never advances to another source. Decoder packet boundaries
+/// therefore cannot reset the converter; only rodio's configured spans remain.
 struct LiveSource {
     ring: Arc<SampleRing>,
     /// The generation this source is playing; a mismatch means `stop()` ran.
@@ -343,10 +370,13 @@ struct LiveSource {
     /// frames so an underrun (or the start-up priming) can never shift the
     /// channel interleave and swap left with right.
     silence_remaining: usize,
+    /// Rate of the audio in the ring, which [`RodioSink::write`] has already
+    /// resampled to the device's rate.
+    rate: rodio::SampleRate,
 }
 
 impl LiveSource {
-    fn new(ring: Arc<SampleRing>) -> Self {
+    fn new(ring: Arc<SampleRing>, rate: rodio::SampleRate) -> Self {
         let generation = ring.generation.load(Ordering::Acquire);
         LiveSource {
             ring,
@@ -354,6 +384,7 @@ impl LiveSource {
             packet: Vec::new(),
             pos: 0,
             silence_remaining: RODIO_BOOTSTRAP_SPAN_SAMPLES,
+            rate,
         }
     }
 }
@@ -399,11 +430,12 @@ impl Iterator for LiveSource {
         Some(sample)
     }
 
-    /// rodio's queue derives its span from this (see [`RODIO_MAX_SPAN_SAMPLES`]);
-    /// it is not an iterator-length promise, and nothing in the playback path
-    /// treats it as one.
+    /// rodio's queue derives its span from this (see [`RODIO_SPAN_SAMPLES`]).
+    /// The lower bound is valid because this iterator is endless; it is not an
+    /// iterator-length promise, and nothing in the playback path treats it as
+    /// one.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (RODIO_MAX_SPAN_SAMPLES, None)
+        (RODIO_SPAN_SAMPLES, None)
     }
 }
 
@@ -419,8 +451,11 @@ impl rodio::Source for LiveSource {
         NUM_CHANNELS as rodio::ChannelCount
     }
 
+    /// The device's rate, not librespot's: [`RodioSink::write`] has already
+    /// resampled. Reporting it is what makes rodio's `SampleRateConverter` and
+    /// `ChannelCountConverter` take their `from == to` pass-through branches.
     fn sample_rate(&self) -> rodio::SampleRate {
-        SAMPLE_RATE
+        self.rate
     }
 
     fn total_duration(&self) -> Option<Duration> {
@@ -428,9 +463,17 @@ impl rodio::Source for LiveSource {
     }
 }
 
+fn attach_live_source(sink: &rodio::Sink, ring: &Arc<SampleRing>, rate: rodio::SampleRate) {
+    sink.append(LiveSource::new(ring.clone(), rate));
+}
+
 pub struct RodioSink {
-    rodio_sink: Arc<rodio::Sink>,
+    rodio_sink: Option<Arc<rodio::Sink>>,
     ring: Arc<SampleRing>,
+    output_rate: rodio::SampleRate,
+    /// `None` when the device already runs at librespot's rate and the samples
+    /// need no conversion.
+    resampler: Option<Resampler>,
     _stream: rodio::OutputStream,
 }
 
@@ -452,6 +495,7 @@ fn volume_to_gain(volume: u16) -> f32 {
 /// change lands on the next audio callback (~10 ms) instead of after the
 /// write-ahead buffer plays out.
 pub fn set_sink_volume(volume: u16) {
+    SINK_VOLUME.store(volume, Ordering::Release);
     let sink = LIVE_SINK
         .lock()
         .expect(LIVE_SINK_POISON_MSG)
@@ -496,11 +540,12 @@ fn select_output_config(
         // 1. Native 44.1 kHz in the format librespot will feed: no rate
         //    conversion and no sample-format conversion.
         at_rate(native, true)
-            // 2. Native 44.1 kHz in some other format. Still no resampling,
-            //    which is what drives drift; cpal converts the sample type.
+            // 2. Native 44.1 kHz in some other format. Still no resampling;
+            //    cpal converts the sample type.
             .or_else(|| at_rate(native, false))
-            // 3. The device's own rate in the requested format. rodio resamples,
-            //    which the single continuous source keeps rate-accurate.
+            // 3. The device's own rate in the requested format. The sink
+            //    resamples (see `crate::resample`), which costs a little CPU
+            //    but nothing audible.
             .or_else(|| at_rate(device_rate, true))
             // 4. The device's own rate in any format.
             .or_else(|| at_rate(device_rate, false))
@@ -509,10 +554,10 @@ fn select_output_config(
     )
 }
 
-fn create_sink(
+fn create_stream(
     host: &cpal::Host,
     format: AudioFormat,
-) -> Result<(Arc<rodio::Sink>, rodio::OutputStream), RodioError> {
+) -> Result<rodio::OutputStream, RodioError> {
     let cpal_device = host
         .default_output_device()
         .ok_or(RodioError::NoDeviceAvailable)?;
@@ -545,8 +590,7 @@ fn create_sink(
     // Disable logging on stream drop.
     stream.log_on_drop(false);
 
-    let sink = Arc::new(rodio::Sink::connect_new(stream.mixer()));
-    Ok((sink, stream))
+    Ok(stream)
 }
 
 /// Opens the default output device through rodio with an immediate-stop sink.
@@ -556,26 +600,57 @@ pub fn open_default_sink(format: AudioFormat) -> Box<dyn Sink> {
 }
 
 pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
-    let (sink, stream) = create_sink(&host, format).expect("rodio sink could not open");
-    // The engine's transport volume changes reach this sink through the
-    // registry; the player owns the authoritative copy, this is a shadow.
-    *LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG) = Arc::downgrade(&sink);
+    let stream = create_stream(&host, format).expect("rodio stream could not open");
+    let output_rate = stream.config().sample_rate();
+    let resampler = Resampler::new(SAMPLE_RATE, output_rate, NUM_CHANNELS as u16);
 
-    // One source, appended once, for the lifetime of the sink: this is what
-    // keeps rodio's rate converter running with continuous state.
-    let ring = SampleRing::new();
-    sink.append(LiveSource::new(ring.clone()));
+    // The one fact that decides output fidelity, and the one that is otherwise
+    // invisible: which rate the device actually opened at, and therefore
+    // whether anything is being resampled at all.
+    eprintln!(
+        "audio output: {} Hz {:?}, decoder {} Hz, {}",
+        output_rate,
+        stream.config().sample_format(),
+        SAMPLE_RATE,
+        match &resampler {
+            Some(_) => "resampling",
+            None => "no resampling (device is at the decoder's rate)",
+        }
+    );
+
+    // Opening the cpal stream validates the device while failure is still
+    // recoverable by the sink factory, but do not connect rodio's keep-alive
+    // SourcesQueueOutput yet. librespot creates this sink in logical Closed
+    // state; connecting early makes the active output callback allocate
+    // 512-sample Zero sources and rebuild converters forever while idle. The
+    // cpal callback itself remains active because rodio does not expose its
+    // stream handle, but an empty mixer has no queue/source work to perform.
+    *LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG) = Weak::new();
 
     RodioSink {
-        rodio_sink: sink,
-        ring,
+        rodio_sink: None,
+        ring: SampleRing::new(write_ahead_samples(output_rate)),
+        output_rate,
+        resampler,
         _stream: stream,
     }
 }
 
 impl Sink for RodioSink {
     fn start(&mut self) -> SinkResult<()> {
-        self.rodio_sink.play();
+        if self.rodio_sink.is_none() {
+            let sink = Arc::new(rodio::Sink::connect_new(self._stream.mixer()));
+            sink.pause();
+            sink.set_volume(volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)));
+            attach_live_source(&sink, &self.ring, self.output_rate);
+            *LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG) = Arc::downgrade(&sink);
+            self.rodio_sink = Some(sink);
+        }
+
+        self.rodio_sink
+            .as_ref()
+            .expect("rodio sink was connected above")
+            .play();
         Ok(())
     }
 
@@ -595,7 +670,15 @@ impl Sink for RodioSink {
     /// ring is not consumed while stopped.
     fn stop(&mut self) -> SinkResult<()> {
         self.ring.clear();
-        self.rodio_sink.pause();
+        // The resampler holds most of a filter length of the audio that was
+        // playing. Without this, a seek or a track change would splice ~0.7 ms
+        // of the old position onto the front of the new one.
+        if let Some(resampler) = &mut self.resampler {
+            resampler.reset();
+        }
+        if let Some(sink) = &self.rodio_sink {
+            sink.pause();
+        }
         Ok(())
     }
 
@@ -614,18 +697,38 @@ impl Sink for RodioSink {
             )));
         }
 
-        // Backpressure: the ring holds about WRITE_AHEAD_SAMPLES (~150 ms),
-        // small enough that seek/volume/track changes land almost immediately,
-        // large enough to absorb decode jitter. The wait is bounded so a dead
-        // audio thread cannot wedge the player thread forever: after
+        // Resample to the device's rate here, on the player thread, rather than
+        // letting rodio do it with linear interpolation on the audio thread.
+        // See "Playback rate and fidelity" in the module docs. The ring
+        // therefore holds device-rate audio from this point on.
+        let queued = match &mut self.resampler {
+            Some(resampler) => {
+                // One allocation per packet, sized up-front by `process`. The
+                // decoder path already allocates one per packet in
+                // `f64_to_f32`, so this adds no new order of cost.
+                let mut resampled = Vec::new();
+                resampler.process(&samples_f32, &mut resampled);
+                // A packet shorter than the filter's look-ahead completes no
+                // output frames. Nothing to queue yet: those samples stay in
+                // the resampler and come out with the next packet.
+                if resampled.is_empty() {
+                    return Ok(());
+                }
+                resampled
+            }
+            None => samples_f32,
+        };
+
+        // Backpressure: the ring holds about WRITE_AHEAD_MS of audio, small
+        // enough that seek/volume/track changes land almost immediately, large
+        // enough to absorb decode jitter. The wait is bounded so a dead audio
+        // thread cannot wedge the player thread forever: after
         // WRITE_DRAIN_TIMEOUT the write fails with a normal sink error and
         // librespot pauses playback (its `handle_packet` error path), which
         // stops further writes and leaves the engine alive and recoverable.
-        self.ring
-            .push(samples_f32, WRITE_DRAIN_TIMEOUT)
-            .map_err(|()| {
-                SinkError::OnWrite("rodio sink stalled: audio output is not draining".to_owned())
-            })
+        self.ring.push(queued, WRITE_DRAIN_TIMEOUT).map_err(|()| {
+            SinkError::OnWrite("rodio sink stalled: audio output is not draining".to_owned())
+        })
     }
 }
 
@@ -633,6 +736,17 @@ impl Sink for RodioSink {
 mod tests {
     use super::*;
     use rodio::Source as _;
+
+    /// Every test here models the reference rig: a 48 kHz device, which is what
+    /// the ring is sized for once the resampler has run.
+    const OUT_RATE: rodio::SampleRate = 48_000;
+    const TEST_RING_CAPACITY: usize = OUT_RATE as usize * NUM_CHANNELS as usize
+        * WRITE_AHEAD_MS
+        / 1000;
+
+    fn test_ring() -> Arc<SampleRing> {
+        SampleRing::new(TEST_RING_CAPACITY)
+    }
 
     fn packet(samples: usize) -> Vec<f32> {
         vec![1.0; samples]
@@ -659,23 +773,28 @@ mod tests {
     /// changes land almost immediately (each waits for this much audio to
     /// play out first), while still absorbing decode jitter. The stock
     /// backend's ~0.5 s budget made every transport action feel delayed.
+    ///
+    /// It must also come out the same in wall-clock terms whatever rate the
+    /// device runs at, since the ring holds device-rate audio.
     #[test]
-    fn write_ahead_stays_in_latency_budget() {
-        let ms = WRITE_AHEAD_SAMPLES as f64 / f64::from(SAMPLE_RATE)
-            / f64::from(NUM_CHANNELS)
-            * 1000.0;
-        assert!(
-            (100.0..=200.0).contains(&ms),
-            "the write-ahead must keep transport latency near 150 ms, got {ms:.0} ms"
-        );
+    fn write_ahead_stays_in_latency_budget_at_every_device_rate() {
+        for rate in [SAMPLE_RATE, 48_000, 96_000, 192_000] {
+            let ms = write_ahead_samples(rate) as f64 / f64::from(rate)
+                / f64::from(NUM_CHANNELS)
+                * 1000.0;
+            assert!(
+                (100.0..=200.0).contains(&ms),
+                "at {rate} Hz the write-ahead is {ms:.0} ms, not near 150 ms"
+            );
+        }
     }
 
     /// A full ring must not block the player thread forever. This is the
     /// property that keeps a dead audio device recoverable.
     #[test]
     fn push_gives_up_when_the_ring_never_drains() {
-        let ring = SampleRing::new();
-        while ring.queued_samples() < WRITE_AHEAD_SAMPLES {
+        let ring = test_ring();
+        while ring.queued_samples() < TEST_RING_CAPACITY {
             ring.push(packet(512), Duration::from_millis(50))
                 .expect("space is available");
         }
@@ -694,8 +813,8 @@ mod tests {
     /// after the first ~150 ms.
     #[test]
     fn popping_frees_space_for_the_producer() {
-        let ring = SampleRing::new();
-        while ring.queued_samples() < WRITE_AHEAD_SAMPLES {
+        let ring = test_ring();
+        while ring.queued_samples() < TEST_RING_CAPACITY {
             ring.push(packet(512), Duration::from_millis(50)).unwrap();
         }
         let popped = ring.pop().expect("a packet is queued");
@@ -709,11 +828,11 @@ mod tests {
     /// packet of stale sound.
     #[test]
     fn clear_drops_queued_audio_and_the_packet_in_flight() {
-        let ring = SampleRing::new();
+        let ring = test_ring();
         ring.push(packet(8), Duration::from_millis(50)).unwrap();
         ring.push(packet(8), Duration::from_millis(50)).unwrap();
 
-        let mut source = LiveSource::new(ring.clone());
+        let mut source = LiveSource::new(ring.clone(), SAMPLE_RATE);
         // Consume the start-up priming silence and enter the first packet.
         for _ in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
             assert_eq!(source.next(), Some(0.0));
@@ -736,11 +855,11 @@ mod tests {
     /// left with right.
     #[test]
     fn underrun_silence_is_frame_aligned() {
-        let ring = SampleRing::new();
+        let ring = test_ring();
         // Two frames of audio, then nothing.
         ring.push(vec![1.0, 2.0, 3.0, 4.0], Duration::from_millis(50))
             .unwrap();
-        let mut source = LiveSource::new(ring.clone());
+        let mut source = LiveSource::new(ring.clone(), SAMPLE_RATE);
         for _ in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
             source.next();
         }
@@ -767,9 +886,9 @@ mod tests {
     /// instead of the first moments of the first track.
     #[test]
     fn source_primes_with_rodios_bootstrap_span_of_silence() {
-        let ring = SampleRing::new();
+        let ring = test_ring();
         ring.push(vec![1.0; 4], Duration::from_millis(50)).unwrap();
-        let mut source = LiveSource::new(ring);
+        let mut source = LiveSource::new(ring, SAMPLE_RATE);
         for i in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
             assert_eq!(source.next(), Some(0.0), "priming sample {i} must be silent");
         }
@@ -780,68 +899,93 @@ mod tests {
         );
     }
 
-    /// The source must describe itself to rodio exactly as an endless 44.1 kHz
-    /// stereo stream, and must report a span at rodio's cap. The span is the
-    /// load-bearing part: reporting less makes rodio rebuild its rate
-    /// converter more often, and every rebuild costs a fraction of a frame.
+    /// The source must describe itself to rodio as an endless stream *at the
+    /// device's rate*. That is the load-bearing claim of the whole arrangement:
+    /// it is what puts rodio's converters on their `from == to` pass-through
+    /// branches, so nothing downstream resamples or reinterleaves the audio.
     #[test]
-    fn source_reports_a_continuous_full_span_stream() {
-        let source = LiveSource::new(SampleRing::new());
-        assert_eq!(source.sample_rate(), SAMPLE_RATE);
+    fn source_reports_the_device_rate_so_rodio_passes_samples_through() {
+        let source = LiveSource::new(test_ring(), OUT_RATE);
+        assert_eq!(
+            source.sample_rate(),
+            OUT_RATE,
+            "reporting 44.1 kHz here would hand resampling back to rodio"
+        );
         assert_eq!(source.channels(), NUM_CHANNELS as rodio::ChannelCount);
         assert_eq!(source.current_span_len(), None, "the format never changes");
         assert_eq!(source.total_duration(), None, "the source never ends");
-        assert_eq!(
-            source.size_hint().0,
-            RODIO_MAX_SPAN_SAMPLES,
-            "rodio clamps spans to 32768; asking for less means more converter rebuilds"
-        );
+        assert_eq!(source.size_hint().0, RODIO_SPAN_SAMPLES);
     }
 
-    /// End-to-end rate accuracy through the real rodio graph.
+    /// End-to-end rate accuracy and transparency through the real rodio graph.
     ///
-    /// Builds the same `Sink` + `Mixer` pair `create_sink` builds (minus the
-    /// cpal device, which only supplies a clock) at the reference rig's 48 kHz,
-    /// feeds a known number of 44.1 kHz frames in realistically varying packet
-    /// sizes, and checks how many frames come out. This graph is a faithful
-    /// model of the device path: run against the real dongle it reproduced the
-    /// same figures to four decimals (256-sample packets measured +0.4882%
-    /// both offline and on hardware). Appending one `SamplesBuffer` per packet
-    /// drifts by +0.0015%..+0.4882% depending on packet size; one continuous
-    /// source must stay accurate regardless of it. See "Playback rate" in the
-    /// module docs.
+    /// Builds the same `Sink` + `Mixer` pair first playback connects to the
+    /// opened stream (minus the cpal device, which only supplies a clock) at
+    /// the reference rig's 48 kHz, pushes 44.1 kHz audio through the sink's own
+    /// resampler in realistically varying packet sizes, and checks what comes
+    /// out the far end. This graph is a faithful model of the device path: run
+    /// against the real dongle it reproduced the same figures to four decimals
+    /// (256-sample packets measured +0.4882% both offline and on hardware).
+    ///
+    /// Two claims, and the second is the one that retired the drift:
+    /// the frame count must be the exact rational conversion regardless of
+    /// packet boundaries, and rodio must hand back the sample values it was
+    /// given, bit for bit, because at a matching rate its converters are
+    /// pass-throughs. See "Playback rate and fidelity" in the module docs.
     #[test]
-    fn continuous_source_keeps_the_resampled_rate_accurate() {
-        const OUT_RATE: rodio::SampleRate = 48_000;
+    fn the_rodio_graph_is_transparent_at_the_device_rate() {
         const BLOCK_FRAMES: usize = 480;
-        const SECONDS: usize = 5;
+        const SECONDS: usize = 15;
 
         let (sink, queue) = rodio::Sink::new();
         let (mixer_in, mut mixer_out) =
             rodio::mixer::mixer(NUM_CHANNELS as rodio::ChannelCount, OUT_RATE);
         mixer_in.add(queue);
 
-        let ring = SampleRing::new();
-        sink.append(LiveSource::new(ring.clone()));
+        let ring = test_ring();
+        sink.append(LiveSource::new(ring.clone(), OUT_RATE));
+
+        let mut resampler =
+            Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16).expect("rates differ");
 
         // Packet sizes cycle through what symphonia hands librespot for
         // Spotify's Ogg Vorbis (blocksizes 256/2048 => 128/576/1024 frames).
         let sizes = [256usize, 2048, 1152, 2048, 256, 1024, 2048, 512];
         let total_samples = SECONDS * SAMPLE_RATE as usize * NUM_CHANNELS as usize;
 
+        // A ramp rather than a constant: a stuck or repeated sample is
+        // invisible against DC, and the mixer's own `from == to` path would
+        // hide a dropped frame too.
+        let mut phase = 0usize;
+        let mut source_sample = || {
+            phase += 1;
+            (phase % 1024) as f32 / 1024.0 - 0.5
+        };
+
         let mut fed_samples = 0usize;
         let mut next_size = 0usize;
         let mut frame = 0usize;
+        let mut queued_total = 0usize;
+        let mut rendered_values: Vec<f32> = Vec::new();
+        let mut expected_values: Vec<f32> = Vec::new();
         let (mut first, mut last) = (None, None);
         let mut silent_blocks = 0usize;
         let mut interior_silent_frames = 0usize;
 
         loop {
-            while fed_samples < total_samples && ring.queued_samples() < WRITE_AHEAD_SAMPLES {
+            while fed_samples < total_samples && ring.queued_samples() < TEST_RING_CAPACITY {
                 let n = sizes[next_size % sizes.len()].min(total_samples - fed_samples);
                 next_size += 1;
-                ring.push(packet(n), Duration::from_millis(50)).unwrap();
+                let input: Vec<f32> = (0..n).map(|_| source_sample()).collect();
+                let mut resampled = Vec::new();
+                resampler.process(&input, &mut resampled);
                 fed_samples += n;
+                if resampled.is_empty() {
+                    continue;
+                }
+                queued_total += resampled.len();
+                expected_values.extend_from_slice(&resampled);
+                ring.push(resampled, Duration::from_millis(50)).unwrap();
             }
             let mut block_had_audio = false;
             for _ in 0..BLOCK_FRAMES {
@@ -851,18 +995,19 @@ mod tests {
                     first.get_or_insert(frame);
                     last = Some(frame);
                     block_had_audio = true;
+                    rendered_values.push(left);
+                    rendered_values.push(right);
                 } else if first.is_some() {
                     interior_silent_frames += 1;
                 }
                 frame += 1;
             }
             // An empty ring is not an empty pipeline: the source still holds
-            // the packet it is playing and the converter holds interpolation
-            // state. The source never ends, so the only way to know the tail
-            // has been rendered is to keep pulling until the output goes and
-            // stays quiet. If the tail were genuinely dropped rather than
-            // merely un-pulled, no amount of extra pulling would recover it
-            // and the frame count below would come up short.
+            // the packet it is playing. The source never ends, so the only way
+            // to know the tail has been rendered is to keep pulling until the
+            // output goes and stays quiet. If the tail were genuinely dropped
+            // rather than merely un-pulled, no amount of extra pulling would
+            // recover it and the counts below would come up short.
             silent_blocks = if block_had_audio { 0 } else { silent_blocks + 1 };
             if fed_samples == total_samples && silent_blocks >= 4 {
                 break;
@@ -873,19 +1018,85 @@ mod tests {
 
         let rendered = last.expect("audio was rendered") - first.expect("audio was rendered") + 1;
         let fed_frames = total_samples / NUM_CHANNELS as usize;
-        let expected = fed_frames as f64 * f64::from(OUT_RATE) / f64::from(SAMPLE_RATE);
-        let error_pct = (rendered as f64 - expected) / expected * 100.0;
+        let ideal = fed_frames * OUT_RATE as usize / SAMPLE_RATE as usize;
 
         assert_eq!(
             interior_silent_frames, 0,
             "rodio's queue splices in silence when it runs dry; the write-ahead \
              budget must keep it fed"
         );
-        assert!(
-            error_pct.abs() < 0.01,
-            "resampled output drifted {error_pct:+.4}% ({rendered} frames, expected {expected:.1}); \
-             per-packet appending measured +0.05%..+0.49% here"
+        assert_eq!(
+            rendered * NUM_CHANNELS as usize,
+            queued_total,
+            "rodio must render every sample the sink queued and no others"
         );
+        assert_eq!(
+            rendered_values, expected_values,
+            "at a matching rate rodio must not alter a single sample value"
+        );
+        // The only permitted shortfall is the filter look-ahead still holding
+        // the last few input frames — a fixed handful, not a growing fraction.
+        let shortfall = ideal - rendered;
+        assert!(
+            shortfall <= 64,
+            "15 s produced {rendered} frames against an ideal {ideal}: the \
+             conversion must be exactly rational, not merely close"
+        );
+    }
+
+    /// The endless source must not be attached while librespot still considers
+    /// the sink Closed, and rodio's pause must stop polling it after the short
+    /// control-update period. Otherwise idle playback takes the ring mutex at
+    /// audio rate.
+    #[test]
+    fn live_source_is_idle_before_start_and_while_paused() {
+        const TWENTY_MS_SAMPLES: usize =
+            OUT_RATE as usize * NUM_CHANNELS as usize * 20 / 1000;
+
+        let (sink, queue) = rodio::Sink::new();
+        let (mixer_in, mut mixer_out) =
+            rodio::mixer::mixer(NUM_CHANNELS as rodio::ChannelCount, OUT_RATE);
+        mixer_in.add(queue);
+        sink.pause();
+
+        let ring = test_ring();
+        ring.push(packet(1024), Duration::from_millis(50)).unwrap();
+
+        for _ in 0..TWENTY_MS_SAMPLES {
+            mixer_out.next();
+        }
+        assert_eq!(
+            ring.queued_samples(),
+            1024,
+            "a Closed sink must not poll LiveSource before start"
+        );
+
+        attach_live_source(&sink, &ring, OUT_RATE);
+        sink.play();
+        for _ in 0..TWENTY_MS_SAMPLES * 4 {
+            mixer_out.next();
+        }
+        assert_eq!(ring.queued_samples(), 0, "start must attach and poll the source");
+
+        sink.pause();
+        for _ in 0..TWENTY_MS_SAMPLES {
+            mixer_out.next();
+        }
+        ring.push(packet(1024), Duration::from_millis(50)).unwrap();
+        for _ in 0..TWENTY_MS_SAMPLES * 4 {
+            mixer_out.next();
+        }
+        assert_eq!(
+            ring.queued_samples(),
+            1024,
+            "a paused sink must emit silence without polling LiveSource"
+        );
+
+        sink.play();
+        for _ in 0..TWENTY_MS_SAMPLES * 4 {
+            mixer_out.next();
+        }
+        assert_eq!(ring.queued_samples(), 0, "resume must poll the existing source");
     }
 
     /// The rodio gain curve must mirror librespot's default SoftMixer
