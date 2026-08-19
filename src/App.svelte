@@ -11,6 +11,7 @@
     goForward,
   } from "./lib/state.svelte.js";
   import IconSprite from "./components/IconSprite.svelte";
+  import Icon from "./components/Icon.svelte";
   import Sidebar from "./components/Sidebar.svelte";
   import PlayerBar from "./components/PlayerBar.svelte";
   import TopBar from "./components/TopBar.svelte";
@@ -98,7 +99,9 @@
       {#if playback.error}
         <div class="error-banner" role="alert">
           <span class="error-text">{playback.error}</span>
-          <button class="btn-icon" title="Dismiss" onclick={() => (playback.error = null)}>✕</button>
+          <button class="btn-icon" title="Dismiss" onclick={() => (playback.error = null)}>
+            <Icon name="x" size={14} />
+          </button>
         </div>
       {/if}
 
@@ -139,6 +142,7 @@
     font-size: var(--t-12);
   }
   .error-text {
+    min-width: 0; /* a long engine error must ellipsis, not widen the pane */
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

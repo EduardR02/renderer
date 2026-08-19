@@ -73,6 +73,14 @@
       >
         <Icon name={isLiked ? "heart-filled" : "heart"} size={16} />
       </button>
+    {:else}
+      <!-- Idle holds the same 48px slot, so the bar does not jump the moment
+           the first track lands. -->
+      <span class="art p-art" aria-hidden="true"></span>
+      <span class="p-meta">
+        <span class="p-title">Nothing playing</span>
+        <span class="p-artists">Pick something from your library</span>
+      </span>
     {/if}
   </div>
 
@@ -147,11 +155,3 @@
     />
   </div>
 </footer>
-
-<style>
-  .p-art-btn {
-    flex: none;
-    line-height: 0;
-    border-radius: var(--r1);
-  }
-</style>

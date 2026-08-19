@@ -9,6 +9,8 @@
     playFrom,
     showAlbum = true,
     showArt = true,
+    /** Off for short embedded lists (search), where column heads are noise. */
+    showHead = true,
     playlistId = null,
   } = $props();
 
@@ -76,15 +78,17 @@
 </script>
 
 <div class="tl" class:no-album={!showAlbum} class:album-page={!showArt}>
-  <div class="tl-head">
-    <span style="text-align:right">#</span>
-    {#if showArt}<span></span>{/if}
-    <span>Title</span>
-    {#if showAlbum}<span>Album</span>{/if}
-    <span></span>
-    <span style="display:grid;justify-items:end"><Icon name="clock" size={13} /></span>
-    <span></span>
-  </div>
+  {#if showHead}
+    <div class="tl-head">
+      <span style="text-align:right">#</span>
+      {#if showArt}<span></span>{/if}
+      <span>Title</span>
+      {#if showAlbum}<span>Album</span>{/if}
+      <span></span>
+      <span style="display:grid;justify-items:end"><Icon name="clock" size={13} /></span>
+      <span></span>
+    </div>
+  {/if}
 
   {#each tracks as track, i}
     <div

@@ -1,131 +1,106 @@
 <script>
-  import { playback, api } from "../lib/state.svelte.js";
+  import { playback, api, navigate, togglePlay } from "../lib/state.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
-  import { formatTime } from "../lib/time.js";
+  import { formatTime, formatTotal } from "../lib/time.js";
+
+  const queue = $derived(playback.queue);
 
   function playAt(i) {
-    api.playQueue(playback.queue, i).catch(() => {});
+    if (i === playback.current_index) togglePlay();
+    else api.playQueue(queue, i).catch(() => {});
   }
 </script>
 
-<section class="page">
-  <header class="page-head">
-    <h1>Queue</h1>
-    <p class="sub">
-      {playback.queue.length} song{playback.queue.length === 1 ? "" : "s"} in queue
-      {playback.current_index >= 0 ? ` · now playing #${playback.current_index + 1}` : ""}
-    </p>
-  </header>
+<section class="view page">
+  <div style="padding:var(--s4) 0 var(--s6)">
+    <span class="eyebrow">Up next</span>
+    <h1 class="page-title">Queue</h1>
+    {#if queue.length}
+      <p class="detail-meta" style="margin-top:var(--s3)">
+        <span class="num">{queue.length} {queue.length === 1 ? "song" : "songs"}</span>
+        <span class="sep">/</span><span class="num">{formatTotal(queue)}</span>
+        {#if playback.current_index >= 0}
+          <span class="sep">/</span><span class="num">now playing #{playback.current_index + 1}</span>
+        {/if}
+      </p>
+    {/if}
+  </div>
 
-  {#if playback.queue.length}
-    <div class="queue-list">
-      {#each playback.queue as track, i}
-        <div class="q-row" class:current={i === playback.current_index}>
-          <button class="q-play" title="Play from here" onclick={() => playAt(i)}>
-            {#if i === playback.current_index}
-              <Icon name={playback.playing ? "pause" : "play"} size={16} />
-            {:else}
-              <Icon name="play" size={16} />
-            {/if}
-          </button>
-          <Cover src={track.cover_url} alt={track.name} style="width:40px;height:40px" iconSize={16} rounded={4} />
-          <div class="q-meta">
-            <span class="q-name" class:current-name={i === playback.current_index}>{track.name}</span>
-            <span class="q-artists">{track.artist_names.join(", ")}</span>
-          </div>
-          <span class="q-time">{formatTime(track.duration_ms)}</span>
-          <div class="q-actions">
-            <button class="icon-btn" title="Move up" disabled={i === 0} onclick={() => api.moveQueue(i, i - 1).catch(() => {})}>
-              <Icon name="chevron-up" size={16} />
+  {#if queue.length}
+    <!-- Same row system as every other track table; only the trailing cell
+         differs, so a queue row and a playlist row line up exactly. -->
+    <div class="tl queue">
+      <div class="tl-head">
+        <span style="text-align:right">#</span>
+        <span></span>
+        <span>Title</span>
+        <span style="display:grid;justify-items:end"><Icon name="clock" size={13} /></span>
+        <span></span>
+      </div>
+
+      {#each queue as track, i (`${track.uri}-${i}`)}
+        <div
+          class="tl-row"
+          class:current={i === playback.current_index}
+          role="button"
+          tabindex="-1"
+          ondblclick={() => playAt(i)}
+        >
+          <span class="c-idx">
+            <span class="n">{i + 1}</span>
+            <span class="eq"><i></i><i></i><i></i><i></i></span>
+            <button class="go" title="Play from here" onclick={() => playAt(i)}>
+              <Icon name={i === playback.current_index && playback.playing ? "pause" : "play"} size={12} />
             </button>
-            <button class="icon-btn" title="Move down" disabled={i === playback.queue.length - 1} onclick={() => api.moveQueue(i, i + 1).catch(() => {})}>
-              <Icon name="chevron-down" size={16} />
+          </span>
+
+          <Cover
+            src={track.cover_url}
+            id={track.album_id || track.uri}
+            name={track.album_name || track.name}
+            size={36}
+            class="c-art"
+          />
+
+          <span class="c-title">
+            <span class="t-name">{track.name}</span>
+            <span class="t-artists">{track.artist_names.join(", ")}</span>
+          </span>
+
+          <span class="c-time">{formatTime(track.duration_ms)}</span>
+
+          <span class="q-actions">
+            <button
+              title="Move up"
+              disabled={i === 0}
+              onclick={() => api.moveQueue(i, i - 1).catch(() => {})}
+            >
+              <Icon name="chevron-up" size={15} />
             </button>
-            <button class="icon-btn" title="Remove from queue" onclick={() => api.removeQueue(i).catch(() => {})}>
-              <Icon name="x" size={16} />
+            <button
+              title="Move down"
+              disabled={i === queue.length - 1}
+              onclick={() => api.moveQueue(i, i + 1).catch(() => {})}
+            >
+              <Icon name="chevron-down" size={15} />
             </button>
-          </div>
+            <button class="danger" title="Remove from queue" onclick={() => api.removeQueue(i).catch(() => {})}>
+              <Icon name="x" size={14} />
+            </button>
+          </span>
         </div>
       {/each}
     </div>
   {:else}
     <div class="empty">
-      <Icon name="queue" size={40} />
-      <p>The queue is empty.</p>
-      <p class="sub">Play something or add a track to the queue.</p>
+      <p class="h">The queue is empty.</p>
+      <p class="sub">Play a playlist or add single tracks from any track menu.</p>
+      <div class="actions">
+        <button class="btn-ghost" onclick={() => navigate("library")}>
+          <Icon name="library" size={14} />Go to your library
+        </button>
+      </div>
     </div>
   {/if}
 </section>
-
-<style>
-  .queue-list {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .q-row {
-    display: grid;
-    grid-template-columns: 32px 40px minmax(0, 1fr) auto auto;
-    align-items: center;
-    gap: var(--space-3);
-    height: 56px;
-    padding: 0 var(--space-3);
-    border-radius: var(--radius-sm);
-    transition: background-color var(--transition-fast);
-  }
-  .q-row:hover {
-    background: var(--bg-highlight);
-  }
-  .q-play {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 32px;
-    height: 32px;
-    color: var(--text-secondary);
-    transition: color var(--transition-fast);
-  }
-  .q-play:hover {
-    color: var(--text-primary);
-  }
-  .q-row.current .q-play {
-    color: var(--accent);
-  }
-  .q-meta {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-    gap: 1px;
-  }
-  .q-name {
-    font-size: var(--font-md);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .q-name.current-name {
-    color: var(--accent);
-  }
-  .q-artists {
-    font-size: var(--font-xs);
-    color: var(--text-secondary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .q-time {
-    font-size: var(--font-sm);
-    color: var(--text-secondary);
-    font-variant-numeric: tabular-nums;
-  }
-  .q-actions {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-  }
-  .q-actions .icon-btn {
-    width: 28px;
-    height: 28px;
-  }
-</style>

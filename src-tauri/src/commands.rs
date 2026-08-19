@@ -9,8 +9,9 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app::{
-    AppState, PlaylistListCache, PlaylistTracksEntry, LIBRARY_LENGTH, data_dir, load_playlist_list,
-    now_secs, playlist_detail_from_cache, save_playlist_list, save_tracks_cache, upsert_playlist,
+    AppState, PlaylistListCache, PlaylistTracksEntry, LIBRARY_LENGTH, apply_cover_candidates,
+    carry_browse_fields, data_dir, load_playlist_list, now_secs, playlist_detail_from_cache,
+    playlists_missing_covers, save_playlist_list, save_tracks_cache, upsert_playlist,
     upsert_tracks_cache,
 };
 use crate::covers;
@@ -555,10 +556,11 @@ async fn fetch_library(
     app: &AppHandle,
 ) -> Result<Vec<Playlist>, String> {
     let references = client.browse_playlists(LIBRARY_LENGTH).await?;
-    let playlists: Vec<Playlist> = references.iter().map(Playlist::from).collect();
+    let mut playlists: Vec<Playlist> = references.iter().map(Playlist::from).collect();
     let fetched_at = now_secs();
     let (dir, me_id) = {
         let guard = state.lock();
+        carry_browse_fields(&guard.playlists, &mut playlists);
         (guard.data_dir.clone(), guard.me_id.clone())
     };
     save_playlist_list(
@@ -576,6 +578,9 @@ async fn fetch_library(
         guard.playlists_fetched_at = Some(fetched_at);
     }
     let _ = app.emit("library", &playlists);
+    // Fire-and-forget: the fresh library is already on screen, and the sweep
+    // only fills in artwork for the playlists that have none.
+    spawn_cover_sweep(app.clone());
     Ok(playlists)
 }
 
@@ -611,6 +616,146 @@ async fn fetch_playlist(
     save_tracks_cache(&dir, &tracks_cache);
     save_playlist_list(&dir, &list_cache);
     Ok(detail)
+}
+
+// ---------------------------------------------------------------------------
+// Cover candidate sweep
+// ---------------------------------------------------------------------------
+
+/// At most this many sweep browses are ever in flight.
+///
+/// Spotify rate-limits — that is why the library refresh backs off at all —
+/// and the sweep is the one place in this app that could fire a hundred
+/// browses back to back. Two at a time, spaced out, keeps it below what a user
+/// clicking through their own playlists already costs.
+const COVER_SWEEP_CONCURRENCY: usize = 2;
+// The batch loop pairs its browses with `join!`, so the width is fixed at
+// compile time: raising the constant alone would leave batches unhandled.
+const _: () = assert!(COVER_SWEEP_CONCURRENCY == 2);
+
+/// Pause between sweep batches.
+const COVER_SWEEP_BATCH_DELAY: Duration = Duration::from_millis(750);
+
+/// Head start given to whatever the user is doing before the sweep begins. The
+/// triggers cluster at startup — the engine's ready transition plus the
+/// frontend's own boot pull — which is exactly when the engine is busiest
+/// serving what the user is actually looking at.
+const COVER_SWEEP_START_DELAY: Duration = Duration::from_secs(5);
+
+/// One background cover-candidate sweep: browses the playlists that have no
+/// artwork of any kind so the sidebar and the home grid can paint the same
+/// mosaic the detail page does, instead of a monogram tile for the very same
+/// playlist. Coalesced like the library refresh, since its trigger — a
+/// successful refresh — fires on engine ready and on every playlist edit.
+fn spawn_cover_sweep(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let client = app.state::<Arc<EngineClient>>();
+        let state = app.state::<Mutex<AppState>>();
+        {
+            let mut guard = state.lock();
+            if guard.covers_sweeping {
+                guard.covers_sweep_queued = true;
+                return;
+            }
+            guard.covers_sweeping = true;
+        }
+        tokio::time::sleep(COVER_SWEEP_START_DELAY).await;
+        loop {
+            sweep_cover_candidates(&state, &client, &app).await;
+            let mut guard = state.lock();
+            if !std::mem::take(&mut guard.covers_sweep_queued) {
+                guard.covers_sweeping = false;
+                return;
+            }
+        }
+    });
+}
+
+/// Browses every playlist without artwork and fills in its cover candidates.
+///
+/// The library cache is saved and `library` re-emitted once, at the end: the
+/// payload is the whole library, and re-emitting it per playlist would put it
+/// back through IPC every few hundred milliseconds for as long as the sweep
+/// runs — the per-second churn this app exists to avoid.
+async fn sweep_cover_candidates(
+    state: &Mutex<AppState>,
+    client: &EngineClient,
+    app: &AppHandle,
+) {
+    let pending = {
+        let guard = state.lock();
+        playlists_missing_covers(&guard.playlists)
+    };
+    if pending.is_empty() {
+        return;
+    }
+    log::info(&format!(
+        "cover sweep: browsing {} playlists with no artwork",
+        pending.len()
+    ));
+
+    let mut updated = 0_usize;
+    for (index, batch) in pending.chunks(COVER_SWEEP_CONCURRENCY).enumerate() {
+        if index > 0 {
+            tokio::time::sleep(COVER_SWEEP_BATCH_DELAY).await;
+        }
+        // `join!` rather than spawned tasks: it bounds the browses in flight to
+        // the batch by construction, and the sweep stays one task.
+        let results = match batch {
+            [only] => vec![fetch_cover_candidates(state, client, only).await],
+            [first, second] => {
+                let (first, second) = tokio::join!(
+                    fetch_cover_candidates(state, client, first),
+                    fetch_cover_candidates(state, client, second),
+                );
+                vec![first, second]
+            }
+            _ => unreachable!("chunks() yields at most COVER_SWEEP_CONCURRENCY ids"),
+        };
+        for result in results {
+            match result {
+                Ok(true) => updated += 1,
+                // The playlist was deleted while its browse was in flight.
+                Ok(false) => {}
+                Err(error) => log::warn(&format!("cover sweep browse failed: {error}")),
+            }
+        }
+    }
+    if updated == 0 {
+        return;
+    }
+
+    let (dir, list_cache) = {
+        let guard = state.lock();
+        (
+            guard.data_dir.clone(),
+            PlaylistListCache {
+                version: 1,
+                fetched_at: guard.playlists_fetched_at,
+                me_id: guard.me_id.clone(),
+                playlists: guard.playlists.clone(),
+            },
+        )
+    };
+    save_playlist_list(&dir, &list_cache);
+    let _ = app.emit("library", &list_cache.playlists);
+    log::info(&format!("cover sweep: filled in {updated} playlists"));
+}
+
+/// Browses one playlist purely for its cover candidates.
+///
+/// Deliberately not [`fetch_playlist`]: that inserts into the 25-entry tracks
+/// cache, so sweeping a whole library would evict every playlist the user
+/// actually opened in favour of whatever the sweep touched last. Returns
+/// whether the library entry was updated.
+async fn fetch_cover_candidates(
+    state: &Mutex<AppState>,
+    client: &EngineClient,
+    id: &str,
+) -> Result<bool, String> {
+    let detail = PlaylistDetail::from(client.browse_playlist(id).await?);
+    let mut guard = state.lock();
+    Ok(apply_cover_candidates(&mut guard.playlists, &detail.playlist))
 }
 
 #[cfg(test)]

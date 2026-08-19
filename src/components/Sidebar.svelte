@@ -76,7 +76,7 @@
           class:playing={playingId === pl.id}
           onclick={() => navigate("playlist", pl.id)}
         >
-          <Cover src={pl.cover_url} id={pl.id} name={pl.name} size={32} />
+          <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} size={32} />
           <span class="lib-name">{pl.name}</span>
           {#if pl.tracks_total}<span class="lib-count">{pl.tracks_total}</span>{/if}
         </button>

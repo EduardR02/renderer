@@ -4,7 +4,15 @@
   paths per instance would multiply DOM nodes across a virtualized list
   of hundreds of rows, each carrying three or four icons.
 -->
-<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+
+<!-- Taken out of flow AND zero-sized AND overflow-clipped: the sprite host
+     itself can never contribute a pixel of layout, whatever it contains. -->
+<svg
+  width="0"
+  height="0"
+  style="position:absolute;left:0;top:0;width:0;height:0;overflow:hidden"
+  aria-hidden="true"
+><defs>
 <symbol id="i-home" viewBox="0 0 24 24"><path fill="currentColor" d="M12 3.4 4.2 9.3c-.3.2-.5.6-.5 1V19c0 .5.4.9.9.9h4.3v-4.8a3.1 3.1 0 0 1 6.2 0v4.8h4.3c.5 0 .9-.4.9-.9v-8.7c0-.4-.2-.8-.5-1L12 3.4Z"/></symbol>
 <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="10.6" cy="10.6" r="6.4"/><path d="m15.6 15.6 5 5"/></symbol>
 <symbol id="i-queue" viewBox="0 0 24 24" fill="currentColor"><rect x="3.4" y="6.2" width="11" height="1.9" rx=".9"/><rect x="3.4" y="11.1" width="8" height="1.9" rx=".9"/><rect x="3.4" y="16" width="5" height="1.9" rx=".9"/><path d="M16.8 9.3v5.4c0 .6.6 1 1.2.7l4.7-2.7a.8.8 0 0 0 0-1.4L18 8.6c-.6-.3-1.2.1-1.2.7Z"/></symbol>

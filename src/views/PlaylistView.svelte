@@ -20,7 +20,8 @@
     return h % 360;
   });
 
-  /* Cover candidates for the 2x2 mosaic when the playlist has no art. */
+  /* Fallback for a playlist the backend has not swept yet: derive the mosaic
+     candidates from the tracks we already have on screen. */
   const artPool = $derived([...new Set(tracks.map((t) => t.cover_url).filter(Boolean))].slice(0, 4));
 
   let renaming = $state(false);
@@ -72,7 +73,7 @@
     <header class="detail-head">
       <Cover
         src={pl.cover_url}
-        srcs={artPool}
+        srcs={pl.cover_urls?.length ? pl.cover_urls : artPool}
         id={pl.id}
         name={pl.name}
         size={184}

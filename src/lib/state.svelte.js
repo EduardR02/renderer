@@ -175,6 +175,9 @@ export function toggleLiked(uri) {
 const coverCache = new Map(); // remote url -> cover:// url
 const coverPending = new Map(); // remote url -> Promise<string|null>
 
+/** Reactive counters for Settings; the Maps above are not observable. */
+export const stats = $state({ coversResolved: 0 });
+
 /**
  * Turns the engine's `cover://<sha1>` into a URL the webview will actually
  * fetch. A bare custom scheme is not one of them: Tauri exposes custom
@@ -199,7 +202,10 @@ export async function resolveCoverUrl(url) {
   const p = invoke("get_cover", { url })
     .then((u) => {
       const local = toLocalUrl(u);
-      if (local) coverCache.set(url, local);
+      if (local) {
+        coverCache.set(url, local);
+        stats.coversResolved = coverCache.size;
+      }
       return local;
     })
     .catch(() => null)

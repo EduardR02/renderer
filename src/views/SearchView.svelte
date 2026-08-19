@@ -1,167 +1,222 @@
 <script>
-  import { search, ui, api, navigate } from "../lib/state.svelte.js";
+  import { untrack } from "svelte";
+  import { search, api, navigate, focusSearch } from "../lib/state.svelte.js";
+  import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
-  import TrackList from "../components/TrackList.svelte";
 
-  let inputEl = $state(null);
+  /* The query field lives in the topbar; this view only renders results. */
 
-  $effect(() => {
-    if (ui.searchFocusTick > 0) inputEl?.focus();
+  const SKELETON_ROWS = Array.from({ length: 6 });
+
+  const tracks = $derived(search.results?.tracks ?? []);
+  const albums = $derived(search.results?.albums ?? []);
+  const artists = $derived(search.results?.artists ?? []);
+  const empty = $derived(!tracks.length && !albums.length && !artists.length);
+
+  /* Top result: an artist beats an album beats a song. Whatever the query
+     names exactly is almost always one of those, in that order. */
+  const top = $derived.by(() => {
+    /* `sub` is the credit line, empty for an artist — the kind already says it */
+    if (artists[0]) return { kind: "Artist", ...artists[0], sub: "" };
+    if (albums[0]) return { kind: "Album", ...albums[0], sub: albums[0].artist_names.join(", ") };
+    if (tracks[0]) return { kind: "Song", ...tracks[0], sub: tracks[0].artist_names.join(", ") };
+    return null;
   });
 
-  function submit(e) {
-    e.preventDefault();
-    const q = search.query.trim();
-    if (!q) return;
-    search.submitted = true;
-    search.results = null;
-    api.search(q, 40).catch(() => {});
+  function openTop() {
+    if (!top) return;
+    if (top.kind === "Artist") navigate("artist", top.id);
+    else if (top.kind === "Album") navigate("album", top.id);
+    else api.playQueue(tracks, 0).catch(() => {});
   }
 
   function playTrack(i) {
-    if (search.results?.tracks?.length) {
-      api.playQueue(search.results.tracks, i).catch(() => {});
+    if (tracks.length) api.playQueue(tracks, i).catch(() => {});
+  }
+
+  /* ---- Recent searches ------------------------------------------------
+     Eight, newest first, in localStorage. Reading is wrapped because a
+     webview with storage disabled throws on access rather than returning
+     null, and a search page must not fail to render over a history list. */
+  const RECENTS_KEY = "sr.recent-searches";
+  const RECENTS_MAX = 8;
+
+  function readRecents() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(RECENTS_KEY) ?? "[]");
+      if (!Array.isArray(raw)) return [];
+      return raw.filter((s) => typeof s === "string" && s.trim()).slice(0, RECENTS_MAX);
+    } catch {
+      return [];
     }
   }
+
+  let recents = $state(readRecents());
+
+  function writeRecents(next) {
+    recents = next.slice(0, RECENTS_MAX);
+    try {
+      localStorage.setItem(RECENTS_KEY, JSON.stringify(recents));
+    } catch {
+      /* private mode / storage disabled: the list is simply not persisted */
+    }
+  }
+
+  function remember(q) {
+    writeRecents([q, ...recents.filter((r) => r.toLowerCase() !== q.toLowerCase())]);
+  }
+
+  function forget(q) {
+    writeRecents(recents.filter((r) => r !== q));
+  }
+
+  function rerun(q) {
+    search.query = q;
+    search.submitted = true;
+    search.results = null;
+    remember(q);
+    api.search(q, 40).catch(() => {});
+  }
+
+  /* Record only queries that actually came back. `search.results` is the sole
+     tracked read: everything else runs untracked, because `remember` both
+     reads and writes `recents` and tracking that would make this effect
+     re-trigger itself forever. */
+  $effect(() => {
+    if (!search.results) return;
+    untrack(() => {
+      const q = search.query.trim();
+      if (q) remember(q);
+    });
+  });
 </script>
 
-<section class="page search-page">
-  <form class="search-form" onsubmit={submit}>
-    <span class="search-icon"><Icon name="search" size={22} /></span>
-    <input
-      bind:this={inputEl}
-      placeholder="What do you want to listen to?"
-      value={search.query}
-      oninput={(e) => (search.query = e.currentTarget.value)}
-    />
-    {#if search.query}
-      <button class="clear-btn" type="button" title="Clear" onclick={() => { search.query = ""; search.results = null; search.submitted = false; }}>
-        <Icon name="x" size={16} />
-      </button>
-    {/if}
-  </form>
+<section class="view page">
+  <div style="padding:var(--s4) 0 var(--s6)">
+    <span class="eyebrow">Search</span>
+    <h1 class="page-title">
+      {search.submitted && search.query ? `Results for “${search.query}”` : "Find something to play"}
+    </h1>
+  </div>
 
   {#if !search.submitted}
-    <div class="empty">
-      <Icon name="search" size={40} />
-      <p>Search for songs, albums or artists.</p>
-    </div>
+    {#if recents.length}
+      <div class="section" style="margin-top:0">
+        <div class="section-head">
+          <h2 class="section-title">Recent searches</h2>
+          <button class="link-more" onclick={() => writeRecents([])}>Clear all</button>
+        </div>
+        <div class="chips">
+          {#each recents as q (q)}
+            <span class="chip">
+              <button class="label" onclick={() => rerun(q)}>{q}</button>
+              <button class="x" title="Remove" onclick={() => forget(q)}>
+                <Icon name="x" size={11} />
+              </button>
+            </span>
+          {/each}
+        </div>
+      </div>
+    {:else}
+      <div class="empty">
+        <p class="h">Nothing searched yet.</p>
+        <p class="sub">Songs, albums and artists all come back from one query.</p>
+        <div class="actions">
+          <button class="btn-ghost" onclick={focusSearch}>
+            <Icon name="search" size={14} />Search
+          </button>
+        </div>
+      </div>
+    {/if}
   {:else if !search.results}
-    <div class="empty">
-      <p>Searching…</p>
+    <!-- Static skeleton rows: a shimmer would animate for as long as the
+         request takes and cost frames the whole time. -->
+    <div class="tl no-album">
+      {#each SKELETON_ROWS as _, i (i)}
+        <div class="sk-row">
+          <span class="sk" style="width:12px"></span>
+          <span class="sk art"></span>
+          <span class="sk a"></span>
+          <span></span>
+          <span class="sk b"></span>
+          <span></span>
+        </div>
+      {/each}
     </div>
-  {:else if !search.results.tracks.length && !search.results.albums.length && !search.results.artists.length}
+  {:else if empty}
     <div class="empty">
-      <Icon name="search" size={40} />
-      <p>No results for “{search.query}”.</p>
+      <p class="h">No results for “{search.query}”.</p>
+      <p class="sub">Check the spelling, or try a shorter query.</p>
+      <div class="actions">
+        <button class="btn-ghost" onclick={focusSearch}>
+          <Icon name="search" size={14} />Try another search
+        </button>
+      </div>
     </div>
   {:else}
-    {#if search.results.tracks.length}
-      <section class="block">
-        <h2 class="block-title">Songs</h2>
-        <TrackList tracks={search.results.tracks} playFrom={playTrack} />
-      </section>
-    {/if}
+    <div class="search-split">
+      {#if top}
+        <div>
+          <div class="section-head"><h2 class="section-title">Top result</h2></div>
+          <button class="top-result" onclick={openTop}>
+            <Cover
+              src={top.cover_url}
+              id={top.id}
+              name={top.name}
+              size={92}
+              lg
+              circle={top.kind === "Artist"}
+            />
+            <span style="min-width:0">
+              <span class="tr-name">{top.name}</span>
+              <span class="tr-sub">{top.sub ? `${top.kind} / ${top.sub}` : top.kind}</span>
+            </span>
+          </button>
+        </div>
+      {/if}
 
-    {#if search.results.albums.length}
-      <section class="block">
-        <h2 class="block-title">Albums</h2>
-        <div class="card-grid">
-          {#each search.results.albums as al (al.id)}
+      {#if tracks.length}
+        <div>
+          <div class="section-head"><h2 class="section-title">Songs</h2></div>
+          <TrackList tracks={tracks.slice(0, 5)} playFrom={playTrack} showAlbum={false} showHead={false} />
+        </div>
+      {/if}
+    </div>
+
+    {#if albums.length}
+      <div class="section">
+        <div class="section-head"><h2 class="section-title">Albums</h2></div>
+        <div class="grid">
+          {#each albums as al (al.id)}
             <button class="card" onclick={() => navigate("album", al.id)}>
-              <div class="card-cover">
-                <Cover src={al.cover_url} alt={al.name} rounded={4} />
-                <span class="card-play"><Icon name="play" size={20} /></span>
-              </div>
+              <span class="card-art">
+                <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />
+                <span class="card-play"><Icon name="play" size={15} /></span>
+              </span>
               <span class="card-name">{al.name}</span>
               <span class="card-sub">{al.artist_names.join(", ")}</span>
             </button>
           {/each}
         </div>
-      </section>
+      </div>
     {/if}
 
-    {#if search.results.artists.length}
-      <section class="block">
-        <h2 class="block-title">Artists</h2>
-        <div class="artist-grid">
-          {#each search.results.artists as ar (ar.id)}
-            <button class="card artist-card" onclick={() => navigate("artist", ar.id)}>
-              <div class="card-cover artist-cover">
-                <Cover src={ar.cover_url} alt={ar.name} circle rounded={0} iconSize={32} />
-              </div>
+    {#if artists.length}
+      <div class="section">
+        <div class="section-head"><h2 class="section-title">Artists</h2></div>
+        <div class="grid">
+          {#each artists as ar (ar.id)}
+            <button class="card" onclick={() => navigate("artist", ar.id)}>
+              <span class="card-art">
+                <Cover src={ar.cover_url} id={ar.id} name={ar.name} fill circle />
+              </span>
               <span class="card-name">{ar.name}</span>
               <span class="card-sub">Artist</span>
             </button>
           {/each}
         </div>
-      </section>
+      </div>
     {/if}
   {/if}
 </section>
-
-<style>
-  .search-page {
-    padding-top: var(--space-6);
-  }
-  .search-form {
-    position: relative;
-    display: flex;
-    align-items: center;
-    height: 48px;
-    margin-bottom: var(--space-6);
-    border-radius: var(--radius-full);
-    background: var(--bg-input);
-  }
-  .search-form:focus-within {
-    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.25);
-  }
-  .search-icon {
-    position: absolute;
-    left: var(--space-4);
-    display: flex;
-    color: var(--text-secondary);
-    pointer-events: none;
-  }
-  .search-form input {
-    flex: 1;
-    height: 100%;
-    padding: 0 48px 0 52px;
-    border: none;
-    background: transparent;
-    font-size: var(--font-md);
-    outline: none;
-  }
-  .clear-btn {
-    position: absolute;
-    right: var(--space-2);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 32px;
-    height: 32px;
-    border-radius: var(--radius-full);
-    color: var(--text-secondary);
-  }
-  .clear-btn:hover {
-    color: var(--text-primary);
-  }
-  .block {
-    margin-bottom: var(--space-7);
-  }
-  .block-title {
-    font-size: var(--font-xl);
-    font-weight: 700;
-    letter-spacing: -0.3px;
-    margin-bottom: var(--space-4);
-  }
-  .artist-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: var(--space-5);
-  }
-  .artist-cover {
-    aspect-ratio: 1 / 1;
-  }
-</style>

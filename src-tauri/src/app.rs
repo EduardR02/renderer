@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{PlaybackState, Playlist, PlaylistDetail, Track};
+use crate::types::{cover_urls_from_tracks, PlaybackState, Playlist, PlaylistDetail, Track};
 
 /// Number of playlists requested from the engine's rootlist browse.
 pub const LIBRARY_LENGTH: usize = 100;
@@ -39,6 +39,13 @@ pub struct AppState {
     /// more instead of the trigger being dropped.
     #[serde(skip)]
     pub library_refresh_queued: bool,
+    /// True while the background cover-candidate sweep is running.
+    #[serde(skip)]
+    pub covers_sweeping: bool,
+    /// Same coalescing as `library_refresh_queued`: a sweep snapshots its
+    /// worklist up front, so a trigger arriving mid-sweep re-runs it once.
+    #[serde(skip)]
+    pub covers_sweep_queued: bool,
 }
 
 impl AppState {
@@ -52,6 +59,8 @@ impl AppState {
             data_dir,
             library_fetching: false,
             library_refresh_queued: false,
+            covers_sweeping: false,
+            covers_sweep_queued: false,
         }
     }
 }
@@ -176,6 +185,10 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: &PlaylistTracksEntry)
     });
     playlist.tracks_total = entry.tracks.len() as u32;
     playlist.snapshot_id = entry.revision.clone();
+    // These tracks are what the detail page renders, so its candidates come
+    // from them rather than from whatever revision the library entry was last
+    // browsed at — candidates and revision always travel together.
+    playlist.cover_urls = cover_urls_from_tracks(&entry.tracks);
     PlaylistDetail {
         playlist,
         tracks: entry.tracks.clone(),
@@ -189,6 +202,59 @@ pub fn upsert_playlist(playlists: &mut Vec<Playlist>, playlist: Playlist) {
     } else {
         playlists.push(playlist);
     }
+}
+
+/// Copies the fields only a browse can produce — the revision and the derived
+/// cover candidates — from the previous library snapshot onto a freshly
+/// fetched one.
+///
+/// The rootlist carries neither, so a plain replacement would blank both on
+/// every library refresh. For the candidates that is not merely cosmetic: the
+/// cover sweep keys off "no candidates yet", so a wipe would re-browse the
+/// whole library after every refresh — and refreshes fire on engine ready and
+/// on every playlist edit — walking straight into Spotify's rate limiter.
+pub fn carry_browse_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
+    for playlist in fresh.iter_mut() {
+        if let Some(old) = previous.iter().find(|entry| entry.id == playlist.id) {
+            playlist.cover_urls = old.cover_urls.clone();
+            playlist.snapshot_id = old.snapshot_id.clone();
+        }
+    }
+}
+
+/// Ids of the playlists with no artwork of any kind: Spotify returned no
+/// custom cover and no browse has derived candidates yet. This is the sweep's
+/// worklist.
+pub fn playlists_missing_covers(playlists: &[Playlist]) -> Vec<String> {
+    playlists
+        .iter()
+        .filter(|playlist| playlist.cover_url.is_empty() && playlist.cover_urls.is_empty())
+        .map(|playlist| playlist.id.clone())
+        .collect()
+}
+
+/// Writes a browse's cover candidates onto the matching library entry.
+///
+/// Candidates and `snapshot_id` are replaced as a pair, never independently:
+/// candidates are taken from the first tracks of one browse, and a revision
+/// bump can replace exactly those tracks, so a stored pair whose revision no
+/// longer matches is stale by construction.
+///
+/// Returns false when the playlist is gone — deleted while the sweep that
+/// browsed it was in flight.
+pub fn apply_cover_candidates(playlists: &mut [Playlist], browsed: &Playlist) -> bool {
+    let Some(entry) = playlists.iter_mut().find(|entry| entry.id == browsed.id) else {
+        return false;
+    };
+    entry.cover_urls = browsed.cover_urls.clone();
+    entry.snapshot_id = browsed.snapshot_id.clone();
+    // A real cover outranks any mosaic, and the browse sees custom artwork the
+    // rootlist omits — but an empty one there means "not reported", not
+    // "removed", so it must not clobber what the rootlist did give us.
+    if !browsed.cover_url.is_empty() {
+        entry.cover_url = browsed.cover_url.clone();
+    }
+    true
 }
 
 pub fn now_secs() -> i64 {
@@ -228,6 +294,21 @@ mod tests {
             id: id.to_owned(),
             uri: format!("spotify:track:{id}"),
             ..Track::default()
+        }
+    }
+
+    fn track_with_cover(id: &str, cover_url: &str) -> Track {
+        Track {
+            cover_url: cover_url.to_owned(),
+            ..track(id)
+        }
+    }
+
+    fn playlist(id: &str) -> Playlist {
+        Playlist {
+            id: id.to_owned(),
+            uri: format!("spotify:playlist:{id}"),
+            ..Playlist::default()
         }
     }
 
@@ -287,6 +368,108 @@ mod tests {
         assert_eq!(detail.playlist.snapshot_id, "rev");
         assert_eq!(detail.playlist.tracks_total, 1);
         assert_eq!(detail.tracks[0].id, "t");
+    }
+
+    #[test]
+    fn detail_from_cache_derives_candidates_from_the_cached_tracks() {
+        let state = AppState::new(PathBuf::from("unused"));
+        let entry = PlaylistTracksEntry {
+            id: "p1".into(),
+            fetched_at: Some(1),
+            revision: "rev".into(),
+            tracks: vec![
+                track_with_cover("a", "cover-a"),
+                track_with_cover("b", "cover-a"),
+                track_with_cover("c", "cover-b"),
+            ],
+        };
+        let detail = playlist_detail_from_cache(&state, &entry);
+        assert_eq!(detail.playlist.cover_urls, vec!["cover-a", "cover-b"]);
+    }
+
+    #[test]
+    fn a_library_refresh_carries_the_browse_derived_fields_forward() {
+        // The rootlist supplies neither, and losing the candidates would put
+        // the whole library back into the sweep's worklist.
+        let previous = vec![Playlist {
+            cover_urls: vec!["cover-a".into(), "cover-b".into()],
+            snapshot_id: "rev-a".into(),
+            ..playlist("p1")
+        }];
+        let mut fresh = vec![playlist("p1"), playlist("p2")];
+        carry_browse_fields(&previous, &mut fresh);
+        assert_eq!(fresh[0].cover_urls, vec!["cover-a", "cover-b"]);
+        assert_eq!(fresh[0].snapshot_id, "rev-a");
+        // A playlist the previous snapshot never had stays empty, so the sweep
+        // picks it up.
+        assert!(fresh[1].cover_urls.is_empty());
+    }
+
+    #[test]
+    fn a_browse_at_a_new_revision_replaces_the_stored_candidates() {
+        let mut playlists = vec![Playlist {
+            cover_urls: vec!["cover-a".into(), "cover-b".into()],
+            snapshot_id: "rev-a".into(),
+            ..playlist("p1")
+        }];
+        let browsed = Playlist {
+            cover_urls: vec!["cover-c".into()],
+            snapshot_id: "rev-b".into(),
+            ..playlist("p1")
+        };
+        assert!(apply_cover_candidates(&mut playlists, &browsed));
+        assert_eq!(playlists[0].cover_urls, vec!["cover-c"]);
+        assert_eq!(playlists[0].snapshot_id, "rev-b");
+        // The browse reported no custom cover; that is "not reported", so what
+        // the rootlist gave us stands.
+        assert!(playlists[0].cover_url.is_empty());
+    }
+
+    #[test]
+    fn candidates_for_a_playlist_deleted_mid_sweep_are_dropped() {
+        let mut playlists = vec![playlist("p1")];
+        let browsed = Playlist {
+            cover_urls: vec!["cover-a".into()],
+            ..playlist("gone")
+        };
+        assert!(!apply_cover_candidates(&mut playlists, &browsed));
+        assert_eq!(playlists.len(), 1);
+        assert!(playlists[0].cover_urls.is_empty());
+    }
+
+    #[test]
+    fn the_sweep_worklist_is_the_playlists_with_no_artwork_at_all() {
+        let playlists = vec![
+            playlist("bare"),
+            Playlist {
+                cover_url: "https://i.scdn.co/image/abc".into(),
+                ..playlist("has-cover")
+            },
+            Playlist {
+                cover_urls: vec!["cover-a".into()],
+                ..playlist("has-candidates")
+            },
+        ];
+        assert_eq!(playlists_missing_covers(&playlists), vec!["bare"]);
+    }
+
+    #[test]
+    fn a_library_cache_written_before_cover_urls_existed_still_loads() {
+        let dir = std::env::temp_dir().join(format!("spotify-renderer-old-cache-{}", now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("playlist_list.json"),
+            r#"{"version":1,"fetched_at":42,"me_id":"me","playlists":[
+                {"id":"p1","uri":"spotify:playlist:p1","name":"Mixtape","owner":"me",
+                 "owner_id":"me","cover_url":"","collaborative":false,"tracks_total":7,
+                 "snapshot_id":"rev-a"}]}"#,
+        )
+        .unwrap();
+        let cache = load_playlist_list(&dir).expect("an old cache file must still deserialize");
+        assert_eq!(cache.playlists.len(), 1);
+        assert_eq!(cache.playlists[0].snapshot_id, "rev-a");
+        assert!(cache.playlists[0].cover_urls.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

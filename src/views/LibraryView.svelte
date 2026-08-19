@@ -24,7 +24,7 @@
         {#each library as pl (pl.id)}
           <button class="card" onclick={() => navigate("playlist", pl.id)}>
             <span class="card-art">
-              <Cover src={pl.cover_url} id={pl.id} name={pl.name} fill lg />
+              <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} fill lg />
               <span class="card-play"><Icon name="play" size={15} /></span>
             </span>
             <span class="card-name">{pl.name}</span>

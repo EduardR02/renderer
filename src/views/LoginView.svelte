@@ -1,77 +1,36 @@
 <script>
-  import { playback, openAuthUrl, navigate } from "../lib/state.svelte.js";
+  import { playback, session, openAuthUrl, navigate } from "../lib/state.svelte.js";
   import Icon from "../components/Icon.svelte";
 </script>
 
-<div class="login">
-  <div class="login-card">
-    <span class="login-logo"><Icon name="note" size={36} /></span>
-    <h1>Spotify Renderer</h1>
-    <p class="sub">Log in with your Spotify account to listen to your music.</p>
-    <button class="btn-accent" disabled={!playback.auth_url} onclick={openAuthUrl}>
-      <Icon name="login" size={17} />
-      Log in with Spotify
-    </button>
-    {#if !playback.auth_url}
-      <p class="sub muted">Waiting for a login URL from the core…</p>
-    {/if}
-    <button class="link" onclick={() => navigate("settings")}>More options</button>
+<!-- Left-aligned under the header with one action, like every other empty
+     state. A card centred in the viewport would read as a modal the rest of
+     the app never uses. -->
+<section class="view page">
+  <div style="padding:var(--s7) 0 var(--s2)">
+    <span class="login-mark"><Icon name="note" size={20} /></span>
+    <span class="eyebrow">Spotify Renderer</span>
+    <h1 class="page-title">Sign in to start listening</h1>
   </div>
-</div>
 
-<style>
-  .login {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 100%;
-    padding: var(--space-6);
-  }
-  .login-card {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-7) var(--space-6);
-    border-radius: var(--radius-lg);
-    background: var(--bg-elevated);
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
-    text-align: center;
-    max-width: 420px;
-    width: 100%;
-  }
-  .login-logo {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 72px;
-    height: 72px;
-    border-radius: var(--radius-full);
-    background: var(--accent);
-    color: #000;
-    margin-bottom: var(--space-2);
-  }
-  .login-card h1 {
-    font-size: var(--font-2xl);
-    font-weight: 700;
-    letter-spacing: -0.5px;
-  }
-  .sub {
-    color: var(--text-secondary);
-    font-size: var(--font-sm);
-    margin-bottom: var(--space-2);
-  }
-  .sub.muted {
-    color: var(--text-subdued);
-  }
-  .link {
-    margin-top: var(--space-2);
-    font-size: var(--font-sm);
-    font-weight: 700;
-    color: var(--text-secondary);
-    transition: color var(--transition-fast);
-  }
-  .link:hover {
-    color: var(--text-primary);
-  }
-</style>
+  <div class="empty">
+    <p class="sub">
+      Authorisation opens in your browser. Nothing is stored here but the
+      session the core hands back.
+    </p>
+
+    <div class="actions">
+      <button class="btn-accent" disabled={!playback.auth_url} onclick={openAuthUrl}>
+        <Icon name="login" size={15} />Log in with Spotify
+      </button>
+      <button class="link-more" onclick={() => navigate("settings")}>Settings</button>
+    </div>
+
+    {#if !playback.auth_url}
+      <p class="sub" style="margin-top:var(--s4)">Waiting for a login URL from the core…</p>
+    {/if}
+    {#if session.error}
+      <p class="sub" style="margin-top:var(--s2); color:var(--danger)">{session.error}</p>
+    {/if}
+  </div>
+</section>

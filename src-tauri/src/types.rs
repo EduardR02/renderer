@@ -86,6 +86,13 @@ pub struct Playlist {
     pub owner: String,
     pub owner_id: String,
     pub cover_url: String,
+    /// Up to [`COVER_URL_CANDIDATES`] distinct track covers, in track order,
+    /// derived the last time the playlist was browsed. Spotify's rootlist
+    /// returns no artwork at all for most playlists, so this is what the
+    /// surfaces that only ever see the library payload — the sidebar, the home
+    /// grid — mosaic instead of dropping to a monogram tile. Empty until a
+    /// browse fills it in; a real `cover_url` still outranks it.
+    pub cover_urls: Vec<String>,
     pub collaborative: bool,
     pub tracks_total: u32,
     /// Playlist4 revision hex (the Web API "snapshot id"); empty when the
@@ -106,12 +113,40 @@ impl From<&PlaylistRef> for Playlist {
             },
             owner_id: reference.owner_id.clone(),
             cover_url: reference.cover_url.clone().unwrap_or_default(),
-            // The rootlist reference does not carry the collaborative flag.
+            // The rootlist reference carries neither the collaborative flag,
+            // nor a revision, nor any track — so the cover candidates have to
+            // be carried over from a browse (see `carry_browse_fields`).
             collaborative: false,
             tracks_total: reference.track_count.unwrap_or(0),
+            cover_urls: Vec::new(),
             snapshot_id: String::new(),
         }
     }
+}
+
+/// How many distinct track covers a playlist keeps as mosaic candidates: the
+/// 2x2 grid the frontend paints for a playlist with no cover of its own.
+pub const COVER_URL_CANDIDATES: usize = 4;
+
+/// The first [`COVER_URL_CANDIDATES`] distinct non-empty track covers, in
+/// track order.
+///
+/// Distinctness is the point: a playlist that is one album top to bottom would
+/// otherwise mosaic four copies of the same square, which reads as a rendering
+/// bug rather than as a cover. Scanning the kept urls beats a set — there are
+/// never more than four of them, and the loop stops at the fourth.
+pub fn cover_urls_from_tracks(tracks: &[Track]) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::with_capacity(COVER_URL_CANDIDATES);
+    for track in tracks {
+        if track.cover_url.is_empty() || urls.iter().any(|url| url == &track.cover_url) {
+            continue;
+        }
+        urls.push(track.cover_url.clone());
+        if urls.len() == COVER_URL_CANDIDATES {
+            break;
+        }
+    }
+    urls
 }
 
 /// A playlist opened for browsing: playlist metadata plus its tracks.
@@ -126,6 +161,7 @@ pub struct PlaylistDetail {
 impl From<PlaylistBrowse> for PlaylistDetail {
     fn from(browse: PlaylistBrowse) -> Self {
         let revision = browse.revision.unwrap_or_default();
+        let tracks: Vec<Track> = browse.tracks.into_iter().map(Track::from).collect();
         Self {
             playlist: Playlist {
                 id: browse.id,
@@ -138,11 +174,16 @@ impl From<PlaylistBrowse> for PlaylistDetail {
                 },
                 owner_id: browse.owner_id,
                 cover_url: browse.cover_url.unwrap_or_default(),
+                // Derived here rather than at the call sites so the candidates
+                // and the revision they came from are always written as a pair:
+                // a revision bump can replace exactly the tracks they were
+                // taken from, so candidates outliving their revision are stale.
+                cover_urls: cover_urls_from_tracks(&tracks),
                 collaborative: false,
-                tracks_total: browse.tracks.len() as u32,
+                tracks_total: tracks.len() as u32,
                 snapshot_id: revision,
             },
-            tracks: browse.tracks.into_iter().map(Track::from).collect(),
+            tracks,
         }
     }
 }
@@ -319,4 +360,69 @@ pub struct AppState {
     pub playback: PlaybackState,
     pub playlists: Vec<Playlist>,
     pub me_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(cover_url: &str) -> Track {
+        Track {
+            cover_url: cover_url.to_owned(),
+            ..Track::default()
+        }
+    }
+
+    fn browse(revision: &str, covers: &[&str]) -> PlaylistBrowse {
+        PlaylistBrowse {
+            id: "p1".to_owned(),
+            uri: "spotify:playlist:p1".to_owned(),
+            name: "Mixtape".to_owned(),
+            revision: Some(revision.to_owned()),
+            owner_id: "me".to_owned(),
+            owner_name: String::new(),
+            cover_url: None,
+            tracks: covers.iter().map(|url| track(url).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn cover_candidates_take_the_first_four_distinct_covers() {
+        let covers = ["a", "a", "b", "c", "b", "d", "e"];
+        let tracks: Vec<Track> = covers.iter().map(|url| track(url)).collect();
+        assert_eq!(cover_urls_from_tracks(&tracks), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn cover_candidates_skip_tracks_without_a_cover() {
+        let tracks: Vec<Track> = ["", "a", "", "b"].iter().map(|url| track(url)).collect();
+        assert_eq!(cover_urls_from_tracks(&tracks), vec!["a", "b"]);
+        // Fewer than four distinct covers is normal (short playlists, one
+        // album); the frontend renders whatever it is given.
+        assert!(cover_urls_from_tracks(&[]).is_empty());
+        assert!(cover_urls_from_tracks(&[track("")]).is_empty());
+    }
+
+    #[test]
+    fn browsing_derives_the_candidates_alongside_the_revision() {
+        let detail = PlaylistDetail::from(browse("rev-a", &["a", "b"]));
+        assert_eq!(detail.playlist.cover_urls, vec!["a", "b"]);
+        assert_eq!(detail.playlist.snapshot_id, "rev-a");
+        assert_eq!(detail.playlist.tracks_total, 2);
+
+        // A revision bump can replace exactly the tracks the old candidates
+        // came from, so a browse never reuses them.
+        let next = PlaylistDetail::from(browse("rev-b", &["c", "d"]));
+        assert_eq!(next.playlist.cover_urls, vec!["c", "d"]);
+        assert_eq!(next.playlist.snapshot_id, "rev-b");
+    }
+
+    #[test]
+    fn a_missing_cover_urls_field_deserializes_to_no_candidates() {
+        // Caches written before the field existed must still load.
+        let playlist: Playlist =
+            serde_json::from_str(r#"{"id":"p1","name":"Mixtape","cover_url":""}"#).unwrap();
+        assert_eq!(playlist.id, "p1");
+        assert!(playlist.cover_urls.is_empty());
+    }
 }

@@ -21,10 +21,11 @@
     name = "",
     size = 48,
     /**
-     * Stretch to the container instead of taking a pixel size. Card art is
-     * laid out with `position:absolute; inset:0`, which an explicit
-     * width/height would over-constrain, so those are omitted entirely.
-     * The container supplies `--tile` for the monogram scale.
+     * Stretch to the container instead of taking a pixel size. The tile still
+     * takes explicit dimensions — 100% rather than none — so it can never fall
+     * back to shrink-wrapping the image's natural 300px in a container that
+     * does not happen to constrain it. The container supplies `--tile` for the
+     * monogram scale.
      */
     fill = false,
     lg = false,
@@ -79,12 +80,14 @@
     class:circle
     class:raised
     class:mosaic={tier === "mosaic"}
-    style:width={fill ? null : `${size}px`}
-    style:height={fill ? null : `${size}px`}
+    style:width={fill ? "100%" : `${size}px`}
+    style:height={fill ? "100%" : `${size}px`}
   >
+    <!-- width/height attributes as well as the CSS above: a load that fails
+         still reserves the identical box, so nothing reflows around it. -->
     {#if tier === "mosaic"}
       {#each pool as url (url)}
-        <img src={resolved[url]} alt="" width={size / 2} height={size / 2} draggable="false" />
+        <img src={resolved[url]} alt="" width={Math.round(size / 2)} height={Math.round(size / 2)} draggable="false" />
       {/each}
     {:else}
       <img src={resolved[primary]} alt={name} width={size} height={size} draggable="false" />
@@ -96,8 +99,8 @@
     class:lg
     class:circle
     class:raised
-    style:width={fill ? null : `${size}px`}
-    style:height={fill ? null : `${size}px`}
+    style:width={fill ? "100%" : `${size}px`}
+    style:height={fill ? "100%" : `${size}px`}
     style:--h={seedHue}
     style:--tile={fill ? null : `${size}px`}
     data-letter={letter}
