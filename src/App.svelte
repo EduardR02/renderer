@@ -2,8 +2,10 @@
   import {
     initEvents,
     route,
-    api,
+    detail,
     playback,
+    credits,
+    api,
     togglePlay,
     focusSearch,
     isLoggedOut,
@@ -15,6 +17,7 @@
   import Sidebar from "./components/Sidebar.svelte";
   import PlayerBar from "./components/PlayerBar.svelte";
   import TopBar from "./components/TopBar.svelte";
+  import CreditsDialog from "./components/CreditsDialog.svelte";
   import LibraryView from "./views/LibraryView.svelte";
   import PlaylistView from "./views/PlaylistView.svelte";
   import AlbumView from "./views/AlbumView.svelte";
@@ -46,12 +49,27 @@
     };
   });
 
-  // Fetch detail data when a detail route becomes active.
+  // Fetch detail data when a detail route becomes active. Browse commands use
+  // their return value as the sole payload path; the sequence guard prevents a
+  // slower response for a previous route from replacing the current page.
+  let browseSeq = 0;
   $effect(() => {
     const { name, id } = route;
-    if (name === "playlist" && id) api.browsePlaylist(id).catch(() => {});
-    else if (name === "album" && id) api.browseAlbum(id).catch(() => {});
-    else if (name === "artist" && id) api.browseArtist(id).catch(() => {});
+    const seq = ++browseSeq;
+    if (!id) return;
+    if (name === "playlist") {
+      api.browsePlaylist(id).then((payload) => {
+        if (seq === browseSeq) detail.playlist = payload ?? null;
+      }).catch(() => {});
+    } else if (name === "album") {
+      api.browseAlbum(id).then((payload) => {
+        if (seq === browseSeq) detail.album = payload ?? null;
+      }).catch(() => {});
+    } else if (name === "artist") {
+      api.browseArtist(id).then((payload) => {
+        if (seq === browseSeq) detail.artist = payload ?? null;
+      }).catch(() => {});
+    }
   });
 
   // Global shortcuts. Ignored while typing in inputs.
@@ -146,6 +164,10 @@
   <PlayerBar />
 </div>
 
+{#if credits.open}
+  <CreditsDialog />
+{/if}
+
 <style>
   .error-banner {
     display: flex;
@@ -155,7 +177,7 @@
     margin: 0 var(--s6);
     padding: var(--s2) var(--s3);
     border-radius: var(--r2);
-    background: rgba(255, 107, 107, 0.12);
+    background: color-mix(in srgb, var(--love) 12%, transparent);
     color: var(--danger);
     font-size: var(--t-12);
   }

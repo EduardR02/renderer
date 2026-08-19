@@ -23,8 +23,12 @@ pub struct TrackRef {
     pub album_name: String,
     pub cover_url: String,
     pub duration_ms: u32,
+    /// Unix timestamp in milliseconds when this item was added to a
+    /// playlist. This is populated only by playlist browsing; tracks from
+    /// albums, search, and playback queues leave it absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<i64>,
 }
-
 impl Default for TrackRef {
     fn default() -> Self {
         Self {
@@ -38,6 +42,7 @@ impl Default for TrackRef {
             album_name: String::new(),
             cover_url: String::new(),
             duration_ms: 0,
+            added_at: None,
         }
     }
 }
@@ -244,6 +249,12 @@ pub struct AlbumRef {
     pub uri: String,
     pub name: String,
     pub artist_names: Vec<String>,
+    /// Artist ids parallel to [`Self::artist_names`], preserving one
+    /// independently navigable entry for every album-header artist.
+    ///
+    /// Older persisted/frontend payloads may omit this field; serde's
+    /// `default` on the containing type makes that a plain-text fallback.
+    pub artist_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,12 +262,16 @@ pub struct AlbumRef {
 }
 
 /// Payload of a successful [`Command::BrowseAlbum`] response.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct AlbumBrowse {
     pub id: String,
     pub uri: String,
     pub name: String,
     pub artist_names: Vec<String>,
+    /// Artist ids parallel to [`Self::artist_names`]; empty entries remain
+    /// plain text in the frontend rather than becoming false links.
+    pub artist_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -306,12 +321,13 @@ pub struct ArtistBrowse {
 
 /// One contributor in a track's credits.
 ///
-/// `id` and `uri` are empty for a contributor with no artist page of their
-/// own — the credits service names plenty of writers and producers who have
-/// none — so the frontend must treat a contributor as a link only when `id`
-/// is non-empty. `subroles` are the service's own lowercase labels
-/// (`"composer"`, `"lyricist"`, `"producer"`, `"main artist"`, ...) and may
-/// be empty.
+/// `id` is the validated Spotify artist id from the source credit URI. The
+/// frontend uses it only as the suffix of the external
+/// `https://artists.spotify.com/songwriter/{id}` URL; it must never navigate
+/// to the in-app artist view with this value. `id` is empty when the source
+/// contributor has no valid link. `subroles` are the service's own labels
+/// (`"composer"`, `"lyricist"`, `"producer"`, `"main artist"`, ...) and may be
+/// empty.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CreditArtist {
@@ -320,11 +336,10 @@ pub struct CreditArtist {
     pub name: String,
     pub subroles: Vec<String>,
 }
-
-/// One role group of a track's credits, e.g. Performers, Writers, Producers.
-/// `title` is passed through as the service spells it rather than being
-/// mapped to an enum: the set is not fixed, and an unknown group is still
-/// worth showing.
+/// One source-provided role group of a track's credits, e.g. Artist or
+/// Composition & Lyrics. `title` is passed through exactly as the service
+/// spells it rather than mapped to an enum: the set is not fixed, and an
+/// unknown group is still worth showing.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CreditRole {
@@ -339,6 +354,9 @@ pub struct TrackCredits {
     pub track_uri: String,
     pub track_name: String,
     pub roles: Vec<CreditRole>,
+    /// The licensor the credits came from, e.g. `Republic Records`. Empty when
+    /// the service does not supply one.
+    pub source: String,
 }
 
 /// Payload of a successful [`Command::BrowseSearch`] response.
@@ -391,11 +409,24 @@ pub struct StateEvent<'a> {
     pub error: Option<&'a str>,
 }
 
+/// The engine's 2-second position heartbeat: only the scalar playhead data
+/// the frontend projects and clamps against. Emitted only while playing.
+/// Full [`StateEvent`]s — queue included — are reserved for real changes
+/// (track/queue/volume/shuffle/repeat/duration, play/pause), so a heartbeat
+/// never serializes or clones the queue: its cost is O(1) in queue length.
+#[derive(Serialize)]
+pub struct PositionEvent {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub position_ms: u32,
+    pub duration_ms: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{AuthState, BrowseResponse, Command, PlaylistRef, RepeatMode, Request, Response,
+    use super::{AuthState, BrowseResponse, Command, PlaylistRef, PositionEvent, RepeatMode, Request, Response,
                 SearchBrowse, StateEvent, TrackRef};
 
     #[test]
@@ -569,6 +600,25 @@ mod tests {
             state["auth_url"],
             "https://accounts.spotify.com/authorize?state=abc"
         );
+    }
+
+    #[test]
+    fn position_heartbeat_serializes_as_a_scalar_line_without_queue() {
+        let heartbeat = serde_json::to_value(PositionEvent {
+            kind: "position",
+            position_ms: 12_345,
+            duration_ms: 240_000,
+        })
+        .unwrap();
+        let object = heartbeat.as_object().expect("heartbeat is an object");
+        // `type` plus the two playhead scalars and nothing else: a heartbeat
+        // must never carry (or serialize) the queue or any other state.
+        assert_eq!(object.len(), 3, "only type, position_ms and duration_ms");
+        assert_eq!(heartbeat["type"], "position");
+        assert_eq!(heartbeat["position_ms"], 12_345);
+        assert_eq!(heartbeat["duration_ms"], 240_000);
+        assert!(!object.contains_key("queue"), "no queue on a heartbeat");
+        assert!(!object.contains_key("playing"), "no flags on a heartbeat");
     }
 
     #[test]

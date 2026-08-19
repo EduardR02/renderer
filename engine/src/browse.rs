@@ -49,7 +49,7 @@
 //!   and pathfinder rejects non-persisted documents with 400, so surfacing
 //!   playcounts would mean tracking a second rotating query hash.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -128,9 +128,42 @@ fn uri_of(uri: &SpotifyUri) -> String {
     uri.to_uri().unwrap_or_default()
 }
 
+/// Logs, once per run, which audio formats Spotify actually offers this
+/// account for a real track.
+///
+/// This is the only way to answer "can we play lossless" with evidence rather
+/// than inference. librespot 0.8.0 cannot *select* FLAC — `Bitrate` is only
+/// 96/160/320 and none of `player.rs`'s three preference lists mentions
+/// `FLAC_FLAC`, so the selector can never match it — but whether the server
+/// offers a FLAC file at all is a separate, account- and client-gated
+/// question, and it decides whether patching that selection would achieve
+/// anything. One line, first resolved track, no per-track cost.
+fn log_available_formats_once(track: &Track) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let mut formats: Vec<String> = track
+            .files
+            .0
+            .keys()
+            .map(|format| format!("{format:?}"))
+            .collect();
+        formats.sort();
+        eprintln!(
+            "audio formats offered for <{}>: {}",
+            track.name,
+            if formats.is_empty() {
+                "none".to_owned()
+            } else {
+                formats.join(", ")
+            }
+        );
+    });
+}
+
 /// Converts resolved track metadata into the protocol's `TrackRef` shape
 /// (identical to the one `play_queue` receives from the UI).
 pub fn track_ref(track: &Track) -> TrackRef {
+    log_available_formats_once(track);
     TrackRef {
         id: id_of(&track.id),
         uri: uri_of(&track.id),
@@ -149,6 +182,7 @@ pub fn track_ref(track: &Track) -> TrackRef {
         album_name: track.album.name.clone(),
         cover_url: cover_url(&track.album.covers).unwrap_or_default(),
         duration_ms: u32::try_from(track.duration).unwrap_or(0),
+        added_at: None,
     }
 }
 
@@ -173,6 +207,7 @@ pub fn album_ref(album: &Album) -> AlbumRef {
         uri: uri_of(&album.id),
         name: album.name.clone(),
         artist_names: album.artists.iter().map(|artist| artist.name.clone()).collect(),
+        artist_ids: album.artists.iter().map(|artist| id_of(&artist.id)).collect(),
         cover_url: cover_url(&album.covers),
         year: album_year(album),
     }
@@ -329,6 +364,21 @@ async fn fetch_extended_batch(
     }
 }
 
+/// Maps each deduplicated URI's canonical string form to its first-appearance
+/// slot in the request list, built once per fetch. The endpoint echoes the
+/// exact `entity_uri` strings the request sent, so a batch response is placed
+/// with one hash lookup per entry instead of a linear scan per entry. Pure so
+/// the mapping is unit-testable.
+fn build_uri_index(uris: &[SpotifyUri]) -> HashMap<String, usize> {
+    let mut index_by_uri = HashMap::with_capacity(uris.len());
+    for (index, uri) in uris.iter().enumerate() {
+        // `or_insert` keeps the first slot when two URIs stringify alike,
+        // mirroring the first-match semantics of the scan it replaces.
+        index_by_uri.entry(uri_of(uri)).or_insert(index);
+    }
+    index_by_uri
+}
+
 /// Resolves extended-metadata entities (tracks, albums, ...) in batches of
 /// [`METADATA_BATCH_SIZE`]. URIs are deduplicated by id in first-appearance
 /// order; each batch is one POST; items missing from the response or failing
@@ -350,6 +400,7 @@ async fn fetch_extended<'a, T>(
     if unique.is_empty() {
         return Ok(Vec::new());
     }
+    let index_by_uri = build_uri_index(&unique);
     let mut results: Vec<Option<T>> = (0..unique.len()).map(|_| None).collect();
     let mut batches_total = 0usize;
     let mut batches_failed = 0usize;
@@ -358,8 +409,7 @@ async fn fetch_extended<'a, T>(
         match fetch_extended_batch(session, chunk, kind).await {
             Ok(entries) => {
                 for (entity_uri, payload) in entries {
-                    let Some(index) = unique.iter().position(|uri| uri_of(uri) == entity_uri)
-                    else {
+                    let Some(&index) = index_by_uri.get(&entity_uri) else {
                         continue;
                     };
                     results[index] = parse(&entity_uri, &payload);
@@ -408,6 +458,36 @@ pub async fn fetch_tracks<'a>(
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
 ) -> Result<Vec<TrackRef>, String> {
     fetch_extended(session, uris, ExtensionKind::TRACK_V4, parse_track_payload).await
+}
+
+/// Playlist item attributes carry the only trustworthy "added" timestamp.
+/// A protobuf default of zero means the field was absent, not January 1970,
+/// so it must remain missing in the browse payload.
+fn playlist_added_at(timestamp_ms: i64) -> Option<i64> {
+    (timestamp_ms > 0).then_some(timestamp_ms)
+}
+
+/// Resolves playlist items while preserving Spotify's item order and
+/// duplicates. Extended metadata intentionally deduplicates requests, so the
+/// playlist layer maps each item back onto its resolved metadata and attaches
+/// that item's own optional added timestamp.
+async fn fetch_playlist_tracks(
+    session: &Session,
+    items: &[(SpotifyUri, Option<i64>)],
+) -> Result<Vec<TrackRef>, String> {
+    let resolved = fetch_tracks(session, items.iter().map(|(uri, _)| uri)).await?;
+    let by_uri: HashMap<String, TrackRef> = resolved
+        .into_iter()
+        .map(|track| (track.uri.clone(), track))
+        .collect();
+    Ok(items
+        .iter()
+        .filter_map(|(uri, added_at)| {
+            let mut track = by_uri.get(&uri_of(uri))?.clone();
+            track.added_at = *added_at;
+            Some(track)
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +727,18 @@ pub async fn playlist_browse(
         ),
         _ => (String::new(), String::new()),
     };
-    let tracks = fetch_tracks(session, playlist.tracks()).await?;
+    let items: Vec<(SpotifyUri, Option<i64>)> = playlist
+        .contents
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                playlist_added_at(item.attributes.timestamp.as_timestamp_ms()),
+            )
+        })
+        .collect();
+    let tracks = fetch_playlist_tracks(session, &items).await?;
     Ok(spotify_playback_engine::protocol::PlaylistBrowse {
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
@@ -687,6 +778,7 @@ pub async fn album_browse(
         uri: uri_of(&album.id),
         name: album.name.clone(),
         artist_names: album.artists.iter().map(|artist| artist.name.clone()).collect(),
+        artist_ids: album.artists.iter().map(|artist| id_of(&artist.id)).collect(),
         cover_url: cover_url(&album.covers),
         year: album_year(&album),
         tracks,
@@ -819,11 +911,9 @@ pub async fn artist_browse(
 
 /// The spclient endpoint behind the official client's Credits dialog.
 ///
-/// There is also a `/v0/experimental/{id}/credits` variant. It carries
-/// contributor images, but identifies writers by `spotify:songwriter:` URIs
-/// plus an artists.spotify.com link — neither of which this app can open.
-/// This variant returns plain `spotify:artist:` URIs, which the existing
-/// artist browse handles, so contributors are linkable with no new plumbing.
+/// Contributors arrive with their source `spotify:artist:{id}` URI. A valid
+/// Spotify artist id is retained for the frontend's external songwriter link;
+/// missing or malformed URIs stay unlinked. No role or id is synthesized.
 const TRACK_CREDITS_ENDPOINT: &str = "https://spclient.wg.spotify.com/track-credits-view/v0/track";
 
 /// Raw JSON of the credits response. Every field is optional so a renamed or
@@ -837,6 +927,17 @@ struct CreditsJson {
     trackTitle: Option<String>,
     #[serde(default)]
     roleCredits: Vec<CreditRoleJson>,
+    /// The licensor the credits came from, e.g. `Republic Records`. The
+    /// official client shows this under the role groups; dropping it made our
+    /// dialog look emptier than the service's for the same track.
+    #[serde(default)]
+    source: Option<CreditSourceJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct CreditSourceJson {
+    #[serde(default)]
+    value: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -850,7 +951,8 @@ struct CreditRoleJson {
 
 #[derive(Default, Deserialize)]
 struct CreditArtistJson {
-    /// Absent for contributors with no artist page of their own.
+    /// Absent for contributors with no source URI that can yield a valid
+    /// external songwriter id.
     #[serde(default)]
     uri: Option<String>,
     #[serde(default)]
@@ -859,15 +961,26 @@ struct CreditArtistJson {
     subroles: Vec<String>,
 }
 
+/// Spotify ids are opaque 22-character base62 values. Restricting the id to
+/// that alphabet and length keeps malformed source URIs from becoming links
+/// or URL path data. The original URI is still retained for diagnostics.
+fn credit_artist_id(uri: &str) -> String {
+    let Some(id) = uri.strip_prefix("spotify:artist:") else {
+        return String::new();
+    };
+    if id.len() == 22 && id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        id.to_owned()
+    } else {
+        String::new()
+    }
+}
+
 fn credit_artist(raw: &CreditArtistJson) -> CreditArtist {
     let uri = raw.uri.clone().unwrap_or_default();
     CreditArtist {
-        // Only an artist URI yields a browsable id; anything else (or
-        // nothing) leaves the contributor as plain text.
-        id: uri
-            .starts_with("spotify:artist:")
-            .then(|| hit_id(Some(uri.as_str())))
-            .unwrap_or_default(),
+        // This id is used only for the external songwriter URL. It is never
+        // an in-app artist route, and invalid/missing source ids stay empty.
+        id: credit_artist_id(&uri),
         uri,
         name: raw.name.clone().unwrap_or_default(),
         subroles: raw.subroles.clone(),
@@ -894,6 +1007,11 @@ fn track_credits_from_json(parsed: &CreditsJson) -> TrackCredits {
             })
             .filter(|role| !role.artists.is_empty())
             .collect(),
+        source: parsed
+            .source
+            .as_ref()
+            .and_then(|source| source.value.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -963,9 +1081,31 @@ pub async fn track_credits_browse(session: &Session, id: &str) -> Result<TrackCr
         }
     };
 
+    log_raw_credits_once(&payload);
     let parsed: CreditsJson = serde_json::from_slice(&payload)
         .map_err(|error| format!("unparseable credits response: {error}"))?;
     Ok(track_credits_from_json(&parsed))
+}
+
+/// Dumps the first credits response verbatim, once per run.
+///
+/// [`CreditsJson`] keeps only `uri`, `name` and `subroles` per contributor, and
+/// the `uri` is a `spotify:artist:` one. The songwriter portal the official
+/// client links to is a *different* namespace: Max Martin is
+/// `artists.spotify.com/songwriter/1T7Hkfs6QmizPlOCzs08LS`, and
+/// `open.spotify.com/artist/1T7Hkfs6QmizPlOCzs08LS` is a 404. So the artist id
+/// cannot be the songwriter id, and building the link from it produces a page
+/// that does not exist — which is exactly what the credits dialog was doing.
+///
+/// Whatever the correct id is has to be a field we are dropping. Rather than
+/// guess at names, this prints what the service actually sends so the struct
+/// can be extended against real data.
+fn log_raw_credits_once(payload: &[u8]) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| match std::str::from_utf8(payload) {
+        Ok(text) => eprintln!("raw track-credits response: {text}"),
+        Err(error) => eprintln!("track-credits response was not utf-8: {error}"),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1390,7 @@ fn track_ref_from_hit(hit: &SearchTrackHitJson) -> TrackRef {
                 .as_ref()
                 .and_then(|duration| duration.totalMilliseconds.as_ref()),
         ),
+        added_at: None,
     }
 }
 
@@ -1259,6 +1400,12 @@ fn album_ref_from_hit(hit: &SearchAlbumHitJson) -> AlbumRef {
         uri: hit.uri.clone().unwrap_or_default(),
         name: hit.name.clone().unwrap_or_default(),
         artist_names: hit.artists.items.iter().map(artist_name).collect(),
+        artist_ids: hit
+            .artists
+            .items
+            .iter()
+            .map(|artist| hit_id(artist.uri.as_deref()))
+            .collect(),
         cover_url: hit_image(hit.coverArt.as_ref()),
         // Free: the year travels in the same search response. A year of 0
         // would be a placeholder, not a release date.
@@ -1904,26 +2051,33 @@ mod tests {
         assert_eq!(writers.title, "Writers");
         assert_eq!(writers.artists[0].id, "2XecPkCBJp99480lrtKlIp");
         assert_eq!(writers.artists[0].subroles, vec!["composer", "lyricist"]);
-        // A contributor with no artist page keeps their name but gets no id,
-        // so the frontend renders them as plain text rather than a dead link.
+        // A contributor without a valid source id keeps their name and
+        // roles, so the frontend renders them as plain text.
         assert_eq!(writers.artists[1].name, "Uncredited Ghost");
         assert_eq!(writers.artists[1].id, "");
         assert_eq!(writers.artists[1].uri, "");
     }
 
     #[test]
-    fn credit_ids_are_only_taken_from_artist_uris() {
-        // The experimental variant of this endpoint returns songwriter URIs,
-        // which `browse_artist` cannot open; anything that is not an artist
-        // URI must stay unlinked.
+    fn credit_ids_are_only_taken_from_valid_artist_uris() {
+        // Only the source artist URI provides an id. Songwriter URIs and
+        // malformed/short path values stay unlinked rather than becoming
+        // arbitrary songwriter URLs.
         let songwriter: CreditArtistJson = serde_json::from_str(
             r#"{"uri": "spotify:songwriter:1pTJCipDqvUaFmILQLnMsC", "name": "Annie Clark"}"#,
         )
         .unwrap();
         let mapped = credit_artist(&songwriter);
-        assert_eq!(mapped.id, "", "a songwriter uri is not browsable here");
+        assert_eq!(mapped.id, "", "a songwriter uri is not an artist id");
         assert_eq!(mapped.uri, "spotify:songwriter:1pTJCipDqvUaFmILQLnMsC");
         assert_eq!(mapped.name, "Annie Clark");
+
+        assert_eq!(
+            credit_artist_id("spotify:artist:2XecPkCBJp99480lrtKlIp"),
+            "2XecPkCBJp99480lrtKlIp"
+        );
+        assert_eq!(credit_artist_id("spotify:artist:x"), "");
+        assert_eq!(credit_artist_id("spotify:artist:bad/id"), "");
     }
 
     #[test]
@@ -2203,6 +2357,29 @@ mod tests {
             ],
             "first-appearance order, repeats dropped"
         );
+    }
+
+    #[test]
+    fn uri_index_maps_each_uri_to_its_first_appearance_slot() {
+        let a = SpotifyUri::from_uri("spotify:track:0123456789ABCDEFGHIJKL").unwrap();
+        let b = SpotifyUri::from_uri("spotify:track:1123456789ABCDEFGHIJKL").unwrap();
+        let index = build_uri_index(&[a.clone(), b, a]);
+        assert_eq!(
+            index.get("spotify:track:0123456789ABCDEFGHIJKL"),
+            Some(&0),
+            "first appearance wins, like the scan it replaces"
+        );
+        assert_eq!(index.get("spotify:track:1123456789ABCDEFGHIJKL"), Some(&1));
+        // Every requested URI is addressable; a batch response places each
+        // entry in O(1) instead of scanning the request list.
+        assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn missing_playlist_added_timestamp_is_not_synthesized() {
+        assert_eq!(playlist_added_at(0), None);
+        assert_eq!(playlist_added_at(-1), None);
+        assert_eq!(playlist_added_at(1_725_000_123_456), Some(1_725_000_123_456));
     }
 
     #[test]

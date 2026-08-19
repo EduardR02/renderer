@@ -29,6 +29,21 @@ export function formatDuration(ms) {
   return s > 0 ? `${m} min ${s} sec` : `${m} min`;
 }
 
+/** Human-readable binary byte size for cache and diagnostics surfaces. */
+export function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = -1;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const decimals = value >= 10 || Number.isInteger(value) ? 0 : 1;
+  return `${value.toFixed(decimals)} ${units[unit]}`;
+}
+
 /** Summed duration of a track list, as "8 hr 12 min". */
 export function formatTotal(tracks) {
   return formatDuration(tracks.reduce((sum, t) => sum + (t.duration_ms || 0), 0));

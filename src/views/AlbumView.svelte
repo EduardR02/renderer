@@ -1,13 +1,17 @@
 <script>
-  import { detail, api, navigate } from "../lib/state.svelte.js";
+  import { detail, api } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
+  import ArtistLinks from "../components/ArtistLinks.svelte";
   import { formatTotal } from "../lib/time.js";
 
   const album = $derived(detail.album);
   const tracks = $derived(album?.tracks ?? []);
-  const artistId = $derived(tracks[0]?.artist_id ?? "");
+  const artistIds = $derived(album?.artist_ids ?? []);
+  // Keep old/partial payloads useful: the primary track id can still link the
+  // first header artist, while missing parallel ids leave other names plain.
+  const artistFallbackId = $derived(artistIds[0] || tracks[0]?.artist_id || "");
 
   /* Same FNV-1a the artwork uses, so the header wash and the generated tile
      land on one colour identity for this album. */
@@ -48,12 +52,14 @@
         <span class="eyebrow">Album</span>
         <h1 class="detail-title">{album.name}</h1>
         <p class="detail-meta">
-          {#if artistId}
-            <button class="who" onclick={() => navigate("artist", artistId)}>
-              {album.artist_names.join(", ")}
-            </button>
-          {:else}
-            <span class="who">{album.artist_names.join(", ")}</span>
+          <ArtistLinks
+            class="who"
+            names={album.artist_names}
+            ids={artistIds}
+            id={artistFallbackId}
+          />
+          {#if album.year}
+            <span class="sep">/</span><span class="num">{album.year}</span>
           {/if}
           <span class="sep">/</span><span class="num">{tracks.length} songs</span>
           {#if tracks.length}

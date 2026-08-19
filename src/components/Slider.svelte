@@ -18,12 +18,19 @@
     kind = "seek",
     onDragStart = null,
     onDragChange = null,
+    formatValue = null,
   } = $props();
 
   let track = $state(null);
   let drag = $state(null);
+  let hover = $state(null);
   const display = $derived(drag !== null ? drag : value);
   const p = $derived(max > min ? Math.min(1, Math.max(0, (display - min) / (max - min))) : 0);
+  const hoverP = $derived(
+    hover !== null && max > min ? Math.min(1, Math.max(0, (hover - min) / (max - min))) : p
+  );
+  const valueText = $derived(formatValue ? formatValue(display) : null);
+  const tooltipId = $derived(`${kind}-slider-tooltip`);
 
   function fromClientX(x) {
     if (!track) return min;
@@ -39,13 +46,15 @@
   function onPointerDown(e) {
     e.preventDefault();
     drag = fromClientX(e.clientX);
+    hover = drag;
     onDragStart?.(drag);
     track.setPointerCapture(e.pointerId);
   }
 
   function onPointerMove(e) {
+    hover = fromClientX(e.clientX);
     if (drag === null) return;
-    drag = fromClientX(e.clientX);
+    drag = hover;
     onDragChange?.(drag);
   }
 
@@ -82,9 +91,13 @@
   aria-valuemin={min}
   aria-valuemax={max}
   aria-valuenow={Math.round(display)}
+  aria-valuetext={valueText}
+  aria-describedby={kind === "seek" ? tooltipId : undefined}
   bind:this={track}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
+  onpointerenter={(e) => (hover = fromClientX(e.clientX))}
+  onpointerleave={() => (hover = null)}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
   onkeydown={onKeyDown}
@@ -94,5 +107,14 @@
   {:else}
     <span class="rail"><span class="rail-fill" style:--p={p}></span></span>
     <span class="rail-knob" style:--pl="{p * 100}%"></span>
+    <span
+      id={tooltipId}
+      class="seek-tip"
+      class:visible={hover !== null}
+      style:--tip-x="{hoverP * 100}%"
+      role="tooltip"
+    >
+      {formatValue ? formatValue(hover ?? display) : Math.round(hover ?? display)}
+    </span>
   {/if}
 </span>

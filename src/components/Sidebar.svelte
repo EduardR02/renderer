@@ -1,11 +1,35 @@
 <script>
-  import { route, navigate, library, api, playback, focusSearch } from "../lib/state.svelte.js";
+  import { route, navigate, library, api, playback } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
 
   let creating = $state(false);
   let newName = $state("");
   let field = $state(null);
+  let libList = $state(null);
+  let fadeTop = $state(false);
+  let fadeBottom = $state(false);
+
+  $effect(() => {
+    library.length;
+    const list = libList;
+    if (!list) return;
+
+    const updateFades = () => {
+      const maxScroll = Math.max(0, list.scrollHeight - list.clientHeight);
+      fadeTop = list.scrollTop > 1;
+      fadeBottom = list.scrollTop < maxScroll - 1;
+    };
+
+    queueMicrotask(updateFades);
+    list.addEventListener("scroll", updateFades, { passive: true });
+    const resizeObserver = new ResizeObserver(updateFades);
+    resizeObserver.observe(list);
+    return () => {
+      list.removeEventListener("scroll", updateFades);
+      resizeObserver.disconnect();
+    };
+  });
 
   $effect(() => {
     if (creating) field?.focus();
@@ -31,9 +55,6 @@
   <nav class="nav">
     <button class="nav-item" class:active={route.name === "library"} onclick={() => navigate("library")}>
       <Icon name="home" size={17} /><span>Home</span>
-    </button>
-    <button class="nav-item" class:active={route.name === "search"} onclick={focusSearch}>
-      <Icon name="search" size={17} /><span>Search</span><span class="kbd">Ctrl F</span>
     </button>
     <button class="nav-item" class:active={route.name === "queue"} onclick={() => navigate("queue")}>
       <Icon name="queue" size={17} /><span>Queue</span>
@@ -68,7 +89,7 @@
       </form>
     {/if}
 
-    <div class="lib-list">
+    <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} bind:this={libList}>
       {#each library as pl (pl.id)}
         <button
           class="lib-row"

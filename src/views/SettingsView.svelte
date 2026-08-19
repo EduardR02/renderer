@@ -3,24 +3,17 @@
     playback,
     session,
     stats,
+    cacheStats,
+    refreshCacheStats,
     api,
     openAuthUrl,
     isLoggedOut,
   } from "../lib/state.svelte.js";
   import Icon from "../components/Icon.svelte";
-  import Slider from "../components/Slider.svelte";
+  import { formatBytes } from "../lib/time.js";
 
   const username = $derived(playback.username || session.username);
 
-  const repeatLabel = $derived(
-    playback.repeat === "track" ? "One song" : playback.repeat === "context" ? "Whole queue" : "Off"
-  );
-
-  function cycleRepeat() {
-    const order = ["off", "context", "track"];
-    const next = order[(order.indexOf(playback.repeat) + 1) % order.length];
-    api.setRepeat(next).catch(() => {});
-  }
 
   /* `status` is a fire-and-forget ping: the engine answers on the event
      channel, not in the response, so all this can report is reachability. */
@@ -37,10 +30,17 @@
   const pingLabel = $derived(
     ping === "ok" ? "Reachable" : ping === "failed" ? "No answer" : ping === "checking" ? "Checking…" : "Not checked"
   );
+
+  // The command is cached server-side for a minute and this effect runs once
+  // per Settings mount, so reopening the page stays fresh without a disk walk
+  // on every render.
+  $effect(() => {
+    refreshCacheStats().catch(() => {});
+  });
 </script>
 
 <section class="view page">
-  <div style="padding:var(--s4) 0 var(--s2)">
+  <div class="settings-intro">
     <h1 class="page-title">Settings</h1>
   </div>
 
@@ -89,66 +89,53 @@
       {/if}
     </div>
 
-    <div class="set-group">
-      <h2>Playback</h2>
-      <div class="set-row">
-        <div>
-          <div class="k">Shuffle</div>
-          <div class="d">Plays the current queue in a random order.</div>
-        </div>
-        <div class="set-ctl">
-          <button
-            class="switch"
-            class:on={playback.shuffle}
-            role="switch"
-            aria-checked={playback.shuffle}
-            aria-label="Shuffle"
-            onclick={() => api.setShuffle(!playback.shuffle).catch(() => {})}
-          ></button>
-        </div>
-      </div>
-      <div class="set-row">
-        <div>
-          <div class="k">Repeat</div>
-          <div class="d">Off, the whole queue, or the current song.</div>
-        </div>
-        <div class="set-ctl">
-          <button class="btn-ghost" onclick={cycleRepeat}>
-            <Icon name={playback.repeat === "track" ? "repeat-one" : "repeat"} size={14} />
-            {repeatLabel}
-          </button>
-        </div>
-      </div>
-      <div class="set-row">
-        <div>
-          <div class="k">Volume</div>
-          <div class="d">Applies to the engine's own output, not the system mixer.</div>
-        </div>
-        <div class="set-ctl">
-          <span class="v">{Math.round(playback.volume)}%</span>
-          <Slider
-            min={0}
-            max={100}
-            value={playback.volume}
-            label="Volume"
-            step={5}
-            kind="vol"
-            onCommit={(v) => api.setVolume(v).catch(() => {})}
-          />
-        </div>
-      </div>
-    </div>
 
-    <div class="set-group">
+    <div class="set-group" data-cache-stats>
       <h2>Storage</h2>
-      <div class="set-row">
+      <div class="set-row" data-cache-stat="audio">
+        <div>
+          <div class="k">Audio cache</div>
+          <div class="d">Downloaded audio retained for offline replay.</div>
+        </div>
+        <div class="set-ctl">
+          <span class="v" aria-live="polite">
+            {#if cacheStats.audio}
+              {cacheStats.audio.files} files · {formatBytes(cacheStats.audio.bytes)}
+            {:else if cacheStats.loading}
+              Measuring…
+            {:else}
+              Unavailable
+            {/if}
+          </span>
+        </div>
+      </div>
+      <div class="set-row" data-cache-stat="covers">
         <div>
           <div class="k">Cover cache</div>
-          <div class="d">
-            Covers are fetched once by the core and served from disk afterwards.
-          </div>
+          <div class="d">Artwork fetched once by the core and served from disk afterwards.</div>
         </div>
-        <div class="set-ctl"><span class="v">{stats.coversResolved} this session</span></div>
+        <div class="set-ctl">
+          <span class="v" aria-live="polite">
+            {#if cacheStats.covers}
+              {cacheStats.covers.files} files · {formatBytes(cacheStats.covers.bytes)}
+            {:else if cacheStats.loading}
+              Measuring…
+            {:else}
+              Unavailable
+            {/if}
+          </span>
+        </div>
+      </div>
+      <div class="set-row">
+        <div>
+          <div class="k">Refresh cache stats</div>
+          <div class="d">{cacheStats.error ?? `${stats.coversResolved} cover requests this session`}</div>
+        </div>
+        <div class="set-ctl">
+          <button class="btn-ghost" onclick={() => refreshCacheStats().catch(() => {})} disabled={cacheStats.loading}>
+            {cacheStats.loading ? "Measuring…" : "Refresh"}
+          </button>
+        </div>
       </div>
     </div>
 

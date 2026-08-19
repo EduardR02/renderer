@@ -92,8 +92,7 @@
 </script>
 
 <section class="view page">
-  <div style="padding:var(--s4) 0 var(--s6)">
-    <span class="eyebrow">Search</span>
+  <div class="search-intro">
     <h1 class="page-title">
       {search.submitted && search.query ? `Results for “${search.query}”` : "Find something to play"}
     </h1>
@@ -194,7 +193,7 @@
                 <span class="card-play"><Icon name="play" size={15} /></span>
               </span>
               <span class="card-name">{al.name}</span>
-              <span class="card-sub">{al.artist_names.join(", ")}</span>
+              <span class="card-sub">{#if al.year}{al.year} · {/if}{al.artist_names.join(", ")}</span>
             </button>
           {/each}
         </div>

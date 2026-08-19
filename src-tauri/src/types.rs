@@ -36,6 +36,9 @@ pub struct Track {
     pub album_name: String,
     pub cover_url: String,
     pub duration_ms: u32,
+    /// Unix timestamp in milliseconds when this playlist item was added.
+    /// Absent for tracks sourced from albums, search, or legacy caches.
+    pub added_at: Option<i64>,
 }
 
 impl From<TrackRef> for Track {
@@ -51,6 +54,7 @@ impl From<TrackRef> for Track {
             album_name: track.album_name,
             cover_url: track.cover_url,
             duration_ms: track.duration_ms,
+            added_at: track.added_at,
         }
     }
 }
@@ -68,6 +72,7 @@ impl From<&TrackRef> for Track {
             album_name: track.album_name.clone(),
             cover_url: track.cover_url.clone(),
             duration_ms: track.duration_ms,
+            added_at: track.added_at,
         }
     }
 }
@@ -85,10 +90,10 @@ impl From<Track> for TrackRef {
             album_name: track.album_name,
             cover_url: track.cover_url,
             duration_ms: track.duration_ms,
+            added_at: track.added_at,
         }
     }
 }
-
 /// A playlist in the user's library (rootlist).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -240,6 +245,10 @@ pub struct Album {
     pub uri: String,
     pub name: String,
     pub artist_names: Vec<String>,
+    /// Artist ids parallel to `artist_names`; empty or missing entries are
+    /// rendered as plain text rather than navigable links.
+    #[serde(default)]
+    pub artist_ids: Vec<String>,
     pub cover_url: String,
     /// Release year, or `null` when the release carries no date. An absent
     /// string field is the empty string by this contract's convention, but a
@@ -248,16 +257,30 @@ pub struct Album {
     pub year: Option<u32>,
 }
 
+/// Keeps an album's artist ids index-aligned with its names. Album payloads
+/// are not currently disk-cached, but applying the same repair as tracks makes
+/// older or hand-authored payloads safe to render without false links.
+pub fn align_album_artist_ids(album: &mut Album) {
+    if album.artist_ids.len() != album.artist_names.len() {
+        album
+            .artist_ids
+            .resize(album.artist_names.len(), String::new());
+    }
+}
+
 impl From<AlbumRef> for Album {
     fn from(reference: AlbumRef) -> Self {
-        Self {
+        let mut album = Self {
             id: reference.id,
             uri: reference.uri,
             name: reference.name,
             artist_names: reference.artist_names,
+            artist_ids: reference.artist_ids,
             cover_url: reference.cover_url.unwrap_or_default(),
             year: reference.year,
-        }
+        };
+        align_album_artist_ids(&mut album);
+        album
     }
 }
 
@@ -271,15 +294,18 @@ pub struct AlbumDetail {
 
 impl From<AlbumBrowse> for AlbumDetail {
     fn from(browse: AlbumBrowse) -> Self {
+        let mut album = Album {
+            id: browse.id,
+            uri: browse.uri,
+            name: browse.name,
+            artist_names: browse.artist_names,
+            artist_ids: browse.artist_ids,
+            cover_url: browse.cover_url.unwrap_or_default(),
+            year: browse.year,
+        };
+        align_album_artist_ids(&mut album);
         Self {
-            album: Album {
-                id: browse.id,
-                uri: browse.uri,
-                name: browse.name,
-                artist_names: browse.artist_names,
-                cover_url: browse.cover_url.unwrap_or_default(),
-                year: browse.year,
-            },
+            album,
             tracks: browse.tracks.into_iter().map(Track::from).collect(),
         }
     }
@@ -375,18 +401,19 @@ impl From<SearchBrowse> for SearchResult {
 
 /// One contributor in a track's credits.
 ///
-/// `id` is empty for a contributor with no artist page — the credits service
-/// names many writers and producers who have none — so the frontend should
-/// render a contributor as a link only when `id` is non-empty, and as plain
-/// text otherwise.
+/// `id` is the validated Spotify artist id from the source credit URI. The
+/// frontend uses it only to open the external
+/// `https://artists.spotify.com/songwriter/{id}` page; it must never route to
+/// the in-app artist view. An empty id means the contributor remains plain
+/// text. `subroles` are the service's own labels (`composer`, `lyricist`,
+/// `producer`, `main artist`, ...), possibly empty.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Contributor {
     pub id: String,
     pub uri: String,
     pub name: String,
-    /// The service's own lowercase labels: `composer`, `lyricist`,
-    /// `producer`, `main artist`, ... Possibly empty.
+    /// The service's own labels, kept verbatim for truthful per-person detail.
     pub subroles: Vec<String>,
 }
 
@@ -400,10 +427,9 @@ impl From<CreditArtist> for Contributor {
         }
     }
 }
-
-/// One role group of a track's credits (Performers, Writers, Producers, ...).
-/// The title is whatever the service called it: the set is not fixed, and an
-/// unrecognised group is still worth showing.
+/// One source-provided role group of a track's credits, e.g. Artist or
+/// Composition & Lyrics. The title is passed through exactly as the service
+/// called it; an unrecognised group is still worth showing.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct CreditGroup {
@@ -427,6 +453,9 @@ pub struct TrackCreditsDetail {
     pub track_uri: String,
     pub track_name: String,
     pub groups: Vec<CreditGroup>,
+    /// The licensor, shown under the groups exactly as the official client
+    /// does. Empty when the service does not supply one.
+    pub source: String,
 }
 
 impl From<TrackCredits> for TrackCreditsDetail {
@@ -435,6 +464,7 @@ impl From<TrackCredits> for TrackCreditsDetail {
             track_uri: credits.track_uri,
             track_name: credits.track_name,
             groups: credits.roles.into_iter().map(CreditGroup::from).collect(),
+            source: credits.source,
         }
     }
 }
@@ -624,10 +654,12 @@ mod tests {
             artist_names: vec!["A".into(), "B".into()],
             artist_ids: vec!["a1".into(), "b1".into()],
             artist_id: "a1".into(),
+            added_at: Some(1_725_000_123_456),
             ..Track::default()
         };
         let reference: TrackRef = track.clone().into();
         assert_eq!(reference.artist_ids, vec!["a1", "b1"]);
+        assert_eq!(reference.added_at, Some(1_725_000_123_456));
         assert_eq!(Track::from(&reference), track);
         assert_eq!(Track::from(reference), track);
     }

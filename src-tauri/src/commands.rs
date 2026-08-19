@@ -10,13 +10,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app::{
     AppState, PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH,
-    apply_cover_candidates, carry_local_fields, compute_cache_stats, data_dir, load_playlist_list,
-    now_secs, order_by_last_played, playlist_detail_from_cache, playlists_missing_covers,
-    save_playlist_list, save_tracks_cache, touch_playlist_played, upsert_playlist,
-    upsert_tracks_cache,
+    carry_local_fields, compute_cache_stats, data_dir, load_playlist_list, now_secs,
+    order_by_last_played, playlist_detail_from_cache, save_playlist_list, save_tracks_cache,
+    touch_playlist_played, upsert_playlist, upsert_tracks_cache,
 };
 use crate::covers;
-use crate::engine_client::{EngineClient, RestoreSnapshot};
+use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistDetail, CacheStats, PlaybackState, Playlist,
@@ -101,16 +100,13 @@ pub async fn move_queue(
 
 #[tauri::command]
 pub async fn search(
-    app: AppHandle,
     client: State<'_, Arc<EngineClient>>,
     query: String,
     limit: Option<usize>,
 ) -> Result<SearchResult, String> {
     let limit = limit.unwrap_or(10).clamp(1, 50);
     let browse = client.browse_search(&query, limit).await?;
-    let result = SearchResult::from(browse);
-    let _ = app.emit("search-results", &result);
-    Ok(result)
+    Ok(SearchResult::from(browse))
 }
 
 #[tauri::command]
@@ -119,15 +115,13 @@ pub async fn browse_playlists(
     state: State<'_, Mutex<AppState>>,
     client: State<'_, Arc<EngineClient>>,
 ) -> Result<Vec<Playlist>, String> {
-    match fetch_library(&state, &client, &app).await {
-        Ok(playlists) => Ok(playlists),
-        Err(error) => {
-            // The engine may still be coming up; retry in the background so
-            // the cached library is replaced as soon as it can be fetched.
-            spawn_refresh_library(app.clone());
-            Err(error)
-        }
+    let result = fetch_library(&state, &client).await;
+    if result.is_err() {
+        // The engine may still be coming up; retry in the background so
+        // the cached library is replaced as soon as it can be fetched.
+        spawn_refresh_library(app.clone());
     }
+    result
 }
 
 /// Opens a playlist: serves the disk cache instantly when present and
@@ -148,35 +142,26 @@ pub async fn browse_playlist(
             let guard = state.lock();
             playlist_detail_from_cache(&guard, &entry)
         };
-        let _ = app.emit("playlist-tracks", &detail);
         spawn_refresh_playlist(app, id);
         return Ok(detail);
     }
-    let detail = fetch_playlist(&state, &client, &id).await?;
-    let _ = app.emit("playlist-tracks", &detail);
-    Ok(detail)
+    fetch_playlist(&state, &client, &id).await
 }
 
 #[tauri::command]
 pub async fn browse_album(
-    app: AppHandle,
     client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<AlbumDetail, String> {
-    let detail = AlbumDetail::from(client.browse_album(&id).await?);
-    let _ = app.emit("album", &detail);
-    Ok(detail)
+    Ok(AlbumDetail::from(client.browse_album(&id).await?))
 }
 
 #[tauri::command]
 pub async fn browse_artist(
-    app: AppHandle,
     client: State<'_, Arc<EngineClient>>,
     id: String,
 ) -> Result<ArtistDetail, String> {
-    let detail = ArtistDetail::from(client.browse_artist(&id).await?);
-    let _ = app.emit("artist", &detail);
-    Ok(detail)
+    Ok(ArtistDetail::from(client.browse_artist(&id).await?))
 }
 
 /// Songwriter/producer/performer credits for one track.
@@ -406,30 +391,24 @@ fn library_retry_delay(attempt: usize) -> Duration {
         .min(LIBRARY_RETRY_MAX)
 }
 
-/// True when `next` differs from `previous` in nothing but `position_ms`.
-///
-/// The engine heartbeats its whole state — queue included — every couple of
-/// seconds. Re-emitting that to the frontend just to advance a progress bar
-/// costs a full serialize + IPC hop + `JSON.parse` + Svelte proxy rebuild of
-/// the entire queue, which is precisely the per-second churn this app exists
-/// to avoid. Heartbeats that only moved the playhead go out as a `position`
-/// number instead; the frontend projects between them off a monotonic clock.
-fn position_only_change(previous: &PlaybackState, next: &PlaybackState) -> bool {
-    if previous.position_ms == next.position_ms {
-        return false;
-    }
-    let mut probe = previous.clone();
-    probe.position_ms = next.position_ms;
-    probe == *next
+/// Applies a scalar position heartbeat to the shared snapshot: only the two
+/// playhead scalars change, in place. The engine already distinguishes
+/// heartbeats from real changes, so this never clones or compares the
+/// queue — the cost is O(1) in queue length. Full states replace the whole
+/// snapshot as before.
+fn apply_position_heartbeat(snapshot: &mut AppState, heartbeat: PositionHeartbeat) {
+    snapshot.playback.position_ms = heartbeat.position_ms;
+    snapshot.playback.duration_ms = heartbeat.duration_ms;
 }
 
 /// Consumes engine state lines, mirrors them into `AppState`, and emits the
-/// `state`/`position`/`session` events. There is no periodic work here: the
-/// playhead is projected in the frontend between engine heartbeats.
+/// `state`/`position`/`session` events. Scalar position heartbeats are
+/// forwarded directly as `position` — the playhead is projected in the
+/// frontend between engine heartbeats, so there is no periodic work here.
 pub async fn consume_states(app: AppHandle) {
     // Owned handle so spawned tasks do not borrow the AppHandle.
     let client = app.state::<Arc<EngineClient>>().inner().clone();
-    let mut states = client.subscribe_state();
+    let mut lines = client.subscribe_lines();
 
     // Instant first paint: hydrate `AppState` from the on-disk library
     // snapshot and emit it before the engine is ready, so a returning user
@@ -441,22 +420,33 @@ pub async fn consume_states(app: AppHandle) {
     let mut last_error = String::new();
 
     loop {
-        let state = match states.recv().await {
-            Ok(state) => state,
-            // The engine out-ran this consumer; the next line is a full
-            // state, so resyncing on it loses nothing.
+        let state = match lines.recv().await {
+            Ok(StateLine::State(state)) => state,
+            Ok(StateLine::Position(heartbeat)) => {
+                // A heartbeat only moved the playhead: freshen the snapshot
+                // scalars in place and forward the existing scalar `position`
+                // event unchanged (a number, no queue payload).
+                let managed = app.state::<Mutex<AppState>>();
+                let mut guard = managed.lock();
+                apply_position_heartbeat(&mut guard, heartbeat);
+                drop(guard);
+                let _ = app.emit("position", heartbeat.position_ms);
+                continue;
+            }
+            // The engine out-ran this consumer; the next line re-syncs
+            // (a skipped full state gets re-emitted by the engine, and a
+            // skipped heartbeat is just one projection step).
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
 
-        let (became_ready, session_changed, auth_changed, position_only) = match &previous {
+        let (became_ready, session_changed, auth_changed) = match &previous {
             Some(prev) => (
                 state.auth_state == "ready" && prev.auth_state != "ready",
                 state.auth_state != prev.auth_state || state.username != prev.username,
                 state.auth_state != prev.auth_state,
-                position_only_change(prev, &state),
             ),
-            None => (state.auth_state == "ready", true, true, false),
+            None => (state.auth_state == "ready", true, true),
         };
 
         if auth_changed {
@@ -489,11 +479,9 @@ pub async fn consume_states(app: AppHandle) {
             }
         }
 
-        if position_only {
-            let _ = app.emit("position", state.position_ms);
-        } else {
-            let _ = app.emit("state", &state);
-        }
+        // Full states are reserved for real changes; heartbeats were already
+        // forwarded as scalar `position` events above.
+        let _ = app.emit("state", &state);
         if session_changed {
             let _ = app.emit(
                 "session",
@@ -603,8 +591,11 @@ async fn refresh_library_with_retry(
 ) -> Result<(), String> {
     let mut last_error = String::new();
     for attempt in 1..=LIBRARY_RETRY_ATTEMPTS {
-        match fetch_library(state, client, app).await {
-            Ok(_) => return Ok(()),
+        match fetch_library(state, client).await {
+            Ok(playlists) => {
+                let _ = app.emit("library", &playlists);
+                return Ok(());
+            }
             Err(error) => {
                 log::warn(&format!(
                     "library refresh attempt {attempt} failed: {error}"
@@ -625,23 +616,18 @@ fn spawn_refresh_playlist(app: AppHandle, id: String) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
-        match fetch_playlist(&state, &client, &id).await {
-            Ok(detail) => {
-                let _ = app.emit("playlist-tracks", &detail);
-            }
-            Err(error) => log::error(&format!(
+        if let Err(error) = fetch_playlist(&state, &client, &id).await {
+            log::error(&format!(
                 "background refresh of playlist {id} failed: {error}"
-            )),
+            ));
         }
     });
 }
 
-/// Engine round-trip for the library, stored to the disk cache and emitted
-/// as `library`.
+/// Engine round-trip for the library, stored to the disk cache.
 async fn fetch_library(
     state: &Mutex<AppState>,
     client: &EngineClient,
-    app: &AppHandle,
 ) -> Result<Vec<Playlist>, String> {
     let references = client.browse_playlists(LIBRARY_LENGTH).await?;
     let mut playlists: Vec<Playlist> = references.iter().map(Playlist::from).collect();
@@ -668,10 +654,6 @@ async fn fetch_library(
         guard.playlists = playlists.clone();
         guard.playlists_fetched_at = Some(fetched_at);
     }
-    let _ = app.emit("library", &playlists);
-    // Fire-and-forget: the fresh library is already on screen, and the sweep
-    // only fills in artwork for the playlists that have none.
-    spawn_cover_sweep(app.clone());
     Ok(playlists)
 }
 
@@ -709,146 +691,6 @@ async fn fetch_playlist(
     Ok(detail)
 }
 
-// ---------------------------------------------------------------------------
-// Cover candidate sweep
-// ---------------------------------------------------------------------------
-
-/// At most this many sweep browses are ever in flight.
-///
-/// Spotify rate-limits — that is why the library refresh backs off at all —
-/// and the sweep is the one place in this app that could fire a hundred
-/// browses back to back. Two at a time, spaced out, keeps it below what a user
-/// clicking through their own playlists already costs.
-const COVER_SWEEP_CONCURRENCY: usize = 2;
-// The batch loop pairs its browses with `join!`, so the width is fixed at
-// compile time: raising the constant alone would leave batches unhandled.
-const _: () = assert!(COVER_SWEEP_CONCURRENCY == 2);
-
-/// Pause between sweep batches.
-const COVER_SWEEP_BATCH_DELAY: Duration = Duration::from_millis(750);
-
-/// Head start given to whatever the user is doing before the sweep begins. The
-/// triggers cluster at startup — the engine's ready transition plus the
-/// frontend's own boot pull — which is exactly when the engine is busiest
-/// serving what the user is actually looking at.
-const COVER_SWEEP_START_DELAY: Duration = Duration::from_secs(5);
-
-/// One background cover-candidate sweep: browses the playlists that have no
-/// artwork of any kind so the sidebar and the home grid can paint the same
-/// mosaic the detail page does, instead of a monogram tile for the very same
-/// playlist. Coalesced like the library refresh, since its trigger — a
-/// successful refresh — fires on engine ready and on every playlist edit.
-fn spawn_cover_sweep(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        let client = app.state::<Arc<EngineClient>>();
-        let state = app.state::<Mutex<AppState>>();
-        {
-            let mut guard = state.lock();
-            if guard.covers_sweeping {
-                guard.covers_sweep_queued = true;
-                return;
-            }
-            guard.covers_sweeping = true;
-        }
-        tokio::time::sleep(COVER_SWEEP_START_DELAY).await;
-        loop {
-            sweep_cover_candidates(&state, &client, &app).await;
-            let mut guard = state.lock();
-            if !std::mem::take(&mut guard.covers_sweep_queued) {
-                guard.covers_sweeping = false;
-                return;
-            }
-        }
-    });
-}
-
-/// Browses every playlist without artwork and fills in its cover candidates.
-///
-/// The library cache is saved and `library` re-emitted once, at the end: the
-/// payload is the whole library, and re-emitting it per playlist would put it
-/// back through IPC every few hundred milliseconds for as long as the sweep
-/// runs — the per-second churn this app exists to avoid.
-async fn sweep_cover_candidates(
-    state: &Mutex<AppState>,
-    client: &EngineClient,
-    app: &AppHandle,
-) {
-    let pending = {
-        let guard = state.lock();
-        playlists_missing_covers(&guard.playlists)
-    };
-    if pending.is_empty() {
-        return;
-    }
-    log::info(&format!(
-        "cover sweep: browsing {} playlists with no artwork",
-        pending.len()
-    ));
-
-    let mut updated = 0_usize;
-    for (index, batch) in pending.chunks(COVER_SWEEP_CONCURRENCY).enumerate() {
-        if index > 0 {
-            tokio::time::sleep(COVER_SWEEP_BATCH_DELAY).await;
-        }
-        // `join!` rather than spawned tasks: it bounds the browses in flight to
-        // the batch by construction, and the sweep stays one task.
-        let results = match batch {
-            [only] => vec![fetch_cover_candidates(state, client, only).await],
-            [first, second] => {
-                let (first, second) = tokio::join!(
-                    fetch_cover_candidates(state, client, first),
-                    fetch_cover_candidates(state, client, second),
-                );
-                vec![first, second]
-            }
-            _ => unreachable!("chunks() yields at most COVER_SWEEP_CONCURRENCY ids"),
-        };
-        for result in results {
-            match result {
-                Ok(true) => updated += 1,
-                // The playlist was deleted while its browse was in flight.
-                Ok(false) => {}
-                Err(error) => log::warn(&format!("cover sweep browse failed: {error}")),
-            }
-        }
-    }
-    if updated == 0 {
-        return;
-    }
-
-    let (dir, list_cache) = {
-        let guard = state.lock();
-        (
-            guard.data_dir.clone(),
-            PlaylistListCache {
-                version: 1,
-                fetched_at: guard.playlists_fetched_at,
-                me_id: guard.me_id.clone(),
-                playlists: guard.playlists.clone(),
-            },
-        )
-    };
-    save_playlist_list(&dir, &list_cache);
-    let _ = app.emit("library", &list_cache.playlists);
-    log::info(&format!("cover sweep: filled in {updated} playlists"));
-}
-
-/// Browses one playlist purely for its cover candidates.
-///
-/// Deliberately not [`fetch_playlist`]: that inserts into the 25-entry tracks
-/// cache, so sweeping a whole library would evict every playlist the user
-/// actually opened in favour of whatever the sweep touched last. Returns
-/// whether the library entry was updated.
-async fn fetch_cover_candidates(
-    state: &Mutex<AppState>,
-    client: &EngineClient,
-    id: &str,
-) -> Result<bool, String> {
-    let detail = PlaylistDetail::from(client.browse_playlist(id).await?);
-    let mut guard = state.lock();
-    Ok(apply_cover_candidates(&mut guard.playlists, &detail.playlist))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,31 +717,31 @@ mod tests {
     }
 
     #[test]
-    fn heartbeats_that_only_move_the_playhead_skip_the_full_state_emit() {
-        assert!(position_only_change(&playing_state(1_000), &playing_state(3_000)));
-        // An unchanged heartbeat is not a position change: nothing is emitted
-        // for it either way, but it must not masquerade as one.
-        assert!(!position_only_change(&playing_state(1_000), &playing_state(1_000)));
-    }
+    fn position_heartbeats_update_only_the_playhead_scalars_in_place() {
+        let mut snapshot = AppState::new(std::path::PathBuf::new());
+        snapshot.playback = playing_state(1_000);
+        let queue_ptr = snapshot.playback.queue.as_ptr();
 
-    #[test]
-    fn any_other_field_forces_a_full_state_emit() {
-        let before = playing_state(1_000);
+        apply_position_heartbeat(
+            &mut snapshot,
+            PositionHeartbeat {
+                position_ms: 3_000,
+                duration_ms: 250_000,
+            },
+        );
 
-        let mut paused = playing_state(3_000);
-        paused.playing = false;
-        assert!(!position_only_change(&before, &paused), "play/pause is a full state");
-
-        let mut skipped = playing_state(3_000);
-        skipped.current_uri = "spotify:track:b".to_owned();
-        assert!(!position_only_change(&before, &skipped), "track change is a full state");
-
-        let mut requeued = playing_state(3_000);
-        requeued.queue.clear();
-        assert!(!position_only_change(&before, &requeued), "queue change is a full state");
-
-        let mut louder = playing_state(3_000);
-        louder.volume = louder.volume.wrapping_add(1);
-        assert!(!position_only_change(&before, &louder), "volume change is a full state");
+        assert_eq!(snapshot.playback.position_ms, 3_000);
+        assert_eq!(snapshot.playback.duration_ms, 250_000);
+        // The queue is never cloned, compared, or rebuilt: the scalars are
+        // written in place over the existing snapshot.
+        assert_eq!(
+            snapshot.playback.queue.as_ptr(),
+            queue_ptr,
+            "heartbeat must not touch the queue"
+        );
+        assert_eq!(snapshot.playback.playing, true);
+        assert_eq!(snapshot.playback.current_uri, "spotify:track:a");
+        assert_eq!(snapshot.playback.volume, 50);
+        assert_eq!(snapshot.playback.queue, vec![Track::default()]);
     }
 }

@@ -6,7 +6,16 @@
 
   const artist = $derived(detail.artist);
   const top = $derived(artist?.top_tracks ?? []);
-  const albums = $derived(artist?.albums ?? []);
+  const releaseSections = $derived.by(() => {
+    const releases = artist?.releases ?? {};
+    return [
+      { key: "albums", title: "Albums", items: releases.albums ?? [] },
+      { key: "singles", title: "Singles", items: releases.singles ?? [] },
+      { key: "compilations", title: "Compilations", items: releases.compilations ?? [] },
+      { key: "appears_on", title: "Appears on", items: releases.appears_on ?? [] },
+    ];
+  });
+  const hasReleases = $derived(releaseSections.some((section) => section.items.length));
 
   /* Seeds the banner's fallback gradient off the same hash as the artwork, so
      an artist with no portrait still gets a stable colour rather than a hole. */
@@ -54,8 +63,8 @@
   {#if artist}
     <p class="detail-meta" style="margin-top:var(--s5)">
       <span class="num">{top.length} popular {top.length === 1 ? "song" : "songs"}</span>
-      {#if albums.length}
-        <span class="sep">/</span><span class="num">{albums.length} {albums.length === 1 ? "album" : "albums"}</span>
+      {#if hasReleases}
+        <span class="sep">/</span><span class="num">{releaseSections.reduce((total, section) => total + section.items.length, 0)} releases</span>
       {/if}
     </p>
 
@@ -75,28 +84,32 @@
       </div>
     {/if}
 
-    {#if albums.length}
-      <div class="section">
-        <div class="section-head"><h2 class="section-title">Albums</h2></div>
-        <div class="grid">
-          {#each albums as al (al.id)}
-            <button class="card" onclick={() => navigate("album", al.id)}>
-              <span class="card-art">
-                <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />
-                <span class="card-play"><Icon name="play" size={15} /></span>
-              </span>
-              <span class="card-name">{al.name}</span>
-              <span class="card-sub">{al.artist_names.join(", ")}</span>
-            </button>
-          {/each}
+    {#each releaseSections as section (section.key)}
+      {#if section.items.length}
+        <div class="section" data-release-group={section.key}>
+          <div class="section-head"><h2 class="section-title">{section.title}</h2></div>
+          <div class="grid">
+            {#each section.items as al (al.id)}
+              <button class="card" onclick={() => navigate("album", al.id)}>
+                <span class="card-art">
+                  <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />
+                  <span class="card-play"><Icon name="play" size={15} /></span>
+                </span>
+                <span class="card-name">{al.name}</span>
+                <span class="card-sub">
+                  {#if al.year}{al.year} · {/if}{al.artist_names.join(", ")}
+                </span>
+              </button>
+            {/each}
+          </div>
         </div>
-      </div>
-    {/if}
+      {/if}
+    {/each}
 
-    {#if !top.length && !albums.length}
+    {#if !top.length && !hasReleases}
       <div class="empty">
         <p class="h">Nothing to show for this artist.</p>
-        <p class="sub">The engine returned no popular songs or albums.</p>
+        <p class="sub">The engine returned no popular songs or releases.</p>
       </div>
     {/if}
   {/if}

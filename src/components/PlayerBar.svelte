@@ -121,6 +121,7 @@
         value={positionMs()}
         label="Seek"
         step={5000}
+        formatValue={formatTime}
         onCommit={(v) => {
           dragPos = null;
           api.seek(v).catch(() => {});

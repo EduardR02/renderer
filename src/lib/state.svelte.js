@@ -152,6 +152,22 @@ export const library = $state([]);
 export const detail = $state({ playlist: null, album: null, artist: null });
 export const search = $state({ query: "", results: null, submitted: false, busy: false });
 
+/**
+ * On-demand track credits surface state. The payload is kept as the backend
+ * returns it (`TrackCreditsDetail`): groups retain their source-provided
+ * headings, contributors retain every returned name and subrole, and a
+ * non-empty contributor `id` is eligible only for an external songwriter URL.
+ */
+export const credits = $state({
+  open: false,
+  loading: false,
+  track: null,
+  data: null,
+  error: null,
+});
+let creditsSeq = 0;
+
+
 /** See the note on `api.search`; this is the single knob that moves latency. */
 export const SEARCH_LIMIT = 10;
 
@@ -197,9 +213,70 @@ export function queueSearch(query) {
   }, SEARCH_DEBOUNCE_MS);
 }
 
+/**
+ * Opens credits only after an explicit row-menu action. A sequence token
+ * prevents a slow response for a closed/replaced dialog from painting stale
+ * contributors into the next track's surface.
+ */
+export function openCredits(track) {
+  const id = track?.id?.trim?.() ?? "";
+  creditsSeq += 1;
+  const seq = creditsSeq;
+  credits.open = true;
+  credits.loading = true;
+  credits.track = track ?? null;
+  credits.data = null;
+  credits.error = null;
+  if (!id) {
+    credits.loading = false;
+    credits.error = "Credits are unavailable for this track.";
+    return;
+  }
+  api
+    .browseTrackCredits(id)
+    .then((data) => {
+      if (seq !== creditsSeq) return;
+      credits.data = data ?? null;
+      credits.loading = false;
+    })
+    .catch((error) => {
+      if (seq !== creditsSeq) return;
+      credits.loading = false;
+      credits.error = String(error || "Could not load credits.");
+    });
+}
+
+export function closeCredits() {
+  creditsSeq += 1;
+  credits.open = false;
+  credits.loading = false;
+  credits.track = null;
+  credits.data = null;
+  credits.error = null;
+}
+
+
 export function setLibrary(playlists) {
   library.length = 0;
   library.push(...(playlists ?? []));
+}
+/**
+ * Optimistically promotes the playlist that supplied a play action.
+ *
+ * The backend persists the timestamp through `touch_playlist`, but it does
+ * not emit a library snapshot for this small local ordering change. Moving
+ * the existing object in the reactive array keeps the sidebar responsive
+ * without inferring ownership from a track URI (the same track can be in
+ * several playlists).
+ */
+export function promotePlaylist(id) {
+  if (!id) return false;
+  const index = library.findIndex((playlist) => playlist?.id === id);
+  if (index < 0) return false;
+  if (index === 0) return true;
+  const [playlist] = library.splice(index, 1);
+  library.unshift(playlist);
+  return true;
 }
 
 /* ---------------- Local likes (no-op backend) ---------------- */
@@ -222,6 +299,44 @@ const coverPending = new Map(); // remote url -> Promise<string|null>
 
 /** Reactive counters for Settings; the Maps above are not observable. */
 export const stats = $state({ coversResolved: 0 });
+
+/**
+ * Disk-backed cache usage returned by `get_cache_stats`. The backend memoises
+ * its filesystem walk, so Settings can refresh on mount/reopen without
+ * repeatedly enumerating the cache directories.
+ */
+export const cacheStats = $state({
+  audio: null,
+  covers: null,
+  loading: false,
+  error: null,
+  updatedAt: 0,
+});
+let cacheStatsRequest = null;
+
+export function refreshCacheStats() {
+  if (cacheStatsRequest) return cacheStatsRequest;
+  cacheStats.loading = true;
+  cacheStats.error = null;
+  const request = api
+    .getCacheStats()
+    .then((payload) => {
+      cacheStats.audio = payload?.audio ?? null;
+      cacheStats.covers = payload?.covers ?? null;
+      cacheStats.updatedAt = Date.now();
+      return payload;
+    })
+    .catch((error) => {
+      cacheStats.error = String(error || "Could not measure caches.");
+      throw error;
+    })
+    .finally(() => {
+      cacheStats.loading = false;
+      cacheStatsRequest = null;
+    });
+  cacheStatsRequest = request;
+  return request;
+}
 
 /**
  * Turns the engine's `cover://<sha1>` into a URL the webview will actually
@@ -268,10 +383,20 @@ export const api = {
   previous: () => invoke("previous"),
   seek: (ms) => {
     const target = Math.max(0, Math.round(ms));
+    const wasPlaying = playback.playing;
+    const previousPosition = positionMs();
     // Anchor optimistically: without this the knob snaps back to the last
     // engine sync until the next heartbeat lands, then jumps forward again.
+    // Seeking never changes `playing`; the engine preserves this intent on
+    // both the paused and playing paths.
     anchorPlayhead(target);
-    return invoke("seek", { positionMs: target });
+    return invoke("seek", { positionMs: target }).catch((error) => {
+      // Keep the optimistic projection honest if the command is rejected,
+      // especially for a paused seek where an error must not look like play.
+      playback.playing = wasPlaying;
+      anchorPlayhead(previousPosition);
+      throw error;
+    });
   },
   setVolume: (percent) => {
     const target = Math.min(100, Math.max(0, Math.round(percent)));
@@ -346,24 +471,10 @@ export async function initEvents() {
   }).catch(() => {});
   listen("session", (e) => applySession(e.payload)).catch(() => {});
   listen("library", (e) => setLibrary(e.payload)).catch(() => {});
-  listen("playlist-tracks", (e) => {
-    detail.playlist = e.payload ?? null;
-  }).catch(() => {});
-  listen("album", (e) => {
-    detail.album = e.payload ?? null;
-  }).catch(() => {});
-  listen("artist", (e) => {
-    detail.artist = e.payload ?? null;
-  }).catch(() => {});
-  listen("search-results", (e) => {
-    search.results = e.payload ?? null;
-    search.submitted = true;
-  }).catch(() => {});
 
   // Pull initial state. The engine may not be ready yet, so the cached
   // library snapshot (hydrated by the Rust side at startup) is applied here
-  // too for an instant paint; the fresh `library` event replaces it once the
-  // engine reports ready.
+  // too for an instant paint; the command response replaces it when fresh.
   api
     .getState()
     .then((payload) => {
@@ -371,7 +482,10 @@ export async function initEvents() {
       if (payload && Array.isArray(payload.playlists)) setLibrary(payload.playlists);
     })
     .catch(() => {});
-  api.browsePlaylists().catch(() => {});
+  api
+    .browsePlaylists()
+    .then((playlists) => setLibrary(playlists))
+    .catch(() => {});
 
   // Advance the projected playhead. 250ms reads as smooth on a progress bar
   // and touches exactly one number; nothing else in the tree invalidates.

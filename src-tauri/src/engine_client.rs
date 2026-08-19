@@ -2,9 +2,9 @@
 //!
 //! Owns the engine's stdin/stdout pipes, serializes requests with
 //! incrementing request ids, routes replies back through tokio oneshots, and
-//! fans `state` lines out on a broadcast channel. A supervisor task respawns
-//! the engine with backoff when its pipe closes and re-requests `status` so
-//! the session re-syncs after a restart.
+//! fans `state` and `position` lines out on a broadcast channel in wire
+//! order. A supervisor task respawns the engine with backoff when its pipe
+//! closes and re-requests `status` so the session re-syncs after a restart.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -46,13 +46,34 @@ const ENGINE_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-/// One engine reply (any non-`state` line). `data` carries the payload of
-/// `browse_*`/`edit_*` responses; plain `response` lines leave it `None`.
+/// One engine reply (any non-`state`/`position` line). `data` carries the
+/// payload of `browse_*`/`edit_*` responses; plain `response` lines leave
+/// it `None`.
 #[derive(Debug, Clone)]
 pub struct EngineReply {
     pub ok: bool,
     pub error: Option<String>,
     pub data: Option<Value>,
+}
+
+/// The engine's 2-second scalar position heartbeat. Deliberately not a
+/// [`PlaybackState`]: a heartbeat carries only the playhead scalars the
+/// frontend projects and clamps against, so parsing and forwarding it never
+/// touches (or clones) the queue.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+pub struct PositionHeartbeat {
+    pub position_ms: u32,
+    pub duration_ms: u32,
+}
+
+/// One playback line the engine emitted, fanned out to subscribers in wire
+/// order. Heartbeats share the channel with full states so a consumer can
+/// never apply an older heartbeat after a newer full state (two channels
+/// would race them).
+#[derive(Clone, Debug)]
+pub enum StateLine {
+    State(PlaybackState),
+    Position(PositionHeartbeat),
 }
 
 /// Playback settings to re-apply after the engine is respawned
@@ -85,7 +106,7 @@ pub struct EngineClient {
     pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<EngineReply>>>,
     stdin: Mutex<Option<ChildStdin>>,
     process: Mutex<Option<Child>>,
-    state_tx: tokio::sync::broadcast::Sender<PlaybackState>,
+    state_tx: tokio::sync::broadcast::Sender<StateLine>,
     exit_tx: watch::Sender<bool>,
     last_state: Mutex<Option<PlaybackState>>,
     restore_pending: tokio::sync::Mutex<Option<RestoreSnapshot>>,
@@ -117,7 +138,9 @@ impl EngineClient {
         client
     }
 
-    pub fn subscribe_state(&self) -> tokio::sync::broadcast::Receiver<PlaybackState> {
+    /// Subscribes to the engine's playback lines (full `state` and scalar
+    /// `position` heartbeats) in wire order.
+    pub fn subscribe_lines(&self) -> tokio::sync::broadcast::Receiver<StateLine> {
         self.state_tx.subscribe()
     }
 
@@ -535,7 +558,18 @@ impl EngineClient {
 
     fn on_state(&self, state: &PlaybackState) {
         *self.last_state.lock() = Some(state.clone());
-        let _ = self.state_tx.send(state.clone());
+        let _ = self.state_tx.send(StateLine::State(state.clone()));
+    }
+
+    /// Applies a scalar position heartbeat: freshens only the playhead
+    /// scalars of the last known state in place (no queue clone, no
+    /// full-state comparison) and forwards the line in wire order.
+    fn on_position(&self, heartbeat: PositionHeartbeat) {
+        if let Some(last) = self.last_state.lock().as_mut() {
+            last.position_ms = heartbeat.position_ms;
+            last.duration_ms = heartbeat.duration_ms;
+        }
+        let _ = self.state_tx.send(StateLine::Position(heartbeat));
     }
 
     fn on_eof(&self) {
@@ -572,9 +606,9 @@ impl EngineClient {
     }
 }
 
-/// Reader thread: parses one protocol line per iteration. `state` lines are
-/// fanned out to subscribers; every other line is routed to the pending
-/// request with the matching id.
+/// Reader thread: parses one protocol line per iteration. `state` and
+/// `position` lines are fanned out to subscribers in wire order; every other
+/// line is routed to the pending request with the matching id.
 fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
     let client = Arc::clone(client);
     std::thread::Builder::new()
@@ -596,24 +630,18 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
                             // Never produced by the engine; be tolerant.
                             Err(_) => continue,
                         };
-                        if value.get("type").and_then(Value::as_str) == Some("state") {
-                            match serde_json::from_value::<PlaybackState>(value) {
-                                Ok(state) => client.on_state(&state),
-                                Err(error) => log::error(&format!(
-                                    "could not parse engine state line: {error}"
-                                )),
+                        match parse_line(value) {
+                            Some(Line::State(state)) => client.on_state(&state),
+                            Some(Line::Position(heartbeat)) => client.on_position(heartbeat),
+                            Some(Line::Reply {
+                                request_id,
+                                ok,
+                                error,
+                                data,
+                            }) => {
+                                client.deliver(&request_id, EngineReply { ok, error, data });
                             }
-                        } else {
-                            let request_id = value
-                                .get("request_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned();
-                            let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-                            let error =
-                                value.get("error").and_then(Value::as_str).map(str::to_owned);
-                            let data = value.get("data").cloned();
-                            client.deliver(&request_id, EngineReply { ok, error, data });
+                            None => {} // unparseable line: logged, dropped
                         }
                     }
                     Err(_) => break,
@@ -622,6 +650,60 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
             client.on_eof();
         })
         .expect("could not start engine reader thread");
+}
+
+/// What one engine output line means. `state` and `position` lines are
+/// fanned out; every other line is a reply to a pending request.
+#[derive(Debug)]
+enum Line {
+    State(PlaybackState),
+    Position(PositionHeartbeat),
+    Reply {
+        request_id: String,
+        ok: bool,
+        error: Option<String>,
+        data: Option<Value>,
+    },
+}
+
+/// Classifies and parses one protocol line. Position heartbeats are parsed
+/// into their two scalars only — never into a [`PlaybackState`], so a
+/// heartbeat can never cost a queue parse. Malformed `state`/`position`
+/// lines are logged and dropped (`None`), matching the reader's old
+/// tolerance; unknown lines fall through to reply routing.
+fn parse_line(value: Value) -> Option<Line> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("state") => match serde_json::from_value::<PlaybackState>(value) {
+            Ok(state) => Some(Line::State(state)),
+            Err(error) => {
+                log::error(&format!("could not parse engine state line: {error}"));
+                None
+            }
+        },
+        Some("position") => match serde_json::from_value::<PositionHeartbeat>(value) {
+            Ok(heartbeat) => Some(Line::Position(heartbeat)),
+            Err(error) => {
+                log::error(&format!("could not parse engine position line: {error}"));
+                None
+            }
+        },
+        _ => {
+            let request_id = value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            let error = value.get("error").and_then(Value::as_str).map(str::to_owned);
+            let data = value.get("data").cloned();
+            Some(Line::Reply {
+                request_id,
+                ok,
+                error,
+                data,
+            })
+        }
+    }
 }
 
 /// Rolls the engine log to `<name>.log.1` once it grows past
@@ -704,6 +786,109 @@ fn locate_engine() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// An `EngineClient` with no live engine process, for unit tests of the
+    /// reader-side callbacks.
+    fn client_with_last_state(state: PlaybackState) -> Arc<EngineClient> {
+        let (state_tx, _) = tokio::sync::broadcast::channel(64);
+        let (exit_tx, _) = tokio::sync::watch::channel(false);
+        Arc::new(EngineClient {
+            state_dir: PathBuf::new(),
+            pending: tokio::sync::Mutex::new(HashMap::new()),
+            stdin: Mutex::new(None),
+            process: Mutex::new(None),
+            state_tx,
+            exit_tx,
+            last_state: Mutex::new(Some(state)),
+            restore_pending: tokio::sync::Mutex::new(None),
+            next_request_id: AtomicU64::new(1),
+            shutting_down: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn position_lines_parse_as_scalar_heartbeats_not_states() {
+        let line = parse_line(serde_json::json!({
+            "type": "position",
+            "position_ms": 12_345,
+            "duration_ms": 240_000,
+        }));
+        let Line::Position(heartbeat) = line.expect("position line parses") else {
+            panic!("expected a position heartbeat");
+        };
+        assert_eq!(heartbeat.position_ms, 12_345);
+        assert_eq!(heartbeat.duration_ms, 240_000);
+    }
+
+    #[test]
+    fn state_and_reply_lines_still_classify_as_before() {
+        let state = parse_line(serde_json::json!({
+            "type": "state",
+            "ready": true,
+            "auth_state": "ready",
+            "playing": true,
+            "position_ms": 1,
+            "duration_ms": 2,
+            "volume": 50,
+            "shuffle": false,
+            "repeat": "off",
+            "queue": [],
+        }));
+        assert!(matches!(state, Some(Line::State(_))));
+
+        let reply = parse_line(serde_json::json!({
+            "type": "response",
+            "request_id": "request-7",
+            "ok": true,
+        }));
+        match reply {
+            Some(Line::Reply { request_id, ok, error, data }) => {
+                assert_eq!(request_id, "request-7");
+                assert!(ok);
+                assert!(error.is_none());
+                assert!(data.is_none());
+            }
+            _ => panic!("response lines stay on the reply path"),
+        }
+    }
+
+    #[test]
+    fn position_heartbeats_freshen_the_last_state_scalars_in_place() {
+        let mut state = PlaybackState::default();
+        state.auth_state = "ready".to_owned();
+        state.queue = vec![Track::default(); 3];
+        let client = client_with_last_state(state);
+        let queue_ptr = client.last_state.lock().as_ref().unwrap().queue.as_ptr();
+
+        // Subscribe before the send: broadcast messages sent with no active
+        // receiver are dropped, exactly like the production flow where
+        // consume_states subscribes before the engine produces lines.
+        let mut receiver = client.subscribe_lines();
+        client.on_position(PositionHeartbeat {
+            position_ms: 42_000,
+            duration_ms: 240_000,
+        });
+
+        let last = client.last_state.lock();
+        let last = last.as_ref().expect("last state kept");
+        assert_eq!(last.position_ms, 42_000);
+        assert_eq!(last.duration_ms, 240_000);
+        assert_eq!(
+            last.queue.as_ptr(),
+            queue_ptr,
+            "a heartbeat must never clone the queue"
+        );
+        assert_eq!(last.queue.len(), 3, "queue contents untouched");
+
+        // Subscribers see the heartbeat as a Position line, in wire order.
+        match receiver.try_recv().expect("heartbeat fanned out") {
+            StateLine::Position(heartbeat) => {
+                assert_eq!(heartbeat.position_ms, 42_000);
+                assert_eq!(heartbeat.duration_ms, 240_000);
+            }
+            StateLine::State(_) => panic!("heartbeat must not arrive as a full state"),
+        }
+    }
+
     /// Finds a built engine binary: `SPOTIFY_ENGINE_PATH`, the workspace
     /// target dir, or the engine package's own target dir.
     fn find_engine() -> Option<PathBuf> {
@@ -749,22 +934,30 @@ mod tests {
         std::env::set_var("SPOTIFY_STATE_DIR", &state_dir);
 
         let client = EngineClient::start();
-        let mut states = client.subscribe_state();
+        let mut lines = client.subscribe_lines();
 
         // The engine announces its session immediately after startup.
-        let first = tokio::time::timeout(Duration::from_secs(20), states.recv())
+        let first = match tokio::time::timeout(Duration::from_secs(20), lines.recv())
             .await
             .expect("engine emits its initial state within 20s")
-            .expect("state channel stays open");
+            .expect("state channel stays open")
+        {
+            StateLine::State(state) => state,
+            StateLine::Position(_) => panic!("the initial line is a full state, not a heartbeat"),
+        };
         assert!(!first.auth_state.is_empty());
         assert_eq!(first.auth_state, "needs_login", "fresh state dir has no session");
 
         // A command round-trip: status is answered and re-emits the state.
         client.status().await.expect("status command round-trips");
-        let after_status = tokio::time::timeout(Duration::from_secs(20), states.recv())
+        let after_status = match tokio::time::timeout(Duration::from_secs(20), lines.recv())
             .await
             .expect("status triggers a fresh state line")
-            .expect("state channel stays open");
+            .expect("state channel stays open")
+        {
+            StateLine::State(state) => state,
+            StateLine::Position(_) => panic!("status re-emits a full state"),
+        };
         assert_eq!(after_status.auth_state, first.auth_state);
 
         // Browse without a session fails cleanly through the reply channel.

@@ -1,5 +1,14 @@
 <script>
-  import { api, navigate, playback, togglePlay, toggleLiked, isTrackLiked, library } from "../lib/state.svelte.js";
+  import {
+    api,
+    navigate,
+    playback,
+    togglePlay,
+    toggleLiked,
+    isTrackLiked,
+    library,
+    openCredits,
+  } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
@@ -13,7 +22,36 @@
     /** Off for short embedded lists (search), where column heads are noise. */
     showHead = true,
     playlistId = null,
+    /** Playlist tables may give artists and added dates their own columns. */
+    showArtist = false,
+    showAdded = false,
+    sortKey = null,
+    sortDirection = "asc",
+    onSort = null,
   } = $props();
+
+  const addedDateFormatter = new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+
+  function formatAddedAt(value) {
+    const timestamp = Number(value);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return "—";
+    const date = new Date(timestamp);
+    if (!Number.isFinite(date.getTime())) return "—";
+    return addedDateFormatter.format(date);
+  }
+
+  function activateSort(key) {
+    onSort?.(key);
+  }
+
+  function sortAriaLabel(key, label) {
+    if (sortKey !== key) return `Sort by ${label}`;
+    return `Sort by ${label}, currently ${sortDirection === "asc" ? "ascending" : "descending"}`;
+  }
 
   /* One shared menu instance for the whole table rather than one per row. */
   const menu = $state({ open: false, x: 0, y: 0, track: null, index: -1 });
@@ -96,6 +134,13 @@
   let curFirst = 0;
   let curLast = 0;
 
+  /* A same-length playlist still needs a new window: the rows are intentionally
+     unkeyed, so retaining the old range would display the previous list's
+     spacer and indexes until the next scroll. */
+  let seenTracks = null;
+  let seenPlaylistId = null;
+  let seenLength = -1;
+
   const visible = $derived(tracks.slice(firstRow, lastRow));
 
   function measure(scroller) {
@@ -104,8 +149,20 @@
     // Layout is clean during scroll, so these reads are cheap and — unlike a
     // cached offset — stay correct when the header above the list changes size.
     const above = scroller.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
-    const f = Math.max(0, Math.floor(above / ROW_H) - OVERSCAN);
-    const l = Math.min(len, Math.ceil((above + scroller.clientHeight) / ROW_H) + OVERSCAN);
+    /* Both ends must stay inside 0..len, and `f` must not pass `l`. A short
+       list that is not the last thing in the pane — Search renders five songs
+       above the album and artist sections — keeps scrolling long after its own
+       rows are gone, so `above` grows without bound. Unclamped, `f` climbed
+       past `len` while `l` stayed pinned there: the window emptied, the top
+       spacer inflated to `f * ROW_H`, and the bottom spacer vanished, so the
+       component *grew* as it scrolled past. That fed straight back into
+       `above` and the pane never converged. Clamped, the three heights always
+       sum to `len * ROW_H` whatever the offset. */
+    const f = Math.min(Math.max(0, Math.floor(above / ROW_H) - OVERSCAN), len);
+    const l = Math.min(
+      len,
+      Math.max(f, Math.ceil((above + scroller.clientHeight) / ROW_H) + OVERSCAN),
+    );
     if (f === curFirst && l === curLast) return;
     curFirst = f;
     curLast = l;
@@ -113,10 +170,59 @@
     lastRow = l;
   }
 
+  function resetWindow(length, scroller) {
+    if (scroller) scroller.scrollTop = 0;
+    const initialLast = scroller
+      ? Math.min(length, Math.ceil(scroller.clientHeight / ROW_H) + OVERSCAN)
+      : length;
+    curFirst = 0;
+    curLast = initialLast;
+    firstRow = 0;
+    lastRow = initialLast;
+  }
+
+  function clampWindow(length) {
+    const maxFirst = Math.max(0, length - 1);
+    const f = Math.min(curFirst, maxFirst);
+    const l = Math.min(Math.max(curLast, f), length);
+    curFirst = f;
+    curLast = l;
+    firstRow = f;
+    lastRow = l;
+  }
+
+  /*
+   * Reset before the new rows are patched into the DOM. This prevents a
+   * previous playlist's top/bottom spacer from surviving a same-length switch.
+   * Identity changes reset the shared pane scroll; length-only changes preserve
+   * the position but clamp the window so a shortened list cannot render a stale
+   * blank range.
+   */
+  $effect.pre(() => {
+    const list = tracks;
+    const length = list.length;
+    const body = bodyEl;
+    if (!body) return;
+
+    const identityChanged = list !== seenTracks || playlistId !== seenPlaylistId;
+    const lengthChanged = length !== seenLength;
+    if (!identityChanged && !lengthChanged) return;
+
+    seenTracks = list;
+    seenPlaylistId = playlistId;
+    seenLength = length;
+    const scroller = body.closest(".scroll");
+    if (identityChanged) resetWindow(length, scroller);
+    else clampWindow(length);
+  });
+
   $effect(() => {
-    // Re-runs when the list is (re)mounted or its length changes; deliberately
-    // does not depend on firstRow/lastRow, which change on every scroll frame.
-    tracks.length;
+    // Re-runs when the list identity, its length, or its presentation context
+    // changes; deliberately does not depend on firstRow/lastRow, which change
+    // on every scroll frame.
+    const list = tracks;
+    list.length;
+    playlistId;
     if (!bodyEl) return;
     const scroller = bodyEl.closest(".scroll");
     if (!scroller) {
@@ -169,20 +275,70 @@
   });
 </script>
 
-<div class="tl" class:no-album={!showAlbum} class:album-page={!showArt}>
+<div
+  class="tl"
+  class:no-album={!showAlbum}
+  class:album-page={!showArt}
+  class:playlist-sort={showAdded}
+  style="overflow-anchor: none"
+>
   {#if showHead}
     <div class="tl-head">
-      <span style="text-align:right">#</span>
+      <button
+        class="tl-sort-btn"
+        class:active={sortKey === "order"}
+        aria-label={sortAriaLabel("order", "original/custom order")}
+        aria-pressed={sortKey === "order"}
+        onclick={() => activateSort("order")}
+      ># {#if sortKey === "order"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
       {#if showArt}<span></span>{/if}
-      <span>Title</span>
-      {#if showAlbum}<span>Album</span>{/if}
+      <button
+        class="tl-sort-btn"
+        class:active={sortKey === "title"}
+        aria-label={sortAriaLabel("title", "title")}
+        aria-pressed={sortKey === "title"}
+        onclick={() => activateSort("title")}
+      >Title {#if sortKey === "title"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+      {#if showArtist}
+        <button
+          class="tl-sort-btn"
+          class:active={sortKey === "artist"}
+          aria-label={sortAriaLabel("artist", "artist")}
+          aria-pressed={sortKey === "artist"}
+          onclick={() => activateSort("artist")}
+        >Artist {#if sortKey === "artist"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+      {/if}
+      {#if showAlbum}
+        <button
+          class="tl-sort-btn"
+          class:active={sortKey === "album"}
+          aria-label={sortAriaLabel("album", "album")}
+          aria-pressed={sortKey === "album"}
+          onclick={() => activateSort("album")}
+        >Album {#if sortKey === "album"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+      {/if}
+      {#if showAdded}
+        <button
+          class="tl-sort-btn"
+          class:active={sortKey === "added"}
+          aria-label={sortAriaLabel("added", "date added")}
+          aria-pressed={sortKey === "added"}
+          onclick={() => activateSort("added")}
+        >Added {#if sortKey === "added"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
+      {/if}
       <span></span>
-      <span style="display:grid;justify-items:end"><Icon name="clock" size={13} /></span>
+      <button
+        class="tl-sort-btn tl-sort-duration"
+        class:active={sortKey === "duration"}
+        aria-label={sortAriaLabel("duration", "duration")}
+        aria-pressed={sortKey === "duration"}
+        onclick={() => activateSort("duration")}
+      ><span class="tl-sort-duration-label">Duration</span><Icon name="clock" size={13} />{#if sortKey === "duration"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
       <span></span>
     </div>
   {/if}
 
-  <div bind:this={bodyEl}>
+  <div bind:this={bodyEl} style="overflow-anchor: none">
   {#if firstRow > 0}<div aria-hidden="true" style:height="{firstRow * ROW_H}px"></div>{/if}
 
   <!-- Unkeyed on purpose: as the window slides, Svelte patches the existing
@@ -216,13 +372,25 @@
 
       <span class="c-title">
         <span class="t-name">{track.name}</span>
-        <ArtistLinks
-          class="t-artists"
-          names={track.artist_names}
-          ids={track.artist_ids ?? []}
-          id={track.artist_id}
-        />
+        {#if !showArtist}
+          <ArtistLinks
+            class="t-artists"
+            names={track.artist_names}
+            ids={track.artist_ids ?? []}
+            id={track.artist_id}
+          />
+        {/if}
       </span>
+
+      {#if showArtist}
+        <span class="c-artist">
+          <ArtistLinks
+            names={track.artist_names}
+            ids={track.artist_ids ?? []}
+            id={track.artist_id}
+          />
+        </span>
+      {/if}
 
       {#if showAlbum}
         <!-- Always rendered, even when it repeats the title (single-track
@@ -231,6 +399,10 @@
         <button class="c-album" onclick={() => track.album_id && navigate("album", track.album_id)}>
           {track.album_name}
         </button>
+      {/if}
+
+      {#if showAdded}
+        <span class="c-added">{formatAddedAt(track.added_at)}</span>
       {/if}
 
       <span class="c-like">
@@ -265,6 +437,11 @@
       Add to queue
     </button>
     <button class="menu-item" onclick={openPicker}>Add to playlist…</button>
+    {#if menu.track?.id}
+      <button class="menu-item" onclick={() => { menu.open = false; openCredits(menu.track); }}>
+        View credits
+      </button>
+    {/if}
     {#if menu.track?.album_id}
       <button class="menu-item" onclick={() => { menu.open = false; navigate("album", menu.track.album_id); }}>
         Go to album

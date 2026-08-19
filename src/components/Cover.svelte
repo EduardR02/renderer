@@ -42,21 +42,20 @@
   const primary = $derived(src || pool[0] || "");
 
   /**
-   * FNV-1a over the id, mapped onto the hue circle. Stable across restarts,
-   * so a playlist keeps the same colour identity for as long as it exists.
+   * FNV-1a over the id, mapped onto the restrained three-accent palette.
+   * Stable across restarts, so generated playlist art keeps its identity.
    */
-  function hue(seed) {
+  function tone(seed) {
     let h = 0x811c9dc5;
     for (let i = 0; i < seed.length; i++) {
       h ^= seed.charCodeAt(i);
       h = Math.imul(h, 0x01000193) >>> 0;
     }
-    return h % 360;
+    return ["var(--rose)", "var(--foam)", "var(--love)"][h % 3];
   }
 
   const letter = $derived((name.trim()[0] ?? "?").toUpperCase());
-  const seedHue = $derived(hue(id || name));
-
+  const seedTone = $derived(tone(id || name));
   /** Resolved `cover://` urls, indexed the same as the source list. */
   let resolved = $state({});
 
@@ -85,12 +84,17 @@
   >
     <!-- width/height attributes as well as the CSS above: a load that fails
          still reserves the identical box, so nothing reflows around it. -->
+    <!-- loading="lazy": the sidebar and queue render covers far below the
+         fold; offscreen ones must not be fetched or decoded until scrolled
+         to. decoding="async": the visible slice paints without waiting for
+         the rest of the decode queue. Both are safe because every image has
+         explicit dimensions — nothing can reflow around a late decode. -->
     {#if tier === "mosaic"}
       {#each pool as url (url)}
-        <img src={resolved[url]} alt="" width={Math.round(size / 2)} height={Math.round(size / 2)} draggable="false" />
+        <img src={resolved[url]} alt="" width={Math.round(size / 2)} height={Math.round(size / 2)} draggable="false" loading="lazy" decoding="async" />
       {/each}
     {:else}
-      <img src={resolved[primary]} alt={name} width={size} height={size} draggable="false" />
+      <img src={resolved[primary]} alt={name} width={size} height={size} draggable="false" loading="lazy" decoding="async" />
     {/if}
   </span>
 {:else}
@@ -101,7 +105,7 @@
     class:raised
     style:width={fill ? "100%" : `${size}px`}
     style:height={fill ? "100%" : `${size}px`}
-    style:--h={seedHue}
+    style:--tone={seedTone}
     style:--tile={fill ? null : `${size}px`}
     data-letter={letter}
     role="img"
