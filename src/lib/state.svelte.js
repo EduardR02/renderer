@@ -150,7 +150,52 @@ export function isLoggedOut() {
 
 export const library = $state([]);
 export const detail = $state({ playlist: null, album: null, artist: null });
-export const search = $state({ query: "", results: null, submitted: false });
+export const search = $state({ query: "", results: null, submitted: false, busy: false });
+
+/** See the note on `api.search`; this is the single knob that moves latency. */
+export const SEARCH_LIMIT = 10;
+
+/**
+ * Debounce before a keystroke becomes a request. Every search costs at least
+ * the ~580ms server floor no matter how small the limit, so firing per
+ * keystroke would queue requests faster than they return. Long enough to skip
+ * the middle of a word, short enough that results feel like they are keeping up.
+ */
+const SEARCH_DEBOUNCE_MS = 220;
+
+let searchTimer = null;
+let searchSeq = 0;
+
+/**
+ * Runs a search after the debounce, discarding replies that arrive out of
+ * order. Without the sequence guard a slow early query can land after a fast
+ * later one and overwrite fresher results with staler ones.
+ */
+export function queueSearch(query) {
+  const q = query.trim();
+  clearTimeout(searchTimer);
+  if (!q) {
+    search.submitted = false;
+    search.results = null;
+    search.busy = false;
+    return;
+  }
+  search.busy = true;
+  searchTimer = setTimeout(() => {
+    const seq = ++searchSeq;
+    api
+      .search(q)
+      .then((result) => {
+        if (seq !== searchSeq) return; // a newer query already answered
+        search.results = result ?? null;
+        search.submitted = true;
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (seq === searchSeq) search.busy = false;
+      });
+  }, SEARCH_DEBOUNCE_MS);
+}
 
 export function setLibrary(playlists) {
   library.length = 0;
@@ -228,15 +273,31 @@ export const api = {
     anchorPlayhead(target);
     return invoke("seek", { positionMs: target });
   },
-  setVolume: (percent) =>
-    invoke("set_volume", { percent: Math.min(100, Math.max(0, Math.round(percent))) }),
+  setVolume: (percent) => {
+    const target = Math.min(100, Math.max(0, Math.round(percent)));
+    // Optimistic for the same reason as `seek`: the volume slider is driven by
+    // `playback.volume`, so between releasing the drag and the engine's next
+    // state event it would fall back to the pre-drag value and flick forward.
+    playback.volume = target;
+    return invoke("set_volume", { percent: target });
+  },
   setShuffle: (enabled) => invoke("set_shuffle", { enabled: !!enabled }),
   setRepeat: (mode) => invoke("set_repeat", { mode }),
   playQueue: (queue, index) => invoke("play_queue", { queue, index }),
   addQueue: (track) => invoke("add_queue", { track }),
   removeQueue: (index) => invoke("remove_queue", { index }),
   moveQueue: (from, to) => invoke("move_queue", { from, to }),
-  search: (query, limit = 40) => invoke("search", { query, limit }),
+  /**
+   * `limit` applies to every section the server returns, not just the three we
+   * parse, and it dominates search latency: measured medians are 743ms at 10
+   * against 1080ms at 40, over a ~580ms irreducible server floor. It also sets
+   * how many covers the results reference (tracks + albums + artists), so 10
+   * asks for ~30 instead of ~120. Both halves of the win come from this number.
+   */
+  search: (query, limit = SEARCH_LIMIT) => invoke("search", { query, limit }),
+  touchPlaylist: (id) => invoke("touch_playlist", { id }),
+  browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
+  getCacheStats: () => invoke("get_cache_stats"),
   browsePlaylists: () => invoke("browse_playlists"),
   browsePlaylist: (id) => invoke("browse_playlist", { id }),
   browseAlbum: (id) => invoke("browse_album", { id }),

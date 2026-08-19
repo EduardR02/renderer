@@ -13,36 +13,21 @@ use tauri::Manager;
 use app::{AppState, data_dir, load_tracks_cache};
 use engine_client::EngineClient;
 
-/// Makes WebView2 composite in software.
-///
-/// WebView2 rasterizes the page into a GPU texture and then hands that texture
-/// to DirectComposition to put on screen. The second step can fail on its own
-/// while the first keeps working: the window paints its own background and the
-/// page never appears over it, which reads as a black window even though the
-/// DOM is intact. GPU/display state shifting under a live process is what
-/// triggers it — driver reset, hybrid-GPU switch, display topology change, or
-/// a Remote Desktop session attaching its virtual adapter.
-///
-/// Software compositing sidesteps that failure entirely and costs close to
-/// nothing here: this UI is static apart from a progress bar redrawing a few
-/// hundred pixels 4x a second, and skipping the GPU path drops a process, a
-/// D3D context, and its surface memory. An existing value is left alone so the
-/// flag stays overridable from the environment.
-#[cfg(windows)]
-fn force_software_compositing() {
-    const VAR: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
-    if std::env::var_os(VAR).is_none() {
-        std::env::set_var(VAR, "--disable-gpu-compositing");
-    }
-}
-
-#[cfg(not(windows))]
-fn force_software_compositing() {}
+// This once forced software compositing (`--disable-gpu-compositing`) to work
+// around a black window: WebView2 rasterizes to a GPU texture and hands it to
+// DirectComposition, and the second step can fail alone, leaving the window
+// painting its own background over an intact DOM.
+//
+// Measurement retired it. Software compositing cost 223% of a core while
+// scrolling against 90% on the GPU path, and 21ms median gesture-to-frame
+// against 13ms — and the black window recurred anyway with the flag active, so
+// it was never buying the thing it was added for. WebView2 still reads
+// WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS from the environment, so the flag
+// remains available for a one-off test without living in the binary.
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     log::init(app::logs_dir());
-    force_software_compositing();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -63,6 +48,7 @@ pub fn run() {
             commands::browse_playlist,
             commands::browse_album,
             commands::browse_artist,
+            commands::browse_track_credits,
             commands::create_playlist,
             commands::rename_playlist,
             commands::delete_playlist,
@@ -74,6 +60,8 @@ pub fn run() {
             commands::logout,
             commands::get_state,
             commands::get_cover,
+            commands::get_cache_stats,
+            commands::touch_playlist,
         ])
         .setup(|app| {
             let state = Mutex::new(AppState::new(data_dir()));

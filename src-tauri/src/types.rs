@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistRef, PlaylistBrowse, PlaylistRef, SearchBrowse,
-    TrackRef,
+    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistRef, ArtistReleases, PlaylistBrowse, PlaylistRef,
+    CreditArtist, CreditRole, SearchBrowse, TrackCredits, TrackRef,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -20,6 +20,17 @@ pub struct Track {
     pub uri: String,
     pub name: String,
     pub artist_names: Vec<String>,
+    /// Artist ids parallel to `artist_names` — same length, same order — so
+    /// every credited artist on a track is individually linkable instead of
+    /// just the primary.
+    ///
+    /// The two are always the same length: the engine builds them in one pass
+    /// over one list, and [`align_artist_ids`] repairs entries loaded from a
+    /// cache written before this field existed. An individual id may still be
+    /// empty for an artist with no resolvable id, so render a name as a link
+    /// only when its id is non-empty.
+    pub artist_ids: Vec<String>,
+    /// Primary artist, unchanged and still used on its own in several places.
     pub artist_id: String,
     pub album_id: String,
     pub album_name: String,
@@ -34,6 +45,7 @@ impl From<TrackRef> for Track {
             uri: track.uri,
             name: track.name,
             artist_names: track.artist_names,
+            artist_ids: track.artist_ids,
             artist_id: track.artist_id,
             album_id: track.album_id,
             album_name: track.album_name,
@@ -50,6 +62,7 @@ impl From<&TrackRef> for Track {
             uri: track.uri.clone(),
             name: track.name.clone(),
             artist_names: track.artist_names.clone(),
+            artist_ids: track.artist_ids.clone(),
             artist_id: track.artist_id.clone(),
             album_id: track.album_id.clone(),
             album_name: track.album_name.clone(),
@@ -66,6 +79,7 @@ impl From<Track> for TrackRef {
             uri: track.uri,
             name: track.name,
             artist_names: track.artist_names,
+            artist_ids: track.artist_ids,
             artist_id: track.artist_id,
             album_id: track.album_id,
             album_name: track.album_name,
@@ -98,6 +112,16 @@ pub struct Playlist {
     /// Playlist4 revision hex (the Web API "snapshot id"); empty when the
     /// library listing did not carry a revision.
     pub snapshot_id: String,
+    /// Unix seconds when playback was last started *from* this playlist, or
+    /// `None` for one that never has been. Set only by the `touch_playlist`
+    /// command, which the frontend calls with the playlist the user played
+    /// from; merely opening a playlist does not count.
+    ///
+    /// The library is ordered by it (see [`crate::app::order_by_last_played`]),
+    /// so the distinction matters: a never-played playlist keeps its rootlist
+    /// position instead of sorting as though it had been played at the epoch.
+    /// Local to this app — Spotify has no equivalent and none is sent.
+    pub last_played: Option<i64>,
 }
 
 impl From<&PlaylistRef> for Playlist {
@@ -120,6 +144,7 @@ impl From<&PlaylistRef> for Playlist {
             tracks_total: reference.track_count.unwrap_or(0),
             cover_urls: Vec::new(),
             snapshot_id: String::new(),
+            last_played: None,
         }
     }
 }
@@ -147,6 +172,23 @@ pub fn cover_urls_from_tracks(tracks: &[Track]) -> Vec<String> {
         }
     }
     urls
+}
+
+/// Makes `artist_ids` the same length as `artist_names`, padding with empty
+/// ids or dropping any excess.
+///
+/// This exists for one real case: `playlist_tracks_cache.json` files written
+/// before `artist_ids` existed deserialize with names but no ids, and every
+/// existing user has one. Without this the two lists would disagree in length
+/// for exactly as long as it takes the background refresh to replace them —
+/// which is precisely the first paint after an upgrade, when the user is most
+/// likely to click. Padding keeps "same length, same order" true
+/// unconditionally, so the frontend can zip without a guard, and the padded
+/// entries are empty ids, which already means "not linkable".
+pub fn align_artist_ids(track: &mut Track) {
+    if track.artist_ids.len() != track.artist_names.len() {
+        track.artist_ids.resize(track.artist_names.len(), String::new());
+    }
 }
 
 /// A playlist opened for browsing: playlist metadata plus its tracks.
@@ -182,6 +224,9 @@ impl From<PlaylistBrowse> for PlaylistDetail {
                 collaborative: false,
                 tracks_total: tracks.len() as u32,
                 snapshot_id: revision,
+                // A browse cannot know this; the library entry keeps it (see
+                // `upsert_playlist`).
+                last_played: None,
             },
             tracks,
         }
@@ -196,6 +241,11 @@ pub struct Album {
     pub name: String,
     pub artist_names: Vec<String>,
     pub cover_url: String,
+    /// Release year, or `null` when the release carries no date. An absent
+    /// string field is the empty string by this contract's convention, but a
+    /// year has no such spelling — 0 would be a date, and a wrong one — so
+    /// this one stays an option.
+    pub year: Option<u32>,
 }
 
 impl From<AlbumRef> for Album {
@@ -206,6 +256,7 @@ impl From<AlbumRef> for Album {
             name: reference.name,
             artist_names: reference.artist_names,
             cover_url: reference.cover_url.unwrap_or_default(),
+            year: reference.year,
         }
     }
 }
@@ -227,6 +278,7 @@ impl From<AlbumBrowse> for AlbumDetail {
                 name: browse.name,
                 artist_names: browse.artist_names,
                 cover_url: browse.cover_url.unwrap_or_default(),
+                year: browse.year,
             },
             tracks: browse.tracks.into_iter().map(Track::from).collect(),
         }
@@ -253,13 +305,38 @@ impl From<ArtistRef> for Artist {
     }
 }
 
+/// An artist's catalogue grouped by release type, mirroring the engine's
+/// `ArtistReleases`. A group may be shorter than the artist's true catalogue
+/// when the engine's per-browse resolution budget bit; `appears_on` is the
+/// one that hits it in practice.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ArtistReleaseGroups {
+    pub albums: Vec<Album>,
+    pub singles: Vec<Album>,
+    pub compilations: Vec<Album>,
+    pub appears_on: Vec<Album>,
+}
+
+impl From<ArtistReleases> for ArtistReleaseGroups {
+    fn from(releases: ArtistReleases) -> Self {
+        let convert = |group: Vec<AlbumRef>| group.into_iter().map(Album::from).collect();
+        Self {
+            albums: convert(releases.albums),
+            singles: convert(releases.singles),
+            compilations: convert(releases.compilations),
+            appears_on: convert(releases.appears_on),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ArtistDetail {
     #[serde(flatten)]
     pub artist: Artist,
     pub top_tracks: Vec<Track>,
-    pub albums: Vec<Album>,
+    pub releases: ArtistReleaseGroups,
 }
 
 impl From<ArtistBrowse> for ArtistDetail {
@@ -272,7 +349,7 @@ impl From<ArtistBrowse> for ArtistDetail {
                 cover_url: browse.portrait_url.unwrap_or_default(),
             },
             top_tracks: browse.top_tracks.into_iter().map(Track::from).collect(),
-            albums: browse.albums.into_iter().map(Album::from).collect(),
+            releases: browse.releases.into(),
         }
     }
 }
@@ -291,6 +368,73 @@ impl From<SearchBrowse> for SearchResult {
             tracks: browse.tracks.into_iter().map(Track::from).collect(),
             albums: browse.albums.into_iter().map(Album::from).collect(),
             artists: browse.artists.into_iter().map(Artist::from).collect(),
+        }
+    }
+}
+
+
+/// One contributor in a track's credits.
+///
+/// `id` is empty for a contributor with no artist page — the credits service
+/// names many writers and producers who have none — so the frontend should
+/// render a contributor as a link only when `id` is non-empty, and as plain
+/// text otherwise.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Contributor {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    /// The service's own lowercase labels: `composer`, `lyricist`,
+    /// `producer`, `main artist`, ... Possibly empty.
+    pub subroles: Vec<String>,
+}
+
+impl From<CreditArtist> for Contributor {
+    fn from(artist: CreditArtist) -> Self {
+        Self {
+            id: artist.id,
+            uri: artist.uri,
+            name: artist.name,
+            subroles: artist.subroles,
+        }
+    }
+}
+
+/// One role group of a track's credits (Performers, Writers, Producers, ...).
+/// The title is whatever the service called it: the set is not fixed, and an
+/// unrecognised group is still worth showing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CreditGroup {
+    pub title: String,
+    pub contributors: Vec<Contributor>,
+}
+
+impl From<CreditRole> for CreditGroup {
+    fn from(role: CreditRole) -> Self {
+        Self {
+            title: role.title,
+            contributors: role.artists.into_iter().map(Contributor::from).collect(),
+        }
+    }
+}
+
+/// Songwriter/producer/performer credits for one track, fetched on demand.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TrackCreditsDetail {
+    pub track_uri: String,
+    pub track_name: String,
+    pub groups: Vec<CreditGroup>,
+}
+
+impl From<TrackCredits> for TrackCreditsDetail {
+    fn from(credits: TrackCredits) -> Self {
+        Self {
+            track_uri: credits.track_uri,
+            track_name: credits.track_name,
+            groups: credits.roles.into_iter().map(CreditGroup::from).collect(),
         }
     }
 }
@@ -362,6 +506,26 @@ pub struct AppState {
     pub me_id: String,
 }
 
+/// What one cache directory is costing on disk.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Disk usage of both on-disk caches, for the Settings page.
+///
+/// `audio` is librespot's own audio cache under the engine state dir — the
+/// songs kept for offline replay — and `covers` is the artwork the shell
+/// downloads for `cover://`. They are reported separately because they are
+/// bounded separately: the audio cache has a 1 GiB ceiling enforced by
+/// librespot, the cover cache has none.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheStats {
+    pub audio: CacheUsage,
+    pub covers: CacheUsage,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +579,57 @@ mod tests {
         let next = PlaylistDetail::from(browse("rev-b", &["c", "d"]));
         assert_eq!(next.playlist.cover_urls, vec!["c", "d"]);
         assert_eq!(next.playlist.snapshot_id, "rev-b");
+    }
+
+    #[test]
+    fn artist_ids_stay_parallel_to_artist_names() {
+        // A track cached before the field existed: names but no ids.
+        let mut legacy: Track = serde_json::from_str(
+            r#"{"id":"t1","name":"Track","artist_names":["A","B","C"],"artist_id":"a1"}"#,
+        )
+        .unwrap();
+        assert!(legacy.artist_ids.is_empty(), "old caches carry no ids");
+        align_artist_ids(&mut legacy);
+        assert_eq!(
+            legacy.artist_ids,
+            vec!["", "", ""],
+            "padded so the two lists zip, with every name unlinkable"
+        );
+        assert_eq!(legacy.artist_id, "a1", "the primary is untouched");
+
+        // A track from the engine already matches and is left alone.
+        let mut fresh = Track {
+            artist_names: vec!["A".into(), "B".into()],
+            artist_ids: vec!["a1".into(), "b1".into()],
+            ..Track::default()
+        };
+        align_artist_ids(&mut fresh);
+        assert_eq!(fresh.artist_ids, vec!["a1", "b1"]);
+
+        // Excess ids (a hand-edited or future-written cache) are trimmed
+        // rather than left to mispair with the names.
+        let mut extra = Track {
+            artist_names: vec!["A".into()],
+            artist_ids: vec!["a1".into(), "stale".into()],
+            ..Track::default()
+        };
+        align_artist_ids(&mut extra);
+        assert_eq!(extra.artist_ids, vec!["a1"]);
+    }
+
+    #[test]
+    fn artist_ids_survive_the_round_trip_through_the_engine_type() {
+        let track = Track {
+            id: "t1".into(),
+            artist_names: vec!["A".into(), "B".into()],
+            artist_ids: vec!["a1".into(), "b1".into()],
+            artist_id: "a1".into(),
+            ..Track::default()
+        };
+        let reference: TrackRef = track.clone().into();
+        assert_eq!(reference.artist_ids, vec!["a1", "b1"]);
+        assert_eq!(Track::from(&reference), track);
+        assert_eq!(Track::from(reference), track);
     }
 
     #[test]

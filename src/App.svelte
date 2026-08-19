@@ -28,6 +28,24 @@
     initEvents();
   });
 
+  /* Whether decorative animation is allowed to run at all. A background window
+     redrawing a VU meter is pure waste, and this app exists because the real
+     client burns CPU at idle — so gate it on focus as well as on playback.
+     A class beats a JS ticker: the compositor stops on its own and nothing
+     re-enters the main thread. */
+  let focused = $state(true);
+  $effect(() => {
+    focused = document.hasFocus();
+    const on = () => (focused = true);
+    const off = () => (focused = false);
+    window.addEventListener("focus", on);
+    window.addEventListener("blur", off);
+    return () => {
+      window.removeEventListener("focus", on);
+      window.removeEventListener("blur", off);
+    };
+  });
+
   // Fetch detail data when a detail route becomes active.
   $effect(() => {
     const { name, id } = route;
@@ -89,7 +107,7 @@
 
 <IconSprite />
 
-<div class="app">
+<div class="app" class:anim-paused={!playback.playing || !focused}>
   <Sidebar />
 
   <main class="pane">

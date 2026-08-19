@@ -14,7 +14,7 @@ use engine::{AuthSignal, Engine, PlayerSignal};
 use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
-use spotify_playback_engine::protocol::{AlbumBrowse, ArtistBrowse, Command, PlaylistBrowse, PlaylistRef, Response, SearchBrowse};
+use spotify_playback_engine::protocol::{AlbumBrowse, ArtistBrowse, Command, PlaylistBrowse, PlaylistRef, Response, SearchBrowse, TrackCredits};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -40,6 +40,10 @@ enum BrowseOutcome {
     Artist {
         request_id: String,
         result: Result<ArtistBrowse, String>,
+    },
+    TrackCredits {
+        request_id: String,
+        result: Result<TrackCredits, String>,
     },
     Search {
         request_id: String,
@@ -260,6 +264,20 @@ async fn run(
                                     }
                                 }
                             }
+                            Command::BrowseTrackCredits { id } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::track_credits_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::TrackCredits { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::TrackCredits { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
                             Command::BrowseSearch { query, limit } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -409,6 +427,9 @@ async fn run(
                         }
                         BrowseOutcome::Artist { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_artist", &result)?;
+                        }
+                        BrowseOutcome::TrackCredits { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_track_credits", &result)?;
                         }
                         BrowseOutcome::Search { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_search", &result)?;

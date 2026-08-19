@@ -2,6 +2,7 @@
   import { api, navigate, playback, togglePlay, toggleLiked, isTrackLiked, library } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
+  import ArtistLinks from "./ArtistLinks.svelte";
   import { formatTime } from "../lib/time.js";
 
   let {
@@ -18,13 +19,32 @@
   const menu = $state({ open: false, x: 0, y: 0, track: null, index: -1 });
   const picker = $state({ open: false, x: 0, y: 0, track: null });
 
+  /**
+   * Which row is the playing one, as an index into `tracks`.
+   *
+   * `playback.current_index` indexes the QUEUE, not this list — this list is
+   * whatever playlist/album/search result is on screen. Using it directly lit
+   * up the row that merely sat at the same ordinal, so switching playlists kept
+   * marking position N as playing even though it was a different song.
+   * Identity is the only thing the two lists share, so resolve by URI.
+   */
+  const currentRow = $derived.by(() => {
+    const uri = playback.current_uri;
+    if (!uri) return -1;
+    // When this list IS the playing context the index still agrees, and taking
+    // it keeps duplicates resolving to the instance actually playing.
+    const i = playback.current_index;
+    if (i >= 0 && i < tracks.length && tracks[i]?.uri === uri) return i;
+    return tracks.findIndex((t) => t.uri === uri);
+  });
+
   function onRowDblClick(i) {
-    if (i === playback.current_index && playback.playing) togglePlay();
+    if (i === currentRow && playback.playing) togglePlay();
     else playFrom(i);
   }
 
   function onPlayIconClick(i) {
-    if (i === playback.current_index) togglePlay();
+    if (i === currentRow) togglePlay();
     else playFrom(i);
   }
 
@@ -53,6 +73,78 @@
     picker.open = false;
     menu.open = false;
   }
+
+  /* ---------------- Windowed rendering ----------------
+     A 2000-track playlist is 2000 grid rows, each with a cover, two buttons
+     and an icon — enough DOM to make every layout and paint in the pane slow.
+     Rows are a fixed --row-h, so the visible slice can be derived from the
+     scroll offset alone and the rest replaced by two spacer divs. The scroller
+     is an ancestor (.scroll in App.svelte), not this component, so the offset
+     has to be read from it rather than from a local scrollTop. */
+  const ROW_H = 48; // must track --row-h
+  /* Sliding the window one row at a time measured better than batching it into
+     blocks of 8 (92 vs 86 fps, worst frame 18ms vs 27ms): the batched version
+     does the same total work in rarer, bigger bursts, and it is the burst that
+     misses the frame. Keep the updates small and frequent. */
+  const OVERSCAN = 6;
+
+  let bodyEl = $state(null);
+  let firstRow = $state(0);
+  let lastRow = $state(0);
+  /* Plain mirrors of the two above: measure() must not *read* reactive state,
+     or the wiring effect below would re-subscribe on every scroll frame. */
+  let curFirst = 0;
+  let curLast = 0;
+
+  const visible = $derived(tracks.slice(firstRow, lastRow));
+
+  function measure(scroller) {
+    if (!bodyEl || !scroller) return;
+    const len = tracks.length;
+    // Layout is clean during scroll, so these reads are cheap and — unlike a
+    // cached offset — stay correct when the header above the list changes size.
+    const above = scroller.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
+    const f = Math.max(0, Math.floor(above / ROW_H) - OVERSCAN);
+    const l = Math.min(len, Math.ceil((above + scroller.clientHeight) / ROW_H) + OVERSCAN);
+    if (f === curFirst && l === curLast) return;
+    curFirst = f;
+    curLast = l;
+    firstRow = f;
+    lastRow = l;
+  }
+
+  $effect(() => {
+    // Re-runs when the list is (re)mounted or its length changes; deliberately
+    // does not depend on firstRow/lastRow, which change on every scroll frame.
+    tracks.length;
+    if (!bodyEl) return;
+    const scroller = bodyEl.closest(".scroll");
+    if (!scroller) {
+      // No scroll ancestor (embedded use): render everything, as before.
+      curFirst = 0;
+      curLast = tracks.length;
+      firstRow = 0;
+      lastRow = tracks.length;
+      return;
+    }
+    let queued = false;
+    const onScroll = () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => {
+        queued = false;
+        measure(scroller);
+      });
+    };
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    const ro = new ResizeObserver(() => measure(scroller));
+    ro.observe(scroller);
+    measure(scroller);
+    return () => {
+      scroller.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+    };
+  });
 
   $effect(() => {
     if (!menu.open && !picker.open) return;
@@ -90,10 +182,16 @@
     </div>
   {/if}
 
-  {#each tracks as track, i}
+  <div bind:this={bodyEl}>
+  {#if firstRow > 0}<div aria-hidden="true" style:height="{firstRow * ROW_H}px"></div>{/if}
+
+  <!-- Unkeyed on purpose: as the window slides, Svelte patches the existing
+       row nodes in place instead of destroying and recreating them. -->
+  {#each visible as track, k}
+    {@const i = firstRow + k}
     <div
       class="tl-row"
-      class:current={track.uri === playback.current_uri}
+      class:current={i === currentRow}
       role="button"
       tabindex="-1"
       ondblclick={() => onRowDblClick(i)}
@@ -102,7 +200,7 @@
         <span class="n">{i + 1}</span>
         <span class="eq"><i></i><i></i><i></i><i></i></span>
         <button class="go" title="Play" onclick={() => onPlayIconClick(i)}>
-          <Icon name={i === playback.current_index && playback.playing ? "pause" : "play"} size={12} />
+          <Icon name={i === currentRow && playback.playing ? "pause" : "play"} size={12} />
         </button>
       </span>
 
@@ -118,7 +216,12 @@
 
       <span class="c-title">
         <span class="t-name">{track.name}</span>
-        <span class="t-artists">{track.artist_names.join(", ")}</span>
+        <ArtistLinks
+          class="t-artists"
+          names={track.artist_names}
+          ids={track.artist_ids ?? []}
+          id={track.artist_id}
+        />
       </span>
 
       {#if showAlbum}
@@ -149,6 +252,11 @@
       </span>
     </div>
   {/each}
+
+  {#if lastRow < tracks.length}
+    <div aria-hidden="true" style:height="{(tracks.length - lastRow) * ROW_H}px"></div>
+  {/if}
+  </div>
 </div>
 
 {#if menu.open}

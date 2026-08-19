@@ -11,6 +11,7 @@
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
+  import ArtistLinks from "./ArtistLinks.svelte";
   import Slider from "./Slider.svelte";
   import { formatTime } from "../lib/time.js";
 
@@ -57,13 +58,12 @@
       </button>
       <span class="p-meta">
         <span class="p-title">{current.name}</span>
-        <button
+        <ArtistLinks
           class="p-artists"
-          title="Go to artist"
-          onclick={() => current.artist_id && navigate("artist", current.artist_id)}
-        >
-          {current.artist_names.join(", ")}
-        </button>
+          names={current.artist_names}
+          ids={current.artist_ids ?? []}
+          id={current.artist_id}
+        />
       </span>
       <button
         class="btn-icon"

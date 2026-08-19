@@ -3,6 +3,7 @@
     route,
     detail,
     search,
+    queueSearch,
     ui,
     api,
     playback,
@@ -34,16 +35,23 @@
           : ""
   );
 
+  /**
+   * Search as you type. The official client feels instant largely because it
+   * is already searching while you type, so results are waiting by the time
+   * you stop; firing only on Enter made every query start from zero.
+   */
   function onInput(e) {
     search.query = e.currentTarget.value;
+    if (route.name !== "search" && search.query.trim()) navigate("search");
+    queueSearch(search.query);
   }
 
+  /** Enter just skips the remaining debounce; the query is already in flight. */
   function onSubmit(e) {
     e.preventDefault();
-    const q = search.query.trim();
-    if (!q) return;
+    if (!search.query.trim()) return;
     if (route.name !== "search") navigate("search");
-    api.search(q, 40).catch(() => {});
+    queueSearch(search.query);
   }
 </script>
 

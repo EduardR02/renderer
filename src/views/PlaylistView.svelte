@@ -27,17 +27,32 @@
   let renaming = $state(false);
   let nameDraft = $state("");
 
+  /**
+   * Library ordering is most-recently-*played*, not most-recently-opened, and
+   * a track URI cannot say which playlist it was played from — the same track
+   * sits in many. This view is the only place that knows, so it reports it.
+   */
+  function markPlayed() {
+    if (pl) api.touchPlaylist(pl.id).catch(() => {});
+  }
+
   function playFrom(i) {
-    if (pl) api.playQueue(tracks, i).catch(() => {});
+    if (!pl) return;
+    markPlayed();
+    api.playQueue(tracks, i).catch(() => {});
   }
 
   function playAll() {
-    if (tracks.length) api.playQueue(tracks, 0).catch(() => {});
+    if (!tracks.length) return;
+    markPlayed();
+    api.playQueue(tracks, 0).catch(() => {});
   }
 
   function shufflePlay() {
+    if (!tracks.length) return;
+    markPlayed();
     api.setShuffle(true).catch(() => {});
-    if (tracks.length) api.playQueue(tracks, 0).catch(() => {});
+    api.playQueue(tracks, 0).catch(() => {});
   }
 
   function startRename() {

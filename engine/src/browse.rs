@@ -34,6 +34,20 @@
 //!   live: both return results). Parsing stays tolerant: unknown/missing
 //!   fields degrade to empty strings, zeros, and empty lists instead of
 //!   failing the whole browse.
+//! - Artist artwork: the search response carries artist avatars in
+//!   `artists.items[].data.visuals.avatarImage.sources` (three sizes,
+//!   unsorted) and the artist metadata carries them in `portrait_group`
+//!   rather than `portrait`. Both were previously left unread, which is why
+//!   every artist rendered as a monogram tile. See [`hit_image`] and
+//!   [`artist_portrait`].
+//! - Play counts are *not* available on any endpoint this engine uses:
+//!   `spotify.metadata.Track` carries `popularity` (0-100) but no count, the
+//!   searchDesktop track hit has no `playcount` field, and the
+//!   extended-metadata `STREAM_COUNT` extension answers a per-entity 404 for
+//!   track, album and artist URIs alike (verified live 2026-08-19). The
+//!   official client reads them from a separate pathfinder persisted query,
+//!   and pathfinder rejects non-persisted documents with 400, so surfacing
+//!   playcounts would mean tracking a second rotating query hash.
 
 use std::collections::HashSet;
 
@@ -51,7 +65,9 @@ use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 use std::time::Duration;
 
-use spotify_playback_engine::protocol::{AlbumRef, ArtistRef, PlaylistRef, TrackRef};
+use spotify_playback_engine::protocol::{
+    AlbumRef, ArtistRef, CreditArtist, CreditRole, PlaylistRef, TrackCredits, TrackRef,
+};
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
 const COVER_BASE: &str = "https://i.scdn.co/image/";
@@ -120,6 +136,10 @@ pub fn track_ref(track: &Track) -> TrackRef {
         uri: uri_of(&track.id),
         name: track.name.clone(),
         artist_names: track.artists.iter().map(|artist| artist.name.clone()).collect(),
+        // Same list, same order, same pass: the ids were already parsed here
+        // and simply discarded, so every credited artist becomes linkable for
+        // no extra request.
+        artist_ids: track.artists.iter().map(|artist| id_of(&artist.id)).collect(),
         artist_id: track
             .artists
             .first()
@@ -132,6 +152,20 @@ pub fn track_ref(track: &Track) -> TrackRef {
     }
 }
 
+/// Release year of an album, or `None` when the metadata carries no date.
+///
+/// The date protobuf is optional and librespot maps a missing one to year 0
+/// via `get_or_default`, so the zero has to be filtered out here: rendering
+/// "0" under a cover is worse than rendering nothing. Only the year is
+/// surfaced because librespot substitutes 1 January for an absent month and
+/// day, which would make a year-only release indistinguishable from a real
+/// New Year's Day one.
+fn album_year(album: &Album) -> Option<u32> {
+    u32::try_from(album.date.as_utc().year())
+        .ok()
+        .filter(|year| *year > 0)
+}
+
 /// Converts resolved album metadata into the protocol's `AlbumRef` shape.
 pub fn album_ref(album: &Album) -> AlbumRef {
     AlbumRef {
@@ -140,6 +174,7 @@ pub fn album_ref(album: &Album) -> AlbumRef {
         name: album.name.clone(),
         artist_names: album.artists.iter().map(|artist| artist.name.clone()).collect(),
         cover_url: cover_url(&album.covers),
+        year: album_year(album),
     }
 }
 
@@ -653,6 +688,7 @@ pub async fn album_browse(
         name: album.name.clone(),
         artist_names: album.artists.iter().map(|artist| artist.name.clone()).collect(),
         cover_url: cover_url(&album.covers),
+        year: album_year(&album),
         tracks,
     })
 }
@@ -666,8 +702,61 @@ async fn fetch_albums<'a>(
     fetch_extended(session, uris, ExtensionKind::ALBUM_V4, parse_album_payload).await
 }
 
-/// Artist portrait, top tracks, and albums via the extended-metadata artist
-/// endpoint.
+/// Artist artwork: the bare `portrait` list first, then the `portrait_group`
+/// image group.
+///
+/// The fallback is not defensive, it is the normal path: ARTIST_V4 leaves
+/// `portrait` empty and puts the three sizes (160/320/640) in `portrait_group`
+/// instead — verified live against Taylor Swift, The Weeknd and Drake
+/// (2026-08-19), all three of which report `portraits=0, portrait_group=3`.
+/// Reading only `portraits`, as this did, meant every artist page rendered a
+/// monogram tile.
+fn artist_portrait(artist: &Artist) -> Option<String> {
+    cover_url(&artist.portraits).or_else(|| cover_url(&artist.portrait_group))
+}
+
+/// Album URIs one artist browse will resolve, across all four release groups.
+///
+/// The groups themselves are free — they arrive inside the single artist
+/// metadata response as lists of URIs — but turning those URIs into names,
+/// covers and years costs one extended-metadata POST per 40. Catalogue sizes
+/// are wildly uneven and the tail is entirely in `appears_on`: measured live
+/// (2026-08-19) Taylor Swift has 33/79/1/158 across albums/singles/
+/// compilations/appears-on, David Bowie 60/102/22/154, and Drake 21/62/0/836.
+/// Resolving everything would therefore cost 7 requests for one artist and 23
+/// for another, against the 1 this browse used to cost.
+///
+/// A flat budget keeps that predictable instead: whoever the artist is, an
+/// artist page costs at most `200 / 40 = 5` album requests. Normal artists
+/// stay well inside it and see their whole catalogue.
+const ARTIST_RELEASE_BUDGET: usize = 200;
+
+/// Splits [`ARTIST_RELEASE_BUDGET`] across the four groups in priority order:
+/// the artist's own albums first, then singles, then compilations, and
+/// "appears on" last with whatever is left.
+///
+/// Priority order rather than equal shares because the groups are not equally
+/// wanted: an artist's own releases are the page, while `appears_on` is the
+/// long tail nobody scrolls to the end of — and it is precisely the group
+/// that runs to the hundreds. Pure so the arithmetic is unit-testable.
+fn allocate_release_budget(sizes: [usize; 4], budget: usize) -> [usize; 4] {
+    let mut remaining = budget;
+    let mut taken = [0usize; 4];
+    for (slot, size) in taken.iter_mut().zip(sizes) {
+        *slot = size.min(remaining);
+        remaining -= *slot;
+    }
+    taken
+}
+
+/// Artist portrait, top tracks, and the grouped release catalogue via the
+/// extended-metadata artist endpoint.
+///
+/// The four groups are resolved in one combined set of batches rather than
+/// four separate ones: batching is per 40 URIs, so four independent fetches
+/// would round up to a partial request each (and re-resolve any album that
+/// appears in two groups), while one combined fetch deduplicates by id and
+/// only ever pays for the last partial batch once.
 pub async fn artist_browse(
     session: &Session,
     id: &str,
@@ -677,15 +766,206 @@ pub async fn artist_browse(
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
     let top_tracks = artist.top_tracks.for_country(&session.country());
     let top_tracks = fetch_tracks(session, top_tracks.iter()).await?;
-    let albums = fetch_albums(session, artist.albums_current()).await?;
+
+    let groups: [Vec<SpotifyUri>; 4] = [
+        artist.albums_current().cloned().collect(),
+        artist.singles_current().cloned().collect(),
+        artist.compilations_current().cloned().collect(),
+        artist.appears_on_albums_current().cloned().collect(),
+    ];
+    let takes = allocate_release_budget(
+        [groups[0].len(), groups[1].len(), groups[2].len(), groups[3].len()],
+        ARTIST_RELEASE_BUDGET,
+    );
+    let wanted: Vec<&SpotifyUri> = groups
+        .iter()
+        .zip(takes)
+        .flat_map(|(group, take)| group.iter().take(take))
+        .collect();
+    let resolved = fetch_albums(session, wanted).await?;
+
+    // Resolution drops albums that fail per-entity (region-locked, pulled),
+    // so the groups are rebuilt by lookup rather than by position.
+    let by_id: std::collections::HashMap<&str, &AlbumRef> = resolved
+        .iter()
+        .map(|album| (album.id.as_str(), album))
+        .collect();
+    let group_of = |index: usize| -> Vec<AlbumRef> {
+        groups[index]
+            .iter()
+            .take(takes[index])
+            .filter_map(|uri| by_id.get(id_of(uri).as_str()).map(|album| (*album).clone()))
+            .collect()
+    };
+
     Ok(spotify_playback_engine::protocol::ArtistBrowse {
         id: id_of(&artist.id),
         uri: uri_of(&artist.id),
         name: artist.name.clone(),
-        portrait_url: cover_url(&artist.portraits),
+        portrait_url: artist_portrait(&artist),
         top_tracks,
-        albums,
+        releases: spotify_playback_engine::protocol::ArtistReleases {
+            albums: group_of(0),
+            singles: group_of(1),
+            compilations: group_of(2),
+            appears_on: group_of(3),
+        },
     })
+}
+
+// ---------------------------------------------------------------------------
+// track credits (track-credits-view)
+// ---------------------------------------------------------------------------
+
+/// The spclient endpoint behind the official client's Credits dialog.
+///
+/// There is also a `/v0/experimental/{id}/credits` variant. It carries
+/// contributor images, but identifies writers by `spotify:songwriter:` URIs
+/// plus an artists.spotify.com link — neither of which this app can open.
+/// This variant returns plain `spotify:artist:` URIs, which the existing
+/// artist browse handles, so contributors are linkable with no new plumbing.
+const TRACK_CREDITS_ENDPOINT: &str = "https://spclient.wg.spotify.com/track-credits-view/v0/track";
+
+/// Raw JSON of the credits response. Every field is optional so a renamed or
+/// missing one degrades to an empty section rather than failing the request.
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // service field names
+struct CreditsJson {
+    #[serde(default)]
+    trackUri: Option<String>,
+    #[serde(default)]
+    trackTitle: Option<String>,
+    #[serde(default)]
+    roleCredits: Vec<CreditRoleJson>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // service field names
+struct CreditRoleJson {
+    #[serde(default)]
+    roleTitle: Option<String>,
+    #[serde(default)]
+    artists: Vec<CreditArtistJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct CreditArtistJson {
+    /// Absent for contributors with no artist page of their own.
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    subroles: Vec<String>,
+}
+
+fn credit_artist(raw: &CreditArtistJson) -> CreditArtist {
+    let uri = raw.uri.clone().unwrap_or_default();
+    CreditArtist {
+        // Only an artist URI yields a browsable id; anything else (or
+        // nothing) leaves the contributor as plain text.
+        id: uri
+            .starts_with("spotify:artist:")
+            .then(|| hit_id(Some(uri.as_str())))
+            .unwrap_or_default(),
+        uri,
+        name: raw.name.clone().unwrap_or_default(),
+        subroles: raw.subroles.clone(),
+    }
+}
+
+/// Maps the credits payload, dropping role groups and contributors that
+/// carry no name at all — an unnamed credit is nothing to render.
+fn track_credits_from_json(parsed: &CreditsJson) -> TrackCredits {
+    TrackCredits {
+        track_uri: parsed.trackUri.clone().unwrap_or_default(),
+        track_name: parsed.trackTitle.clone().unwrap_or_default(),
+        roles: parsed
+            .roleCredits
+            .iter()
+            .map(|role| CreditRole {
+                title: role.roleTitle.clone().unwrap_or_default(),
+                artists: role
+                    .artists
+                    .iter()
+                    .map(credit_artist)
+                    .filter(|artist| !artist.name.is_empty())
+                    .collect(),
+            })
+            .filter(|role| !role.artists.is_empty())
+            .collect(),
+    }
+}
+
+/// Songwriter/producer/performer credits for one track.
+///
+/// One GET of roughly a kilobyte, authenticated with the session's own
+/// login5 bearer and client token like every other browse here. Called only
+/// when the user actually asks for credits: nothing else in the app needs
+/// them, and this is the one endpoint whose cost is per track rather than
+/// per page.
+pub async fn track_credits_browse(session: &Session, id: &str) -> Result<TrackCredits, String> {
+    // Validated rather than interpolated blindly: the id lands in a URL path.
+    let uri = SpotifyUri::from_uri(&format!("spotify:track:{id}"))
+        .map_err(|error| format!("invalid track id: {error}"))?;
+    let track_id = id_of(&uri);
+    if track_id.is_empty() {
+        return Err("invalid track id".to_owned());
+    }
+    let url = format!("{TRACK_CREDITS_ENDPOINT}/{track_id}/credits");
+
+    let token = session
+        .login5()
+        .auth_token()
+        .await
+        .map_err(|error| format!("credits authentication failed: {error}"))?;
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri(&url)
+        .header("Accept", "application/json")
+        .header(
+            "Authorization",
+            format!("{} {}", token.token_type, token.access_token),
+        );
+    if let Ok(client_token) = session.spclient().client_token().await {
+        builder = builder.header("client-token", client_token.as_str());
+    }
+    let request = builder
+        .body(Bytes::new())
+        .map_err(|error| format!("credits request construction failed: {error}"))?;
+
+    let backoffs = backoff_sequence(
+        BROWSE_RETRY_ATTEMPTS,
+        BROWSE_BACKOFF_BASE_MS,
+        BROWSE_BACKOFF_MAX_MS,
+    );
+    let mut attempt = 0usize;
+    let payload = loop {
+        match session.http_client().request_body(request.clone()).await {
+            Ok(bytes) => break bytes,
+            Err(error) => {
+                let transient = browse_error_is_transient(error.kind, http_status_of(&error));
+                if !transient || attempt >= backoffs.len() {
+                    return Err(format!(
+                        "credits request failed after {} attempt(s) (last error: {error})",
+                        attempt + 1,
+                    ));
+                }
+                let backoff = backoffs[attempt];
+                eprintln!(
+                    "credits request failed ({error}); retrying in {backoff} ms (attempt {}/{})",
+                    attempt + 1,
+                    backoffs.len() + 1,
+                );
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+        }
+    };
+
+    let parsed: CreditsJson = serde_json::from_slice(&payload)
+        .map_err(|error| format!("unparseable credits response: {error}"))?;
+    Ok(track_credits_from_json(&parsed))
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +1069,16 @@ struct SearchAlbumHitJson {
     artists: SearchArtistListJson,
     #[serde(default)]
     coverArt: Option<SearchCoverArtJson>,
+    #[serde(default)]
+    date: Option<SearchDateJson>,
+}
+
+/// Release date of an album hit. The searchDesktop response carries only the
+/// year here, which is exactly the precision [`AlbumRef::year`] wants.
+#[derive(Default, Deserialize)]
+struct SearchDateJson {
+    #[serde(default)]
+    year: Option<u32>,
 }
 
 #[derive(Default, Deserialize)]
@@ -800,6 +1090,20 @@ struct SearchArtistHitJson {
     name: Option<String>,
     #[serde(default)]
     profile: Option<SearchProfileJson>,
+    #[serde(default)]
+    visuals: Option<SearchArtistVisualsJson>,
+}
+
+/// Artist artwork in a search hit. The avatar is the same image group the
+/// artist page shows, in the same `sources` shape as album `coverArt`; an
+/// artist with no picture arrives as an explicit `"avatarImage": null`
+/// (verified live 2026-08-19), which is why it is an `Option` rather than a
+/// defaulted struct.
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // GraphQL schema field names
+struct SearchArtistVisualsJson {
+    #[serde(default)]
+    avatarImage: Option<SearchCoverArtJson>,
 }
 
 #[derive(Default, Deserialize)]
@@ -863,14 +1167,29 @@ fn hit_id(raw_uri: Option<&str>) -> String {
         .to_owned()
 }
 
-/// Picks a cover URL from the image sources: the first ≥300 px source when
-/// present, otherwise the first.
+/// Smallest image a search hit may be painted from: covers and avatars are
+/// rendered at up to ~200 CSS px, so anything at least this wide is sharp on
+/// a 1.5x display.
+const HIT_IMAGE_MIN_WIDTH: u32 = 300;
+
+/// Picks an artwork URL from a hit's image sources: the *smallest* source at
+/// least [`HIT_IMAGE_MIN_WIDTH`] wide, falling back to the widest one when
+/// every source is smaller than that.
+///
+/// Smallest-that-is-big-enough rather than first-that-is-big-enough because
+/// the `sources` array is not sorted, and not even consistently ordered
+/// between entity types: album covers arrive 300 px first, artist avatars
+/// arrive 640/160/320 (verified live 2026-08-19). Taking the first match
+/// would download and cache a 640 px portrait to paint a tile that is never
+/// larger than 200, doubling the bytes on disk for no visible difference.
 fn hit_image(cover: Option<&SearchCoverArtJson>) -> Option<String> {
-    cover?
-        .sources
+    let sources = &cover?.sources;
+    let width = |source: &&SearchImageSourceJson| source.width.unwrap_or(0);
+    sources
         .iter()
-        .find(|source| source.width.unwrap_or(0) >= 300)
-        .or_else(|| cover?.sources.first())
+        .filter(|source| width(source) >= HIT_IMAGE_MIN_WIDTH)
+        .min_by_key(width)
+        .or_else(|| sources.iter().max_by_key(width))
         .and_then(|source| source.url.clone())
         .filter(|url| !url.is_empty())
 }
@@ -898,6 +1217,13 @@ fn track_ref_from_hit(hit: &SearchTrackHitJson) -> TrackRef {
         uri: hit.uri.clone().unwrap_or_default(),
         name: hit.name.clone().unwrap_or_default(),
         artist_names: hit.artists.items.iter().map(artist_name).collect(),
+        // The search hit already carries a uri per artist alongside the name.
+        artist_ids: hit
+            .artists
+            .items
+            .iter()
+            .map(|artist| hit_id(artist.uri.as_deref()))
+            .collect(),
         artist_id: hit
             .artists
             .items
@@ -934,6 +1260,13 @@ fn album_ref_from_hit(hit: &SearchAlbumHitJson) -> AlbumRef {
         name: hit.name.clone().unwrap_or_default(),
         artist_names: hit.artists.items.iter().map(artist_name).collect(),
         cover_url: hit_image(hit.coverArt.as_ref()),
+        // Free: the year travels in the same search response. A year of 0
+        // would be a placeholder, not a release date.
+        year: hit
+            .date
+            .as_ref()
+            .and_then(|date| date.year)
+            .filter(|year| *year > 0),
     }
 }
 
@@ -950,8 +1283,13 @@ fn artist_ref_from_hit(hit: &SearchArtistHitJson) -> ArtistRef {
                     .and_then(|profile| profile.name.clone())
             })
             .unwrap_or_default(),
-        // The searchDesktop persisted query returns no artist avatar.
-        portrait_url: None,
+        // Free: the avatar travels in the same searchDesktop response as the
+        // name, so a portrait costs no extra round-trip.
+        portrait_url: hit_image(
+            hit.visuals
+                .as_ref()
+                .and_then(|visuals| visuals.avatarImage.as_ref()),
+        ),
     }
 }
 
@@ -1436,13 +1774,19 @@ mod tests {
                             "uri": "spotify:album:1abcdefghijklmnopqrstu",
                             "name": "Album Hit",
                             "artists": {"items": [{"profile": {"name": "Album Artist"}}]},
-                            "coverArt": {"sources": [{"url": "https://i.scdn.co/image/ab67616d000048511abcdefghijklmnopqrstu", "width": 64}]}
+                            "coverArt": {"sources": [{"url": "https://i.scdn.co/image/ab67616d000048511abcdefghijklmnopqrstu", "width": 64}]},
+                            "date": {"year": 2014}
                         }}]
                     },
                     "artists": {
                         "items": [{"data": {
                             "uri": "spotify:artist:3abcdefghijklmnopqrstu",
-                            "profile": {"name": "Artist Hit"}
+                            "profile": {"name": "Artist Hit"},
+                            "visuals": {"avatarImage": {"sources": [
+                                {"height": 640, "url": "https://i.scdn.co/image/ab6761610000e5eb3abcdefghijklmnopqrstu", "width": 640},
+                                {"height": 160, "url": "https://i.scdn.co/image/ab6761610000f1783abcdefghijklmnopqrstu", "width": 160},
+                                {"height": 320, "url": "https://i.scdn.co/image/ab676161000051743abcdefghijklmnopqrstu", "width": 320}
+                            ]}}
                         }}]
                     }
                 }
@@ -1500,11 +1844,226 @@ mod tests {
             Some("https://i.scdn.co/image/ab67616d000048511abcdefghijklmnopqrstu"),
             "the only source is used when no ≥300px source exists"
         );
+        assert_eq!(
+            converted.albums[0].year,
+            Some(2014),
+            "the search response carries the release year for free"
+        );
+        // A hit with no date at all reports no year rather than 0.
+        let undated: SearchAlbumHitJson =
+            serde_json::from_str(r#"{"uri": "spotify:album:9abcdefghijklmnopqrstu"}"#).unwrap();
+        assert_eq!(album_ref_from_hit(&undated).year, None);
+        let zeroed: SearchAlbumHitJson =
+            serde_json::from_str(r#"{"uri": "spotify:album:9abcdefghijklmnopqrstu", "date": {"year": 0}}"#)
+                .unwrap();
+        assert_eq!(album_ref_from_hit(&zeroed).year, None);
 
         assert_eq!(converted.artists.len(), 1);
         assert_eq!(converted.artists[0].id, "3abcdefghijklmnopqrstu");
         assert_eq!(converted.artists[0].name, "Artist Hit");
-        assert_eq!(converted.artists[0].portrait_url, None);
+        assert_eq!(
+            converted.artists[0].portrait_url.as_deref(),
+            Some("https://i.scdn.co/image/ab676161000051743abcdefghijklmnopqrstu"),
+            "the smallest ≥300px avatar wins, not the first one the array happens to list"
+        );
+    }
+
+    #[test]
+    fn track_credits_map_the_live_response_shape() {
+        // Trimmed from a real /v0/track/{id}/credits response.
+        let body = r#"{
+            "label": "Credits",
+            "trackUri": "spotify:track:1BxfuPKGuaTgP7aM0Bbdwr",
+            "trackTitle": "Cruel Summer",
+            "roleCredits": [
+                {"roleTitle": "Performers", "artists": [
+                    {"uri": "spotify:artist:06HL4z0CvFAxyc27GXpf02", "name": "Taylor Swift", "subroles": ["main artist"], "weight": 9.0}
+                ]},
+                {"roleTitle": "Writers", "artists": [
+                    {"uri": "spotify:artist:2XecPkCBJp99480lrtKlIp", "name": "Annie Clark", "subroles": ["composer", "lyricist"], "weight": 6.0},
+                    {"name": "Uncredited Ghost", "subroles": ["composer"]}
+                ]},
+                {"roleTitle": "Producers", "artists": []},
+                {"roleTitle": "Nameless", "artists": [{"uri": "spotify:artist:x"}]}
+            ]
+        }"#;
+        let parsed: CreditsJson = serde_json::from_str(body).unwrap();
+        let credits = track_credits_from_json(&parsed);
+
+        assert_eq!(credits.track_uri, "spotify:track:1BxfuPKGuaTgP7aM0Bbdwr");
+        assert_eq!(credits.track_name, "Cruel Summer");
+        // The empty "Producers" group and the group whose only contributor has
+        // no name are both dropped: neither renders as anything.
+        assert_eq!(credits.roles.len(), 2);
+
+        assert_eq!(credits.roles[0].title, "Performers");
+        assert_eq!(credits.roles[0].artists[0].id, "06HL4z0CvFAxyc27GXpf02");
+        assert_eq!(credits.roles[0].artists[0].subroles, vec!["main artist"]);
+
+        let writers = &credits.roles[1];
+        assert_eq!(writers.title, "Writers");
+        assert_eq!(writers.artists[0].id, "2XecPkCBJp99480lrtKlIp");
+        assert_eq!(writers.artists[0].subroles, vec!["composer", "lyricist"]);
+        // A contributor with no artist page keeps their name but gets no id,
+        // so the frontend renders them as plain text rather than a dead link.
+        assert_eq!(writers.artists[1].name, "Uncredited Ghost");
+        assert_eq!(writers.artists[1].id, "");
+        assert_eq!(writers.artists[1].uri, "");
+    }
+
+    #[test]
+    fn credit_ids_are_only_taken_from_artist_uris() {
+        // The experimental variant of this endpoint returns songwriter URIs,
+        // which `browse_artist` cannot open; anything that is not an artist
+        // URI must stay unlinked.
+        let songwriter: CreditArtistJson = serde_json::from_str(
+            r#"{"uri": "spotify:songwriter:1pTJCipDqvUaFmILQLnMsC", "name": "Annie Clark"}"#,
+        )
+        .unwrap();
+        let mapped = credit_artist(&songwriter);
+        assert_eq!(mapped.id, "", "a songwriter uri is not browsable here");
+        assert_eq!(mapped.uri, "spotify:songwriter:1pTJCipDqvUaFmILQLnMsC");
+        assert_eq!(mapped.name, "Annie Clark");
+    }
+
+    #[test]
+    fn the_release_budget_favours_the_artists_own_catalogue() {
+        // Measured live: Taylor Swift's four groups. Everything but the
+        // "appears on" tail fits, so her own catalogue is complete.
+        assert_eq!(
+            allocate_release_budget([33, 79, 1, 158], ARTIST_RELEASE_BUDGET),
+            [33, 79, 1, 87]
+        );
+        // Drake: 836 features. The budget stops that from costing 23 requests.
+        let drake = allocate_release_budget([21, 62, 0, 836], ARTIST_RELEASE_BUDGET);
+        assert_eq!(drake, [21, 62, 0, 117]);
+        assert_eq!(drake.iter().sum::<usize>(), ARTIST_RELEASE_BUDGET);
+        // David Bowie: own catalogue alone nearly fills the budget, and it is
+        // the "appears on" group that gets squeezed, never the albums.
+        assert_eq!(
+            allocate_release_budget([60, 102, 22, 154], ARTIST_RELEASE_BUDGET),
+            [60, 102, 22, 16]
+        );
+
+        // A modest artist is fully resolved, and an artist with nothing costs
+        // no album request at all.
+        assert_eq!(allocate_release_budget([4, 2, 0, 3], ARTIST_RELEASE_BUDGET), [4, 2, 0, 3]);
+        assert_eq!(allocate_release_budget([0, 0, 0, 0], ARTIST_RELEASE_BUDGET), [0, 0, 0, 0]);
+        // The budget is never exceeded, even when the first group alone busts it.
+        assert_eq!(allocate_release_budget([500, 10, 10, 10], 200), [200, 0, 0, 0]);
+        assert_eq!(allocate_release_budget([5, 5, 5, 5], 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn album_years_drop_the_placeholder_zero() {
+        let covers = Images(vec![image(ImageSize::DEFAULT, 0x11)]);
+        let mut album = test_album("0abcdefghijklmnopqrstu", "Album", Vec::new(), covers);
+
+        // A real release date surfaces as its year.
+        album.date = Date::from_timestamp_ms(1_388_534_400_000).unwrap();
+        assert_eq!(album_year(&album), Some(2014));
+        assert_eq!(album_ref(&album).year, Some(2014));
+
+        // No date at all: the protobuf field is absent, librespot's
+        // `get_or_default` reads year 0 out of it, and 0000-01-01 UTC is
+        // 719_528 days before the epoch. That is a placeholder, not a release
+        // year, and must not be rendered under a cover.
+        album.date = Date::from_timestamp_ms(-719_528 * 86_400 * 1_000).unwrap();
+        assert_eq!(album.date.as_utc().year(), 0, "the placeholder really is year 0");
+        assert_eq!(album_year(&album), None);
+        assert_eq!(album_ref(&album).year, None);
+    }
+
+    #[test]
+    fn an_artist_portrait_falls_back_to_the_portrait_group() {
+        let mut artist = test_artist("0123456789ABCDEFGHIJKL", "Artist");
+        assert_eq!(artist_portrait(&artist), None, "no artwork at all is None");
+
+        // The live ARTIST_V4 shape: `portrait` empty, sizes in the group.
+        artist.portrait_group = Images(vec![image(ImageSize::DEFAULT, 0xab)]);
+        assert_eq!(
+            artist_portrait(&artist).as_deref(),
+            Some(format!("{COVER_BASE}{}", "ab".repeat(20))).as_deref()
+        );
+
+        // A bare `portrait` still wins where the server does send one.
+        artist.portraits = Images(vec![image(ImageSize::DEFAULT, 0xcd)]);
+        assert_eq!(
+            artist_portrait(&artist).as_deref(),
+            Some(format!("{COVER_BASE}{}", "cd".repeat(20))).as_deref()
+        );
+    }
+
+    #[test]
+    fn an_artist_hit_without_a_picture_has_no_portrait() {
+        // The live shape for a picture-less artist: `visuals` is present and
+        // `avatarImage` is an explicit null, so this must not fail the parse.
+        let body = r#"{"data": {"searchV2": {"artists": {"items": [
+            {"data": {"uri": "spotify:artist:4abcdefghijklmnopqrstu", "profile": {"name": "No Picture"},
+                      "visuals": {"avatarImage": null}}},
+            {"data": {"uri": "spotify:artist:5abcdefghijklmnopqrstu", "profile": {"name": "No Visuals"}}}
+        ]}}}}"#;
+        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        let artists: Vec<ArtistRef> = parsed
+            .data
+            .searchV2
+            .artists
+            .items
+            .iter()
+            .map(|wrapper| artist_ref_from_hit(&wrapper.data))
+            .collect();
+        assert_eq!(artists.len(), 2);
+        assert_eq!(artists[0].name, "No Picture");
+        assert_eq!(artists[0].portrait_url, None);
+        assert_eq!(artists[1].name, "No Visuals");
+        assert_eq!(artists[1].portrait_url, None);
+    }
+
+    #[test]
+    fn hit_images_prefer_the_smallest_source_that_is_big_enough() {
+        fn sources(widths: &[u32]) -> SearchCoverArtJson {
+            SearchCoverArtJson {
+                sources: widths
+                    .iter()
+                    .map(|width| SearchImageSourceJson {
+                        url: Some(format!("https://i.scdn.co/image/w{width}")),
+                        width: Some(*width),
+                    })
+                    .collect(),
+            }
+        }
+
+        // Artist avatars arrive 640/160/320: order must not decide.
+        let avatar = sources(&[640, 160, 320]);
+        assert_eq!(
+            hit_image(Some(&avatar)).as_deref(),
+            Some("https://i.scdn.co/image/w320")
+        );
+        // Album covers already list the 300px source first; unchanged.
+        let cover = sources(&[300, 64, 640]);
+        assert_eq!(
+            hit_image(Some(&cover)).as_deref(),
+            Some("https://i.scdn.co/image/w300")
+        );
+        // Nothing is big enough: the widest available beats a thumbnail.
+        let tiny = sources(&[64, 160]);
+        assert_eq!(
+            hit_image(Some(&tiny)).as_deref(),
+            Some("https://i.scdn.co/image/w160")
+        );
+        // A source with no width at all is still better than no artwork.
+        let unsized_source = SearchCoverArtJson {
+            sources: vec![SearchImageSourceJson {
+                url: Some("https://i.scdn.co/image/unsized".to_owned()),
+                width: None,
+            }],
+        };
+        assert_eq!(
+            hit_image(Some(&unsized_source)).as_deref(),
+            Some("https://i.scdn.co/image/unsized")
+        );
+        assert_eq!(hit_image(None), None);
+        assert_eq!(hit_image(Some(&sources(&[]))), None);
     }
 
     #[test]

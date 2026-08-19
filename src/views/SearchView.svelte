@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { search, api, navigate, focusSearch } from "../lib/state.svelte.js";
+  import { search, api, navigate, focusSearch, queueSearch } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -73,10 +73,9 @@
 
   function rerun(q) {
     search.query = q;
-    search.submitted = true;
     search.results = null;
     remember(q);
-    api.search(q, 40).catch(() => {});
+    queueSearch(q);
   }
 
   /* Record only queries that actually came back. `search.results` is the sole

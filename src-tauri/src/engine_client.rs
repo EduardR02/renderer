@@ -448,6 +448,16 @@ impl EngineClient {
         parse_data(reply, "browse_artist")
     }
 
+    pub async fn browse_track_credits(
+        &self,
+        id: &str,
+    ) -> Result<spotify_playback_engine::protocol::TrackCredits, String> {
+        let reply = self
+            .request("browse_track_credits", json!({"id": id}))
+            .await?;
+        parse_data(reply, "browse_track_credits")
+    }
+
     pub async fn browse_search(
         &self,
         query: &str,

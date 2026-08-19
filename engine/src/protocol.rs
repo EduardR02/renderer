@@ -7,6 +7,17 @@ pub struct TrackRef {
     pub uri: String,
     pub name: String,
     pub artist_names: Vec<String>,
+    /// Artist ids parallel to [`Self::artist_names`]: same length, same
+    /// order, so the two zip index-for-index and every credited artist can be
+    /// linked, not just the primary.
+    ///
+    /// Both lists are built from one pass over the same source list on every
+    /// path that produces a `TrackRef`, so the lengths cannot diverge. An
+    /// *individual* entry can still be empty when an artist has no resolvable
+    /// id, so a name is only a link when its id is non-empty.
+    ///
+    /// [`Self::artist_id`] stays as the primary artist and is unchanged.
+    pub artist_ids: Vec<String>,
     pub artist_id: String,
     pub album_id: String,
     pub album_name: String,
@@ -21,6 +32,7 @@ impl Default for TrackRef {
             uri: String::new(),
             name: String::new(),
             artist_names: Vec::new(),
+            artist_ids: Vec::new(),
             artist_id: String::new(),
             album_id: String::new(),
             album_name: String::new(),
@@ -98,6 +110,13 @@ pub enum Command {
     BrowseSearch {
         query: String,
         limit: usize,
+    },
+    /// Songwriter/producer/performer credits for one track via the spclient
+    /// track-credits-view endpoint. Responded to with a
+    /// `browse_track_credits` message. Fetched on demand only — nothing else
+    /// in the app needs credits, and it is one request per track.
+    BrowseTrackCredits {
+        id: String,
     },
     /// Creates a playlist via the spclient playlist4 create endpoint and adds
     /// it to the user's rootlist. Responded to with an `edit_create_playlist`
@@ -211,7 +230,15 @@ pub struct PlaylistBrowse {
 }
 
 /// Album reference inside browse responses.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+///
+/// `year` is the release year and is deliberately the only date field: the
+/// metadata protobuf leaves month and day absent for most releases, and
+/// librespot substitutes 1 January for them, so a full date would be
+/// indistinguishable from a genuine New Year's Day release. The year itself
+/// is always real, and absent (rather than 0) when the release carries no
+/// date at all.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct AlbumRef {
     pub id: String,
     pub uri: String,
@@ -219,6 +246,8 @@ pub struct AlbumRef {
     pub artist_names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<u32>,
 }
 
 /// Payload of a successful [`Command::BrowseAlbum`] response.
@@ -230,6 +259,8 @@ pub struct AlbumBrowse {
     pub artist_names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<u32>,
     pub tracks: Vec<TrackRef>,
 }
 
@@ -243,6 +274,24 @@ pub struct ArtistRef {
     pub portrait_url: Option<String>,
 }
 
+/// An artist's catalogue, grouped the way the official client groups it.
+///
+/// The four groups come from the artist metadata itself (one request), which
+/// carries them as separate lists of album URIs; resolving those URIs into
+/// [`AlbumRef`]s is what costs extra round-trips, so the total resolved per
+/// browse is capped (see `browse::ARTIST_RELEASE_BUDGET`). Each group keeps
+/// the order the metadata listed it in, and a group can be shorter than the
+/// artist's true catalogue when the cap bit — `appears_on` reaches the high
+/// hundreds for prolific features artists.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ArtistReleases {
+    pub albums: Vec<AlbumRef>,
+    pub singles: Vec<AlbumRef>,
+    pub compilations: Vec<AlbumRef>,
+    pub appears_on: Vec<AlbumRef>,
+}
+
 /// Payload of a successful [`Command::BrowseArtist`] response.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArtistBrowse {
@@ -252,7 +301,44 @@ pub struct ArtistBrowse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub portrait_url: Option<String>,
     pub top_tracks: Vec<TrackRef>,
-    pub albums: Vec<AlbumRef>,
+    pub releases: ArtistReleases,
+}
+
+/// One contributor in a track's credits.
+///
+/// `id` and `uri` are empty for a contributor with no artist page of their
+/// own — the credits service names plenty of writers and producers who have
+/// none — so the frontend must treat a contributor as a link only when `id`
+/// is non-empty. `subroles` are the service's own lowercase labels
+/// (`"composer"`, `"lyricist"`, `"producer"`, `"main artist"`, ...) and may
+/// be empty.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CreditArtist {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub subroles: Vec<String>,
+}
+
+/// One role group of a track's credits, e.g. Performers, Writers, Producers.
+/// `title` is passed through as the service spells it rather than being
+/// mapped to an enum: the set is not fixed, and an unknown group is still
+/// worth showing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CreditRole {
+    pub title: String,
+    pub artists: Vec<CreditArtist>,
+}
+
+/// Payload of a successful [`Command::BrowseTrackCredits`] response.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TrackCredits {
+    pub track_uri: String,
+    pub track_name: String,
+    pub roles: Vec<CreditRole>,
 }
 
 /// Payload of a successful [`Command::BrowseSearch`] response.
@@ -597,6 +683,7 @@ mod tests {
                         "uri": "spotify:track:2abcdefghijklmnopqrstu",
                         "name": "Track",
                         "artist_names": [],
+                        "artist_ids": [],
                         "artist_id": "",
                         "album_id": "",
                         "album_name": "",

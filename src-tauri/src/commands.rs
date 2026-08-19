@@ -9,17 +9,18 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app::{
-    AppState, PlaylistListCache, PlaylistTracksEntry, LIBRARY_LENGTH, apply_cover_candidates,
-    carry_browse_fields, data_dir, load_playlist_list, now_secs, playlist_detail_from_cache,
-    playlists_missing_covers, save_playlist_list, save_tracks_cache, upsert_playlist,
+    AppState, PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH,
+    apply_cover_candidates, carry_local_fields, compute_cache_stats, data_dir, load_playlist_list,
+    now_secs, order_by_last_played, playlist_detail_from_cache, playlists_missing_covers,
+    save_playlist_list, save_tracks_cache, touch_playlist_played, upsert_playlist,
     upsert_tracks_cache,
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, RestoreSnapshot};
 use crate::log;
 use crate::types::{
-    AlbumDetail, AppState as AppStateSnapshot, ArtistDetail, PlaybackState, Playlist,
-    PlaylistDetail, SearchResult, Track,
+    AlbumDetail, AppState as AppStateSnapshot, ArtistDetail, CacheStats, PlaybackState, Playlist,
+    PlaylistDetail, SearchResult, Track, TrackCreditsDetail,
 };
 
 // ---------------------------------------------------------------------------
@@ -178,6 +179,25 @@ pub async fn browse_artist(
     Ok(detail)
 }
 
+/// Songwriter/producer/performer credits for one track.
+///
+/// Returned only, never emitted: credits are opened for one track at a time
+/// from an overflow menu, so the caller that asked is the only consumer and a
+/// broadcast would just be a second copy of the payload crossing IPC.
+///
+/// One ~1 KB request per invocation, and nothing prefetches it — this is the
+/// only endpoint here whose cost scales per track rather than per page, so it
+/// must stay strictly on demand.
+#[tauri::command]
+pub async fn browse_track_credits(
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+) -> Result<TrackCreditsDetail, String> {
+    Ok(TrackCreditsDetail::from(
+        client.browse_track_credits(&id).await?,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Playlist edit commands
 // ---------------------------------------------------------------------------
@@ -297,6 +317,74 @@ pub async fn get_state(state: State<'_, Mutex<AppState>>) -> Result<AppStateSnap
 #[tauri::command]
 pub async fn get_cover(url: String) -> Result<String, String> {
     covers::get_cover(&url).await
+}
+
+/// Records that the user started playback *from* playlist `id`, which is what
+/// the library's most-recent-first ordering is built on.
+///
+/// The frontend calls this because only the frontend knows the answer. A play
+/// command carries track URIs, and the same track sits in any number of
+/// playlists, so nothing on this side could work out which playlist a play
+/// came from — it could only guess. The view the user pressed play in is the
+/// unambiguous source, so it passes the id.
+///
+/// Browsing a playlist deliberately does not count: looking at something is
+/// not using it.
+///
+/// The re-ordered library is persisted but *not* re-emitted. Promoting a row
+/// the instant it is played would slide it to the top under the user's
+/// cursor; the new order is picked up at the next natural library refresh or
+/// at the next launch instead.
+#[tauri::command]
+pub async fn touch_playlist(
+    state: State<'_, Mutex<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    let (dir, cache) = {
+        let mut guard = state.lock();
+        if !touch_playlist_played(&mut guard.playlists, &id, now_secs()) {
+            // Playback started somewhere that is not a followed playlist (an
+            // album, an artist page): nothing to order.
+            return Ok(());
+        }
+        (
+            guard.data_dir.clone(),
+            PlaylistListCache {
+                version: 1,
+                fetched_at: guard.playlists_fetched_at,
+                me_id: guard.me_id.clone(),
+                playlists: guard.playlists.clone(),
+            },
+        )
+    };
+    save_playlist_list(&dir, &cache);
+    Ok(())
+}
+
+/// File count and total bytes of the audio cache and the cover cache.
+///
+/// Two guards keep a Settings visit from costing anything noticeable. The
+/// walk runs on the blocking pool, so counting thousands of files never
+/// occupies an async worker (and never the UI thread, which only ever awaits
+/// the IPC reply); and the result is memoised for [`CACHE_STATS_TTL_SECS`],
+/// so a Settings page that re-invokes on every render still walks the disk at
+/// most once a minute.
+#[tauri::command]
+pub async fn get_cache_stats(state: State<'_, Mutex<AppState>>) -> Result<CacheStats, String> {
+    let now = now_secs();
+    {
+        let guard = state.lock();
+        if let Some((computed_at, stats)) = guard.cache_stats {
+            if now.saturating_sub(computed_at) < CACHE_STATS_TTL_SECS {
+                return Ok(stats);
+            }
+        }
+    }
+    let stats = tauri::async_runtime::spawn_blocking(compute_cache_stats)
+        .await
+        .map_err(|error| format!("could not measure the caches: {error}"))?;
+    state.lock().cache_stats = Some((now, stats));
+    Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -560,9 +648,12 @@ async fn fetch_library(
     let fetched_at = now_secs();
     let (dir, me_id) = {
         let guard = state.lock();
-        carry_browse_fields(&guard.playlists, &mut playlists);
+        carry_local_fields(&guard.playlists, &mut playlists);
         (guard.data_dir.clone(), guard.me_id.clone())
     };
+    // Rootlist order is only the tiebreaker; the fetch arrives in it, so the
+    // sort has to happen after the timestamps are carried over.
+    order_by_last_played(&mut playlists);
     save_playlist_list(
         &dir,
         &PlaylistListCache {
