@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, watch};
 
-use crate::app::engine_state_dir;
+use crate::app::{engine_state_dir, load_app_settings};
 use crate::log;
 use crate::types::{PlaybackState, Track};
 
@@ -233,11 +233,14 @@ impl EngineClient {
         let engine_log = logs_dir.join("playback_engine.log");
         rotate_if_large(&engine_log);
         let mut command = Command::new(&exe);
+        let audio_cache_limit_mb = load_app_settings().audio_cache_limit_mb;
         command
             .arg("--state-dir")
             .arg(&self.state_dir)
             .arg("--log-file")
             .arg(&engine_log)
+            .arg("--audio-cache-limit-mb")
+            .arg(audio_cache_limit_mb.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(match OpenOptions::new().create(true).append(true).open(&engine_log) {
@@ -469,6 +472,30 @@ impl EngineClient {
     ) -> Result<spotify_playback_engine::protocol::ArtistBrowse, String> {
         let reply = self.request("browse_artist", json!({"id": id})).await?;
         parse_data(reply, "browse_artist")
+    }
+
+    pub async fn browse_artist_catalogue_tracks(
+        &self,
+        id: &str,
+        release_types: &[String],
+    ) -> Result<Vec<spotify_playback_engine::protocol::TrackRef>, String> {
+        let reply = self
+            .request(
+                "browse_artist_catalogue_tracks",
+                json!({"id": id, "release_types": release_types}),
+            )
+            .await?;
+        parse_data(reply, "browse_artist_catalogue_tracks")
+    }
+
+    pub async fn browse_liked_songs(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<spotify_playback_engine::protocol::LikedSongsPage, String> {
+        let reply = self
+            .request("browse_liked_songs", json!({"cursor": cursor}))
+            .await?;
+        parse_data(reply, "browse_liked_songs")
     }
 
     pub async fn browse_track_credits(
@@ -936,7 +963,13 @@ mod tests {
         let client = EngineClient::start();
         let mut lines = client.subscribe_lines();
 
-        // The engine announces its session immediately after startup.
+        // `start` launches the child synchronously, so a fast engine can
+        // publish its first broadcast before this receiver exists. Production
+        // performs the same post-subscription status sync during setup; do it
+        // explicitly here to make the wire test deterministic.
+        client.status().await.expect("initial status command round-trips");
+
+        // The engine announces its session in response to the status sync.
         let first = match tokio::time::timeout(Duration::from_secs(20), lines.recv())
             .await
             .expect("engine emits its initial state within 20s")

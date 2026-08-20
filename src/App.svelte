@@ -21,10 +21,12 @@
   import CreditsDialog from "./components/CreditsDialog.svelte";
   import NowPlayingPanel from "./components/NowPlayingPanel.svelte";
   import LibraryView from "./views/LibraryView.svelte";
+  import LikedSongsView from "./views/LikedSongsView.svelte";
   import PlaylistView from "./views/PlaylistView.svelte";
   import AlbumView from "./views/AlbumView.svelte";
   import ArtistView from "./views/ArtistView.svelte";
   import SearchView from "./views/SearchView.svelte";
+  import SearchSongsView from "./views/SearchSongsView.svelte";
   import QueueView from "./views/QueueView.svelte";
   import SettingsView from "./views/SettingsView.svelte";
   import LoginView from "./views/LoginView.svelte";
@@ -149,6 +151,10 @@
         <LibraryView />
       {:else if route.name === "search"}
         <SearchView />
+      {:else if route.name === "search-songs"}
+        <SearchSongsView />
+      {:else if route.name === "liked"}
+        <LikedSongsView />
       {:else if route.name === "playlist"}
         <PlaylistView />
       {:else if route.name === "album"}

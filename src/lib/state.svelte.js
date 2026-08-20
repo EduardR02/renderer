@@ -434,11 +434,16 @@ export const api = {
    * asks for ~30 instead of ~120. Both halves of the win come from this number.
    */
   search: (query, limit = SEARCH_LIMIT) => invoke("search", { query, limit }),
+  browseArtistCatalogueTracks: (id, releaseTypes = ["albums", "singles"]) =>
+    invoke("browse_artist_catalogue_tracks", { id, releaseTypes }),
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
   clearCache: (kind) => invoke("clear_cache", { kind }),
+  getAppSettings: () => invoke("get_app_settings"),
+  setAudioCacheLimit: (mb) => invoke("set_audio_cache_limit", { mb }),
   browsePlaylists: () => invoke("browse_playlists"),
+  browseLikedSongs: (cursor = null) => invoke("browse_liked_songs", { cursor }),
   browsePlaylist: (id) => invoke("browse_playlist", { id }),
   browseAlbum: (id) => invoke("browse_album", { id }),
   browseArtist: (id) => invoke("browse_artist", { id }),

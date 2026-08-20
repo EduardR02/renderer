@@ -624,6 +624,8 @@ impl Engine {
             | Command::BrowsePlaylist { .. }
             | Command::BrowseAlbum { .. }
             | Command::BrowseArtist { .. }
+            | Command::BrowseArtistCatalogueTracks { .. }
+            | Command::BrowseLikedSongs { .. }
             | Command::BrowseSearch { .. }
             | Command::BrowseTrackCredits { .. }
             | Command::EditCreatePlaylist { .. }

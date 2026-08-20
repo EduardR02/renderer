@@ -446,6 +446,16 @@ fn parse_album_payload(entity_uri: &str, payload: &[u8]) -> Option<AlbumRef> {
     Some(album_ref(&album))
 }
 
+/// Album metadata already carries its ordered track URI list, so a catalogue
+/// queue can resolve albums in batches and then resolve all tracks in batches;
+/// it never needs one network request per release or per song.
+fn parse_album_track_uris(entity_uri: &str, payload: &[u8]) -> Option<Vec<SpotifyUri>> {
+    let message = librespot_protocol::metadata::Album::parse_from_bytes(payload).ok()?;
+    let uri = SpotifyUri::from_uri(entity_uri).ok()?;
+    let album = Album::parse(&message, &uri).ok()?;
+    Some(album.tracks().cloned().collect())
+}
+
 /// Resolves a batch of track URIs into `TrackRef`s via the extended-metadata
 /// endpoint: URIs are deduplicated by id (playlists repeat tracks), fetched
 /// in ~40-URI batches in first-appearance order, and items that fail to
@@ -915,6 +925,133 @@ pub async fn artist_browse(
             compilations: group_of(2),
             appears_on: group_of(3),
         },
+    })
+}
+
+/// Explicit, lazy cross-release queue for an artist catalogue. Album and
+/// single groups are the useful default; compilations and appears-on releases
+/// are opt-in because they are duplicate-heavy and can be enormous. The
+/// request only happens when the user presses Play catalogue.
+pub async fn artist_catalogue_tracks_browse(
+    session: &Session,
+    id: &str,
+    release_types: &[String],
+) -> Result<Vec<TrackRef>, String> {
+    let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
+        .map_err(|error| format!("invalid artist id: {error}"))?;
+    let artist: Artist = metadata_get(session, &uri, "artist").await?;
+
+    let wanted: HashSet<&str> = if release_types.is_empty() {
+        ["albums", "singles"].into_iter().collect()
+    } else {
+        release_types.iter().map(String::as_str).collect()
+    };
+    if let Some(invalid) = wanted
+        .iter()
+        .find(|kind| !matches!(**kind, "albums" | "singles" | "compilations" | "appears_on"))
+    {
+        return Err(format!("unsupported artist release type: {invalid}"));
+    }
+
+    let groups: [(&str, Vec<SpotifyUri>); 4] = [
+        ("albums", artist.albums_current().cloned().collect()),
+        ("singles", artist.singles_current().cloned().collect()),
+        ("compilations", artist.compilations_current().cloned().collect()),
+        (
+            "appears_on",
+            artist.appears_on_albums_current().cloned().collect(),
+        ),
+    ];
+    const MAX_CATALOGUE_RELEASES: usize = 250;
+    let mut seen_releases = HashSet::new();
+    let releases: Vec<SpotifyUri> = groups
+        .iter()
+        .filter(|(kind, _)| wanted.contains(kind))
+        .flat_map(|(_, releases)| releases.iter())
+        .filter(|uri| seen_releases.insert(uri_of(uri)))
+        .take(MAX_CATALOGUE_RELEASES)
+        .cloned()
+        .collect();
+    if releases.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let album_tracks = fetch_extended(
+        session,
+        releases.iter(),
+        ExtensionKind::ALBUM_V4,
+        parse_album_track_uris,
+    )
+    .await?;
+    let track_uris: Vec<SpotifyUri> = album_tracks.into_iter().flatten().collect();
+    fetch_tracks(session, track_uris.iter()).await
+}
+
+fn context_page_track_uris(
+    page: &librespot_protocol::context_page::ContextPage,
+) -> Vec<SpotifyUri> {
+    page.tracks
+        .iter()
+        .filter_map(|track| SpotifyUri::from_uri(track.uri()).ok())
+        .collect()
+}
+
+fn context_page_next_cursor(
+    page: &librespot_protocol::context_page::ContextPage,
+) -> Option<String> {
+    page.next_page_url
+        .clone()
+        .filter(|url| !url.is_empty())
+        .or_else(|| {
+            (page.tracks.is_empty())
+                .then(|| page.page_url.clone())
+                .flatten()
+                .filter(|url| !url.is_empty())
+        })
+}
+
+/// Read-only Saved Tracks browse through librespot's authenticated context
+/// resolver. Pagination remains explicit: opening Liked Songs fetches one
+/// page; following `next_cursor` is the only thing that fetches another.
+pub async fn liked_songs_browse(
+    session: &Session,
+    cursor: Option<&str>,
+) -> Result<spotify_playback_engine::protocol::LikedSongsPage, String> {
+    let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+        let payload = session
+            .spclient()
+            .get_next_page(cursor)
+            .await
+            .map_err(|error| format!("liked songs page request failed: {error}"))?;
+        let json = std::str::from_utf8(&payload)
+            .map_err(|error| format!("liked songs page was not utf-8: {error}"))?;
+        let page = protobuf_json_mapping::parse_from_str::<
+            librespot_protocol::context_page::ContextPage,
+        >(json)
+        .map_err(|error| format!("unparseable liked songs page: {error}"))?;
+        (
+            context_page_track_uris(&page),
+            context_page_next_cursor(&page),
+        )
+    } else {
+        let context_uri = format!("spotify:user:{}:collection", session.username());
+        let context = session
+            .spclient()
+            .get_context(&context_uri)
+            .await
+            .map_err(|error| format!("liked songs request failed: {error}"))?;
+        let uris = context
+            .pages
+            .iter()
+            .flat_map(context_page_track_uris)
+            .collect();
+        let next_cursor = context.pages.iter().find_map(context_page_next_cursor);
+        (uris, next_cursor)
+    };
+    let tracks = fetch_tracks(session, uris.iter()).await?;
+    Ok(spotify_playback_engine::protocol::LikedSongsPage {
+        tracks,
+        next_cursor,
     })
 }
 

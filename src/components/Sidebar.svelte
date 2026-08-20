@@ -20,10 +20,14 @@
   });
 
   $effect(() => {
-    filteredLibrary.length;
-    filterQuery;
+    const query = filterQuery;
     const list = libList;
     if (!list) return;
+
+    /* A filtered collection is a new result set, not the old list at its old
+       scroll offset. Reset before measuring so both mask edges describe the
+       rows that are actually visible after this query. */
+    if (query) list.scrollTop = 0;
 
     const updateFades = () => {
       const maxScroll = Math.max(0, list.scrollHeight - list.clientHeight);
@@ -35,9 +39,12 @@
     list.addEventListener("scroll", updateFades, { passive: true });
     const resizeObserver = new ResizeObserver(updateFades);
     resizeObserver.observe(list);
+    const mutationObserver = new MutationObserver(updateFades);
+    mutationObserver.observe(list, { childList: true, subtree: true });
     return () => {
       list.removeEventListener("scroll", updateFades);
       resizeObserver.disconnect();
+      mutationObserver.disconnect();
     };
   });
 
@@ -50,14 +57,19 @@
   });
 
   function startCreate() {
+    /* A previous filter activation may have marked the editor cancelled. */
     filtering = false;
     filterQuery = "";
     creating = true;
   }
 
-  function startFilter() {
+  function cancelCreate() {
     creating = false;
     newName = "";
+  }
+
+  function startFilter() {
+    cancelCreate();
     filtering = true;
   }
 
@@ -67,6 +79,9 @@
   }
 
   function commitCreate() {
+    /* Pointer-down on Filter cancels before moving focus. Its ensuing blur
+       must not resurrect the discarded partial name as a new playlist. */
+    if (!creating) return;
     const name = newName.trim();
     creating = false;
     newName = "";
@@ -116,9 +131,7 @@
           <button
             class="btn-icon"
             title="Filter library"
-            onpointerdown={(event) => {
-              if (creating) event.preventDefault();
-            }}
+            onpointerdown={cancelCreate}
             onclick={startFilter}
           >
             <Icon name="search" size={13} />
@@ -144,12 +157,20 @@
           placeholder="Playlist name"
           spellcheck="false"
           onblur={commitCreate}
-          onkeydown={(e) => e.key === "Escape" && ((creating = false), (newName = ""))}
+          onkeydown={(e) => e.key === "Escape" && cancelCreate()}
         />
       </form>
     {/if}
 
     <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} bind:this={libList}>
+      <button
+        class="lib-row liked-row"
+        class:active={route.name === "liked"}
+        onclick={() => navigate("liked")}
+      >
+        <span class="liked-mini"><Icon name="heart-filled" size={14} /></span>
+        <span class="lib-name">Liked Songs</span>
+      </button>
       {#each filteredLibrary as pl (pl.id)}
         <button
           class="lib-row"

@@ -15,7 +15,10 @@ use engine::{AuthSignal, Engine, PlayerSignal};
 use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
-use spotify_playback_engine::protocol::{AlbumBrowse, ArtistBrowse, Command, PlaylistBrowse, PlaylistRef, Response, SearchBrowse, TrackCredits};
+use spotify_playback_engine::protocol::{
+    AlbumBrowse, ArtistBrowse, Command, LikedSongsPage, PlaylistBrowse, PlaylistRef, Response,
+    SearchBrowse, TrackCredits,
+};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -41,6 +44,14 @@ enum BrowseOutcome {
     Artist {
         request_id: String,
         result: Result<ArtistBrowse, String>,
+    },
+    ArtistCatalogueTracks {
+        request_id: String,
+        result: Result<Vec<spotify_playback_engine::protocol::TrackRef>, String>,
+    },
+    LikedSongs {
+        request_id: String,
+        result: Result<LikedSongsPage, String>,
     },
     TrackCredits {
         request_id: String,
@@ -108,8 +119,8 @@ fn configure_audio_fetch() {
 }
 
 fn main() -> ExitCode {
-    let (state_directory, log_file) = match parse_arguments(std::env::args_os().skip(1).collect())
-    {
+    let (state_directory, log_file, audio_cache_limit_bytes) =
+        match parse_arguments(std::env::args_os().skip(1).collect()) {
         Ok(arguments) => arguments,
         Err(error) => {
             eprintln!("SpotifyPlaybackEngine: {error}");
@@ -131,7 +142,8 @@ fn main() -> ExitCode {
     // future death is diagnosable even when stderr is gone.
     install_panic_hook(log_file);
 
-    let (cache, temporary_directory, credentials_file) = match create_state(&state_directory) {
+    let (cache, temporary_directory, credentials_file) =
+        match create_state(&state_directory, audio_cache_limit_bytes) {
         Ok(state) => state,
         Err(error) => {
             eprintln!("SpotifyPlaybackEngine: {error}");
@@ -262,6 +274,57 @@ async fn run(
                                     }
                                     Err(error) => {
                                         let _ = browse_sender.send(BrowseOutcome::Artist { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
+                            Command::BrowseArtistCatalogueTracks { id, release_types } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::artist_catalogue_tracks_browse(
+                                                &session,
+                                                &id,
+                                                &release_types,
+                                            )
+                                            .await;
+                                            let _ = sender.send(BrowseOutcome::ArtistCatalogueTracks {
+                                                request_id,
+                                                result,
+                                            });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(
+                                            BrowseOutcome::ArtistCatalogueTracks {
+                                                request_id,
+                                                result: Err(error),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            Command::BrowseLikedSongs { cursor } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::liked_songs_browse(
+                                                &session,
+                                                cursor.as_deref(),
+                                            )
+                                            .await;
+                                            let _ = sender.send(BrowseOutcome::LikedSongs {
+                                                request_id,
+                                                result,
+                                            });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::LikedSongs {
+                                            request_id,
+                                            result: Err(error),
+                                        });
                                     }
                                 }
                             }
@@ -429,6 +492,16 @@ async fn run(
                         BrowseOutcome::Artist { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_artist", &result)?;
                         }
+                        BrowseOutcome::ArtistCatalogueTracks { request_id, result } => {
+                            engine.send_browse_response(
+                                &request_id,
+                                "browse_artist_catalogue_tracks",
+                                &result,
+                            )?;
+                        }
+                        BrowseOutcome::LikedSongs { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_liked_songs", &result)?;
+                        }
                         BrowseOutcome::TrackCredits { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_track_credits", &result)?;
                         }
@@ -466,28 +539,50 @@ async fn run(
 /// the diagnostic log the parent redirects stderr to; the panic hook appends
 /// there too). Accepts the arguments in any order and tolerates extra
 /// pairs, so older launchers that only pass `--state-dir` keep working.
-fn parse_arguments(arguments: Vec<OsString>) -> Result<(PathBuf, Option<PathBuf>), String> {
+fn parse_arguments(
+    arguments: Vec<OsString>,
+) -> Result<(PathBuf, Option<PathBuf>, Option<u64>), String> {
     let mut state_directory: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
+    let mut audio_cache_limit_bytes = Some(AUDIO_CACHE_LIMIT_BYTES);
+    let mut audio_cache_limit_seen = false;
     let mut index = 0usize;
     while index < arguments.len() {
         let name = arguments[index].to_string_lossy().into_owned();
         let value = arguments
             .get(index + 1)
             .ok_or_else(|| format!("{name} requires a value"))?;
-        let path = PathBuf::from(value);
         match name.as_str() {
             "--state-dir" => {
                 if state_directory.is_some() {
                     return Err("--state-dir given more than once".to_owned());
                 }
+                let path = PathBuf::from(value);
                 if !path.is_absolute() {
                     return Err("--state-dir must be an absolute path".to_owned());
                 }
                 state_directory = Some(path);
             }
             "--log-file" => {
-                log_file = Some(path);
+                log_file = Some(PathBuf::from(value));
+            }
+            "--audio-cache-limit-mb" => {
+                if audio_cache_limit_seen {
+                    return Err("--audio-cache-limit-mb given more than once".to_owned());
+                }
+                audio_cache_limit_seen = true;
+                let mb = value
+                    .to_string_lossy()
+                    .parse::<u64>()
+                    .map_err(|_| "--audio-cache-limit-mb must be a non-negative integer".to_owned())?;
+                audio_cache_limit_bytes = if mb == 0 {
+                    None
+                } else {
+                    Some(
+                        mb.checked_mul(1024 * 1024)
+                            .ok_or_else(|| "--audio-cache-limit-mb is too large".to_owned())?,
+                    )
+                };
             }
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -495,7 +590,7 @@ fn parse_arguments(arguments: Vec<OsString>) -> Result<(PathBuf, Option<PathBuf>
     }
     let state_directory = state_directory
         .ok_or_else(|| "usage: SpotifyPlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned())?;
-    Ok((state_directory, log_file))
+    Ok((state_directory, log_file, audio_cache_limit_bytes))
 }
 
 /// One panic report: thread, payload, location, and a captured backtrace.
@@ -594,6 +689,7 @@ fn version_audio_cache(state_directory: &std::path::Path) -> Result<(), String> 
 
 fn create_state(
     state_directory: &std::path::Path,
+    audio_cache_limit_bytes: Option<u64>,
 ) -> Result<(Cache, PathBuf, PathBuf), String> {
     std::fs::create_dir_all(state_directory)
         .map_err(|error| format!("could not create state directory: {error}"))?;
@@ -609,7 +705,7 @@ fn create_state(
         Some(credentials),
         Some(volume),
         Some(audio),
-        Some(AUDIO_CACHE_LIMIT_BYTES),
+        audio_cache_limit_bytes,
     )
     .map_err(|error| format!("could not initialize the app-owned cache: {error}"))?;
     // librespot stores credentials as credentials.json inside the credentials
@@ -771,16 +867,19 @@ mod tests {
 
     #[test]
     fn parse_arguments_requires_state_dir_and_accepts_an_optional_log_file() {
-        let (state, log) = parse_arguments(os(&["--state-dir", "C:\\sr\\engine"]))
+        let (state, log, cache_limit) = parse_arguments(os(&["--state-dir", "C:\\sr\\engine"]))
             .expect("state dir alone");
         assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
         assert!(log.is_none(), "log file is optional");
+        assert_eq!(cache_limit, Some(AUDIO_CACHE_LIMIT_BYTES));
 
-        let (state, log) = parse_arguments(os(&[
+        let (state, log, cache_limit) = parse_arguments(os(&[
             "--state-dir",
             "C:\\sr\\engine",
             "--log-file",
             "C:\\sr\\logs\\playback_engine.log",
+            "--audio-cache-limit-mb",
+            "4096",
         ]))
         .expect("both flags");
         assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
@@ -788,9 +887,12 @@ mod tests {
             log,
             Some(PathBuf::from("C:\\sr\\logs\\playback_engine.log"))
         );
+        assert_eq!(cache_limit, Some(4096 * 1024 * 1024));
 
         // Flag order must not matter.
-        let (state, log) = parse_arguments(os(&[
+        let (state, log, cache_limit) = parse_arguments(os(&[
+            "--audio-cache-limit-mb",
+            "0",
             "--log-file",
             "C:\\sr\\logs\\playback_engine.log",
             "--state-dir",
@@ -799,6 +901,7 @@ mod tests {
         .expect("log file first");
         assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
         assert!(log.is_some());
+        assert_eq!(cache_limit, None, "zero selects an unlimited cache");
     }
 
     #[test]
@@ -825,6 +928,28 @@ mod tests {
             ]))
             .is_err(),
             "duplicate state dir rejected"
+        );
+        assert!(
+            parse_arguments(os(&[
+                "--state-dir",
+                "C:\\a",
+                "--audio-cache-limit-mb",
+                "wat",
+            ]))
+            .is_err(),
+            "cache limit must be numeric"
+        );
+        assert!(
+            parse_arguments(os(&[
+                "--state-dir",
+                "C:\\a",
+                "--audio-cache-limit-mb",
+                "1024",
+                "--audio-cache-limit-mb",
+                "2048",
+            ]))
+            .is_err(),
+            "duplicate cache limit rejected"
         );
     }
 

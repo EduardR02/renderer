@@ -13,17 +13,12 @@ use tauri::Manager;
 use app::{AppState, data_dir, load_tracks_cache};
 use engine_client::EngineClient;
 
-// This once forced software compositing (`--disable-gpu-compositing`) to work
-// around a black window: WebView2 rasterizes to a GPU texture and hands it to
-// DirectComposition, and the second step can fail alone, leaving the window
-// painting its own background over an intact DOM.
-//
-// Measurement retired it. Software compositing cost 223% of a core while
-// scrolling against 90% on the GPU path, and 21ms median gesture-to-frame
-// against 13ms — and the black window recurred anyway with the flag active, so
-// it was never buying the thing it was added for. WebView2 still reads
-// WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS from the environment, so the flag
-// remains available for a one-off test without living in the binary.
+// WebView2 can keep painting a correct GPU surface while DirectComposition
+// stops presenting it to the host HWND: CDP screenshots remain correct while
+// the actual window turns black after startup. `additionalBrowserArgs` in
+// tauri.conf disables only that presentation path. This is intentionally a
+// browser flag rather than an app-side repaint loop, which would burn CPU at
+// idle and still be racing the compositor.
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -48,6 +43,8 @@ pub fn run() {
             commands::browse_playlist,
             commands::browse_album,
             commands::browse_artist,
+            commands::browse_artist_catalogue_tracks,
+            commands::browse_liked_songs,
             commands::browse_track_credits,
             commands::create_playlist,
             commands::rename_playlist,
@@ -62,6 +59,8 @@ pub fn run() {
             commands::get_cover,
             commands::get_cache_stats,
             commands::clear_cache,
+            commands::get_app_settings,
+            commands::set_audio_cache_limit,
             commands::touch_playlist,
         ])
         .setup(|app| {

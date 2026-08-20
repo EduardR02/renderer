@@ -13,33 +13,7 @@
   const albums = $derived(search.results?.albums ?? []);
   const artists = $derived(search.results?.artists ?? []);
   const empty = $derived(!tracks.length && !albums.length && !artists.length);
-  let expandedTracksFor = $state("");
-  let fullyLoadedTracksFor = $state("");
-  let loadingAllTracksFor = $state("");
-  const tracksExpanded = $derived(expandedTracksFor === search.query && tracks.length > 5);
-  const visibleTracks = $derived(tracksExpanded ? tracks : tracks.slice(0, 5));
-
-  async function toggleAllTracks() {
-    const query = search.query;
-    if (tracksExpanded) {
-      expandedTracksFor = "";
-      return;
-    }
-    expandedTracksFor = query;
-    if (fullyLoadedTracksFor === query || loadingAllTracksFor === query) return;
-
-    loadingAllTracksFor = query;
-    try {
-      const result = await api.search(query, 50);
-      if (search.query !== query || !search.results) return;
-      search.results = { ...search.results, tracks: result?.tracks ?? tracks };
-      fullyLoadedTracksFor = query;
-    } catch {
-      /* The initial ten remain useful; expansion degrades to those. */
-    } finally {
-      if (loadingAllTracksFor === query) loadingAllTracksFor = "";
-    }
-  }
+  const visibleTracks = $derived(tracks.slice(0, 5));
 
   /* Top result: an artist beats an album beats a song. Whatever the query
      names exactly is almost always one of those, in that order. */
@@ -206,11 +180,9 @@
           <div class="section-head">
             <h2 class="section-title">Songs</h2>
             {#if tracks.length > 5}
-              <button
-                class="link-more"
-                disabled={loadingAllTracksFor === search.query}
-                onclick={toggleAllTracks}
-              >{loadingAllTracksFor === search.query ? "Loading…" : tracksExpanded ? "Show less" : "See all"}</button>
+              <!-- The larger request starts only after this explicit click.
+                   Keeping it on its own route also gives long results the full pane. -->
+              <button class="link-more" onclick={() => navigate("search-songs", search.query)}>See all</button>
             {/if}
           </div>
           <TrackList tracks={visibleTracks} playFrom={playTrack} showAlbum={false} showHead={false} />

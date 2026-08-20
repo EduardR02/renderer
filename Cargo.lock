@@ -4485,6 +4485,7 @@ dependencies = [
  "librespot-protocol",
  "oauth2",
  "protobuf",
+ "protobuf-json-mapping",
  "reqwest 0.12.28",
  "rodio",
  "serde",

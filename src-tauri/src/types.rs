@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistRef, ArtistReleases, PlaylistBrowse, PlaylistRef,
-    CreditArtist, CreditRole, SearchBrowse, TrackCredits, TrackRef,
+    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistRef, ArtistReleases, CreditArtist, CreditRole,
+    LikedSongsPage, PlaylistBrowse, PlaylistRef, SearchBrowse, TrackCredits, TrackRef,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -97,6 +97,21 @@ impl From<Track> for TrackRef {
             duration_ms: track.duration_ms,
             play_count: track.play_count,
             added_at: track.added_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LikedSongsDetail {
+    pub tracks: Vec<Track>,
+    pub next_cursor: Option<String>,
+}
+
+impl From<LikedSongsPage> for LikedSongsDetail {
+    fn from(page: LikedSongsPage) -> Self {
+        Self {
+            tracks: page.tracks.into_iter().map(Track::from).collect(),
+            next_cursor: page.next_cursor,
         }
     }
 }

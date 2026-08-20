@@ -27,6 +27,8 @@
     showAdded = false,
     /** Official desktop surfaces expose lifetime plays on albums/Popular. */
     showPlays = false,
+    /** Read-only collections can suppress the local-only heart affordance. */
+    showLike = true,
     sortKey = null,
     sortDirection = "asc",
     onSort = null,
@@ -419,15 +421,19 @@
         <span class="c-plays">{formatPlayCount(track.play_count)}</span>
       {/if}
 
-      <span class="c-like">
-        <button
-          class:liked={isTrackLiked(track.uri)}
-          title={isTrackLiked(track.uri) ? "Remove from Liked Songs" : "Save to Liked Songs"}
-          onclick={() => toggleLiked(track.uri)}
-        >
-          <Icon name={isTrackLiked(track.uri) ? "heart-filled" : "heart"} size={15} />
-        </button>
-      </span>
+      {#if showLike}
+        <span class="c-like">
+          <button
+            class:liked={isTrackLiked(track.uri)}
+            title={isTrackLiked(track.uri) ? "Remove from Liked Songs" : "Save to Liked Songs"}
+            onclick={() => toggleLiked(track.uri)}
+          >
+            <Icon name={isTrackLiked(track.uri) ? "heart-filled" : "heart"} size={15} />
+          </button>
+        </span>
+      {:else}
+        <span aria-hidden="true"></span>
+      {/if}
 
       <span class="c-time">{formatTime(track.duration_ms)}</span>
 

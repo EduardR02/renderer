@@ -9,18 +9,19 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app::{
-    AppState, PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH,
+    AppSettings, AppState, PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS,
+    LIBRARY_LENGTH,
     carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
-    load_playlist_list, now_secs, order_by_last_played, playlist_detail_from_cache,
-    save_playlist_list, save_tracks_cache, touch_playlist_played, upsert_playlist,
-    upsert_tracks_cache,
+    load_app_settings, load_playlist_list, now_secs, order_by_last_played,
+    playlist_detail_from_cache, save_app_settings, save_playlist_list, save_tracks_cache,
+    touch_playlist_played, upsert_playlist, upsert_tracks_cache,
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
 use crate::types::{
-    AlbumDetail, AppState as AppStateSnapshot, ArtistDetail, CacheStats, PlaybackState, Playlist,
-    PlaylistDetail, SearchResult, Track, TrackCreditsDetail,
+    AlbumDetail, AppState as AppStateSnapshot, ArtistDetail, CacheStats, LikedSongsDetail,
+    PlaybackState, Playlist, PlaylistDetail, SearchResult, Track, TrackCreditsDetail,
 };
 
 // ---------------------------------------------------------------------------
@@ -163,6 +164,30 @@ pub async fn browse_artist(
     id: String,
 ) -> Result<ArtistDetail, String> {
     Ok(ArtistDetail::from(client.browse_artist(&id).await?))
+}
+
+#[tauri::command]
+pub async fn browse_artist_catalogue_tracks(
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+    release_types: Option<Vec<String>>,
+) -> Result<Vec<Track>, String> {
+    Ok(client
+        .browse_artist_catalogue_tracks(&id, release_types.as_deref().unwrap_or_default())
+        .await?
+        .into_iter()
+        .map(Track::from)
+        .collect())
+}
+
+#[tauri::command]
+pub async fn browse_liked_songs(
+    client: State<'_, Arc<EngineClient>>,
+    cursor: Option<String>,
+) -> Result<LikedSongsDetail, String> {
+    Ok(LikedSongsDetail::from(
+        client.browse_liked_songs(cursor.as_deref()).await?,
+    ))
 }
 
 /// Songwriter/producer/performer credits for one track.
@@ -345,6 +370,22 @@ pub async fn touch_playlist(
     };
     save_playlist_list(&dir, &cache);
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_app_settings() -> AppSettings {
+    load_app_settings()
+}
+
+#[tauri::command]
+pub fn set_audio_cache_limit(mb: u64) -> Result<AppSettings, String> {
+    if !matches!(mb, 0 | 1024 | 2048 | 4096 | 8192) {
+        return Err("audio cache limit must be 1, 2, 4, or 8 GiB, or unlimited".to_owned());
+    }
+    let mut settings = load_app_settings();
+    settings.audio_cache_limit_mb = mb;
+    save_app_settings(&settings)?;
+    Ok(settings)
 }
 
 /// File count and total bytes of the audio cache and the cover cache.

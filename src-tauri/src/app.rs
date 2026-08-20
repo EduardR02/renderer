@@ -21,6 +21,26 @@ pub const LIBRARY_LENGTH: usize = 100;
 /// Most-recent-first cap for the playlist tracks cache.
 const TRACKS_CACHE_MAX: usize = 25;
 
+/// Default audio cache cap. Kept in MB because that is the user-facing unit
+/// and the engine command line accepts the same value without rounding.
+pub const DEFAULT_AUDIO_CACHE_LIMIT_MB: u64 = 1024;
+
+/// Persistent preferences that affect process startup rather than live
+/// playback state. Zero means an unlimited audio cache.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AppSettings {
+    pub audio_cache_limit_mb: u64,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            audio_cache_limit_mb: DEFAULT_AUDIO_CACHE_LIMIT_MB,
+        }
+    }
+}
+
 /// Managed application state. Only the contract fields are serialized; the
 /// cache bookkeeping and the data dir are internal.
 #[derive(Debug, Serialize)]
@@ -92,6 +112,32 @@ pub fn data_dir() -> PathBuf {
             .join("SpotifyRenderer");
     }
     std::env::temp_dir().join("SpotifyRenderer")
+}
+
+fn settings_path() -> PathBuf {
+    data_dir().join("settings.json")
+}
+
+pub fn load_app_settings() -> AppSettings {
+    let mut settings: AppSettings = std::fs::read(settings_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if !matches!(settings.audio_cache_limit_mb, 0 | 1024 | 2048 | 4096 | 8192) {
+        settings.audio_cache_limit_mb = DEFAULT_AUDIO_CACHE_LIMIT_MB;
+    }
+    settings
+}
+
+pub fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create settings directory: {error}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(settings)
+        .map_err(|error| format!("could not serialize settings: {error}"))?;
+    std::fs::write(path, bytes).map_err(|error| format!("could not save settings: {error}"))
 }
 
 /// Diagnostic logs: `%LOCALAPPDATA%\SpotifyRenderer\logs` — the app's own

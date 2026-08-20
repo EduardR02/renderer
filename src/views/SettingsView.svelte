@@ -23,6 +23,17 @@
   let clearTarget = $state(null);
   let clearing = $state(false);
   let clearError = $state("");
+  let appSettings = $state(null);
+  let settingsBusy = $state(false);
+  let settingsError = $state("");
+
+  const CACHE_LIMITS = [
+    { value: 1024, label: "1 GiB" },
+    { value: 2048, label: "2 GiB" },
+    { value: 4096, label: "4 GiB" },
+    { value: 8192, label: "8 GiB" },
+    { value: 0, label: "Unlimited" },
+  ];
 
   const clearCopy = $derived(
     clearTarget === "audio"
@@ -63,6 +74,20 @@
       .catch(() => (ping = "failed"));
   }
 
+  async function updateAudioCacheLimit(event) {
+    const mb = Number(event.currentTarget.value);
+    if (!Number.isFinite(mb) || settingsBusy) return;
+    settingsBusy = true;
+    settingsError = "";
+    try {
+      appSettings = await api.setAudioCacheLimit(mb);
+    } catch (error) {
+      settingsError = String(error || "Could not save the cache limit.");
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
   const pingLabel = $derived(
     ping === "ok" ? "Reachable" : ping === "failed" ? "No answer" : ping === "checking" ? "Checking…" : "Not checked"
   );
@@ -72,6 +97,9 @@
   // on every render.
   $effect(() => {
     refreshCacheStats().catch(() => {});
+    api.getAppSettings()
+      .then((value) => (appSettings = value))
+      .catch((error) => (settingsError = String(error || "Could not load app settings.")));
   });
 </script>
 
@@ -146,6 +174,26 @@
           <button class="btn-ghost" onclick={() => requestClear("audio")}>Clear</button>
         </div>
       </div>
+      <div class="set-row" data-cache-limit>
+        <div>
+          <div class="k">Audio cache limit</div>
+          <div class="d">Maximum downloaded audio kept on disk. Applies after the next restart.</div>
+          {#if settingsError}<div class="inline-error">{settingsError}</div>{/if}
+        </div>
+        <div class="set-ctl">
+          <select
+            class="set-select"
+            aria-label="Audio cache limit"
+            disabled={!appSettings || settingsBusy}
+            value={appSettings?.audio_cache_limit_mb ?? 1024}
+            onchange={updateAudioCacheLimit}
+          >
+            {#each CACHE_LIMITS as option (option.value)}
+              <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
+        </div>
+      </div>
       <div class="set-row" data-cache-stat="covers">
         <div>
           <div class="k">Cover cache</div>
@@ -192,10 +240,6 @@
       <div class="set-row">
         <div class="k">Auth state</div>
         <div class="set-ctl"><span class="v">{playback.auth_state ?? "unknown"}</span></div>
-      </div>
-      <div class="set-row">
-        <div class="k">Queue length</div>
-        <div class="set-ctl"><span class="v">{playback.queue.length}</span></div>
       </div>
       <div class="set-row">
         <div class="k">Version</div>

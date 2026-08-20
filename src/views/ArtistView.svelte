@@ -16,8 +16,39 @@
     ];
   });
   const hasReleases = $derived(releaseSections.some((section) => section.items.length));
-  const RELEASE_PREVIEW = 8;
-  const expandedSections = $state({});
+  const releaseTotal = $derived(releaseSections.reduce((total, section) => total + section.items.length, 0));
+  const RELEASE_PREVIEW = 12;
+  let catalogueFilter = $state("all");
+  let catalogueExpanded = $state(false);
+  let catalogueLoading = $state(false);
+  let catalogueError = $state("");
+  let loadingReleaseId = $state("");
+
+  const catalogueItems = $derived(
+    releaseSections.flatMap((section) =>
+      section.items.map((release) => ({
+        ...release,
+        releaseKey: section.key,
+        releaseLabel: section.title === "Appears on" ? "Appears on" : section.title.replace(/s$/, ""),
+      })),
+    ),
+  );
+  const filteredCatalogue = $derived(
+    catalogueFilter === "all"
+      ? catalogueItems
+      : catalogueItems.filter((release) => release.releaseKey === catalogueFilter),
+  );
+  const visibleCatalogue = $derived(
+    catalogueExpanded ? filteredCatalogue : filteredCatalogue.slice(0, RELEASE_PREVIEW),
+  );
+  const cataloguePlayTypes = $derived(
+    catalogueFilter === "all" ? ["albums", "singles"] : [catalogueFilter],
+  );
+  const cataloguePlayLabel = $derived(
+    catalogueFilter === "all"
+      ? "Play albums + singles"
+      : `Play ${releaseSections.find((section) => section.key === catalogueFilter)?.title.toLowerCase() ?? "catalogue"}`,
+  );
 
   /* Seeds the banner's fallback gradient off the same hash as the artwork, so
      an artist with no portrait still gets a stable colour rather than a hole. */
@@ -40,6 +71,47 @@
     api.setShuffle(true).catch(() => {});
     api.playQueue(top, 0).catch(() => {});
   }
+
+  async function playCatalogue() {
+    if (!artist?.id || catalogueLoading) return;
+    catalogueLoading = true;
+    catalogueError = "";
+    try {
+      const tracks = await api.browseArtistCatalogueTracks(artist.id, cataloguePlayTypes);
+      if (!tracks?.length) {
+        catalogueError = "No playable tracks were returned for this part of the catalogue.";
+        return;
+      }
+      await api.playQueue(tracks, 0);
+    } catch (reason) {
+      catalogueError = String(reason || "Could not play this catalogue.");
+    } finally {
+      catalogueLoading = false;
+    }
+  }
+
+  async function playRelease(release) {
+    if (!release?.id || loadingReleaseId) return;
+    loadingReleaseId = release.id;
+    catalogueError = "";
+    try {
+      const album = await api.browseAlbum(release.id);
+      const tracks = album?.tracks ?? [];
+      if (!tracks.length) throw new Error("No playable tracks were returned for this release.");
+      await api.playQueue(tracks, 0);
+    } catch (reason) {
+      catalogueError = String(reason || "Could not play this release.");
+    } finally {
+      loadingReleaseId = "";
+    }
+  }
+
+  $effect(() => {
+    artist?.id;
+    catalogueFilter;
+    catalogueExpanded = false;
+    catalogueError = "";
+  });
 </script>
 
 <!-- `bleed`: the banner carries its own negative margins up under the topbar,
@@ -66,12 +138,12 @@
     <p class="detail-meta" style="margin-top:var(--s5)">
       <span class="num">{top.length} popular {top.length === 1 ? "song" : "songs"}</span>
       {#if hasReleases}
-        <span class="sep">/</span><span class="num">{releaseSections.reduce((total, section) => total + section.items.length, 0)} releases</span>
+        <span class="sep">/</span><span class="num">{releaseTotal} releases</span>
       {/if}
     </p>
 
     <div class="actions">
-      <button class="play-lg" title="Play" onclick={() => playFrom(0)} disabled={!top.length}>
+      <button class="play-lg" title="Play popular songs" onclick={() => playFrom(0)} disabled={!top.length}>
         <Icon name="play" size={19} />
       </button>
       <button class="btn-ghost" onclick={shufflePlay} disabled={!top.length}>
@@ -86,37 +158,65 @@
       </div>
     {/if}
 
-    {#each releaseSections as section (section.key)}
-      {#if section.items.length}
-        <div class="section" data-release-group={section.key}>
-          <div class="section-head">
-            <h2 class="section-title">
-              {section.title}<span class="section-count">{section.items.length}</span>
-            </h2>
-            {#if section.items.length > RELEASE_PREVIEW}
-              <button
-                class="link-more"
-                onclick={() => (expandedSections[section.key] = !expandedSections[section.key])}
-              >{expandedSections[section.key] ? "Show less" : "See all"}</button>
-            {/if}
+    {#if hasReleases}
+      <section class="section catalogue" aria-labelledby="catalogue-title">
+        <div class="catalogue-heading">
+          <div>
+            <span class="eyebrow">Discography</span>
+            <h2 class="section-title" id="catalogue-title">Catalogue<span class="section-count">{releaseTotal}</span></h2>
           </div>
-          <div class="grid">
-            {#each section.items.slice(0, expandedSections[section.key] ? undefined : RELEASE_PREVIEW) as al (al.id)}
-              <button class="card" onclick={() => navigate("album", al.id)}>
-                <span class="card-art">
-                  <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />
-                  <span class="card-play"><Icon name="play" size={15} /></span>
-                </span>
-                <span class="card-name">{al.name}</span>
-                <span class="card-sub">
-                  {#if al.year}{al.year} · {/if}{al.artist_names.join(", ")}
+          <button class="btn-ghost catalogue-play" onclick={playCatalogue} disabled={catalogueLoading || !filteredCatalogue.length}>
+            <Icon name="play" size={13} />{catalogueLoading ? "Building queue…" : cataloguePlayLabel}
+          </button>
+        </div>
+
+        <div class="catalogue-tabs" aria-label="Filter catalogue">
+          <button class:active={catalogueFilter === "all"} aria-pressed={catalogueFilter === "all"} onclick={() => (catalogueFilter = "all")}>All <span>{releaseTotal}</span></button>
+          {#each releaseSections as section (section.key)}
+            {#if section.items.length}
+              <button
+                class:active={catalogueFilter === section.key}
+                aria-pressed={catalogueFilter === section.key}
+                onclick={() => (catalogueFilter = section.key)}
+              >{section.title} <span>{section.items.length}</span></button>
+            {/if}
+          {/each}
+        </div>
+
+        <div class="catalogue-list" data-release-group={catalogueFilter}>
+          {#each visibleCatalogue as release (`${release.releaseKey}-${release.id}`)}
+            <article class="catalogue-item">
+              <button class="catalogue-open" onclick={() => navigate("album", release.id)}>
+                <Cover src={release.cover_url} id={release.id} name={release.name} size={64} lg />
+                <span class="catalogue-copy">
+                  <span class="catalogue-name">{release.name}</span>
+                  <span class="catalogue-meta">
+                    <span class="release-kind">{release.releaseLabel}</span>
+                    {#if release.year}<span>{release.year}</span>{/if}
+                    {#if release.artist_names?.length}<span class="catalogue-artists">{release.artist_names.join(", ")}</span>{/if}
+                  </span>
                 </span>
               </button>
-            {/each}
-          </div>
+              <button
+                class="catalogue-item-play"
+                title={`Play ${release.name}`}
+                aria-label={`Play ${release.name}`}
+                disabled={!!loadingReleaseId}
+                onclick={() => playRelease(release)}
+              ><Icon name={loadingReleaseId === release.id ? "more" : "play"} size={14} /></button>
+            </article>
+          {/each}
         </div>
-      {/if}
-    {/each}
+
+        {#if filteredCatalogue.length > RELEASE_PREVIEW}
+          <button class="catalogue-more" onclick={() => (catalogueExpanded = !catalogueExpanded)}>
+            {catalogueExpanded ? "Show less" : `Show all ${filteredCatalogue.length}`}
+            <Icon name={catalogueExpanded ? "chevron-up" : "chevron-down"} size={14} />
+          </button>
+        {/if}
+        {#if catalogueError}<p class="inline-error" role="alert">{catalogueError}</p>{/if}
+      </section>
+    {/if}
 
     {#if !top.length && !hasReleases}
       <div class="empty">

@@ -116,6 +116,18 @@ pub enum Command {
     BrowseArtist {
         id: String,
     },
+    /// Lazily resolves tracks across selected artist release groups into one
+    /// continuous playback queue.
+    BrowseArtistCatalogueTracks {
+        id: String,
+        #[serde(default)]
+        release_types: Vec<String>,
+    },
+    /// One authenticated page of the user's Saved Tracks collection.
+    BrowseLikedSongs {
+        #[serde(default)]
+        cursor: Option<String>,
+    },
     /// Search via the spclient searchview endpoint. Responded to with a
     /// `browse_search` message.
     BrowseSearch {
@@ -322,6 +334,14 @@ pub struct ArtistBrowse {
     pub portrait_url: Option<String>,
     pub top_tracks: Vec<TrackRef>,
     pub releases: ArtistReleases,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LikedSongsPage {
+    pub tracks: Vec<TrackRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// One contributor in a track's credits.
@@ -697,6 +717,32 @@ mod tests {
         assert!(matches!(
             search.command,
             Command::BrowseSearch { ref query, limit: 10 } if query == "fire & ice"
+        ));
+
+        let catalogue: Request = serde_json::from_value(json!({
+            "request_id": "request-16",
+            "type": "browse_artist_catalogue_tracks",
+            "id": "0123456789ABCDEFGHIJKL",
+            "release_types": ["albums", "singles"],
+        }))
+        .unwrap();
+        assert!(matches!(
+            catalogue.command,
+            Command::BrowseArtistCatalogueTracks { ref id, ref release_types }
+                if id == "0123456789ABCDEFGHIJKL"
+                    && release_types == &["albums".to_owned(), "singles".to_owned()]
+        ));
+
+        let liked_songs: Request = serde_json::from_value(json!({
+            "request_id": "request-17",
+            "type": "browse_liked_songs",
+            "cursor": "hm://context-page/collection?offset=50",
+        }))
+        .unwrap();
+        assert!(matches!(
+            liked_songs.command,
+            Command::BrowseLikedSongs { ref cursor }
+                if cursor.as_deref() == Some("hm://context-page/collection?offset=50")
         ));
     }
 
