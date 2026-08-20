@@ -6,37 +6,141 @@
 :root {
   color-scheme: dark;
 
-  /* --- Surfaces --------------------------------------------------------
-     Three separate panels float on a black ground. The ground is only
-     ever visible as an 8px gutter. A luminance ladder + that gutter is
-     how the sidebar / player boundary gets expressed — no border needed. */
-  --bg-0:  #08080a;  /* window ground: visible only as gutters          */
-  --bg-nav:#0e0e11;  /* sidebar panel  — recessed, it is a rail         */
-  --bg-1:  #121215;  /* content panel  — the focus                      */
-  --bg-bar:#17171b;  /* player panel   — lifted, always-on controls     */
-  --bg-2:  #1c1c21;  /* raised: menus, inputs, skeletons                */
-  --bg-3:  #232329;  /* hover                                           */
-  --bg-4:  #2d2d35;  /* pressed / selected                              */
+  /* =====================================================================
+     SURFACES — two planes and a ground.
 
-  /* --- Text ---------------------------------------------------------- */
-  --fg:   #f1f1f3;   /* never pure #fff: it vibrates on near-black      */
-  --fg-1: #b7b7c0;
-  --fg-2: #898993;
-  --fg-3: #5c5c66;
+     Earlier passes gave the sidebar, the player bar and the content pane
+     three separate values one or two steps apart, which is a difference too
+     small to read as a decision and just enough to stop the window looking
+     properly dark. There are only two kinds of surface here:
 
-  /* --- Rose Pine accents. Foam leads; rose warms; love signals risk. -- */
-  --rose:        #ebbcba;
+       CHROME   — permanent furniture (sidebar, player bar, inspector). One
+                  value, shared, so the L-shape of chrome reads as one object.
+       CONTENT  — the pane you are actually reading. The lit plane.
+
+     The ground behind both is darker than either and is only ever visible as
+     an 8px gutter, which is what draws the boundary — no borders needed.
+     ===================================================================== */
+  --bg-0:   #080808;  /* window ground: gutters only                     */
+  --bg-nav: #0e0e0e;  /* CHROME: sidebar, player bar, now-playing rail   */
+  --bg-1:   #121212;  /* CONTENT: the pane, the brightest large plane    */
+  --bg-bar: var(--bg-nav);
+  /* A modal is lifted by its border and its shadow, not by luminance: at a
+     raised grey it became the brightest thing on screen and read as a card. */
+  --bg-sheet: #131313;
+  --bg-2:   #1c1c1c;  /* raised: menus, inputs, chips, skeletons         */
+  --bg-3:   #242424;  /* hover                                           */
+  --bg-4:   #2e2e2e;  /* pressed / selected                              */
+
+  /* --- Text. Neutral, deliberately: R = G = B at every step.
+         This ramp was wrong twice, in opposite directions — first mauve
+         (#bdb9c2: B > G), which turned rose muddy, then taupe (#c2bdb8:
+         R > G > B), which is worse, because brown is not a neutral, it is a
+         colour, and it fought every accent placed near it.
+         The tint belongs in the accents, not in the greys. A dead-neutral
+         ramp is what gives the accents the only chroma on screen.
+
+         Still dead neutral, but lifted about half a step at every rung. The
+         previous values were tuned against a header wash that barely existed;
+         under a wash with real colour in it, --fg-2 at L* 67 sat too close to
+         the tinted ground and picked the ground's hue up by simultaneous
+         contrast — which is what "the grey subtext leans brown" was. Brighter
+         grey resists that, and reads as quiet rather than as dim. --- */
+  --fg:   #f2f2f2;   /* never pure #fff: it vibrates on near-black      */
+  --fg-1: #c4c4c4;
+  --fg-2: #a0a0a0;
+  --fg-3: #757575;
+
+  /* =====================================================================
+     ACCENTS — four hues, four layers of meaning, no overlap.
+
+       FOAM  #9ccfd8  WHAT YOU CAN DO.   Play, active nav, focus, selection,
+                                         the currently playing row, counts,
+                                         links. The app's interactive colour.
+       ROSE  #ebbcba  WHAT IS YOURS.     The liked heart, Liked Songs, library
+                                         membership. Plus the warm end of the
+                                         one gradient the app reuses.
+       GOLD  #f6c177  WHO MADE IT.       Credits, contributor roles, the kind
+                                         of record something is. The liner-note
+                                         layer: facts ABOUT a record rather
+                                         than things you can do to it.
+       LOVE  #eb6f92  WHAT YOU CANNOT UNDO. Destructive actions and errors.
+
+     Gold is the addition, and it exists because of a measurement. Rose is a
+     low-chroma warm near-white — L* 84, chroma 0.054 in Oklab, which is a
+     twentieth of the way to the gamut edge. Set as 11px uppercase type it does
+     not read as a hue at all; it reads as dirty white, and against anything
+     warm it reads as brown. Painting every micro-label with it failed for that
+     reason. Painting every micro-label grey instead fixed the brown and left
+     the app monotone, which is the opposite failure.
+
+     The answer is not a compromise between those two. It is that a warm accent
+     needs REAL CHROMA to survive at type scale, and gold has double rose's
+     (0.110). Gold at 11px is unmistakably gold. So the "about this record"
+     layer gets a hue it can actually wear as ink, and rose keeps the jobs it is
+     genuinely good at, all of which are large or solid:
+
+       - a filled heart (a solid glyph, ~120px² of pure hue)
+       - the 176px Liked Songs tile
+       - the warm stop of the signature gradient
+       - the tint under a selected library row
+
+     ROSE-INK is rose corrected for small scale: same hue, chroma raised to
+     0.11, for the handful of places rose has to be a MARK rather than a field
+     — a tag, a rule, a 12px glyph. It is not a second colour. It is the same
+     pigment ground finer so it still shows up.
+     ===================================================================== */
   --foam:        #9ccfd8;
+  --rose:        #ebbcba;
+  --rose-ink:    #f99e98;
+  --gold:        #f6c177;
   --love:        #eb6f92;
+
   --accent:      var(--foam);
-  --accent-hi:   var(--rose);
-  --accent-lo:   var(--love);
+  /* Hover on a foam fill brightens the foam. It used to jump to rose, which
+     made every button press look like a change of meaning. */
+  --accent-hi:   color-mix(in srgb, var(--foam) 78%, #ffffff);
+  --accent-lo:   color-mix(in srgb, var(--foam) 82%, var(--bg-0));
   --accent-ink:  var(--bg-0);
-  --accent-wash: color-mix(in srgb, var(--foam) 14%, transparent);
+  --saved:       var(--rose);
   --danger:      var(--love);
 
+  --accent-wash: color-mix(in srgb, var(--foam) 14%, transparent);
+  /* Rose-INK, not rose, under a tint: 13% of a pale warm over near-black lands
+     on #35201f, which is brown. 13% of the ink lands on #342726 with twice the
+     chroma, which still reads pink. Alpha destroys chroma; start with more. */
+  --saved-wash:  color-mix(in srgb, var(--rose-ink) 15%, transparent);
+  --credit-wash: color-mix(in srgb, var(--gold) 13%, transparent);
+  --danger-wash: color-mix(in srgb, var(--love) 13%, transparent);
+  /* The one gradient the app reuses: cool → warm, foam through rose. It is
+     the signature — seek rail, cache meter, brand mark, login mark, the
+     top edge of a modal sheet. Nothing else gets a gradient. */
+  --accent-grad: linear-gradient(90deg, var(--foam), var(--rose));
+  /* A hairline that leads with the accent and fades into the ordinary line
+     colour: structure, so it leads with foam. */
+  --rule-accent: linear-gradient(90deg,
+    color-mix(in srgb, var(--foam) 52%, transparent), var(--line) 32%, var(--line));
+
+  /* Micro-labels come in two kinds and they are not the same object.
+
+     A FIELD label names a column or a value — "Title", "Added", "Album". It is
+     furniture. It is grey, always, because a table with eight coloured column
+     heads has no hierarchy left to spend.
+
+     A SECTION label names what you are looking at — "Playlist", "Credits",
+     "Discography". There is at most one per region, so it can afford to carry
+     the region's hue. That is `.tag`, and it wears the hue as a SOLID FILL
+     rather than as ink, which is the only treatment a 10px word can wear and
+     still be legible as a colour. */
+  --label:     var(--fg-2);
+  --label-hi:  var(--fg-1);
+  /* Counts stay foam-tinted. They are the one place a number is also a link
+     to more of something, and a quiet cyan digit beside grey type is most of
+     the colour a dense list can carry without becoming noisy. */
+  --count:     color-mix(in srgb, var(--foam) 62%, var(--fg-2));
+
   /* --- Hairlines ----------------------------------------------------- */
-  --line:   rgba(255, 255, 255, 0.055);
+  --line:   rgba(255, 255, 255, 0.06);
   --line-2: rgba(255, 255, 255, 0.11);
   --ring:   inset 0 0 0 1px rgba(255, 255, 255, 0.07); /* art edge      */
 
@@ -47,13 +151,29 @@
   --font-text:    "Segoe UI Variable Text", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
   --font-small:   "Segoe UI Variable Small", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
   --font-mono:    "Cascadia Mono", ui-monospace, Consolas, monospace;
-  --font-number:  "Segoe UI Variable Text", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-number:  var(--font-text);
 
-  --t-11: 11px;   /* micro labels, column heads, counts                  */
-  --t-12: 12px;   /* secondary meta, artists, durations                  */
-  --t-13: 13px;   /* body: track titles, nav, menu items                 */
+  /* Weights. Segoe UI Variable is a variable family, so these interpolate on
+     the wght axis and 430 is a real weight, not a rounded 400. Light-on-dark
+     loses apparent stroke weight, which is why body sits above 400. */
+  --w-body:  430;
+  --w-med:   520;   /* numerals, meta emphasis                          */
+  --w-semi:  600;   /* caps labels, column heads                        */
+  --w-bold:  650;   /* display headings                                 */
+
+  /* One caps treatment, defined once. 11px with 0.12em tracking rather than
+     11.5/0.09: at this size the extra letterspacing is what separates a label
+     from small body text, and it costs nothing in stroke weight the way a
+     coloured fill did. */
+  --t-caps:  11px;
+  --track-caps: 0.12em;
+
+  --t-11: 11.5px; /* running micro-text: sub-lines, counts, role lines   */
+  --t-12: 12.5px; /* secondary meta, artists, durations                  */
+  --t-13: 13.5px; /* body: track titles, nav, menu items                 */
   --t-15: 15px;   /* emphasis: sidebar nav, card titles                  */
-  --t-20: 20px;   /* section headings                                    */
+  --t-20: 20px;   /* section headings, shelf headings                    */
+  --t-23: 23px;   /* inspector + dialog titles                           */
   --t-32: 32px;   /* page titles                                         */
   --t-56: 56px;   /* detail display titles                               */
 
@@ -75,7 +195,7 @@
 
   /* --- Layout ------------------------------------------------------ */
   --sidebar-w: 240px;
-  --inspector-w: 320px;
+  --inspector-w: 336px;
   --player-h: 76px;
   --topbar-h: 52px;
   --row-h: 48px;    /* track row — fixed, virtualization-friendly       */
@@ -83,6 +203,15 @@
   --pane-pad: 24px;
   --r-panel: 12px;
   --seek-tip-w: 56px;
+
+  /* --- Content colour ----------------------------------------------
+     Set per page/panel by `coverTone()` (src/lib/covertone.svelte.js) from
+     the artwork on screen. These defaults are only ever visible for the
+     handful of frames before a tone resolves, so they are deliberately the
+     app's own cool dark rather than a neutral. */
+  --tone-wash:      #232f38;
+  --tone-wash-deep: #18222a;
+  --tone-glow:      #4e7182;
 }
 
 
@@ -93,15 +222,30 @@ html, body { height: 100%; margin: 0; overflow: hidden; }
 body {
   font-family: var(--font-text);
   font-size: var(--t-13);
-  line-height: 1.4;
+  font-weight: var(--w-body);
+  line-height: 1.45;
   background: var(--bg-0);
   color: var(--fg);
-  -webkit-font-smoothing: antialiased;
-  font-variant-numeric: tabular-nums;
-  font-feature-settings: "kern" 1, "ss01" 1;
+  /* No `-webkit-font-smoothing: antialiased`. On Windows that switch turns
+     ClearType off and renders every glyph with grayscale AA, which visibly
+     thins the strokes — it was the single largest contributor to the type
+     reading light. Subpixel rendering is the platform default and is what the
+     rest of the OS looks like. */
+  font-feature-settings: "kern" 1;
+  /* Proportional figures in running text; tabular is opted INTO by the few
+     places that align numbers in a column (see `.tnum`). Tabular everywhere
+     was what made ordinary sentences read like a spreadsheet: it forces the
+     narrow digits to carry the width of a zero, so "1,204" gets airy gaps. */
+  font-variant-numeric: proportional-nums;
   text-rendering: optimizeLegibility;
   user-select: none;
   cursor: default;
+}
+
+/* Opt-in tabular figures: columns of numbers that must align vertically. */
+.tnum, .c-time, .c-plays, .c-idx, .c-added, .p-time, .seek-tip,
+.lib-count, .set-row .v, .detail-meta .num, .results-summary {
+  font-variant-numeric: tabular-nums;
 }
 
 h1, h2, h3, p { margin: 0; }
@@ -118,12 +262,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.11);
+  background: color-mix(in srgb, var(--foam) 16%, rgba(255, 255, 255, 0.1));
   border-radius: var(--rf);
   border: 3px solid transparent;
   background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { background-color: rgba(255, 255, 255, 0.22); background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--foam) 42%, transparent); background-clip: padding-box; }
 
 /* =====================================================================
    SHELL
@@ -161,7 +305,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .brand .name {
   font-family: var(--font-display);
-  font-size: var(--t-13); font-weight: 600; letter-spacing: 0.02em;
+  font-size: var(--t-13); font-weight: var(--w-semi); letter-spacing: 0.02em;
   text-transform: uppercase; color: var(--fg-1);
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -175,7 +319,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .nav-item svg { flex: none; opacity: 0.8; }
 .nav-item:hover { color: var(--fg); background: rgba(255, 255, 255, 0.04); }
-.nav-item.active { color: var(--fg); background: var(--bg-3); box-shadow: inset 2px 0 var(--accent); }
+/* Selected nav: an accent wash over the raised step rather than the raised
+   step alone, plus the existing rail. Colour now carries the state; the
+   luminance change is only the support. */
+.nav-item.active {
+  color: var(--fg);
+  background: linear-gradient(90deg, var(--accent-wash), transparent 78%), var(--bg-3);
+  box-shadow: inset 2px 0 var(--accent);
+}
 .nav-item.active svg { opacity: 1; color: var(--accent); }
 /* the label ellipses; the shortcut chip is never pushed out of the rail */
 .nav-item > span:not(.kbd) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -186,6 +337,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   color: var(--fg-3); padding: 1px 4px; border: 1px solid var(--line);
   border-radius: 3px;
 }
+/* The queue count used to borrow `.kbd`, which is the *keyboard keycap* style:
+   monospaced, 10px, boxed. It is a quantity, not a shortcut, so it belongs in
+   the interface font with the rest of the counts. */
+.nav-count {
+  margin-left: auto; padding-left: var(--s2);
+  font-size: var(--t-11); font-variant-numeric: tabular-nums;
+  color: var(--count);
+}
 
 .lib { display: flex; flex-direction: column; flex: 1; min-height: 0; margin-top: var(--s3); }
 .lib-head {
@@ -194,8 +353,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .lib-head .label {
   font-family: var(--font-small);
-  font-size: var(--t-11); font-weight: 600; letter-spacing: 0.09em;
-  text-transform: uppercase; color: var(--fg-2);
+  font-size: var(--t-caps); font-weight: var(--w-semi); letter-spacing: var(--track-caps);
+  text-transform: uppercase; color: var(--label);
 }
 .lib-head-actions { display: flex; align-items: center; margin-right: calc(var(--s1) * -1); }
 .lib-filter {
@@ -245,7 +404,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: background-color var(--d1) var(--ease);
 }
 .lib-row:hover { background: rgba(255, 255, 255, 0.045); }
-.lib-row.active { background: var(--bg-3); }
+.lib-row.active { background: linear-gradient(90deg, var(--accent-wash), transparent 80%), var(--bg-3); }
 .lib-row.active .lib-name { color: var(--fg); }
 .lib-name {
   font-size: var(--t-13); color: var(--fg-1);
@@ -254,19 +413,30 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .lib-row:hover .lib-name { color: var(--fg); }
 .lib-count {
-  font-family: var(--font-number); font-size: var(--t-11); font-weight: 600;
-  color: var(--fg-2); font-variant-numeric: tabular-nums;
+  font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
+  color: var(--count);
 }
 .lib-row.playing .lib-name { color: var(--accent); }
+/* The one row in the rail whose selected state is warm, because the thing it
+   selects is the saved collection. Everything else selected is foam. */
+.lib-row.liked-row.active {
+  background: linear-gradient(90deg, var(--saved-wash), transparent 80%), var(--bg-3);
+}
 .liked-row { margin-bottom: var(--s2); }
 .liked-row + .lib-row { position: relative; }
 .liked-row + .lib-row::before {
   content: ""; position: absolute; left: var(--s2); right: var(--s2); top: calc(var(--s1) * -1);
   height: 1px; background: var(--line);
 }
+/* The one warm object in a cool rail. Rose leads because this row IS the saved
+   collection. Love is not in it at all — love means risk, nothing else. */
+/* Pale rose into ink rose, not rose into foam. Mixing a warm and a cool of
+   near-equal lightness in sRGB lands on grey — the old second stop resolved to
+   #c0c6ca — so the tile was half rose and half nothing. A ramp within one hue
+   keeps all 1024 pixels of it saying the same word. */
 .liked-mini {
   display: grid; place-items: center; width: 32px; height: 32px; border-radius: var(--r1);
-  background: linear-gradient(145deg, var(--love), var(--rose) 54%, var(--foam));
+  background: linear-gradient(150deg, var(--rose), var(--rose-ink));
   color: var(--bg-0); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .14);
 }
 
@@ -280,80 +450,180 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   overflow: hidden;
   display: flex; flex-direction: column; min-width: 0;
 }
+/* ------------------------------------------------------- now playing panel
+   An inspector for one track: artwork at full column width, then identity,
+   album, credits, and what follows — in that order, each block separated by
+   space and a hairline rather than by a box. The previous version stacked
+   small facts in bordered rows, which made a 320px rail read like a settings
+   table; the panel is now mostly artwork and names. */
+/* The rail takes the playing record's colour, top to bottom. It was chrome
+   grey everywhere except the artwork, which is a strange thing for the one
+   surface in the app that always has a picture in it. */
 .np-panel {
   grid-row: 1; grid-column: 3;
-  display: flex; flex-direction: column; min-height: 0; overflow-y: auto;
-  gap: var(--s5); padding: var(--s4);
-  border-radius: var(--r-panel); background: var(--bg-nav);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  display: flex; flex-direction: column; min-height: 0;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 0 0 var(--s6);
+  border-radius: var(--r-panel);
+  /* A short band of the track's colour at the top, then chrome. Short on
+     purpose: this is a fixed 336px column of dense small type, and a tint
+     running the full height would make every line of it harder to read for no
+     gain. The colour's job is to say WHOSE panel this is, which takes 220px. */
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--tone-wash) 62%, var(--bg-nav)) 0,
+      var(--bg-nav) 220px),
+    var(--bg-nav);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 .np-head {
+  position: sticky; top: 0; z-index: 2;
   display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
-  height: 32px; flex: none; color: var(--fg-1);
-  font-family: var(--font-small); font-size: var(--t-11); font-weight: 650;
-  letter-spacing: 0.09em; text-transform: uppercase;
+  height: 44px; flex: none; padding: 0 var(--s2) 0 var(--s4);
+  /* Sticky over a tinted panel, so it has to be glass rather than a fade to a
+     colour it does not know — the fade to --bg-nav used to leave a grey ghost
+     across the top of the tint as soon as anything scrolled under it. */
+  background: color-mix(in srgb, var(--bg-nav) 45%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(1.6);
+          backdrop-filter: blur(16px) saturate(1.6);
 }
-.np-head-title { display: inline-flex; align-items: center; gap: var(--s2); }
-.np-head-title i {
-  width: 6px; height: 6px; border-radius: 50%; background: var(--foam);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--foam) 10%, transparent);
+
+/* The stage holds the cover and, behind it, a blurred and slightly enlarged
+   copy of the same image. That is the app's one piece of colour taken from
+   content instead of from the palette. It is a static composited layer — no
+   animation, no per-frame cost — and it degrades correctly: with no artwork
+   the generated tile is a Rose Pine gradient, so the glow is still on-palette. */
+.np-stage { position: relative; flex: none; padding: var(--s1) var(--s4) var(--s5); }
+.np-glow {
+  position: absolute; z-index: 0; inset: var(--s4) var(--s5) var(--s6);
+  display: block; filter: blur(38px) saturate(1.5); opacity: 0.5;
+  transform: translateY(8px) scale(1.02);
+  pointer-events: none;
 }
-.np-hero { position: relative; padding: var(--s2); }
-.np-hero::before {
-  content: ""; position: absolute; inset: 0; border-radius: var(--r3);
-  background: linear-gradient(145deg,
-    color-mix(in srgb, var(--foam) 14%, var(--bg-2)),
-    color-mix(in srgb, var(--rose) 8%, var(--bg-nav)));
+.np-glow .art { box-shadow: none; border-radius: var(--r4); }
+.np-glow .art.gen::after { content: none; }
+@media (prefers-reduced-transparency: reduce) { .np-glow { display: none; } }
+.np-art { position: relative; z-index: 1; width: 100%; aspect-ratio: 1; --tile: 288px; }
+/* The sleeve casts its own colour rather than a neutral black. Two shadows:
+   one dark for the lift, one tinted and wider for the light. */
+.np-art .art.raised {
+  box-shadow:
+    var(--ring),
+    0 16px 36px -12px rgba(0, 0, 0, 0.85),
+    0 22px 54px -18px color-mix(in srgb, var(--tone-glow) 72%, transparent);
 }
-.np-art { position: relative; width: 100%; aspect-ratio: 1; flex: none; --tile: 256px; }
-.np-copy { min-width: 0; }
-.np-copy h2 {
-  font-family: var(--font-display); font-size: 24px; font-weight: 650;
-  letter-spacing: -0.018em; line-height: 1.14; overflow-wrap: anywhere;
+
+.np-block { flex: none; padding: 0 var(--s4); min-width: 0; }
+.np-identity h2 {
+  font-family: var(--font-display); font-size: var(--t-23); font-weight: var(--w-bold);
+  letter-spacing: -0.02em; line-height: 1.16; overflow-wrap: anywhere;
 }
+/* Artists wrap to two lines rather than ellipsing at one: on a track with
+   four credited artists the names are the point, not an overflow problem. */
 .np-artists {
-  display: block; min-width: 0; margin-top: var(--s1);
-  color: var(--fg-1); font-family: var(--font-small); font-size: var(--t-12);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: block; min-width: 0; margin-top: var(--s2);
+  color: var(--fg-1); font-size: var(--t-13);
+  overflow: hidden; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
 }
-.np-actions { display: flex; align-items: center; gap: var(--s2); }
-.np-actions .btn-ghost { flex: 1; justify-content: center; }
-.np-context {
-  overflow: hidden; border: 1px solid var(--line); border-radius: var(--r2);
-  background: color-mix(in srgb, var(--bg-2) 62%, transparent);
+.np-meta {
+  display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
+  margin-top: var(--s3); color: var(--fg-2);
+  font-family: var(--font-small); font-size: var(--t-12);
 }
-.np-fact {
-  display: grid; grid-template-columns: 48px minmax(0, 1fr) auto; gap: var(--s3);
-  align-items: center; width: 100%; padding: var(--s3); color: var(--fg-1); text-align: left;
-  font-size: var(--t-12);
+.np-dot { width: 3px; height: 3px; border-radius: 50%; background: var(--fg-3); flex: none; }
+
+.np-album {
+  display: grid; grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center; gap: var(--s3);
+  width: calc(100% - var(--s6)); margin: var(--s5) var(--s3) 0;
+  padding: var(--s2); border-radius: var(--r2);
+  color: var(--fg-1); text-align: left;
+  transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
-.np-fact > span:nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-button.np-fact:hover { color: var(--fg); }
-.np-fact + .np-fact { border-top: 1px solid var(--line); }
+.np-album:hover:not(:disabled) { background: rgba(255, 255, 255, 0.05); color: var(--fg); }
+.np-album:disabled { opacity: 1; }
+.np-album-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.np-album-name {
+  font-size: var(--t-12); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .np-label {
-  color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11);
-  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--label); font-family: var(--font-small); font-size: var(--t-caps);
+  font-weight: var(--w-semi); text-transform: uppercase; letter-spacing: var(--track-caps);
 }
+
+/* A rule plus generous space is the only grouping device in the panel — but
+   the rules are no longer identical greys. Each section's rule leads with that
+   section's hue and fades into the ordinary hairline, so scrolling the rail
+   passes gold (who made it) and then foam (what is next) rather than two
+   indistinguishable lines. Same object as `--rule-accent`, different lead. */
+.np-credits, .np-upnext { margin-top: var(--s6); padding-top: var(--s5); }
+.np-credits {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(90deg,
+    color-mix(in srgb, var(--gold) 62%, transparent), var(--line) 34%, var(--line)) 1;
+}
+.np-upnext {
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(90deg,
+    color-mix(in srgb, var(--foam) 55%, transparent), var(--line) 34%, var(--line)) 1;
+}
+.np-section-head {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+  margin-bottom: var(--s4);
+}
+.np-count {
+  font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
+  color: var(--count);
+}
+.np-credit-line { min-width: 0; }
+.np-credit-line + .np-credit-line { margin-top: var(--s4); }
+/* The demonstration, in one rule. A role set as 11px tracked caps in ROSE was
+   indistinguishable from dirty white; in gold — same warmth, twice the chroma
+   — it is unmistakably a colour at the same size, weight and tracking. */
+.np-role {
+  display: block;
+  font-family: var(--font-small); font-size: var(--t-caps); font-weight: var(--w-semi);
+  letter-spacing: var(--track-caps); text-transform: uppercase;
+  color: color-mix(in srgb, var(--gold) 76%, var(--fg-2));
+}
+.np-credit-line p {
+  margin-top: 3px; color: var(--fg-1); font-size: var(--t-12); line-height: 1.42;
+  overflow-wrap: anywhere;
+}
+.np-more-inline { color: color-mix(in srgb, var(--gold) 70%, var(--fg-2)); font-weight: var(--w-med); }
+.np-muted { color: var(--fg-2); font-size: var(--t-12); }
+
+/* Text link, not a button: the credits are already on the page, so the way to
+   the rest of them should not compete with them for weight. */
+.np-link {
+  display: inline-flex; align-items: center; gap: var(--s1);
+  margin-top: var(--s4); color: var(--fg-2);
+  font-family: var(--font-small); font-size: var(--t-12);
+  transition: color var(--d1) var(--ease);
+}
+.np-link:hover { color: var(--accent); }
+.np-link.credit:hover { color: var(--gold); }
+.np-section-head .np-link { margin-top: 0; }
+
 .np-next {
-  display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center;
-  gap: var(--s3); width: 100%; padding: var(--s7) var(--s3) var(--s3);
-  position: relative; border-radius: var(--r2); background: var(--bg-2); text-align: left;
+  display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: center;
+  gap: var(--s3); width: calc(100% + var(--s4)); margin-left: calc(var(--s2) * -1);
+  padding: var(--s2); border-radius: var(--r2); text-align: left;
   transition: background-color var(--d1) var(--ease);
 }
-.np-next:hover { background: var(--bg-3); }
-.np-next-label {
-  position: absolute; top: var(--s2); left: var(--s3);
-  color: var(--fg-2); font-family: var(--font-small); font-size: 10px;
-  font-weight: 650; letter-spacing: .09em; text-transform: uppercase;
-}
+.np-next:hover { background: rgba(255, 255, 255, 0.05); }
 .np-next-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .np-next-copy strong, .np-next-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.np-next-copy strong { font-size: var(--t-12); font-weight: 600; }
+.np-next-copy strong { font-size: var(--t-12); font-weight: var(--w-med); }
 .np-next-copy span { color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11); }
-.np-empty { margin: auto 0; color: var(--fg-2); text-align: center; }
+.np-empty { margin: auto 0; padding: 0 var(--s5); color: var(--fg-2); text-align: center; }
 .np-empty p { color: var(--fg); font-family: var(--font-display); font-size: var(--t-15); }
 .np-empty span { display: block; margin-top: var(--s2); font-size: var(--t-12); }
-.scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+/* `position: relative` is the containing block for the topbar's scroll
+   sentinel and nothing else — every other absolutely positioned box inside the
+   pane already has a positioned parent of its own. */
+.scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; position: relative; }
 
 /* ---------------------------------------------------------------- topbar */
 .topbar {
@@ -361,23 +631,62 @@ button.np-fact:hover { color: var(--fg); }
   display: grid; grid-template-columns: auto 1fr auto;
   align-items: center; gap: var(--s4);
   height: var(--topbar-h); padding: 0 var(--pane-pad);
-  background: color-mix(in srgb, var(--bg-1) 82%, transparent);
-  backdrop-filter: blur(14px);
+  /* Passthrough glass, and it is back on purpose.
+     A previous pass removed the blur while chasing the "scroll moves but
+     nothing repaints until I jiggle the mouse" stall, and left a comment here
+     blaming `backdrop-filter` for it. That comment was wrong. The cause was the
+     pair of scroll-driven animations that used to live below this rule —
+     `animation-timeline: scroll()` binds an animation to the scroller, and when
+     it cannot be composited every change of scroll offset needs a main-thread
+     animation update before a frame can be produced. Removing those two fixed
+     it; the blur never had anything to do with it. Do not re-remove the blur,
+     and do not reintroduce `animation-timeline` anywhere in this app.
+
+     The bar is translucent and blurs whatever is scrolling under it, which is
+     the point: a detail page's header wash is a real colour now, and the bar
+     picks it up and carries it across the top of the pane instead of cutting a
+     flat grey band through it.
+
+     `saturate` is doing as much work as `blur`. Averaging a colour field over a
+     20px radius desaturates it — the mean of a gradient is always duller than
+     its parts — so without the boost the glass reads grey over a red header,
+     which defeats the exercise.
+
+     The fill under the blur is 62% rather than opaque: below about 70% the bar
+     stops reading as glass and starts reading as a hole. */
+  background: color-mix(in srgb, var(--bg-1) 62%, transparent);
+  -webkit-backdrop-filter: blur(22px) saturate(1.9);
+          backdrop-filter: blur(22px) saturate(1.9);
 }
-/* hairline + sticky title fade in on scroll — CSS scroll timeline, no JS */
+/* Where the effect is unavailable the bar must still hide the rows sliding
+   under it, so it goes back to being opaque rather than staying see-through. */
+@supports not (backdrop-filter: blur(1px)) {
+  .topbar { background: var(--bg-1); }
+}
+/* The hairline and the sticky title appear once the page has been scrolled
+   past its header.
+
+   This used to be a CSS scroll timeline, which was elegant and was also the
+   bug: a scroll-driven animation runs an animation update per frame, on the
+   main thread when it cannot be composited, and that is what was deferring
+   presents until the mouse moved. It is now an IntersectionObserver on a
+   zero-size sentinel parked 150px down the scroll container (see TopBar), which
+   fires exactly twice — once crossing down, once crossing back — and costs
+   nothing in between. The fade is an ordinary transition, which is composited
+   and has nothing to do with the scroller. */
 .topbar::after {
   content: ""; position: absolute; inset: auto 0 0 0; height: 1px;
   background: var(--line-2); opacity: 0;
+  transition: opacity var(--d2) var(--ease);
 }
-@supports (animation-timeline: scroll()) {
-  .topbar::after,
-  .topbar-title {
-    animation: fade-in-on-scroll linear both;
-    animation-timeline: scroll(nearest);
-    animation-range: 90px 190px;
-  }
+.topbar.scrolled::after { opacity: 1; }
+
+/* The sentinel itself: no size, no paint, no hit area. It only has to have a
+   position in the scrolled content for the observer to watch. */
+.topbar-sentinel {
+  position: absolute; top: 150px; left: 0;
+  width: 1px; height: 1px; pointer-events: none; visibility: hidden;
 }
-@keyframes fade-in-on-scroll { from { opacity: 0; } to { opacity: 1; } }
 
 .hist { display: flex; gap: var(--s1); flex: none; }
 .round {
@@ -388,13 +697,14 @@ button.np-fact:hover { color: var(--fg); }
 .round:hover:not(:disabled) { color: var(--fg); background: rgba(255, 255, 255, 0.07); }
 .round:disabled { color: var(--fg-3); }
 
-/* base opacity 1 so browsers without scroll timelines simply always show it */
 .topbar-title {
   display: flex; align-items: center; gap: var(--s3);
-  min-width: 0; opacity: 1;
+  min-width: 0; opacity: 0;
+  transition: opacity var(--d2) var(--ease);
 }
+.topbar.scrolled .topbar-title { opacity: 1; }
 .topbar-title .t {
-  font-family: var(--font-display); font-size: var(--t-15); font-weight: 600;
+  font-family: var(--font-display); font-size: var(--t-15); font-weight: var(--w-bold);
   letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .topbar-play {
@@ -422,33 +732,99 @@ button.np-fact:hover { color: var(--fg); }
 .page { padding: var(--s2) var(--pane-pad) var(--s9); }
 .page-title {
   font-family: var(--font-display);
-  font-size: var(--t-32); font-weight: 600; letter-spacing: -0.022em;
+  font-size: var(--t-32); font-weight: var(--w-bold); letter-spacing: -0.022em;
   line-height: 1.15;
 }
-.eyebrow {
+/* The one caps treatment for FIELD labels, defined once so every one of them
+   in the app is literally the same object: 11px, 600, 0.12em, neutral. Colour
+   is not what makes a field label a label — tracking and weight are. */
+.caps {
   font-family: var(--font-small);
-  font-size: var(--t-11); font-weight: 600; letter-spacing: 0.11em;
-  text-transform: uppercase; color: var(--fg-2);
+  font-size: var(--t-caps); font-weight: var(--w-semi);
+  letter-spacing: var(--track-caps); text-transform: uppercase;
+  color: var(--label);
+}
+
+/* =====================================================================
+   THE TAG — a section label, and the app's one loud small object.
+
+   This replaces the old eyebrow, which was grey caps behind a 2px gradient
+   tick. The tick was the right instinct and the wrong size: 2 x 11 pixels of a
+   hue is not enough area to register as that hue, so the eyebrow read as grey
+   text with a smudge in front of it, on every page, identically.
+
+   A tag is the hue as a SOLID FIELD with the ground colour punched out of it.
+   That is the only treatment at which a ten-pixel word is unambiguously
+   coloured, and it is the same argument the accent block above makes about
+   rose. There is at most one tag per region — "Playlist", "Credits", "Your
+   collection" — so it can afford to shout, and it is what tells you which of
+   the four layers you are standing in before you have read anything.
+   ===================================================================== */
+.tag {
+  display: inline-flex; align-items: center;
+  height: 19px; padding: 0 var(--s2) 0 9px;
+  border-radius: var(--rf);
+  background: var(--tag, var(--foam)); color: var(--bg-0);
+  font-family: var(--font-small);
+  font-size: 10px; font-weight: var(--w-bold);
+  /* Wider than --track-caps. Reversed out of a solid fill, caps close up
+     visually — the counters lose their surrounding white — so the tracking has
+     to open further than it does for the same word set as ink. */
+  letter-spacing: 0.14em; text-transform: uppercase;
+  white-space: nowrap;
+}
+.tag.credit { --tag: var(--gold); }
+/* Where the page already HAS a colour — a header wash, an artist's portrait —
+   a palette-coloured tag would be one arbitrary hue laid over another. So on
+   those surfaces it drops its fill and becomes frosted glass instead: white
+   type on a plate that picks up whatever is behind it. The rule underneath is
+   simple and holds everywhere — the tag carries the palette's hue on pages
+   that have no colour of their own, and the CONTENT's hue on pages that do. */
+.wash .tag, .banner .tag, .np-head .tag {
+  background: rgba(255, 255, 255, 0.12);
+  -webkit-backdrop-filter: blur(10px) saturate(1.6);
+          backdrop-filter: blur(10px) saturate(1.6);
+  color: var(--fg);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+}
+/* The exception, and the only one: Liked Songs is the rose page end to end —
+   rose tile, rose wash, rose heart — so its tag stays solid rose rather than
+   going neutral. Declared after the frosted rule so it wins on source order. */
+.tag.saved {
+  background: var(--rose); color: var(--bg-0);
+  backdrop-filter: none; -webkit-backdrop-filter: none; box-shadow: none;
+}
+/* A hairline that leads with the accent and fades into the ordinary line
+   colour. Structure, so it leads with foam. */
+.rule-accent {
+  flex: 1; min-width: var(--s7); height: 1px; border: 0; margin: 0;
+  background: var(--rule-accent);
 }
 .section { margin-top: var(--s8); }
 .section-head {
   display: flex; align-items: baseline; justify-content: space-between;
-  margin-bottom: var(--s4);
+  gap: var(--s5); margin-bottom: var(--s4);
 }
+/* Baseline, not `align-items: center`: a 20px heading and an 11px count share
+   a baseline or they do not line up at all. `vertical-align: middle` on the
+   count was the bug the owner saw in "Albums 33" — it centres the small text
+   on the x-height of the large text, which parks it visibly high. */
 .section-title {
+  display: flex; align-items: baseline; gap: var(--s3); min-width: 0;
   font-family: var(--font-display);
-  font-size: var(--t-20); font-weight: 600; letter-spacing: -0.015em;
+  font-size: var(--t-20); font-weight: var(--w-bold); letter-spacing: -0.015em;
 }
 .section-count {
-  margin-left: var(--s2); color: var(--fg-2);
-  font-family: var(--font-number); font-size: var(--t-11); font-weight: 600;
-  vertical-align: middle;
+  flex: none; color: var(--count);
+  font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-med);
+  letter-spacing: 0;
 }
 .link-more {
+  flex: none; display: inline-flex; align-items: center; gap: var(--s1);
   font-size: var(--t-12); color: var(--fg-2);
   transition: color var(--d1) var(--ease);
 }
-.link-more:hover { color: var(--fg); }
+.link-more:hover { color: var(--accent); }
 
 /* =====================================================================
    COVER ART — four tiers
@@ -484,21 +860,25 @@ button.np-fact:hover { color: var(--fg); }
 .art.mosaic { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
 .art.mosaic > img { width: 100%; height: 100%; }
 
-/* Tier 4 — generated identity tile, deterministic from an id hash and
-   deliberately limited to the same three accents as the rest of the chrome. */
+/* Tier 4 — generated identity tile, deterministic from an id hash.
+   It used to draw from foam and rose only, which meant every second coverless
+   playlist was the same pale warm square, and — because the header wash was
+   picked by the same coin flip — every second playlist page opened brown. The
+   hues now come from the identity ring in covertone.svelte.js: eight of them,
+   spread around the wheel, at a lightness and chroma chosen here rather than
+   mixed down from a pale accent. See that file for why the ring skips the
+   40-60° band. */
 .art.gen {
   background:
-    radial-gradient(120% 110% at 18% 8%, color-mix(in srgb, var(--fg) 14%, transparent) 0%, transparent 58%),
-    linear-gradient(146deg,
-      color-mix(in srgb, var(--tone, var(--foam)) 72%, var(--bg-4)) 0%,
-      color-mix(in srgb, var(--tone, var(--foam)) 18%, var(--bg-2)) 100%);
+    radial-gradient(120% 110% at 18% 8%, color-mix(in srgb, var(--fg) 13%, transparent) 0%, transparent 58%),
+    linear-gradient(146deg, var(--tone-a, #4e7182) 0%, var(--tone-b, #1e2a31) 100%);
   display: grid; place-items: center;
 }
 .art.gen::after {
   content: attr(data-letter);
   font-family: var(--font-display);
   font-size: calc(var(--tile, 48px) * 0.46);
-  font-weight: 650; line-height: 1;
+  font-weight: var(--w-bold); line-height: 1;
   letter-spacing: -0.02em;
   color: var(--fg);
   text-shadow: 0 calc(var(--tile, 48px) * 0.012) 0 rgba(0, 0, 0, 0.28);
@@ -512,8 +892,24 @@ button.np-fact:hover { color: var(--fg); }
   gap: var(--s6); align-items: end;
   padding: var(--s6) 0 var(--s5);
 }
-/* A restrained header wash separates detail pages without introducing a
-   fourth hue. `--wash` is selected from rose, foam, or love by the view. */
+/* =====================================================================
+   THE HEADER WASH
+
+   This is where the record's own colour enters the interface, and it is the
+   single biggest reason the app is not monotone: every playlist, album and
+   collection opens a different colour, and none of them came from the palette.
+
+   It used to be a palette tint at 20% alpha over near-black. Two things were
+   wrong with that. It was far too weak to register as colour at all, and —
+   because the tone was chosen by hashing the id into a two-entry list — half
+   of everything came out rose, and rose at 20% over #121212 is arithmetically
+   #3d2d2c. Brown. Not a taste failure; a compositing one.
+
+   So the stops are OPAQUE and the colour arrives pre-mixed. `--tone-wash` is a
+   real dark colour at a fixed lightness (see covertone.svelte.js), so the top
+   of the page is as strong as Spotify's and the bottom lands exactly on the
+   pane so the join is invisible.
+   ===================================================================== */
 .wash {
   position: relative;
 }
@@ -524,10 +920,36 @@ button.np-fact:hover { color: var(--fg); }
      width. Pulling them out by another 24px each side overflowed the scroll
      container — invisible behind overflow-x:hidden, but real. */
   inset: calc(var(--topbar-h) * -1) 0 auto;
-  height: 340px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--wash, var(--foam)) 20%, transparent) 0%, transparent 100%);
+  height: 460px;
+  /* Four stops, not two. A straight two-stop ramp over 460px reads as a
+     gradient *effect*; a fast fall through a deeper shade and then a long tail
+     reads as light on a surface, which is what the eye is expecting here. */
+  background: linear-gradient(
+    180deg,
+    var(--tone-wash) 0%,
+    var(--tone-wash-deep) 30%,
+    color-mix(in srgb, var(--tone-wash-deep) 42%, var(--bg-1)) 58%,
+    var(--bg-1) 100%
+  );
   pointer-events: none;
 }
+/* The one shape that sits inside the wash and is not type. A soft light in the
+   top-left corner keeps the flat colour field from reading as a printed block,
+   and it costs one extra gradient on a layer that is already painted. */
+.wash::after {
+  content: ""; position: absolute; z-index: 0; pointer-events: none;
+  inset: calc(var(--topbar-h) * -1) 0 auto;
+  height: 460px;
+  background: radial-gradient(
+    88% 62% at 8% 0%,
+    color-mix(in srgb, var(--tone-glow) 30%, transparent),
+    transparent 68%
+  );
+}
+/* A third of the strength, for pages whose subject is not one record: the
+   home screen, where the colour is a mood rather than an identification. */
+.wash.soft::before { height: 320px; opacity: 0.42; }
+.wash.soft::after { height: 320px; opacity: 0.5; }
 .wash > * { position: relative; z-index: 1; }
 /* Keep header popovers in a higher local layer than sticky/windowed rows.
    The topbar remains above the whole page in its own z-index: 30 layer. */
@@ -536,7 +958,7 @@ button.np-fact:hover { color: var(--fg); }
 .detail-title {
   font-family: var(--font-display);
   font-size: clamp(30px, 4.4vw, var(--t-56));
-  font-weight: 600; letter-spacing: -0.028em; line-height: 1.03;
+  font-weight: var(--w-bold); letter-spacing: -0.028em; line-height: 1.03;
   margin: var(--s3) 0 var(--s3);
   overflow-wrap: anywhere;
 }
@@ -561,11 +983,13 @@ button.np-fact:hover { color: var(--fg); }
   box-shadow: 0 8px 20px -6px color-mix(in srgb, var(--foam) 42%, transparent);
   transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease);
 }
-.play-lg:hover:not(:disabled),
-.play-lg:active:not(:disabled) {
+/* Hover brightens the foam rather than switching hue. Jumping to rose here
+   made the primary action look like it changed meaning under the pointer. */
+.play-lg:hover:not(:disabled) {
   background: var(--accent-hi);
-  box-shadow: 0 8px 24px -6px color-mix(in srgb, var(--rose) 46%, transparent);
+  box-shadow: 0 10px 26px -6px color-mix(in srgb, var(--foam) 52%, transparent);
 }
+.play-lg:active:not(:disabled) { background: var(--accent-lo); transform: scale(0.96); }
 
 .btn-ghost {
   display: inline-flex; align-items: center; gap: var(--s2); flex: none;
@@ -575,13 +999,20 @@ button.np-fact:hover { color: var(--fg); }
   transition: color var(--d1) var(--ease), border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .btn-ghost:hover:not(:disabled) { color: var(--fg); border-color: rgba(255, 255, 255, 0.2); background: rgba(255, 255, 255, 0.04); }
+/* Destructive, but not alarming at rest: neutral until the pointer is on it,
+   then unmistakably love. A row of permanently red "Clear" buttons in Settings
+   reads as an error state rather than as a set of available actions. */
+.btn-ghost.danger:hover:not(:disabled) {
+  color: var(--love); background: var(--danger-wash);
+  border-color: color-mix(in srgb, var(--love) 45%, transparent);
+}
 
 /* the one filled button; the round .play-lg is its detail-header sibling */
 .btn-accent {
   display: inline-flex; align-items: center; gap: var(--s2); flex: none;
   height: 34px; padding: 0 var(--s5);
   border-radius: var(--r2); background: var(--accent); color: var(--accent-ink);
-  font-size: var(--t-13); font-weight: 600; white-space: nowrap;
+  font-size: var(--t-13); font-weight: var(--w-semi); white-space: nowrap;
   transition: background-color var(--d1) var(--ease), transform var(--d1) var(--ease);
 }
 .btn-accent:hover:not(:disabled) { background: var(--accent-hi); }
@@ -595,6 +1026,14 @@ button.np-fact:hover { color: var(--fg); }
 }
 .btn-icon:hover { color: var(--fg); background: rgba(255, 255, 255, 0.06); }
 .btn-icon.on { color: var(--accent); }
+/* A toggle that is ON is foam (interactive state); a thing that is SAVED is
+   rose. They are different facts and used to share one class.
+   The INK rose, not the pale one: a filled heart is only about 120 square
+   pixels, and at rose's own chroma that is a pale blob that could as easily be
+   grey. Twice the chroma at the same hue makes it unmistakable at 15px, which
+   is the whole reason the ink token exists. */
+.btn-icon.saved { color: var(--rose-ink); }
+.btn-icon.saved:hover { color: color-mix(in srgb, var(--rose-ink) 55%, var(--fg)); }
 .btn-icon.danger:hover { color: var(--danger); }
 
 /* Liked Songs is deliberately its own collection identity, without reusing a
@@ -603,13 +1042,23 @@ button.np-fact:hover { color: var(--fg); }
   display: grid; grid-template-columns: 176px minmax(0, 1fr); align-items: end;
   gap: var(--s6); padding: var(--s6) 0 var(--s5);
 }
+/* Dark with a rose light in it, not a pastel tile. Two pale accents filling a
+   176px square is candy — the same two accents as GLOW over a neutral dark
+   ground is the app. The heart is solid rose, which is the object you actually
+   read the colour off. */
 .liked-art {
   display: grid; place-items: center; width: 176px; height: 176px;
-  border-radius: var(--r3); color: var(--bg-0);
+  border-radius: var(--r3); color: var(--rose);
+  /* The hot spot has to stay SATURATED. Rose at ~50% over a mid grey lands
+     around #806968 — same hue, but a dark low-chroma warm, which is exactly
+     the neighbourhood the greys were wrongly living in and reads as brown.
+     A strong peak falling off to near-black instead of to grey keeps it
+     unmistakably rose the whole way down. */
   background:
-    radial-gradient(90% 90% at 78% 14%, color-mix(in srgb, var(--foam) 82%, transparent), transparent 64%),
-    linear-gradient(145deg, var(--love), var(--rose) 62%, var(--foam));
-  box-shadow: var(--ring), 0 18px 40px -16px color-mix(in srgb, var(--love) 46%, transparent);
+    radial-gradient(105% 105% at 22% 8%, color-mix(in srgb, var(--rose) 78%, transparent), transparent 68%),
+    radial-gradient(115% 125% at 106% 106%, color-mix(in srgb, var(--foam) 30%, transparent), transparent 68%),
+    #101010;
+  box-shadow: var(--ring), 0 18px 40px -16px color-mix(in srgb, var(--rose) 30%, transparent);
 }
 .liked-copy { min-width: 0; }
 .liked-copy .detail-title { margin-bottom: var(--s3); }
@@ -659,19 +1108,77 @@ button.np-fact:hover { color: var(--fg); }
   align-items: center; gap: var(--s4);
   padding: 0 var(--s3);
 }
+
+/* =====================================================================
+   NARROW PANE — drop columns rather than crush them.
+
+   Every flexible track column is a `minmax(0, …)`, which means that when the
+   pane runs out of room they do not overflow, they go to ZERO: at a 409px pane
+   (a 1000px window with the now-playing rail open) the playlist table rendered
+   as a column of thumbnails and dates with the song titles squeezed out
+   entirely. Correct by the grid's rules, and useless.
+
+   So the columns that are context — the album a track came from, when it was
+   added — are dropped, and the ones that are identity — the title, the artist
+   — keep the room. This is a media query and not a container query on purpose:
+   `container-type: inline-size` implies `contain: layout`, which would make
+   the pane a containing block for `position: fixed`, and the row menus are
+   positioned with viewport coordinates. The pane's width is exactly derivable
+   from the window anyway — sidebar, gutters, and the rail when it is open.
+   ===================================================================== */
+@media (max-width: 932px) {
+  .tl:not(.no-album):not(.album-page) { --cols: 28px 36px minmax(0, 1fr) 32px 52px 28px; }
+  .tl.has-plays:not(.no-album):not(.album-page) { --cols: 28px 36px minmax(0, 1fr) 108px 32px 52px 28px; }
+  .tl.playlist-sort { --cols: 28px 36px minmax(0, 1.6fr) minmax(0, 1fr) 32px 52px 28px; }
+  .tl.playlist-sort.has-plays {
+    --cols: 28px 36px minmax(0, 1.6fr) minmax(0, 1fr) 108px 32px 52px 28px;
+  }
+  .tl-head, .tl-row { gap: var(--s3); }
+  .tl-col-album, .tl-col-added, .c-album, .c-added { display: none; }
+}
+/* Same widths, arrived at with the inspector open: it takes 336px plus a gutter
+   out of the pane, so the pane crosses the same threshold 344px earlier. */
+@media (max-width: 1276px) {
+  .has-inspector .tl:not(.no-album):not(.album-page) { --cols: 28px 36px minmax(0, 1fr) 32px 52px 28px; }
+  .has-inspector .tl.has-plays:not(.no-album):not(.album-page) { --cols: 28px 36px minmax(0, 1fr) 108px 32px 52px 28px; }
+  .has-inspector .tl.playlist-sort { --cols: 28px 36px minmax(0, 1.6fr) minmax(0, 1fr) 32px 52px 28px; }
+  .has-inspector .tl.playlist-sort.has-plays {
+    --cols: 28px 36px minmax(0, 1.6fr) minmax(0, 1fr) 108px 32px 52px 28px;
+  }
+  .has-inspector .tl-head, .has-inspector .tl-row { gap: var(--s3); }
+  .has-inspector .tl-col-album,
+  .has-inspector .tl-col-added,
+  .has-inspector .c-album,
+  .has-inspector .c-added { display: none; }
+}
 .tl-head {
   position: sticky; top: var(--topbar-h); z-index: 20;
   height: 32px; margin-bottom: var(--s2);
   font-family: var(--font-small);
-  font-size: var(--t-11); font-weight: 600; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--fg-2);
-  background: var(--bg-1);
+  font-size: var(--t-caps); font-weight: var(--w-semi); letter-spacing: var(--track-caps);
+  text-transform: uppercase; color: var(--label);
+  /* Glass, not an opaque grey slab. This bar is sticky directly under the
+     topbar and a detail page's wash is a real colour now: filled with --bg-1 it
+     cut a flat grey stripe straight across the header colour. Same material as
+     the topbar, half the radius — it only has to separate itself from 48px
+     rows, not from a whole page. */
+  background: color-mix(in srgb, var(--bg-1) 68%, transparent);
+  -webkit-backdrop-filter: blur(14px) saturate(1.7);
+          backdrop-filter: blur(14px) saturate(1.7);
   box-shadow: inset 0 -1px 0 var(--line);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  .tl-head { background: var(--bg-1); }
 }
 .tl-sort-btn {
   display: inline-flex; align-items: center; gap: var(--s1);
   min-width: 0; max-width: 100%; height: calc(100% - var(--s1));
   color: inherit; text-transform: inherit; letter-spacing: inherit;
+  /* A narrow pane must clip these, not let them run into each other. The
+     columns are all minmax(0, …), so at a squeezed width the heads are the
+     first thing to collide, and two overlapping tracked-out caps labels read
+     as a rendering fault rather than as a tight layout. */
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
   transition: color var(--d1) var(--ease);
 }
 .tl-head > .tl-sort-btn:first-child { justify-content: flex-end; }
@@ -690,17 +1197,33 @@ button.np-fact:hover { color: var(--fg); }
   transition: background-color var(--d1) var(--ease);
 }
 .tl-row:hover { background: rgba(255, 255, 255, 0.045); }
+/* The playing row is the one row in a list of fifty that has to be findable
+   without reading. A left-anchored accent wash does that at a glance, where a
+   recoloured title alone only worked once you were already looking at it. */
+.tl-row.current {
+  background: linear-gradient(90deg, var(--accent-wash), transparent 46%);
+  box-shadow: inset 2px 0 var(--accent);
+}
+.tl-row.current:hover { background: linear-gradient(90deg, var(--accent-wash), transparent 46%), rgba(255, 255, 255, 0.045); }
 .tl-row.current .t-name { color: var(--accent); }
+.tl-row.current .c-idx { color: var(--accent); }
 
 .c-idx {
   display: flex; align-items: center; justify-content: flex-end;
-  font-family: var(--font-number); font-size: var(--t-11); font-weight: 600;
-  color: var(--fg-2); font-variant-numeric: tabular-nums;
+  font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-med);
+  color: var(--fg-3);
 }
 .c-idx .n { display: block; }
 .c-idx .go, .c-idx .eq { display: none; }
 .tl-row:hover .n { display: none; }
-.tl-row:hover .go { display: grid; place-items: center; color: var(--fg); }
+/* The glyph stays 12px, but the button fills its cell so the pointer does not
+   have to find a 12px square in a 48px row. Negative margins keep the larger
+   target from widening the column. */
+.tl-row:hover .go {
+  display: grid; place-items: center; color: var(--fg);
+  width: 100%; min-height: 32px;
+  margin: -6px -6px; padding: 6px;
+}
 .tl-row.current .n { display: none; }
 .tl-row.current .eq { display: flex; }
 .tl-row.current:hover .eq { display: none; }
@@ -766,22 +1289,31 @@ button.np-fact:hover { color: var(--fg); }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   transition: color var(--d1) var(--ease);
 }
+/* Same weight as the album and artist columns it sits beside. It was a step
+   brighter than either, which made the least interesting column in the table
+   the most visible one — and with the whole grey ramp lifted it would now be
+   shouting. Hover still promotes it, like the rest of the row. */
 .c-added {
   min-width: 0; font-family: var(--font-small); font-size: var(--t-12);
-  color: var(--fg-1); font-variant-numeric: tabular-nums;
+  color: var(--fg-2); font-variant-numeric: tabular-nums;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   transition: color var(--d1) var(--ease);
 }
 .tl-row:hover .c-artist,
 .tl-row:hover .c-artist > span { color: var(--fg-1); }
 .tl-row:hover .c-added { color: var(--fg); }
+/* Durations and play counts sat at 11px/600 — small enough to need weight to
+   be legible, heavy enough to read as little bold stubs beside 400 titles.
+   Half a step larger and two steps lighter reads as the same voice as the
+   text it sits next to, which is what a quiet data column should do. */
 .c-time {
-  font-family: var(--font-number); font-size: var(--t-11); font-weight: 600;
-  color: var(--fg-2); font-variant-numeric: tabular-nums; text-align: right;
+  font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-body);
+  color: var(--fg-2); text-align: right;
 }
+.tl-row:hover .c-time { color: var(--fg-1); }
 .c-plays {
-  font-family: var(--font-number); font-size: var(--t-11); font-weight: 600;
-  color: var(--fg-1); font-variant-numeric: tabular-nums; text-align: right;
+  font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-med);
+  color: var(--fg-1); text-align: right;
 }
 .c-like, .c-more { display: grid; place-items: center; }
 .c-like button, .c-more button {
@@ -791,7 +1323,10 @@ button.np-fact:hover { color: var(--fg); }
 }
 .tl-row:hover .c-like button, .tl-row:hover .c-more button { opacity: 1; }
 .c-like button:focus-visible, .c-more button:focus-visible { opacity: 1; }
-.c-like button.liked { opacity: 1; color: var(--accent); }
+/* ROSE = saved, in its ink weight — see `.btn-icon.saved`. This is the mark
+   that appears most often in the app and on the smallest surface. */
+.c-like button.liked { opacity: 1; color: var(--rose-ink); }
+.c-like button.liked:hover { color: color-mix(in srgb, var(--rose-ink) 55%, var(--fg)); }
 .c-like button:hover, .c-more button:hover { color: var(--fg); }
 
 /* Queue row trailing cluster — same reveal-on-hover rule as .c-more. */
@@ -820,6 +1355,26 @@ button.np-fact:hover { color: var(--fg); }
   display: grid; gap: var(--s5);
   grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
 }
+/* The big-cover card: artwork at column width, then the name and one line of
+   context under it. It is the one layout in the app that is about recognising
+   a record rather than reading about one, and it carries the library, search
+   and the artist's discography — same object, same gesture, everywhere.
+
+   ONE RULE, and it is not negotiable anywhere a card appears:
+
+       clicking the CARD — artwork included — OPENS the thing.
+       playing happens only from the floating play button.
+
+   The artist page used to invert this: its artwork played the record and only
+   the text under it opened the record, so clicking an album started it instead
+   of showing it. That is backwards from the rest of this app, from Spotify,
+   and from every music client there has ever been.
+
+   Structurally the artwork is NOT a button. A `<button>` cannot contain a
+   `<button>`, so instead `.card-open` is a transparent full-bleed button laid
+   over the tile and `.card-play` is its SIBLING at a higher layer. Two real
+   controls, correct semantics, no nesting, and the whole tile is a hit target.
+*/
 .card {
   display: flex; flex-direction: column; gap: var(--s3);
   min-width: 0;                       /* a long name ellipses, never widens */
@@ -830,25 +1385,60 @@ button.np-fact:hover { color: var(--fg); }
 /* aspect-ratio, not a height: the tile is square at any column width, and it
    holds that square whether or not the image inside it ever arrives. No
    overflow clip here — the hover drop shadow belongs outside the box. */
-.card-art { position: relative; aspect-ratio: 1; width: 100%; --tile: 160px; }
+.card-art {
+  position: relative; display: block; aspect-ratio: 1; width: 100%;
+  border-radius: var(--r3); line-height: 0; --tile: 160px;
+}
 .card-art .art { position: absolute; inset: 0; }
-.card:hover .card-art .art { box-shadow: var(--ring), 0 16px 32px -12px rgba(0, 0, 0, 0.9); }
+/* The lift on hover is the record's OWN colour, not a black drop shadow. It is
+   the cheapest way to get content colour onto the two pages that have no
+   header wash to carry it — the library and search results — and a grid of
+   forty covers each throwing its own light is the single biggest difference
+   between this looking like a music app and looking like a file browser. */
+.card:hover .card-art .art {
+  box-shadow:
+    var(--ring),
+    0 16px 26px -14px rgba(0, 0, 0, 0.9),
+    0 16px 40px -8px color-mix(in srgb, var(--tone-glow) 72%, transparent);
+}
+/* Transparent, full-bleed, and BELOW the play button. Focus is drawn on the
+   artwork's edge rather than on the invisible box, so keyboard focus looks
+   like it is on the cover, which is where it effectively is. */
+.card-open {
+  position: absolute; inset: 0; z-index: 1;
+  border-radius: var(--r3); background: none;
+}
+.card-open:focus-visible { outline-offset: 3px; }
 .card-play {
   position: absolute; right: var(--s2); bottom: var(--s2); z-index: 2;
   display: grid; place-items: center; width: 36px; height: 36px;
   border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
   opacity: 0; transform: translateY(6px) scale(0.9);
-  transition: opacity var(--d2) var(--ease), transform var(--d2) var(--ease);
+  transition: opacity var(--d2) var(--ease), transform var(--d2) var(--ease),
+              background-color var(--d1) var(--ease);
   box-shadow: 0 8px 18px -4px rgba(0, 0, 0, 0.7);
 }
-.card:hover .card-play, .card:focus-visible .card-play { opacity: 1; transform: none; }
+.card:hover .card-play,
+.card-play:focus-visible,
+.card-open:focus-visible ~ .card-play { opacity: 1; transform: none; }
+.card-play:hover { background: var(--accent-hi); }
+.card-play:active { transform: scale(0.93); }
+/* Name and sub are one block with their own tight gap, so the card's 12px gap
+   sits between the ARTWORK and the copy and nowhere else. This used to be a
+   -8px margin cancelling that gap after the fact, which meant the two lines
+   were never actually set as a pair. */
+.card-copy {
+  display: flex; flex-direction: column; gap: 2px; min-width: 0;
+  text-align: left;
+}
 .card-name {
   font-size: var(--t-13); color: var(--fg);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.card-copy:hover .card-name { color: var(--fg); text-decoration-color: var(--line-2); }
 .card-sub {
   font-family: var(--font-small);
-  font-size: var(--t-11); color: var(--fg-2); margin-top: -8px;
+  font-size: var(--t-11); color: var(--fg-2);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
@@ -897,23 +1487,33 @@ button.np-fact:hover { color: var(--fg); }
   content: ""; position: absolute; bottom: -6px; left: 50%; margin-left: -1.5px;
   width: 3px; height: 3px; border-radius: 50%; background: var(--accent);
 }
+/* The play button is the one control the eye returns to constantly. It sits
+   directly above the seek rail, which is a foam→rose gradient — so a foam
+   button at rest put two versions of the same hue 10px apart and the button
+   stopped reading as the brightest thing in the bar. White at rest wins that
+   contest against a coloured rail without competing with it, and foam arrives
+   on hover, where it is a state and not a decoration. */
 .play-btn {
   display: grid; place-items: center; width: 36px; height: 36px; flex: none;
   border-radius: var(--rf); background: var(--fg); color: var(--bg-0);
-  box-shadow: inset 0 0 0 1px transparent;
-  transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease);
+  box-shadow: 0 4px 14px -4px rgba(0, 0, 0, 0.65);
+  transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease), transform var(--d1) var(--ease);
 }
-.play-btn:hover:not(:disabled),
+.play-btn:hover:not(:disabled) {
+  background: var(--foam);
+  box-shadow: 0 6px 18px -4px color-mix(in srgb, var(--foam) 60%, transparent);
+}
 .play-btn:active:not(:disabled) {
-  background: var(--accent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bg-0) 22%, transparent);
+  background: var(--accent-lo); transform: scale(0.94);
+  box-shadow: 0 4px 12px -4px color-mix(in srgb, var(--foam) 55%, transparent);
 }
+.play-btn:disabled { box-shadow: none; }
 .play-btn:disabled { background: var(--bg-4); color: var(--fg-2); }
 
 .p-seek { display: flex; align-items: center; gap: var(--s3); width: 100%; min-width: 0; }
 .p-time {
-  font-family: var(--font-number); font-size: var(--t-11); font-weight: 600; letter-spacing: 0.01em;
-  color: var(--fg-1); font-variant-numeric: tabular-nums; width: 38px; flex: none;
+  font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-med);
+  color: var(--fg-2); width: 40px; flex: none;
 }
 .p-time.l { text-align: right; }
 .p-time.r { text-align: left; }
@@ -922,8 +1522,11 @@ button.np-fact:hover { color: var(--fg); }
 .rail { position: relative; width: 100%; height: 3px; border-radius: var(--rf);
   background: rgba(255, 255, 255, 0.13); overflow: hidden;
   transition: height var(--d1) var(--ease); }
-/* scaleX on the fill is composited — no layout on every playhead tick */
-.rail-fill { position: absolute; inset: 0; background: var(--fg);
+/* scaleX on the fill is composited — no layout on every playhead tick.
+   The gradient is painted at the rail's full width and then scaled, so the
+   progress bar warms from foam toward rose as the track plays: the one place
+   in the app where elapsed time is legible as colour, for free. */
+.rail-fill { position: absolute; inset: 0; background: var(--accent-grad);
   transform-origin: left; transform: scaleX(var(--p, 0)); }
 .rail-knob {
   position: absolute; top: 50%; left: var(--pl, 0%); width: 10px; height: 10px;
@@ -932,7 +1535,6 @@ button.np-fact:hover { color: var(--fg); }
   transition: opacity var(--d1) var(--ease);
 }
 .rail-hit:hover .rail, .rail-hit:focus-visible .rail { height: 5px; }
-.rail-hit:hover .rail-fill, .rail-hit:focus-visible .rail-fill { background: var(--accent); }
 .rail-hit:hover .rail-knob, .rail-hit:focus-visible .rail-knob { opacity: 1; }
 .seek-tip {
   position: absolute;
@@ -942,7 +1544,7 @@ button.np-fact:hover { color: var(--fg); }
   padding: var(--s1) var(--s2); border: 1px solid var(--line-2);
   border-radius: var(--r1); background: var(--bg-4); color: var(--fg);
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
-  font-family: var(--font-number); font-size: var(--t-11); font-weight: 600;
+  font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-semi);
   font-variant-numeric: tabular-nums; text-align: center;
   opacity: 0; visibility: hidden; pointer-events: none;
   transition: opacity var(--d1) var(--ease);
@@ -955,7 +1557,11 @@ button.np-fact:hover { color: var(--fg); }
 .vol { display: flex; align-items: center; width: 96px; height: 12px; flex: none; cursor: pointer; }
 .vol-rail { position: relative; width: 100%; height: 3px; border-radius: var(--rf);
   background: rgba(255, 255, 255, 0.13); overflow: hidden; }
-.vol-fill { position: absolute; inset: 0; background: var(--fg-1); transform-origin: left; transform: scaleX(var(--p, 0.6)); }
+.vol-fill {
+  position: absolute; inset: 0; transform-origin: left; transform: scaleX(var(--p, 0.6));
+  background: color-mix(in srgb, var(--foam) 62%, var(--fg-2));
+  transition: background-color var(--d1) var(--ease);
+}
 .vol:hover .vol-fill { background: var(--accent); }
 
 .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
@@ -988,8 +1594,8 @@ button.np-fact:hover { color: var(--fg); }
 .menu-sep { height: 1px; margin: var(--s1) var(--s2); background: var(--line); }
 .menu-label {
   padding: var(--s2) var(--s3) var(--s1);
-  font-family: var(--font-small); font-size: var(--t-11); font-weight: 600;
-  letter-spacing: 0.09em; text-transform: uppercase; color: var(--fg-2);
+  font-family: var(--font-small); font-size: var(--t-caps); font-weight: var(--w-semi);
+  letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label);
 }
 
 .playlist-menu-wrap { position: relative; }
@@ -1012,7 +1618,7 @@ button.np-fact:hover { color: var(--fg); }
 }
 .dialog-sheet { padding: var(--s6); }
 .dialog-copy h2 {
-  font-family: var(--font-display); font-size: var(--t-20); font-weight: 650;
+  font-family: var(--font-display); font-size: var(--t-20); font-weight: var(--w-bold);
   letter-spacing: -0.015em;
 }
 .dialog-copy > p { margin-top: var(--s2); color: var(--fg-1); font-size: var(--t-13); }
@@ -1024,7 +1630,7 @@ button.np-fact:hover { color: var(--fg); }
 .btn-danger {
   display: inline-flex; align-items: center; justify-content: center;
   height: 34px; padding: 0 var(--s4); border-radius: var(--r2);
-  background: var(--love); color: var(--bg-0); font-size: var(--t-13); font-weight: 650;
+  background: var(--love); color: var(--bg-0); font-size: var(--t-13); font-weight: var(--w-bold);
   transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease);
 }
 .btn-danger:hover:not(:disabled) {
@@ -1032,91 +1638,250 @@ button.np-fact:hover { color: var(--fg); }
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bg-0) 18%, transparent);
 }
 
+/* ---------------------------------------------------------------- credits
+   Up to a hundred contributors across an arbitrary number of licensor-named
+   role groups, each person with optional subroles and an optional link.
+
+   The previous version stacked STICKY GROUP HEADERS over a column grid, and
+   painted the header, the tools row, every group bar and the footer in the
+   raised grey. On a sheet only two steps darker that produced a stack of
+   hard-edged light-grey rectangles — the "malformed and blocky" — and made
+   the whole dialog read as one undifferentiated grey.
+
+   Same information, turned ninety degrees: the role is a LEFT RAIL beside its
+   people instead of a bar above them. Consequences, all good:
+     - the role label is adjacent to its names at every scroll position, so
+       nothing has to be sticky (and nothing sticky repaints over a scroller);
+     - a group is one row of a definition list, separated by a hairline, so the
+       only shapes on the sheet are rules and text;
+     - the rail gives the sheet a spine, which is what the blocks were badly
+       trying to be.
+   ===================================================================== */
+/* Width is chosen ONCE, before showModal(), and never animates. It used to be
+   a reactive class on the payload: the sheet opened at 920px while loading and
+   then slid to 600px when a short list landed, so every credits dialog for a
+   two-writer single visibly corrected itself after first paint. There is no
+   `transition: width` here on purpose. See CreditsDialog.svelte. */
 .credits-dialog {
-  width: min(700px, calc(100vw - var(--s8)));
-  max-width: none; max-height: calc(100vh - var(--s8));
+  width: min(920px, calc(100vw - var(--s7)));
+  max-width: none; max-height: min(84vh, 880px);
   margin: auto; padding: 0; overflow: hidden;
   border: 1px solid var(--line-2); border-radius: var(--r3);
-  background: var(--bg-2); color: var(--fg);
+  /* A modal is lifted by its border and its shadow, not by luminance. At the
+     raised grey it was the brightest plane on screen and read as a card. */
+  background: var(--bg-sheet); color: var(--fg);
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.72);
 }
-.credits-dialog::backdrop {
-  background: color-mix(in srgb, var(--bg-0) 76%, transparent);
+/* A 2px edge, and it is GOLD rather than the app's foam→rose signature. The
+   signature gradient means "this is the app" and turns up on the seek rail,
+   the brand mark and the cache meter. This sheet is not the app announcing
+   itself, it is the liner notes — so it takes the liner-note hue, and it is
+   the one surface in the interface whose top edge is not cyan. */
+.credits-sheet::before {
+  content: ""; position: absolute; inset: 0 0 auto; height: 2px; z-index: 2;
+  background: linear-gradient(90deg,
+    var(--gold), color-mix(in srgb, var(--gold) 55%, var(--rose)) 62%,
+    color-mix(in srgb, var(--gold) 20%, transparent));
 }
-.credits-sheet { display: flex; flex-direction: column; max-height: calc(100vh - var(--s8)); }
+.credits-dialog::backdrop {
+  background: color-mix(in srgb, var(--bg-0) 80%, transparent);
+}
+/* A two-writer single is not a 920px problem. */
+.credits-dialog.compact { width: min(560px, calc(100vw - var(--s7))); }
+.credits-sheet {
+  position: relative;
+  display: flex; flex-direction: column; max-height: min(84vh, 880px);
+}
+
+/* No fill. The header is separated from the body by space and one hairline,
+   like every other grouping in the app. The wash is a light source in the
+   corner, not a panel — and it is now the TRACK'S OWN colour, so opening the
+   credits for a record carries that record's colour with it instead of the
+   same pink corner every time. Gold rides over it as the layer's own hue. */
 .credits-head {
   display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s4);
-  padding: var(--s6); border-bottom: 1px solid var(--line);
-  background: linear-gradient(115deg,
-    color-mix(in srgb, var(--foam) 8%, var(--bg-2)),
-    color-mix(in srgb, var(--rose) 5%, var(--bg-2)) 58%,
-    var(--bg-2));
+  padding: var(--s6) var(--s5) var(--s5) var(--s6); flex: none;
+  background:
+    radial-gradient(130% 165% at 0% 0%, color-mix(in srgb, var(--tone-wash) 88%, transparent), transparent 62%),
+    radial-gradient(90% 150% at 100% 0%, color-mix(in srgb, var(--gold) 9%, transparent), transparent 58%);
 }
+/* The sleeve throws its colour under itself here too, which is what stops the
+   64px tile reading as a stamp glued onto a grey header. */
+.credits-identity .art {
+  box-shadow: var(--ring), 0 10px 26px -10px color-mix(in srgb, var(--tone-glow) 78%, transparent);
+}
+/* Grain, on the header only.
+   These are liner notes, and liner notes were printed on something. A few
+   percent of fractal noise over the colour field is the difference between a
+   surface and a fill — flat colour at this size reads as a UI panel, grained
+   colour reads as a card stock the type was put onto.
+   Header only, and deliberately: a blended layer over the SCROLLING list would
+   have to recomposite on every frame for an effect nobody can see while they
+   are moving. The header never moves, so it costs one paint, ever. */
+.credits-head::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  opacity: 0.05; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.credits-head { position: relative; }
 .credits-identity { display: flex; align-items: center; gap: var(--s4); min-width: 0; }
 .credits-title-copy { min-width: 0; }
 .credits-head h2 {
-  margin-top: 2px; font-family: var(--font-display);
-  font-size: 22px; font-weight: 650; letter-spacing: -0.018em;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-top: var(--s1); font-family: var(--font-display);
+  font-size: var(--t-23); font-weight: var(--w-bold); letter-spacing: -0.02em; line-height: 1.15;
+  /* Two lines, then ellipsis: remaster titles are long, but the header must
+     not push the list it introduces off the screen. */
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; overflow-wrap: anywhere;
 }
 .credits-title-copy p {
-  margin-top: 2px; color: var(--fg-1); font-family: var(--font-small);
-  font-size: var(--t-12); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-top: 2px; color: var(--fg-2); font-size: var(--t-12);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.credits-body { min-height: 180px; padding: var(--s5) var(--s6) var(--s6); overflow-y: auto; }
+
+.credits-tools {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s4);
+  flex: none; padding: 0 var(--s6) var(--s4);
+}
+.credits-summary {
+  display: flex; align-items: center; gap: var(--s2); min-width: 0;
+  color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-12);
+}
+.credits-summary .tnum { color: color-mix(in srgb, var(--gold) 62%, var(--fg-1)); font-weight: var(--w-med); }
+.credits-sep { width: 3px; height: 3px; border-radius: 50%; background: var(--fg-3); flex: none; }
+/* A finder, not a feature: it only appears once the list is long enough that
+   scanning it stops working (see FILTERABLE_FROM). */
+.credits-filter {
+  display: flex; align-items: center; gap: var(--s2); flex: none;
+  width: 236px; height: 30px; padding: 0 var(--s2) 0 var(--s3);
+  border-radius: var(--r2); background: var(--bg-0);
+  border: 1px solid var(--line); color: var(--fg-2);
+  transition: border-color var(--d1) var(--ease);
+}
+.credits-filter:focus-within { border-color: color-mix(in srgb, var(--foam) 58%, transparent); }
+.credits-filter input {
+  flex: 1; min-width: 0; height: 100%; border: 0; background: none; outline: none;
+  font-size: var(--t-12); color: var(--fg);
+}
+.credits-filter input::placeholder { color: var(--fg-3); }
+.credits-filter-clear {
+  display: grid; place-items: center; width: 18px; height: 18px; flex: none;
+  border-radius: 50%; color: var(--fg-3);
+}
+.credits-filter-clear:hover { color: var(--fg); background: rgba(255, 255, 255, 0.08); }
+
+.credits-body {
+  flex: 1; min-height: 200px; padding: 0 var(--s6) var(--s5);
+  overflow-y: auto;
+  /* The rule that opens the list leads with gold and fades to the ordinary
+     hairline — the same shape as `--rule-accent`, in this surface's own hue. */
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(90deg,
+    color-mix(in srgb, var(--gold) 58%, transparent), var(--line) 28%, var(--line)) 1;
+}
 .credits-loading { padding: var(--s6) 0; }
-.credits-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s3); }
+
+/* [role rail] [people]. One hairline per group and nothing else. */
 .credits-group {
-  min-width: 0; align-self: start; padding: var(--s4);
-  border: 1px solid var(--line); border-radius: var(--r2);
-  background: color-mix(in srgb, var(--bg-3) 42%, transparent);
+  display: grid; grid-template-columns: 150px minmax(0, 1fr);
+  gap: var(--s3) var(--s6);
+  padding: var(--s5) 0; min-width: 0;
+  border-bottom: 1px solid var(--line);
 }
-.credits-group h3 {
-  font-family: var(--font-small); font-size: var(--t-11); font-weight: 650;
-  letter-spacing: 0.1em; text-transform: uppercase; color: var(--foam);
+.credits-group:last-child { border-bottom: 0; }
+/* Sticks *within its own group row* rather than to the scrollport, so a long
+   group keeps its label beside the names without a bar that overlaps anything.
+   `align-self: start` is what makes the rail a rail instead of a cell. */
+.credits-group-head {
+  position: sticky; top: var(--s5); align-self: start;
+  display: flex; align-items: baseline; gap: var(--s2); min-width: 0;
+  padding-top: 2px;
 }
-.credits-group ul { list-style: none; margin: var(--s2) 0 0; padding: 0; }
-.credits-group li {
-  display: flex; flex-direction: column; align-items: flex-start;
-  gap: var(--s1); padding: var(--s3) 0 var(--s2);
+/* Each role gets a solid gold tick and gold caps. Eight of them down the left
+   edge is the spine the old grey bars were reaching for, and it is the one
+   place in the app where a column of small warm caps is the *point* — which is
+   only possible because gold carries enough chroma to be a hue at 11px. The
+   same run set in rose was the change the owner rejected, and correctly: it
+   read as eight lines of dirty white. */
+.credits-group-head::before {
+  content: ""; flex: none; align-self: flex-start;
+  width: 3px; height: 11px; margin-top: 2px; border-radius: 1px;
+  background: var(--gold);
 }
-.credits-group li + li { border-top: 1px solid var(--line); }
-.credit-name { min-width: 0; max-width: 100%; }
-.credit-link,
-.credit-plain {
-  font-family: var(--font-text); font-size: var(--t-13); font-weight: 650;
-  line-height: 1.3; color: var(--fg); overflow-wrap: anywhere;
+.credits-group-title {
+  min-width: 0;
+  font-family: var(--font-small);
+  font-size: var(--t-caps); font-weight: var(--w-semi);
+  letter-spacing: var(--track-caps); text-transform: uppercase;
+  color: color-mix(in srgb, var(--gold) 72%, var(--fg-1)); line-height: 1.5;
+  /* Group titles come from the licensor and can be a whole sentence, so they
+     wrap down the rail rather than truncating: a role you cannot read is a
+     fact you have lost. */
+  overflow-wrap: anywhere;
 }
+.credits-group-count {
+  flex: none; font-family: var(--font-number); font-size: var(--t-11);
+  font-weight: var(--w-med); color: color-mix(in srgb, var(--gold) 48%, var(--fg-2));
+}
+.credits-people {
+  list-style: none; margin: 0; padding: 0; min-width: 0;
+  display: grid; gap: var(--s4) var(--s5);
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  align-content: start;
+}
+.credits-people li { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+/* The person is the point. A name half a step up and a subrole a step down
+   opens the gap between "who" and "what they did", which at eight columns of
+   two-line entries is the difference between a list you can scan and a block
+   of text you have to read. */
+.credit-name {
+  min-width: 0; font-family: var(--font-text);
+  font-size: var(--t-15); font-weight: var(--w-med);
+  letter-spacing: -0.005em; line-height: 1.25; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.credit-plain { display: block; }
+/* The link affordance is the hover colour and the mark that appears with it —
+   at this density a permanent glyph on every second name is visual static. */
 .credit-link {
-  display: inline-flex; align-items: baseline; max-width: 100%;
-  text-align: left; white-space: normal;
+  display: flex; align-items: center; gap: var(--s1); min-width: 0; max-width: 100%;
+  text-align: left; color: var(--fg);
   transition: color var(--d1) var(--ease);
 }
-.credit-link::after {
-  content: "↗"; margin-left: var(--s1); flex: none;
-  font-family: var(--font-small); font-size: var(--t-11); color: var(--fg-2);
+.credit-link .icon { opacity: 0; color: var(--accent); transition: opacity var(--d1) var(--ease); }
+.credit-link:hover, .credit-link:focus-visible { color: var(--accent); }
+.credit-link:hover .icon, .credit-link:focus-visible .icon { opacity: 1; }
+.credit-roles {
+  min-width: 0; color: var(--fg-3);
+  font-family: var(--font-small); font-size: var(--t-11); line-height: 1.35;
+  letter-spacing: 0.005em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.credit-link:hover { color: var(--foam); }
-.credit-details {
-  display: flex; flex-wrap: wrap; align-items: baseline;
-  gap: var(--s1) var(--s2); min-width: 0;
-}
-.credit-detail {
-  display: inline-flex; align-items: center; min-height: 20px; padding: 1px var(--s2);
-  border-radius: var(--rf); background: rgba(255, 255, 255, 0.045);
-  font-family: var(--font-small); font-size: var(--t-11);
-  line-height: 1.35; color: var(--fg-1);
-}
+
 .credits-foot {
   display: flex; align-items: center; justify-content: space-between; gap: var(--s4);
-  padding: var(--s4) var(--s6); border-top: 1px solid var(--line);
+  flex: none; padding: var(--s4) var(--s6); border-top: 1px solid var(--line);
 }
 /* Pushes Close to the right on its own when there is no licensor to show. */
 .credits-foot > :only-child { margin-left: auto; }
-.credit-source { color: var(--fg-3); font-size: var(--t-12); min-width: 0; }
+.credit-source {
+  min-width: 0; color: var(--fg-3); font-family: var(--font-small); font-size: var(--t-11);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .empty.compact { padding: var(--s6) 0; }
-@media (max-width: 680px) { .credits-groups { grid-template-columns: minmax(0, 1fr); } }
 
+/* Where the rail costs more width than it earns the label goes back on top of
+   its names — still as text on the sheet, never as a bar. The compact sheet is
+   560px wide: a 150px rail there would take a third of the room away from two
+   columns of names. */
+.credits-dialog.compact .credits-group { grid-template-columns: minmax(0, 1fr); gap: var(--s3); }
+.credits-dialog.compact .credits-group-head { position: static; }
+@media (max-width: 720px) {
+  .credits-tools { flex-direction: column; align-items: stretch; gap: var(--s3); }
+  .credits-filter { width: 100%; }
+  .credits-group { grid-template-columns: minmax(0, 1fr); gap: var(--s3); }
+  .credits-group-head { position: static; }
+}
 
 /* =====================================================================
    SETTINGS
@@ -1124,38 +1889,114 @@ button.np-fact:hover { color: var(--fg); }
 .settings-intro { padding: var(--s3) 0 0; }
 .set { max-width: 720px; }
 .set-group { margin-top: var(--s6); }
+/* A group heading is a hairline with a short accent lead-in rather than a
+   full-width rule in grey: it names the group and tints the page at the same
+   time, which is most of what stops a settings screen reading as a form. */
 .set-group > h2 {
+  position: relative;
+  display: flex; align-items: center; gap: var(--s3);
   font-family: var(--font-small);
-  font-size: var(--t-11); font-weight: 600; letter-spacing: 0.11em;
-  text-transform: uppercase; color: var(--fg-2);
-  padding-bottom: var(--s3); border-bottom: 1px solid var(--line);
+  font-size: var(--t-caps); font-weight: var(--w-semi); letter-spacing: var(--track-caps);
+  text-transform: uppercase; color: var(--label-hi);
+  padding-bottom: var(--s3);
+}
+/* One rule, not two: the hairline runs from the label instead of under it, so
+   the heading and its separator are a single mark. */
+.set-group > h2::after {
+  content: ""; flex: 1; height: 1px; background: var(--rule-accent);
 }
 /* [label + helper] … [control]. No card, no box: a hairline is the whole
    grouping device, so nothing has to be sized to contain anything. */
 .set-row {
   display: grid; grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center; gap: var(--s6);
+  align-items: center; gap: var(--s3) var(--s6);
   padding: var(--s4) 0; border-bottom: 1px solid var(--line);
 }
 .set-row:last-child { border-bottom: none; }
 .set-row .k { font-size: var(--t-13); color: var(--fg); }
 .set-row .d { font-size: var(--t-12); color: var(--fg-2); margin-top: 2px; }
 .set-row .v {
-  font-family: var(--font-number); font-size: var(--t-12); font-weight: 600;
-  color: var(--fg-1); letter-spacing: 0.01em;
-  font-variant-numeric: tabular-nums;
+  display: inline-flex; align-items: center; gap: var(--s2);
+  font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-body);
+  color: var(--fg-2);
   max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* The measurement is the answer; the file count is context for it. */
+.set-row .v strong { color: var(--fg); font-weight: var(--w-med); }
+.set-row .v-sep { width: 3px; height: 3px; border-radius: 50%; background: var(--fg-3); flex: none; }
+.set-row .v.status .status-dot {
+  width: 6px; height: 6px; border-radius: 50%; flex: none;
+  background: var(--fg-3); box-shadow: 0 0 0 3px transparent;
+}
+.set-row .v.status.ok { color: var(--fg-1); }
+.set-row .v.status.ok .status-dot {
+  background: var(--foam); box-shadow: 0 0 0 3px color-mix(in srgb, var(--foam) 14%, transparent);
+}
+.set-row .v.status.bad { color: var(--love); }
+.set-row .v.status.bad .status-dot {
+  background: var(--love); box-shadow: 0 0 0 3px color-mix(in srgb, var(--love) 16%, transparent);
+}
+
+/* Usage against the configured ceiling, on the row that owns both numbers. */
+.set-meter { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--s3); }
+.set-meter-rail {
+  position: relative; flex: 1; min-width: 0; height: 4px; overflow: hidden;
+  border-radius: var(--rf); background: rgba(255, 255, 255, 0.07);
+}
+.set-meter-fill {
+  position: absolute; inset: 0; border-radius: var(--rf);
+  background: var(--accent-grad); transform-origin: left; transform: scaleX(var(--p, 0));
+}
+.set-meter-note {
+  flex: none; color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11);
+}
+
 /* the control cell: fixed-size widgets, right-aligned, never squeezed */
 .set-ctl { display: flex; align-items: center; justify-content: flex-end; gap: var(--s3); flex: none; }
-.set-select {
-  min-width: 124px; height: 34px; padding: 0 34px 0 var(--s3);
+
+/* --------------------------------------------------------------- listbox
+   Replaces the one native <select>, which rendered as a light OS widget with
+   its own font and radius in the middle of a dark panel. */
+.sel { position: relative; flex: none; }
+.sel-btn {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+  min-width: 140px; height: 34px; padding: 0 var(--s3);
   border: 1px solid var(--line-2); border-radius: var(--r2);
-  background: var(--bg-2); color: var(--fg); font-family: var(--font-number);
-  font-size: var(--t-12); font-weight: 600; outline: none; cursor: pointer;
+  background: var(--bg-2); color: var(--fg);
+  font-size: var(--t-12); font-weight: var(--w-med);
+  transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
-.set-select:hover:not(:disabled), .set-select:focus { border-color: color-mix(in srgb, var(--foam) 50%, var(--line-2)); }
-.set-select:disabled { opacity: .5; cursor: default; }
+.sel-btn .icon { color: var(--fg-2); transition: color var(--d1) var(--ease); }
+.sel-btn:hover:not(:disabled) { background: var(--bg-3); border-color: rgba(255, 255, 255, 0.18); }
+.sel-btn:hover:not(:disabled) .icon { color: var(--fg-1); }
+.sel-btn.open {
+  border-color: color-mix(in srgb, var(--foam) 62%, transparent);
+  background: var(--bg-3);
+}
+.sel-btn.open .icon { color: var(--accent); }
+.sel-btn:disabled { opacity: 0.45; }
+.sel-value { font-family: var(--font-number); font-variant-numeric: tabular-nums; }
+
+.sel-list {
+  position: absolute; z-index: 40; top: calc(100% + var(--s1)); right: 0;
+  min-width: 100%; margin: 0; padding: var(--s1); list-style: none;
+  border: 1px solid var(--line-2); border-radius: var(--r2);
+  background: var(--bg-2);
+  box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85), 0 2px 6px rgba(0, 0, 0, 0.5);
+  animation: sel-in var(--d2) var(--ease) both;
+}
+@keyframes sel-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .sel-list { animation: none; } }
+.sel-list li {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s5);
+  height: 30px; padding: 0 var(--s2) 0 var(--s3);
+  border-radius: var(--r1); color: var(--fg-1);
+  font-family: var(--font-number); font-size: var(--t-12);
+  font-variant-numeric: tabular-nums; white-space: nowrap; cursor: pointer;
+}
+.sel-list li.selected { color: var(--fg); font-weight: var(--w-med); }
+.sel-list li.selected .icon { color: var(--accent); }
+.sel-list li.active { background: var(--bg-4); color: var(--fg); }
 
 
 /* =====================================================================
@@ -1169,7 +2010,7 @@ button.np-fact:hover { color: var(--fg); }
 .results-head .page-title { margin-top: var(--s1); }
 .results-summary {
   margin-top: var(--s2); color: var(--fg-2); font-family: var(--font-number);
-  font-size: var(--t-12); font-weight: 600; font-variant-numeric: tabular-nums;
+  font-size: var(--t-12); font-weight: var(--w-med); font-variant-numeric: tabular-nums;
 }
 .search-songs-page > .tl { margin-top: var(--s3); }
 .inline-status { padding: var(--s4) var(--s3); color: var(--fg-2); font-size: var(--t-12); }
@@ -1183,6 +2024,72 @@ button.np-fact:hover { color: var(--fg); }
   transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
 .chip:hover { background: var(--bg-3); color: var(--fg); }
+/* Selected filter. Tinted rather than solid-accent: these sit in a row of
+   three and a filled pill would out-shout the content they filter. */
+.chip.on {
+  background: var(--accent-wash); color: var(--fg);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+.chip.on:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.chip[role="tab"] { padding: 0 var(--s3); }
+/* How many are behind the chip, so choosing a filter is an informed choice
+   rather than a guess. Quiet by default; inherits the chip's colour when on. */
+.chip-count {
+  flex: none; font-family: var(--font-number); font-size: var(--t-11);
+  font-weight: var(--w-med); color: var(--count);
+}
+.chip.on .chip-count { color: color-mix(in srgb, var(--foam) 62%, var(--fg)); }
+
+/* What KIND of record this is — Album, EP, Single. Gold, not foam: it is a
+   fact about the record, not something you can do to it, and gold is the layer
+   that owns facts about records. It is also the demonstration of why gold
+   exists at all: at 11px this pill would be invisible in rose and would be
+   mistaken for a button in foam. */
+.kind {
+  flex: none; padding: 2px var(--s2); border-radius: var(--rf);
+  background: var(--credit-wash);
+  color: color-mix(in srgb, var(--gold) 82%, var(--fg));
+  font-family: var(--font-small); font-size: var(--t-11); font-weight: var(--w-semi);
+  letter-spacing: 0.05em; white-space: nowrap;
+}
+
+/* =====================================================================
+   SEGMENTED TOGGLE
+
+   One control, one row, and the list under it is whatever is selected. It
+   replaces four separate shelves that each had their own "Show all" and a
+   second page with a chip row — the same choice offered five times in two
+   shapes. A segment carries its own count, so choosing "Compilations" is an
+   informed choice rather than a guess that might land on an empty page.
+   ===================================================================== */
+.seg {
+  display: inline-flex; align-items: center; gap: 2px; flex-wrap: wrap;
+  padding: 3px; border-radius: var(--rf);
+  background: var(--bg-2); border: 1px solid var(--line);
+}
+.seg-btn {
+  display: inline-flex; align-items: center; gap: var(--s2);
+  height: 28px; padding: 0 var(--s3); border-radius: var(--rf);
+  font-size: var(--t-12); color: var(--fg-2); white-space: nowrap;
+  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+}
+.seg-btn:hover { color: var(--fg); background: rgba(255, 255, 255, 0.05); }
+/* Selected: a raised chip lit from the top in foam. Not a solid foam fill —
+   this control sits above a list whose playing row is already foam-washed, and
+   two saturated foam objects in one column makes neither of them the answer. */
+.seg-btn.on,
+.seg-btn.on:hover {
+  color: var(--fg);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--foam) 24%, transparent), transparent),
+    var(--bg-4);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 32%, transparent);
+}
+.seg-n {
+  font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
+  color: var(--count);
+}
+.seg-btn.on .seg-n { color: color-mix(in srgb, var(--foam) 70%, var(--fg)); }
 /* a pasted paragraph of a search term truncates instead of blowing the row out */
 .chip .label {
   min-width: 0; max-width: 220px; text-align: left; color: inherit;
@@ -1199,84 +2106,27 @@ button.np-fact:hover { color: var(--fg); }
 .top-result {
   display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s4);
   align-items: end; padding: var(--s4); border-radius: var(--r3);
-  background: var(--bg-2); transition: background-color var(--d1) var(--ease);
+  /* The record's own colour, mixed back toward the raised grey so the panel is
+     tinted rather than painted — it still has to read as a surface with a
+     cover sitting on it, not as a second cover. */
+  background:
+    linear-gradient(155deg,
+      color-mix(in srgb, var(--tone-wash, var(--bg-2)) 76%, var(--bg-2)),
+      var(--bg-2) 78%);
+  transition: filter var(--d1) var(--ease);
   text-align: left; width: 100%;
 }
-.top-result:hover { background: var(--bg-3); }
+.top-result:hover { filter: brightness(1.28); }
 .top-result:focus-visible { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 45%, transparent); }
 .top-result .tr-name {
   display: block;
-  font-family: var(--font-display); font-size: var(--t-20); font-weight: 600;
+  font-family: var(--font-display); font-size: var(--t-20); font-weight: var(--w-bold);
   letter-spacing: -0.015em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .top-result .tr-sub {
   display: block; font-size: var(--t-12); color: var(--fg-2); margin-top: var(--s1);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-
-/* One catalogue surface keeps release types close enough to scan and compare.
-   Only the preview is mounted initially, so offscreen covers do not start core
-   cache work until Show all is explicitly requested. */
-.catalogue-heading {
-  display: flex; align-items: flex-end; justify-content: space-between; gap: var(--s5);
-  margin-bottom: var(--s4);
-}
-.catalogue-heading .section-title { margin-top: 2px; }
-.catalogue-play { color: var(--fg); }
-.catalogue-tabs {
-  display: flex; flex-wrap: wrap; gap: var(--s2); margin-bottom: var(--s4);
-  padding-bottom: var(--s4); border-bottom: 1px solid var(--line);
-}
-.catalogue-tabs button {
-  display: inline-flex; align-items: center; gap: var(--s2); height: 30px;
-  padding: 0 var(--s3); border: 1px solid var(--line); border-radius: var(--rf);
-  color: var(--fg-1); font-family: var(--font-small); font-size: var(--t-12);
-  transition: color var(--d1) var(--ease), border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
-}
-.catalogue-tabs button:hover { color: var(--fg); border-color: var(--line-2); }
-.catalogue-tabs button.active {
-  color: var(--bg-0); border-color: var(--foam); background: var(--foam); font-weight: 650;
-}
-.catalogue-tabs button span {
-  font-family: var(--font-number); font-size: 10px; font-weight: 650;
-  font-variant-numeric: tabular-nums; opacity: .72;
-}
-.catalogue-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s2); }
-.catalogue-item {
-  display: grid; grid-template-columns: minmax(0, 1fr) 36px; align-items: center;
-  gap: var(--s2); min-width: 0; padding: var(--s2); border-radius: var(--r2);
-  background: color-mix(in srgb, var(--bg-2) 52%, transparent);
-  transition: background-color var(--d1) var(--ease);
-}
-.catalogue-item:hover { background: var(--bg-2); }
-.catalogue-open {
-  display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: center;
-  gap: var(--s3); min-width: 0; width: 100%; text-align: left;
-}
-.catalogue-copy { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
-.catalogue-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--t-13); font-weight: 600; }
-.catalogue-meta { display: flex; align-items: center; gap: var(--s2); min-width: 0; color: var(--fg-2); font-size: var(--t-11); }
-.catalogue-meta > span:not(.catalogue-artists) { flex: none; }
-.catalogue-artists { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.release-kind {
-  padding: 1px var(--s2); border-radius: var(--rf);
-  background: color-mix(in srgb, var(--foam) 10%, transparent); color: var(--foam);
-  font-family: var(--font-small); font-size: 10px; font-weight: 650;
-}
-.catalogue-item-play {
-  display: grid; place-items: center; width: 32px; height: 32px;
-  border-radius: var(--rf); background: var(--bg-3); color: var(--fg-1);
-  opacity: 0; transition: opacity var(--d1) var(--ease), color var(--d1) var(--ease), background-color var(--d1) var(--ease);
-}
-.catalogue-item:hover .catalogue-item-play, .catalogue-item-play:focus-visible { opacity: 1; }
-.catalogue-item-play:hover:not(:disabled) { background: var(--foam); color: var(--bg-0); }
-.catalogue-more {
-  display: flex; align-items: center; justify-content: center; gap: var(--s2);
-  width: 100%; height: 38px; margin-top: var(--s3); border-top: 1px solid var(--line);
-  color: var(--fg-2); font-size: var(--t-12);
-}
-.catalogue-more:hover { color: var(--fg); }
-@media (max-width: 980px) { .catalogue-list { grid-template-columns: minmax(0, 1fr); } }
 
 /* Empty states sit under the header, left-aligned, with one action. Centring
    them in the viewport makes an ordinary state look like a failure. */
@@ -1304,10 +2154,16 @@ button.np-fact:hover { color: var(--fg); }
   background: linear-gradient(180deg, rgba(10,10,12,0.35) 0%, rgba(10,10,12,0.6) 45%, var(--bg-1) 100%);
 }
 .banner > *:not(.bg) { position: relative; z-index: 1; }
+/* The banner is a flex COLUMN, so without this the tag stretches to the full
+   width of the pane and stops looking like a tag. (Nowhere else needs it: every
+   other tag sits in a block or in a centred flex row, and `align-self` on the
+   base rule was what pushed the now-playing one out of line with its own
+   close button.) */
+.banner .tag { align-self: flex-start; }
 .banner .verified { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--t-12); color: var(--fg-1); }
 .banner .name {
   font-family: var(--font-display);
-  font-size: clamp(34px, 5.6vw, 64px); font-weight: 600;
+  font-size: clamp(34px, 5.6vw, 64px); font-weight: var(--w-bold);
   letter-spacing: -0.03em; line-height: 1.02;
   margin-top: var(--s2); overflow-wrap: anywhere;
   text-shadow: 0 2px 20px rgba(0, 0, 0, 0.55);
@@ -1340,7 +2196,7 @@ button.np-fact:hover { color: var(--fg); }
 .rename {
   width: 100%;
   font-family: var(--font-display);
-  font-size: clamp(30px, 4.4vw, var(--t-56)); font-weight: 600; line-height: 1.03;
+  font-size: clamp(30px, 4.4vw, var(--t-56)); font-weight: var(--w-bold); line-height: 1.03;
   letter-spacing: -0.028em;
   color: var(--fg); background: transparent;
   border: none; border-bottom: 2px solid var(--accent);
@@ -1360,3 +2216,25 @@ button.np-fact:hover { color: var(--fg); }
 .lib-create input:focus { border-color: var(--accent); }
 
 .sub { color: var(--fg-2); font-size: var(--t-12); }
+
+/* =====================================================================
+   REDUCED TRANSPARENCY
+
+   Last in the file on purpose: each of these has to beat the background it
+   overrides, and every one of those rules is declared above.
+
+   The glass surfaces — topbar, track-list head, now-playing head, and the tag
+   when it sits on a coloured header — go back to being solid. Each of them is
+   a sticky bar whose real job is to hide what is sliding underneath it; the
+   blur is how it does that beautifully, not how it does it at all.
+   ===================================================================== */
+@media (prefers-reduced-transparency: reduce) {
+  .topbar, .tl-head { background: var(--bg-1); }
+  .np-head { background: var(--bg-nav); }
+  .wash .tag, .banner .tag, .np-head .tag { background: rgba(255, 255, 255, 0.16); }
+  .topbar, .tl-head, .np-head,
+  .wash .tag, .banner .tag, .np-head .tag {
+    -webkit-backdrop-filter: none;
+            backdrop-filter: none;
+  }
+}

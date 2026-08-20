@@ -68,7 +68,7 @@
       </span>
       <button
         class="btn-icon"
-        class:on={isLiked}
+        class:saved={isLiked}
         title={isLiked ? "Remove from Liked Songs" : "Save to Liked Songs"}
         onclick={() => toggleLiked(current.uri)}
       >

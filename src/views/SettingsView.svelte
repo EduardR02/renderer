@@ -12,6 +12,7 @@
   } from "../lib/state.svelte.js";
   import Icon from "../components/Icon.svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
+  import Select from "../components/Select.svelte";
   import { formatBytes } from "../lib/time.js";
 
   const username = $derived(playback.username || session.username);
@@ -74,8 +75,18 @@
       .catch(() => (ping = "failed"));
   }
 
-  async function updateAudioCacheLimit(event) {
-    const mb = Number(event.currentTarget.value);
+  /* The cache limit is the one number in Settings with a live counterpart on
+     disk, so the row shows the two against each other rather than as two
+     unrelated facts three rows apart. Unlimited has nothing to fill, so it
+     draws no meter at all. */
+  const cacheLimitMb = $derived(appSettings?.audio_cache_limit_mb ?? 0);
+  const cacheFill = $derived(
+    cacheLimitMb > 0 && cacheStats.audio
+      ? Math.min(1, cacheStats.audio.bytes / (cacheLimitMb * 1024 * 1024))
+      : null,
+  );
+
+  async function updateAudioCacheLimit(mb) {
     if (!Number.isFinite(mb) || settingsBusy) return;
     settingsBusy = true;
     settingsError = "";
@@ -164,15 +175,26 @@
         <div class="set-ctl">
           <span class="v" aria-live="polite">
             {#if cacheStats.audio}
-              {cacheStats.audio.files} files · {formatBytes(cacheStats.audio.bytes)}
+              <span class="tnum">{cacheStats.audio.files}</span> files
+              <span class="v-sep" aria-hidden="true"></span>
+              <strong class="tnum">{formatBytes(cacheStats.audio.bytes)}</strong>
             {:else if cacheStats.loading}
               Measuring…
             {:else}
               Unavailable
             {/if}
           </span>
-          <button class="btn-ghost" onclick={() => requestClear("audio")}>Clear</button>
+          <button class="btn-ghost danger" onclick={() => requestClear("audio")}>Clear</button>
         </div>
+        {#if cacheFill !== null}
+          <div class="set-meter" style:--p={cacheFill}>
+            <span class="set-meter-rail"><span class="set-meter-fill"></span></span>
+            <span class="set-meter-note">
+              <span class="tnum">{Math.round(cacheFill * 100)}%</span> of the
+              {CACHE_LIMITS.find((o) => o.value === cacheLimitMb)?.label ?? ""} limit
+            </span>
+          </div>
+        {/if}
       </div>
       <div class="set-row" data-cache-limit>
         <div>
@@ -181,17 +203,13 @@
           {#if settingsError}<div class="inline-error">{settingsError}</div>{/if}
         </div>
         <div class="set-ctl">
-          <select
-            class="set-select"
-            aria-label="Audio cache limit"
+          <Select
+            label="Audio cache limit"
+            options={CACHE_LIMITS}
+            value={cacheLimitMb}
             disabled={!appSettings || settingsBusy}
-            value={appSettings?.audio_cache_limit_mb ?? 1024}
             onchange={updateAudioCacheLimit}
-          >
-            {#each CACHE_LIMITS as option (option.value)}
-              <option value={option.value}>{option.label}</option>
-            {/each}
-          </select>
+          />
         </div>
       </div>
       <div class="set-row" data-cache-stat="covers">
@@ -202,14 +220,16 @@
         <div class="set-ctl">
           <span class="v" aria-live="polite">
             {#if cacheStats.covers}
-              {cacheStats.covers.files} files · {formatBytes(cacheStats.covers.bytes)}
+              <span class="tnum">{cacheStats.covers.files}</span> files
+              <span class="v-sep" aria-hidden="true"></span>
+              <strong class="tnum">{formatBytes(cacheStats.covers.bytes)}</strong>
             {:else if cacheStats.loading}
               Measuring…
             {:else}
               Unavailable
             {/if}
           </span>
-          <button class="btn-ghost" onclick={() => requestClear("covers")}>Clear</button>
+          <button class="btn-ghost danger" onclick={() => requestClear("covers")}>Clear</button>
         </div>
       </div>
       <div class="set-row">
@@ -233,13 +253,19 @@
           <div class="d">{playback.ready ? "Connected and ready." : "Not reported ready yet."}</div>
         </div>
         <div class="set-ctl">
-          <span class="v">{pingLabel}</span>
+          <span class="v status" class:ok={ping === "ok"} class:bad={ping === "failed"}>
+            <span class="status-dot" aria-hidden="true"></span>{pingLabel}
+          </span>
           <button class="btn-ghost" onclick={checkEngine} disabled={ping === "checking"}>Check</button>
         </div>
       </div>
       <div class="set-row">
         <div class="k">Auth state</div>
-        <div class="set-ctl"><span class="v">{playback.auth_state ?? "unknown"}</span></div>
+        <div class="set-ctl">
+          <span class="v status" class:ok={playback.auth_state === "authenticated"}>
+            <span class="status-dot" aria-hidden="true"></span>{playback.auth_state ?? "unknown"}
+          </span>
+        </div>
       </div>
       <div class="set-row">
         <div class="k">Version</div>

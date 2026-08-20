@@ -4,6 +4,7 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import ArtistLinks from "../components/ArtistLinks.svelte";
+  import { coverTone } from "../lib/covertone.svelte.js";
   import { formatTotal } from "../lib/time.js";
 
   const album = $derived(detail.album);
@@ -13,17 +14,11 @@
   // first header artist, while missing parallel ids leave other names plain.
   const artistFallbackId = $derived(artistIds[0] || tracks[0]?.artist_id || "");
 
-  /* Same FNV-1a the artwork uses, so the header wash and the generated tile
-     land on one colour identity for this album. */
-  const hue = $derived.by(() => {
-    const seed = album?.id ?? "";
-    let h = 0x811c9dc5;
-    for (let i = 0; i < seed.length; i++) {
-      h ^= seed.charCodeAt(i);
-      h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return h % 360;
-  });
+  /* An album always has a sleeve, so this is the page where content colour is
+     least ambiguous: the header is simply the record's own colour. (The old
+     `--h` here was dead — it set a variable the wash rule never read, so every
+     album page washed the same default foam.) */
+  const tone = $derived(coverTone(album?.cover_url ?? "", album?.id ?? ""));
 
   function playFrom(i) {
     if (tracks.length) api.playQueue(tracks, i).catch(() => {});
@@ -36,7 +31,12 @@
   }
 </script>
 
-<section class="view page wash" style:--h={hue}>
+<section
+  class="view page wash"
+  style:--tone-wash={tone.wash}
+  style:--tone-wash-deep={tone.washDeep}
+  style:--tone-glow={tone.glow}
+>
   {#if !album}
     <header class="detail-head">
       <span class="art lg skeleton" style="width:184px;height:184px"></span>
@@ -49,7 +49,7 @@
     <header class="detail-head">
       <Cover src={album.cover_url} id={album.id} name={album.name} size={184} lg raised />
       <div>
-        <span class="eyebrow">Album</span>
+        <span class="tag">Album</span>
         <h1 class="detail-title">{album.name}</h1>
         <p class="detail-meta">
           <ArtistLinks

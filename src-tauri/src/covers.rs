@@ -80,6 +80,12 @@ pub fn serve_cover(hex: &str) -> tauri::http::Response<std::borrow::Cow<'static,
         Ok(bytes) => tauri::http::Response::builder()
             .status(200)
             .header("Content-Type", sniff_content_type(&bytes))
+            // Lets the frontend read cover pixels back off a canvas, which is
+            // how a detail header derives its wash from the actual artwork
+            // rather than from a hash of the id. Without it the image taints
+            // the canvas and `getImageData` throws. This scheme only ever
+            // serves files out of our own cover cache to our own webview.
+            .header("Access-Control-Allow-Origin", "*")
             .body(std::borrow::Cow::Owned(bytes))
             .expect("cover response is valid"),
         Err(_) => tauri::http::Response::builder()

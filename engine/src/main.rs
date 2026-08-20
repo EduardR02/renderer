@@ -16,8 +16,8 @@ use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, ArtistBrowse, Command, LikedSongsPage, PlaylistBrowse, PlaylistRef, Response,
-    SearchBrowse, TrackCredits,
+    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistReleasePage, Command, LikedSongsPage,
+    PlaylistBrowse, PlaylistRef, Response, SearchBrowse, TrackCredits,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -45,9 +45,13 @@ enum BrowseOutcome {
         request_id: String,
         result: Result<ArtistBrowse, String>,
     },
-    ArtistCatalogueTracks {
+    ArtistReleases {
         request_id: String,
-        result: Result<Vec<spotify_playback_engine::protocol::TrackRef>, String>,
+        result: Result<ArtistReleasePage, String>,
+    },
+    ArtistCatalogue {
+        request_id: String,
+        result: Result<ArtistCataloguePage, String>,
     },
     LikedSongs {
         request_id: String,
@@ -277,30 +281,45 @@ async fn run(
                                     }
                                 }
                             }
-                            Command::BrowseArtistCatalogueTracks { id, release_types } => {
+                            Command::BrowseArtistReleases { id, release_types, offset, limit } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
                                         let sender = browse_sender.clone();
                                         tokio::spawn(async move {
-                                            let result = browse::artist_catalogue_tracks_browse(
+                                            let result = browse::artist_releases_browse(
                                                 &session,
                                                 &id,
                                                 &release_types,
+                                                offset,
+                                                limit,
                                             )
                                             .await;
-                                            let _ = sender.send(BrowseOutcome::ArtistCatalogueTracks {
-                                                request_id,
-                                                result,
-                                            });
+                                            let _ = sender.send(BrowseOutcome::ArtistReleases { request_id, result });
                                         });
                                     }
                                     Err(error) => {
-                                        let _ = browse_sender.send(
-                                            BrowseOutcome::ArtistCatalogueTracks {
-                                                request_id,
-                                                result: Err(error),
-                                            },
-                                        );
+                                        let _ = browse_sender.send(BrowseOutcome::ArtistReleases { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
+                            Command::BrowseArtistCatalogue { id, release_types, offset, limit } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::artist_catalogue_browse(
+                                                &session,
+                                                &id,
+                                                &release_types,
+                                                offset,
+                                                limit,
+                                            )
+                                            .await;
+                                            let _ = sender.send(BrowseOutcome::ArtistCatalogue { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::ArtistCatalogue { request_id, result: Err(error) });
                                     }
                                 }
                             }
@@ -492,12 +511,11 @@ async fn run(
                         BrowseOutcome::Artist { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_artist", &result)?;
                         }
-                        BrowseOutcome::ArtistCatalogueTracks { request_id, result } => {
-                            engine.send_browse_response(
-                                &request_id,
-                                "browse_artist_catalogue_tracks",
-                                &result,
-                            )?;
+                        BrowseOutcome::ArtistReleases { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_artist_releases", &result)?;
+                        }
+                        BrowseOutcome::ArtistCatalogue { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_artist_catalogue", &result)?;
                         }
                         BrowseOutcome::LikedSongs { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_liked_songs", &result)?;

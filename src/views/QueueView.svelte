@@ -8,7 +8,7 @@
 
   function playAt(i) {
     if (i === playback.current_index) togglePlay();
-    else api.playQueue(queue, i).catch(() => {});
+    else api.playQueueIndex(i).catch(() => {});
   }
 
   /* ---------------- Windowed rendering ----------------
@@ -169,7 +169,7 @@
 
 <section class="view page">
   <div style="padding:var(--s4) 0 var(--s6)">
-    <span class="eyebrow">Up next</span>
+    <span class="tag">Up next</span>
     <h1 class="page-title">Queue</h1>
     {#if queue.length}
       <p class="detail-meta" style="margin-top:var(--s3)">

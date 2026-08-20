@@ -68,6 +68,9 @@ pub enum Command {
         index: usize,
         position_ms: u32,
     },
+    PlayQueueIndex {
+        index: usize,
+    },
     Play,
     Pause,
     Next,
@@ -86,6 +89,9 @@ pub enum Command {
     },
     AddQueue {
         track: TrackRef,
+    },
+    AddQueueBatch {
+        tracks: Vec<TrackRef>,
     },
     RemoveQueue {
         index: usize,
@@ -116,12 +122,25 @@ pub enum Command {
     BrowseArtist {
         id: String,
     },
-    /// Lazily resolves tracks across selected artist release groups into one
-    /// continuous playback queue.
-    BrowseArtistCatalogueTracks {
+    /// One bounded page of an artist's release artwork/metadata.
+    BrowseArtistReleases {
         id: String,
         #[serde(default)]
         release_types: Vec<String>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_browse_page_size")]
+        limit: usize,
+    },
+    /// A bounded number of complete releases for the expanded catalogue view.
+    BrowseArtistCatalogue {
+        id: String,
+        #[serde(default)]
+        release_types: Vec<String>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_catalogue_release_page_size")]
+        limit: usize,
     },
     /// One authenticated page of the user's Saved Tracks collection.
     BrowseLikedSongs {
@@ -185,6 +204,14 @@ pub enum Command {
     /// published in its `needs_login` state. No-op while a session is live or
     /// a flow is already running.
     Login,
+}
+
+fn default_browse_page_size() -> usize {
+    20
+}
+
+fn default_catalogue_release_page_size() -> usize {
+    4
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -306,15 +333,9 @@ pub struct ArtistRef {
     pub portrait_url: Option<String>,
 }
 
-/// An artist's catalogue, grouped the way the official client groups it.
-///
-/// The four groups come from the artist metadata itself (one request), which
-/// carries them as separate lists of album URIs; resolving those URIs into
-/// [`AlbumRef`]s is what costs extra round-trips, so the total resolved per
-/// browse is capped (see `browse::ARTIST_RELEASE_BUDGET`). Each group keeps
-/// the order the metadata listed it in, and a group can be shorter than the
-/// artist's true catalogue when the cap bit — `appears_on` reaches the high
-/// hundreds for prolific features artists.
+/// An artist's resolved release page, grouped the way the official client
+/// groups it. The vectors contain only the requested page, never the full
+/// catalogue.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ArtistReleases {
@@ -322,6 +343,33 @@ pub struct ArtistReleases {
     pub singles: Vec<AlbumRef>,
     pub compilations: Vec<AlbumRef>,
     pub appears_on: Vec<AlbumRef>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ArtistReleaseCounts {
+    pub albums: usize,
+    pub singles: usize,
+    pub compilations: usize,
+    pub appears_on: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ArtistReleasePage {
+    pub releases: ArtistReleases,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ArtistCataloguePage {
+    pub releases: Vec<AlbumBrowse>,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 /// Payload of a successful [`Command::BrowseArtist`] response.
@@ -334,6 +382,9 @@ pub struct ArtistBrowse {
     pub portrait_url: Option<String>,
     pub top_tracks: Vec<TrackRef>,
     pub releases: ArtistReleases,
+    pub release_counts: ArtistReleaseCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_next_offset: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -668,6 +719,17 @@ mod tests {
     }
 
     #[test]
+    fn queue_index_jump_does_not_resend_the_queue() {
+        let jump: Request = serde_json::from_value(json!({
+            "request_id": "request-jump",
+            "type": "play_queue_index",
+            "index": 79,
+        }))
+        .unwrap();
+        assert!(matches!(jump.command, Command::PlayQueueIndex { index: 79 }));
+    }
+
+    #[test]
     fn browse_commands_deserialize_from_the_line_protocol() {
         let playlists: Request = serde_json::from_value(json!({
             "request_id": "request-11",
@@ -707,6 +769,18 @@ mod tests {
         .unwrap();
         assert!(matches!(artist.command, Command::BrowseArtist { .. }));
 
+        let catalogue: Request = serde_json::from_value(json!({
+            "request_id": "request-catalogue",
+            "type": "browse_artist_catalogue",
+            "id": "0123456789ABCDEFGHIJKL",
+            "release_types": ["albums", "singles"],
+        }))
+        .unwrap();
+        assert!(matches!(
+            catalogue.command,
+            Command::BrowseArtistCatalogue { offset: 0, limit: 4, .. }
+        ));
+
         let search: Request = serde_json::from_value(json!({
             "request_id": "request-15",
             "type": "browse_search",
@@ -717,20 +791,6 @@ mod tests {
         assert!(matches!(
             search.command,
             Command::BrowseSearch { ref query, limit: 10 } if query == "fire & ice"
-        ));
-
-        let catalogue: Request = serde_json::from_value(json!({
-            "request_id": "request-16",
-            "type": "browse_artist_catalogue_tracks",
-            "id": "0123456789ABCDEFGHIJKL",
-            "release_types": ["albums", "singles"],
-        }))
-        .unwrap();
-        assert!(matches!(
-            catalogue.command,
-            Command::BrowseArtistCatalogueTracks { ref id, ref release_types }
-                if id == "0123456789ABCDEFGHIJKL"
-                    && release_types == &["albums".to_owned(), "singles".to_owned()]
         ));
 
         let liked_songs: Request = serde_json::from_value(json!({

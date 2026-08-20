@@ -12,6 +12,7 @@
     goBack,
     goForward,
     ui,
+    maybeBackfillLazyQueue,
   } from "./lib/state.svelte.js";
   import IconSprite from "./components/IconSprite.svelte";
   import Icon from "./components/Icon.svelte";
@@ -33,6 +34,14 @@
 
   $effect(() => {
     initEvents();
+  });
+
+  // Dynamic album/catalogue queues stay small. The next bounded page is
+  // requested only when playback approaches the loaded tail.
+  $effect(() => {
+    playback.current_index;
+    playback.queue.length;
+    maybeBackfillLazyQueue().catch(() => {});
   });
 
   /* Whether decorative animation is allowed to run at all. A background window

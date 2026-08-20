@@ -611,7 +611,7 @@ impl Engine {
         // commands may wait a tick — no press is dropped.
         if matches!(
             &command,
-            Command::PlayQueue { .. } | Command::Next | Command::Previous
+            Command::PlayQueue { .. } | Command::PlayQueueIndex { .. } | Command::Next | Command::Previous
         ) {
             self.pace_track_change().await;
         }
@@ -624,7 +624,8 @@ impl Engine {
             | Command::BrowsePlaylist { .. }
             | Command::BrowseAlbum { .. }
             | Command::BrowseArtist { .. }
-            | Command::BrowseArtistCatalogueTracks { .. }
+            | Command::BrowseArtistReleases { .. }
+            | Command::BrowseArtistCatalogue { .. }
             | Command::BrowseLikedSongs { .. }
             | Command::BrowseSearch { .. }
             | Command::BrowseTrackCredits { .. }
@@ -639,6 +640,7 @@ impl Engine {
                 index,
                 position_ms,
             } => self.play_queue(queue, index, position_ms),
+            Command::PlayQueueIndex { index } => self.play_queue_index(index),
             Command::Play => self.play(),
             Command::Pause => self.pause(),
             Command::Next => self.advance(false),
@@ -648,6 +650,7 @@ impl Engine {
             Command::SetShuffle { enabled } => self.set_shuffle(enabled),
             Command::SetRepeat { mode } => self.set_repeat(mode),
             Command::AddQueue { track } => self.add_queue(track),
+            Command::AddQueueBatch { tracks } => self.add_queue_batch(tracks),
             Command::RemoveQueue { index } => self.remove_queue(index),
             Command::MoveQueue { from, to } => self.move_queue(from, to),
         }
@@ -869,6 +872,26 @@ impl Engine {
         Ok(true)
     }
 
+    fn play_queue_index(&mut self, index: usize) -> Result<bool, String> {
+        if index >= self.state.queue.len() {
+            return Err(format!("queue index {index} is out of range"));
+        }
+        if let Some(current) = self.state.current_index {
+            if current != index {
+                self.history.push(current);
+            }
+        }
+        self.state.current_index = Some(index);
+        self.state.duration_ms = self.state.queue[index].duration_ms;
+        self.update_position(0);
+        self.state.playing = true;
+        self.state.error = None;
+        self.rebuild_shuffle_pool();
+        self.last_track_change = Some(Instant::now());
+        self.load_current(true)?;
+        Ok(true)
+    }
+
     fn play(&mut self) -> Result<bool, String> {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
@@ -1070,6 +1093,20 @@ impl Engine {
     fn add_queue(&mut self, track: TrackRef) -> Result<bool, String> {
         parse_track_uri(&track)?;
         self.state.queue.push(track);
+        self.history.clear();
+        self.rebuild_shuffle_pool();
+        self.preload_next();
+        Ok(true)
+    }
+
+    fn add_queue_batch(&mut self, tracks: Vec<TrackRef>) -> Result<bool, String> {
+        for track in &tracks {
+            parse_track_uri(track)?;
+        }
+        if tracks.is_empty() {
+            return Ok(true);
+        }
+        self.state.queue.extend(tracks);
         self.history.clear();
         self.rebuild_shuffle_pool();
         self.preload_next();

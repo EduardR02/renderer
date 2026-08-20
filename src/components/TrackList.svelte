@@ -29,6 +29,12 @@
     showPlays = false,
     /** Read-only collections can suppress the local-only heart affordance. */
     showLike = true,
+    /**
+     * Whether this list owns the pane's scroll position. True for a list that
+     * is the page's content (a playlist, an album); false for one embedded
+     * among other sections, which must leave the shared scroller alone.
+     */
+    resetsScroll = true,
     sortKey = null,
     sortDirection = "asc",
     onSort = null,
@@ -181,7 +187,13 @@
   }
 
   function resetWindow(length, scroller) {
-    if (scroller) scroller.scrollTop = 0;
+    // Only a list that *is* the page may move the page. The scroller is a
+    // shared ancestor, so a list embedded among other content must not touch
+    // it: the artist catalogue mounts several TrackLists per lazily loaded
+    // batch, and each one homing the scroller to 0 threw the reader back to
+    // the top of the page every time scrolling reached the next batch — the
+    // scroll position fighting the very load it had just triggered.
+    if (scroller && resetsScroll) scroller.scrollTop = 0;
     const initialLast = scroller
       ? Math.min(length, Math.ceil(scroller.clientHeight / ROW_H) + OVERSCAN)
       : length;
@@ -321,7 +333,7 @@
       {/if}
       {#if showAlbum}
         <button
-          class="tl-sort-btn"
+          class="tl-sort-btn tl-col-album"
           class:active={sortKey === "album"}
           aria-label={sortAriaLabel("album", "album")}
           aria-pressed={sortKey === "album"}
@@ -330,7 +342,7 @@
       {/if}
       {#if showAdded}
         <button
-          class="tl-sort-btn"
+          class="tl-sort-btn tl-col-added"
           class:active={sortKey === "added"}
           aria-label={sortAriaLabel("added", "date added")}
           aria-pressed={sortKey === "added"}

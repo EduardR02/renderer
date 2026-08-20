@@ -9,7 +9,7 @@
 <section class="view page">
   <div style="padding:var(--s7) 0 var(--s2)">
     <span class="login-mark"><Icon name="note" size={20} /></span>
-    <span class="eyebrow">Spotify Renderer</span>
+    <span class="tag">Spotify Renderer</span>
     <h1 class="page-title">Sign in to start listening</h1>
   </div>
 

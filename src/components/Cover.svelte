@@ -1,5 +1,6 @@
 <script>
   import { resolveCoverUrl } from "../lib/state.svelte.js";
+  import { identityTone } from "../lib/covertone.svelte.js";
 
   /**
    * Artwork in four tiers, falling back in order:
@@ -41,21 +42,10 @@
   const tier = $derived(src ? "single" : pool.length >= 4 ? "mosaic" : pool.length ? "single" : "gen");
   const primary = $derived(src || pool[0] || "");
 
-  /**
-   * FNV-1a over the id, mapped onto the restrained three-accent palette.
-   * Stable across restarts, so generated playlist art keeps its identity.
-   */
-  function tone(seed) {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < seed.length; i++) {
-      h ^= seed.charCodeAt(i);
-      h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return ["var(--rose)", "var(--foam)", "var(--love)"][h % 3];
-  }
-
   const letter = $derived((name.trim()[0] ?? "?").toUpperCase());
-  const seedTone = $derived(tone(id || name));
+  /* One hash, one ring of hues, shared with the header wash — so a coverless
+     playlist's tile and its page open on the same colour. See covertone. */
+  const seedTone = $derived(identityTone(id || name));
   /** Resolved `cover://` urls, indexed the same as the source list. */
   let resolved = $state({});
 
@@ -105,7 +95,8 @@
     class:raised
     style:width={fill ? "100%" : `${size}px`}
     style:height={fill ? "100%" : `${size}px`}
-    style:--tone={seedTone}
+    style:--tone-a={seedTone.tileA}
+    style:--tone-b={seedTone.tileB}
     style:--tile={fill ? null : `${size}px`}
     data-letter={letter}
     role="img"

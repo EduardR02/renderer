@@ -1,9 +1,10 @@
 <script>
-  import { detail, api, playback, navigate, route, promotePlaylist } from "../lib/state.svelte.js";
+  import { detail, api, playback, navigate, route, promotePlaylist, togglePlay } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
+  import { coverTone } from "../lib/covertone.svelte.js";
   import { formatTotal } from "../lib/time.js";
 
   const pl = $derived(detail.playlist);
@@ -104,21 +105,21 @@
     }
   }
 
-  /* Same deterministic palette mapping as generated artwork, so the header
-     wash and identity tile stay related without introducing extra hues. */
-  const washTone = $derived.by(() => {
-    const seed = pl?.id ?? "";
-    let h = 0x811c9dc5;
-    for (let i = 0; i < seed.length; i++) {
-      h ^= seed.charCodeAt(i);
-      h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return ["var(--rose)", "var(--foam)", "var(--love)"][h % 3];
-  });
-
   /* Fallback for a playlist the backend has not swept yet: derive the mosaic
      candidates from the tracks we already have on screen. */
   const artPool = $derived([...new Set(tracks.map((t) => t.cover_url).filter(Boolean))].slice(0, 4));
+
+  /**
+   * The page's colour, read out of the artwork.
+   *
+   * A playlist's own cover if it has one; otherwise the first track's, because
+   * Spotify's rootlist ships no playlist covers at all and a mosaic of four
+   * sleeves has no single colour anyway — the first one is at least a real
+   * colour from the record you are about to hear. With neither, `coverTone`
+   * falls back to the same id-hashed identity hue the generated tile uses, so
+   * the header and the tile still agree.
+   */
+  const tone = $derived(coverTone(pl?.cover_url || artPool[0] || "", pl?.id ?? ""));
 
   let renaming = $state(false);
   let nameDraft = $state("");
@@ -174,7 +175,35 @@
     api.playQueue(queue, i).catch(() => {});
   }
 
-  function playAll() {
+  /**
+   * Whether what is playing came from this playlist.
+   *
+   * Judged by the queue's contents rather than by a "current context" the
+   * engine does not report: if the playing track is one of ours *and* the
+   * queue is the same length, this playlist is what is on. Cheap, and wrong
+   * only for the case of two identical-length playlists sharing the current
+   * track — where either answer is defensible.
+   */
+  const playingThis = $derived.by(() => {
+    const uri = playback.current_uri;
+    if (!uri || !tracks.length) return false;
+    if (playback.queue.length !== tracks.length) return false;
+    return tracks.some((track) => track.uri === uri);
+  });
+
+  /**
+   * Play, or pause/resume what this playlist already started.
+   *
+   * Restarting from track one when the playlist is already playing is the
+   * behaviour of a button that has not been told what is going on: the glyph
+   * says play while music from this very list is coming out of the speakers,
+   * and pressing it throws away the listener's position.
+   */
+  function playOrToggle() {
+    if (playingThis) {
+      togglePlay();
+      return;
+    }
     const queue = sortedTracks;
     if (!queue.length) return;
     markPlayed();
@@ -283,7 +312,12 @@
   }
 </script>
 
-<section class="view page wash" style:--wash={washTone}>
+<section
+  class="view page wash"
+  style:--tone-wash={tone.wash}
+  style:--tone-wash-deep={tone.washDeep}
+  style:--tone-glow={tone.glow}
+>
   {#if !pl}
     <header class="detail-head">
       <span class="art lg skeleton" style="width:184px;height:184px"></span>
@@ -304,7 +338,7 @@
         raised
       />
       <div>
-        <span class="eyebrow">Playlist</span>
+        <span class="tag">Playlist</span>
         {#if renaming}
           <form
             class="rename-form"
@@ -349,8 +383,13 @@
           {/if}
         </p>
         <div class="actions">
-          <button class="play-lg" title="Play" onclick={playAll} disabled={!tracks.length}>
-            <Icon name="play" size={19} />
+          <button
+            class="play-lg"
+            title={playingThis ? (playback.playing ? "Pause" : "Resume") : "Play"}
+            onclick={playOrToggle}
+            disabled={!tracks.length}
+          >
+            <Icon name={playingThis && playback.playing ? "pause" : "play"} size={19} />
           </button>
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
             <Icon name="shuffle" size={14} />Shuffle

@@ -446,16 +446,6 @@ fn parse_album_payload(entity_uri: &str, payload: &[u8]) -> Option<AlbumRef> {
     Some(album_ref(&album))
 }
 
-/// Album metadata already carries its ordered track URI list, so a catalogue
-/// queue can resolve albums in batches and then resolve all tracks in batches;
-/// it never needs one network request per release or per song.
-fn parse_album_track_uris(entity_uri: &str, payload: &[u8]) -> Option<Vec<SpotifyUri>> {
-    let message = librespot_protocol::metadata::Album::parse_from_bytes(payload).ok()?;
-    let uri = SpotifyUri::from_uri(entity_uri).ok()?;
-    let album = Album::parse(&message, &uri).ok()?;
-    Some(album.tracks().cloned().collect())
-}
-
 /// Resolves a batch of track URIs into `TrackRef`s via the extended-metadata
 /// endpoint: URIs are deduplicated by id (playlists repeat tracks), fetched
 /// in ~40-URI batches in first-appearance order, and items that fail to
@@ -820,38 +810,77 @@ fn artist_portrait(artist: &Artist) -> Option<String> {
     cover_url(&artist.portraits).or_else(|| cover_url(&artist.portrait_group))
 }
 
-/// Album URIs one artist browse will resolve, across all four release groups.
-///
-/// The groups themselves are free — they arrive inside the single artist
-/// metadata response as lists of URIs — but turning those URIs into names,
-/// covers and years costs one extended-metadata POST per 40. Catalogue sizes
-/// are wildly uneven and the tail is entirely in `appears_on`: measured live
-/// (2026-08-19) Taylor Swift has 33/79/1/158 across albums/singles/
-/// compilations/appears-on, David Bowie 60/102/22/154, and Drake 21/62/0/836.
-/// Resolving everything would therefore cost 7 requests for one artist and 23
-/// for another, against the 1 this browse used to cost.
-///
-/// A flat budget keeps that predictable instead: whoever the artist is, an
-/// artist page costs at most `200 / 40 = 5` album requests. Normal artists
-/// stay well inside it and see their whole catalogue.
-const ARTIST_RELEASE_BUDGET: usize = 200;
+const INITIAL_ARTIST_RELEASES: usize = 12;
+const MAX_ARTIST_RELEASE_PAGE: usize = 40;
 
-/// Splits [`ARTIST_RELEASE_BUDGET`] across the four groups in priority order:
-/// the artist's own albums first, then singles, then compilations, and
-/// "appears on" last with whatever is left.
-///
-/// Priority order rather than equal shares because the groups are not equally
-/// wanted: an artist's own releases are the page, while `appears_on` is the
-/// long tail nobody scrolls to the end of — and it is precisely the group
-/// that runs to the hundreds. Pure so the arithmetic is unit-testable.
-fn allocate_release_budget(sizes: [usize; 4], budget: usize) -> [usize; 4] {
-    let mut remaining = budget;
-    let mut taken = [0usize; 4];
-    for (slot, size) in taken.iter_mut().zip(sizes) {
-        *slot = size.min(remaining);
-        remaining -= *slot;
+fn artist_release_groups(artist: &Artist) -> [Vec<SpotifyUri>; 4] {
+    [
+        artist.albums_current().cloned().collect(),
+        artist.singles_current().cloned().collect(),
+        artist.compilations_current().cloned().collect(),
+        artist.appears_on_albums_current().cloned().collect(),
+    ]
+}
+
+fn selected_release_group_indices(release_types: &[String]) -> Result<Vec<usize>, String> {
+    if release_types.is_empty() {
+        return Ok(vec![0, 1, 2, 3]);
     }
-    taken
+    let mut selected = Vec::new();
+    for kind in release_types {
+        let index = match kind.as_str() {
+            "albums" => 0,
+            "singles" => 1,
+            "compilations" => 2,
+            "appears_on" => 3,
+            _ => return Err(format!("unsupported artist release type: {kind}")),
+        };
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    Ok(selected)
+}
+
+async fn resolve_artist_release_page(
+    session: &Session,
+    groups: &[Vec<SpotifyUri>; 4],
+    release_types: &[String],
+    offset: usize,
+    limit: usize,
+) -> Result<spotify_playback_engine::protocol::ArtistReleasePage, String> {
+    let selected = selected_release_group_indices(release_types)?;
+    let total = selected.iter().map(|&index| groups[index].len()).sum::<usize>();
+    let limit = limit.clamp(1, MAX_ARTIST_RELEASE_PAGE);
+    let page: Vec<(usize, &SpotifyUri)> = selected
+        .iter()
+        .flat_map(|&index| groups[index].iter().map(move |uri| (index, uri)))
+        .skip(offset)
+        .take(limit)
+        .collect();
+    let resolved = fetch_albums(session, page.iter().map(|(_, uri)| *uri)).await?;
+    let by_id: HashMap<&str, &AlbumRef> = resolved
+        .iter()
+        .map(|album| (album.id.as_str(), album))
+        .collect();
+    let mut releases = spotify_playback_engine::protocol::ArtistReleases::default();
+    for (group, uri) in page {
+        let Some(album) = by_id.get(id_of(uri).as_str()).map(|album| (*album).clone()) else {
+            continue;
+        };
+        match group {
+            0 => releases.albums.push(album),
+            1 => releases.singles.push(album),
+            2 => releases.compilations.push(album),
+            _ => releases.appears_on.push(album),
+        }
+    }
+    let end = offset.saturating_add(limit).min(total);
+    Ok(spotify_playback_engine::protocol::ArtistReleasePage {
+        releases,
+        total,
+        next_offset: (end < total).then_some(end),
+    })
 }
 
 /// Artist portrait, top tracks, and the grouped release catalogue via the
@@ -882,36 +911,15 @@ pub async fn artist_browse(
         }
     }
 
-    let groups: [Vec<SpotifyUri>; 4] = [
-        artist.albums_current().cloned().collect(),
-        artist.singles_current().cloned().collect(),
-        artist.compilations_current().cloned().collect(),
-        artist.appears_on_albums_current().cloned().collect(),
-    ];
-    let takes = allocate_release_budget(
-        [groups[0].len(), groups[1].len(), groups[2].len(), groups[3].len()],
-        ARTIST_RELEASE_BUDGET,
-    );
-    let wanted: Vec<&SpotifyUri> = groups
-        .iter()
-        .zip(takes)
-        .flat_map(|(group, take)| group.iter().take(take))
-        .collect();
-    let resolved = fetch_albums(session, wanted).await?;
-
-    // Resolution drops albums that fail per-entity (region-locked, pulled),
-    // so the groups are rebuilt by lookup rather than by position.
-    let by_id: std::collections::HashMap<&str, &AlbumRef> = resolved
-        .iter()
-        .map(|album| (album.id.as_str(), album))
-        .collect();
-    let group_of = |index: usize| -> Vec<AlbumRef> {
-        groups[index]
-            .iter()
-            .take(takes[index])
-            .filter_map(|uri| by_id.get(id_of(uri).as_str()).map(|album| (*album).clone()))
-            .collect()
-    };
+    let groups = artist_release_groups(&artist);
+    let page = resolve_artist_release_page(
+        session,
+        &groups,
+        &[],
+        0,
+        INITIAL_ARTIST_RELEASES,
+    )
+    .await?;
 
     Ok(spotify_playback_engine::protocol::ArtistBrowse {
         id: id_of(&artist.id),
@@ -919,72 +927,124 @@ pub async fn artist_browse(
         name: artist.name.clone(),
         portrait_url: artist_portrait(&artist),
         top_tracks,
-        releases: spotify_playback_engine::protocol::ArtistReleases {
-            albums: group_of(0),
-            singles: group_of(1),
-            compilations: group_of(2),
-            appears_on: group_of(3),
+        releases: page.releases,
+        release_counts: spotify_playback_engine::protocol::ArtistReleaseCounts {
+            albums: groups[0].len(),
+            singles: groups[1].len(),
+            compilations: groups[2].len(),
+            appears_on: groups[3].len(),
         },
+        releases_next_offset: page.next_offset,
     })
 }
 
-/// Explicit, lazy cross-release queue for an artist catalogue. Album and
-/// single groups are the useful default; compilations and appears-on releases
-/// are opt-in because they are duplicate-heavy and can be enormous. The
-/// request only happens when the user presses Play catalogue.
-pub async fn artist_catalogue_tracks_browse(
+pub async fn artist_releases_browse(
     session: &Session,
     id: &str,
     release_types: &[String],
-) -> Result<Vec<TrackRef>, String> {
+    offset: usize,
+    limit: usize,
+) -> Result<spotify_playback_engine::protocol::ArtistReleasePage, String> {
+    let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
+        .map_err(|error| format!("invalid artist id: {error}"))?;
+    let artist: Artist = metadata_get(session, &uri, "artist").await?;
+    let groups = artist_release_groups(&artist);
+    resolve_artist_release_page(session, &groups, release_types, offset, limit).await
+}
+
+struct CatalogueReleaseSeed {
+    header: spotify_playback_engine::protocol::AlbumBrowse,
+    track_uris: Vec<SpotifyUri>,
+}
+
+fn parse_catalogue_release_payload(
+    entity_uri: &str,
+    payload: &[u8],
+) -> Option<CatalogueReleaseSeed> {
+    let message = librespot_protocol::metadata::Album::parse_from_bytes(payload).ok()?;
+    let uri = SpotifyUri::from_uri(entity_uri).ok()?;
+    let album = Album::parse(&message, &uri).ok()?;
+    Some(CatalogueReleaseSeed {
+        header: spotify_playback_engine::protocol::AlbumBrowse {
+            id: id_of(&album.id),
+            uri: uri_of(&album.id),
+            name: album.name.clone(),
+            artist_names: album.artists.iter().map(|artist| artist.name.clone()).collect(),
+            artist_ids: album.artists.iter().map(|artist| id_of(&artist.id)).collect(),
+            cover_url: cover_url(&album.covers),
+            year: album_year(&album),
+            tracks: Vec::new(),
+        },
+        track_uris: album.tracks().cloned().collect(),
+    })
+}
+
+/// A lazy page of complete releases for the expanded artist catalogue. The
+/// page boundary is albums, not arbitrary track counts: opening a release
+/// always resolves that logical unit in full, while scrolling controls how
+/// many releases exist in memory and on screen.
+pub async fn artist_catalogue_browse(
+    session: &Session,
+    id: &str,
+    release_types: &[String],
+    offset: usize,
+    limit: usize,
+) -> Result<spotify_playback_engine::protocol::ArtistCataloguePage, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
         .map_err(|error| format!("invalid artist id: {error}"))?;
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
 
-    let wanted: HashSet<&str> = if release_types.is_empty() {
-        ["albums", "singles"].into_iter().collect()
+    let selected = if release_types.is_empty() {
+        vec![0, 1]
     } else {
-        release_types.iter().map(String::as_str).collect()
+        selected_release_group_indices(release_types)?
     };
-    if let Some(invalid) = wanted
-        .iter()
-        .find(|kind| !matches!(**kind, "albums" | "singles" | "compilations" | "appears_on"))
-    {
-        return Err(format!("unsupported artist release type: {invalid}"));
-    }
-
-    let groups: [(&str, Vec<SpotifyUri>); 4] = [
-        ("albums", artist.albums_current().cloned().collect()),
-        ("singles", artist.singles_current().cloned().collect()),
-        ("compilations", artist.compilations_current().cloned().collect()),
-        (
-            "appears_on",
-            artist.appears_on_albums_current().cloned().collect(),
-        ),
-    ];
-    const MAX_CATALOGUE_RELEASES: usize = 250;
+    let groups = artist_release_groups(&artist);
     let mut seen_releases = HashSet::new();
-    let releases: Vec<SpotifyUri> = groups
+    let releases: Vec<SpotifyUri> = selected
         .iter()
-        .filter(|(kind, _)| wanted.contains(kind))
-        .flat_map(|(_, releases)| releases.iter())
+        .flat_map(|&index| groups[index].iter())
         .filter(|uri| seen_releases.insert(uri_of(uri)))
-        .take(MAX_CATALOGUE_RELEASES)
         .cloned()
         .collect();
-    if releases.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let album_tracks = fetch_extended(
+    let total = releases.len();
+    let limit = limit.clamp(1, 6);
+    let end = offset.saturating_add(limit).min(total);
+    let page = releases.get(offset..end).unwrap_or_default();
+    let mut seeds = fetch_extended(
         session,
-        releases.iter(),
+        page.iter(),
         ExtensionKind::ALBUM_V4,
-        parse_album_track_uris,
+        parse_catalogue_release_payload,
     )
     .await?;
-    let track_uris: Vec<SpotifyUri> = album_tracks.into_iter().flatten().collect();
-    fetch_tracks(session, track_uris.iter()).await
+    let wanted_tracks: Vec<SpotifyUri> = seeds
+        .iter()
+        .flat_map(|release| release.track_uris.iter().cloned())
+        .collect();
+    let resolved_tracks = fetch_tracks(session, wanted_tracks.iter()).await?;
+    let by_uri: HashMap<String, TrackRef> = resolved_tracks
+        .into_iter()
+        .map(|track| (track.uri.clone(), track))
+        .collect();
+    let mut complete = Vec::with_capacity(seeds.len());
+    for mut release in seeds.drain(..) {
+        release.header.tracks = release
+            .track_uris
+            .iter()
+            .filter_map(|uri| by_uri.get(&uri_of(uri)).cloned())
+            .collect();
+        match album_playcounts(session, &release.header.uri, release.track_uris.len()).await {
+            Ok(counts) => apply_playcounts(&mut release.header.tracks, &counts),
+            Err(error) => eprintln!("album play counts unavailable: {error}"),
+        }
+        complete.push(release.header);
+    }
+    Ok(spotify_playback_engine::protocol::ArtistCataloguePage {
+        releases: complete,
+        total,
+        next_offset: (end < total).then_some(end),
+    })
 }
 
 fn context_page_track_uris(
@@ -2642,31 +2702,13 @@ mod tests {
     }
 
     #[test]
-    fn the_release_budget_favours_the_artists_own_catalogue() {
-        // Measured live: Taylor Swift's four groups. Everything but the
-        // "appears on" tail fits, so her own catalogue is complete.
+    fn artist_release_selection_is_explicit_and_validated() {
+        assert_eq!(selected_release_group_indices(&[]).unwrap(), vec![0, 1, 2, 3]);
         assert_eq!(
-            allocate_release_budget([33, 79, 1, 158], ARTIST_RELEASE_BUDGET),
-            [33, 79, 1, 87]
+            selected_release_group_indices(&["singles".into(), "albums".into()]).unwrap(),
+            vec![1, 0]
         );
-        // Drake: 836 features. The budget stops that from costing 23 requests.
-        let drake = allocate_release_budget([21, 62, 0, 836], ARTIST_RELEASE_BUDGET);
-        assert_eq!(drake, [21, 62, 0, 117]);
-        assert_eq!(drake.iter().sum::<usize>(), ARTIST_RELEASE_BUDGET);
-        // David Bowie: own catalogue alone nearly fills the budget, and it is
-        // the "appears on" group that gets squeezed, never the albums.
-        assert_eq!(
-            allocate_release_budget([60, 102, 22, 154], ARTIST_RELEASE_BUDGET),
-            [60, 102, 22, 16]
-        );
-
-        // A modest artist is fully resolved, and an artist with nothing costs
-        // no album request at all.
-        assert_eq!(allocate_release_budget([4, 2, 0, 3], ARTIST_RELEASE_BUDGET), [4, 2, 0, 3]);
-        assert_eq!(allocate_release_budget([0, 0, 0, 0], ARTIST_RELEASE_BUDGET), [0, 0, 0, 0]);
-        // The budget is never exceeded, even when the first group alone busts it.
-        assert_eq!(allocate_release_budget([500, 10, 10, 10], 200), [200, 0, 0, 0]);
-        assert_eq!(allocate_release_budget([5, 5, 5, 5], 0), [0, 0, 0, 0]);
+        assert!(selected_release_group_indices(&["podcasts".into()]).is_err());
     }
 
     #[test]

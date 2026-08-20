@@ -409,10 +409,25 @@ impl EngineClient {
         .map(|_| ())
     }
 
+    pub async fn play_queue_index(&self, index: usize) -> Result<(), String> {
+        self.request("play_queue_index", json!({"index": index}))
+            .await
+            .map(|_| ())
+    }
+
     pub async fn add_queue(&self, track: &Track) -> Result<(), String> {
         self.request(
             "add_queue",
             json!({"track": serde_json::to_value(track).map_err(|error| error.to_string())?}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn add_queue_batch(&self, tracks: &[Track]) -> Result<(), String> {
+        self.request(
+            "add_queue_batch",
+            json!({"tracks": tracks}),
         )
         .await
         .map(|_| ())
@@ -474,18 +489,36 @@ impl EngineClient {
         parse_data(reply, "browse_artist")
     }
 
-    pub async fn browse_artist_catalogue_tracks(
+    pub async fn browse_artist_releases(
         &self,
         id: &str,
         release_types: &[String],
-    ) -> Result<Vec<spotify_playback_engine::protocol::TrackRef>, String> {
+        offset: usize,
+        limit: usize,
+    ) -> Result<spotify_playback_engine::protocol::ArtistReleasePage, String> {
         let reply = self
             .request(
-                "browse_artist_catalogue_tracks",
-                json!({"id": id, "release_types": release_types}),
+                "browse_artist_releases",
+                json!({"id": id, "release_types": release_types, "offset": offset, "limit": limit}),
             )
             .await?;
-        parse_data(reply, "browse_artist_catalogue_tracks")
+        parse_data(reply, "browse_artist_releases")
+    }
+
+    pub async fn browse_artist_catalogue(
+        &self,
+        id: &str,
+        release_types: &[String],
+        offset: usize,
+        limit: usize,
+    ) -> Result<spotify_playback_engine::protocol::ArtistCataloguePage, String> {
+        let reply = self
+            .request(
+                "browse_artist_catalogue",
+                json!({"id": id, "release_types": release_types, "offset": offset, "limit": limit}),
+            )
+            .await?;
+        parse_data(reply, "browse_artist_catalogue")
     }
 
     pub async fn browse_liked_songs(

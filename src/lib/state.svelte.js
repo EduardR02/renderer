@@ -89,6 +89,95 @@ export const playback = $state({
   error: null,
 });
 
+const lazyQueue = $state({ generation: 0, source: null, cursor: null, loading: false, retryAfter: 0 });
+const QUEUE_BACKFILL_LOW_WATER = 8;
+let lazyBackfillPromise = null;
+const cataloguePageCache = new Map();
+const cataloguePagePending = new Map();
+
+function clearLazyQueue() {
+  lazyQueue.generation += 1;
+  lazyQueue.source = null;
+  lazyQueue.cursor = null;
+  lazyQueue.loading = false;
+  lazyQueue.retryAfter = 0;
+  lazyBackfillPromise = null;
+}
+
+async function startLazyQueue(tracks, source, cursor, index = 0) {
+  if (!tracks?.length) throw new Error("No playable tracks were returned.");
+  clearLazyQueue();
+  const generation = lazyQueue.generation;
+  await invoke("play_queue", { queue: tracks, index });
+  if (generation !== lazyQueue.generation) return;
+  lazyQueue.source = cursor == null ? null : source;
+  lazyQueue.cursor = cursor;
+}
+
+function catalogueTracks(releases) {
+  return (releases ?? []).flatMap((release) => release?.tracks ?? []);
+}
+
+export function loadCataloguePage(id, releaseTypes = ["albums", "singles"], offset = 0, limit = 4) {
+  const key = `${id}:${releaseTypes.join(",")}:${offset}:${limit}`;
+  if (cataloguePageCache.has(key)) return Promise.resolve(cataloguePageCache.get(key));
+  if (cataloguePagePending.has(key)) return cataloguePagePending.get(key);
+  const request = api.browseArtistCatalogue(id, releaseTypes, offset, limit)
+    .then((page) => {
+      cataloguePageCache.set(key, page);
+      return page;
+    })
+    .finally(() => cataloguePagePending.delete(key));
+  cataloguePagePending.set(key, request);
+  return request;
+}
+
+export async function playCatalogueContext(releases, id, releaseTypes, nextOffset, index) {
+  // A catalogue is progressively discovered in release order. Global shuffle
+  // would require enumerating the very catalogue this path intentionally does
+  // not fetch, so this context is explicitly sequential.
+  if (playback.shuffle) await invoke("set_shuffle", { enabled: false });
+  await startLazyQueue(
+    catalogueTracks(releases),
+    { kind: "catalogue", id, releaseTypes: [...releaseTypes] },
+    nextOffset,
+    index,
+  );
+}
+
+async function backfillLazyQueue(force = false) {
+  const source = lazyQueue.source;
+  const cursor = lazyQueue.cursor;
+  if (!source || cursor == null) return;
+  if (!force && (performance.now() < lazyQueue.retryAfter || playback.current_index < 0 || playback.queue.length - playback.current_index > QUEUE_BACKFILL_LOW_WATER)) return;
+  if (lazyBackfillPromise) return lazyBackfillPromise;
+  const generation = lazyQueue.generation;
+  lazyQueue.loading = true;
+  lazyBackfillPromise = (async () => {
+    try {
+      const page = await loadCataloguePage(source.id, source.releaseTypes, cursor);
+      if (generation !== lazyQueue.generation) return;
+      const tracks = catalogueTracks(page?.releases);
+      if (tracks.length) await invoke("add_queue_batch", { tracks });
+      if (generation !== lazyQueue.generation) return;
+      lazyQueue.retryAfter = 0;
+      lazyQueue.cursor = page?.next_offset ?? null;
+      if (lazyQueue.cursor == null) lazyQueue.source = null;
+    } catch (error) {
+      if (generation === lazyQueue.generation) lazyQueue.retryAfter = performance.now() + 5000;
+      throw error;
+    } finally {
+      if (generation === lazyQueue.generation) lazyQueue.loading = false;
+      lazyBackfillPromise = null;
+    }
+  })();
+  return lazyBackfillPromise;
+}
+
+export function maybeBackfillLazyQueue() {
+  return backfillLazyQueue(false);
+}
+
 export const session = $state({ auth_state: null, username: null, error: null });
 
 /* ---------------- Playhead projection ---------------- */
@@ -167,6 +256,54 @@ export const credits = $state({
 });
 let creditsSeq = 0;
 
+/**
+ * Credits shown *inside* the now-playing panel, as opposed to the modal.
+ *
+ * Separate state, one shared cache. The panel is an opt-in inspector, so this
+ * only ever fetches while it is open, and each track is fetched at most once
+ * per session; opening the full dialog for a track the panel already loaded
+ * then paints from the cache with no second request.
+ */
+export const trackCredits = $state({ id: null, loading: false, data: null, error: null });
+const creditsCache = new Map();
+let panelCreditsSeq = 0;
+
+export function loadTrackCredits(track) {
+  const id = track?.id?.trim?.() ?? "";
+  if (!id) {
+    trackCredits.id = null;
+    trackCredits.loading = false;
+    trackCredits.data = null;
+    trackCredits.error = null;
+    return;
+  }
+  if (trackCredits.id === id && (trackCredits.data || trackCredits.loading)) return;
+  panelCreditsSeq += 1;
+  const seq = panelCreditsSeq;
+  trackCredits.id = id;
+  trackCredits.error = null;
+  if (creditsCache.has(id)) {
+    trackCredits.data = creditsCache.get(id);
+    trackCredits.loading = false;
+    return;
+  }
+  trackCredits.data = null;
+  trackCredits.loading = true;
+  api
+    .browseTrackCredits(id)
+    .then((data) => {
+      if (seq !== panelCreditsSeq) return;
+      creditsCache.set(id, data ?? null);
+      trackCredits.data = data ?? null;
+      trackCredits.loading = false;
+    })
+    .catch((error) => {
+      if (seq !== panelCreditsSeq) return;
+      trackCredits.loading = false;
+      trackCredits.error = String(error || "Could not load credits.");
+    });
+}
+
 
 /** See the note on `api.search`; this is the single knob that moves latency. */
 export const SEARCH_LIMIT = 10;
@@ -232,10 +369,17 @@ export function openCredits(track) {
     credits.error = "Credits are unavailable for this track.";
     return;
   }
+  // Opened from the now-playing panel, the payload is usually already here.
+  if (creditsCache.has(id)) {
+    credits.data = creditsCache.get(id);
+    credits.loading = false;
+    return;
+  }
   api
     .browseTrackCredits(id)
     .then((data) => {
       if (seq !== creditsSeq) return;
+      creditsCache.set(id, data ?? null);
       credits.data = data ?? null;
       credits.loading = false;
     })
@@ -393,7 +537,12 @@ export async function resolveCoverUrl(url) {
 export const api = {
   play: () => invoke("play"),
   pause: () => invoke("pause"),
-  next: () => invoke("next"),
+  next: async () => {
+    if (lazyQueue.source && playback.current_index >= playback.queue.length - 1) {
+      await backfillLazyQueue(true);
+    }
+    return invoke("next");
+  },
   previous: () => invoke("previous"),
   seek: (ms) => {
     const target = Math.max(0, Math.round(ms));
@@ -422,10 +571,21 @@ export const api = {
   },
   setShuffle: (enabled) => invoke("set_shuffle", { enabled: !!enabled }),
   setRepeat: (mode) => invoke("set_repeat", { mode }),
-  playQueue: (queue, index) => invoke("play_queue", { queue, index }),
+  playQueue: (queue, index) => {
+    clearLazyQueue();
+    return invoke("play_queue", { queue, index });
+  },
+  playQueueIndex: (index) => invoke("play_queue_index", { index }),
   addQueue: (track) => invoke("add_queue", { track }),
-  removeQueue: (index) => invoke("remove_queue", { index }),
-  moveQueue: (from, to) => invoke("move_queue", { from, to }),
+  addQueueBatch: (tracks) => invoke("add_queue_batch", { tracks }),
+  removeQueue: (index) => {
+    clearLazyQueue();
+    return invoke("remove_queue", { index });
+  },
+  moveQueue: (from, to) => {
+    clearLazyQueue();
+    return invoke("move_queue", { from, to });
+  },
   /**
    * `limit` applies to every section the server returns, not just the three we
    * parse, and it dominates search latency: measured medians are 743ms at 10
@@ -434,8 +594,8 @@ export const api = {
    * asks for ~30 instead of ~120. Both halves of the win come from this number.
    */
   search: (query, limit = SEARCH_LIMIT) => invoke("search", { query, limit }),
-  browseArtistCatalogueTracks: (id, releaseTypes = ["albums", "singles"]) =>
-    invoke("browse_artist_catalogue_tracks", { id, releaseTypes }),
+  browseArtistCatalogue: (id, releaseTypes = ["albums", "singles"], offset = 0, limit = 4) =>
+    invoke("browse_artist_catalogue", { id, releaseTypes, offset, limit }),
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
@@ -447,6 +607,8 @@ export const api = {
   browsePlaylist: (id) => invoke("browse_playlist", { id }),
   browseAlbum: (id) => invoke("browse_album", { id }),
   browseArtist: (id) => invoke("browse_artist", { id }),
+  browseArtistReleases: (id, releaseTypes = [], offset = 0, limit = 20) =>
+    invoke("browse_artist_releases", { id, releaseTypes, offset, limit }),
   createPlaylist: (name) => invoke("create_playlist", { name }),
   renamePlaylist: (id, name) => invoke("rename_playlist", { id, name }),
   deletePlaylist: (id) => invoke("delete_playlist", { id }),

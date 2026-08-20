@@ -20,8 +20,9 @@ use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
 use crate::types::{
-    AlbumDetail, AppState as AppStateSnapshot, ArtistDetail, CacheStats, LikedSongsDetail,
-    PlaybackState, Playlist, PlaylistDetail, SearchResult, Track, TrackCreditsDetail,
+    AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
+    ArtistReleasePageDetail, CacheStats, LikedSongsDetail, PlaybackState, Playlist,
+    PlaylistDetail, SearchResult, Track, TrackCreditsDetail,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,8 +79,24 @@ pub async fn play_queue(
 }
 
 #[tauri::command]
+pub async fn play_queue_index(
+    client: State<'_, Arc<EngineClient>>,
+    index: usize,
+) -> Result<(), String> {
+    client.play_queue_index(index).await
+}
+
+#[tauri::command]
 pub async fn add_queue(client: State<'_, Arc<EngineClient>>, track: Track) -> Result<(), String> {
     client.add_queue(&track).await
+}
+
+#[tauri::command]
+pub async fn add_queue_batch(
+    client: State<'_, Arc<EngineClient>>,
+    tracks: Vec<Track>,
+) -> Result<(), String> {
+    client.add_queue_batch(&tracks).await
 }
 
 #[tauri::command]
@@ -167,17 +184,43 @@ pub async fn browse_artist(
 }
 
 #[tauri::command]
-pub async fn browse_artist_catalogue_tracks(
+pub async fn browse_artist_releases(
     client: State<'_, Arc<EngineClient>>,
     id: String,
     release_types: Option<Vec<String>>,
-) -> Result<Vec<Track>, String> {
-    Ok(client
-        .browse_artist_catalogue_tracks(&id, release_types.as_deref().unwrap_or_default())
-        .await?
-        .into_iter()
-        .map(Track::from)
-        .collect())
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<ArtistReleasePageDetail, String> {
+    Ok(ArtistReleasePageDetail::from(
+        client
+            .browse_artist_releases(
+                &id,
+                release_types.as_deref().unwrap_or_default(),
+                offset.unwrap_or(0),
+                limit.unwrap_or(20).clamp(1, 40),
+            )
+            .await?,
+    ))
+}
+
+#[tauri::command]
+pub async fn browse_artist_catalogue(
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+    release_types: Option<Vec<String>>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<ArtistCataloguePageDetail, String> {
+    Ok(ArtistCataloguePageDetail::from(
+        client
+            .browse_artist_catalogue(
+                &id,
+                release_types.as_deref().unwrap_or_default(),
+                offset.unwrap_or(0),
+                limit.unwrap_or(4).clamp(1, 6),
+            )
+            .await?,
+    ))
 }
 
 #[tauri::command]

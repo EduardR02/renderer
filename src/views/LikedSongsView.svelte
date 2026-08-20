@@ -2,6 +2,13 @@
   import { api } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Icon from "../components/Icon.svelte";
+  import { paletteFor } from "../lib/covertone.svelte.js";
+
+  /* Rose's own hue, rebuilt at the header's fixed dark. Every other detail
+     page takes its colour from artwork; this collection has none, and does not
+     want any — it is the one page in the app that is about YOU rather than
+     about a record, so it gets the palette's "yours" hue at full strength. */
+  const ROSE_TONE = paletteFor(21, 0.105);
 
   let tracks = $state([]);
   let nextCursor = $state(null);
@@ -46,11 +53,16 @@
   }
 </script>
 
-<section class="view page liked-page wash" style:--wash="var(--love)">
+<section
+  class="view page liked-page wash"
+  style:--tone-wash={ROSE_TONE.wash}
+  style:--tone-wash-deep={ROSE_TONE.washDeep}
+  style:--tone-glow={ROSE_TONE.glow}
+>
   <header class="liked-head">
     <div class="liked-art" aria-hidden="true"><Icon name="heart-filled" size={42} /></div>
     <div class="liked-copy">
-      <span class="eyebrow">Your collection</span>
+      <span class="tag saved">Your collection</span>
       <h1 class="detail-title">Liked Songs</h1>
       <p class="detail-meta">
         <span class="num">{tracks.length} loaded {tracks.length === 1 ? "song" : "songs"}</span>

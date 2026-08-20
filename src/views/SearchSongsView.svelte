@@ -40,7 +40,7 @@
 <section class="view page search-songs-page">
   <header class="results-head">
     <div>
-      <span class="eyebrow">Song results</span>
+      <span class="tag">Song results</span>
       <h1 class="page-title">{query ? `Songs for “${query}”` : "Songs"}</h1>
       <p class="results-summary">
         {#if loading}

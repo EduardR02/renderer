@@ -8,8 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistRef, ArtistReleases, CreditArtist, CreditRole,
-    LikedSongsPage, PlaylistBrowse, PlaylistRef, SearchBrowse, TrackCredits, TrackRef,
+    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistCataloguePage, ArtistRef, ArtistReleaseCounts,
+    ArtistReleasePage, ArtistReleases, CreditArtist, CreditRole, LikedSongsPage, PlaylistBrowse,
+    PlaylistRef, SearchBrowse, TrackCredits, TrackRef,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -365,6 +366,62 @@ pub struct ArtistReleaseGroups {
     pub appears_on: Vec<Album>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ArtistReleaseTotals {
+    pub albums: usize,
+    pub singles: usize,
+    pub compilations: usize,
+    pub appears_on: usize,
+}
+
+impl From<ArtistReleaseCounts> for ArtistReleaseTotals {
+    fn from(counts: ArtistReleaseCounts) -> Self {
+        Self {
+            albums: counts.albums,
+            singles: counts.singles,
+            compilations: counts.compilations,
+            appears_on: counts.appears_on,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ArtistReleasePageDetail {
+    pub releases: ArtistReleaseGroups,
+    pub total: usize,
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ArtistCataloguePageDetail {
+    pub releases: Vec<AlbumDetail>,
+    pub total: usize,
+    pub next_offset: Option<usize>,
+}
+
+impl From<ArtistCataloguePage> for ArtistCataloguePageDetail {
+    fn from(page: ArtistCataloguePage) -> Self {
+        Self {
+            releases: page.releases.into_iter().map(AlbumDetail::from).collect(),
+            total: page.total,
+            next_offset: page.next_offset,
+        }
+    }
+}
+
+impl From<ArtistReleasePage> for ArtistReleasePageDetail {
+    fn from(page: ArtistReleasePage) -> Self {
+        Self {
+            releases: page.releases.into(),
+            total: page.total,
+            next_offset: page.next_offset,
+        }
+    }
+}
+
 impl From<ArtistReleases> for ArtistReleaseGroups {
     fn from(releases: ArtistReleases) -> Self {
         let convert = |group: Vec<AlbumRef>| group.into_iter().map(Album::from).collect();
@@ -384,6 +441,8 @@ pub struct ArtistDetail {
     pub artist: Artist,
     pub top_tracks: Vec<Track>,
     pub releases: ArtistReleaseGroups,
+    pub release_counts: ArtistReleaseTotals,
+    pub releases_next_offset: Option<usize>,
 }
 
 impl From<ArtistBrowse> for ArtistDetail {
@@ -397,6 +456,8 @@ impl From<ArtistBrowse> for ArtistDetail {
             },
             top_tracks: browse.top_tracks.into_iter().map(Track::from).collect(),
             releases: browse.releases.into(),
+            release_counts: browse.release_counts.into(),
+            releases_next_offset: browse.releases_next_offset,
         }
     }
 }

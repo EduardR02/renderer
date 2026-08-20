@@ -53,7 +53,21 @@
   });
 
   $effect(() => {
-    if (filtering) queueMicrotask(() => filterInput?.focus());
+    if (!filtering) return;
+    queueMicrotask(() => filterInput?.focus());
+
+    /* Clicking away dismisses an *empty* filter, the same as pressing Escape.
+       A filter with text in it stays: the list on screen is the result of that
+       text, so silently discarding it would leave the sidebar showing a subset
+       with nothing to explain why. Those are only dismissed deliberately. */
+    function onPointerDown(event) {
+      if (filterQuery.trim()) return;
+      if (filterInput?.parentElement?.contains(event.target)) return;
+      closeFilter();
+    }
+
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
   });
 
   function startCreate() {
@@ -104,7 +118,7 @@
     </button>
     <button class="nav-item" class:active={route.name === "queue"} onclick={() => navigate("queue")}>
       <Icon name="queue" size={17} /><span>Queue</span>
-      {#if playback.queue.length}<span class="kbd">{playback.queue.length}</span>{/if}
+      {#if playback.queue.length}<span class="nav-count">{playback.queue.length}</span>{/if}
     </button>
   </nav>
 

@@ -1,6 +1,8 @@
 <script>
   import { untrack } from "svelte";
   import { search, api, navigate, focusSearch, queueSearch } from "../lib/state.svelte.js";
+  import { playAlbumById } from "../lib/play.js";
+  import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -34,6 +36,24 @@
 
   function playTrack(i) {
     if (tracks.length) api.playQueue(tracks, i).catch(() => {});
+  }
+
+  let busy = $state("");
+  let playError = $state("");
+
+  /* The card opens; only this button plays. A result card knows an id and
+     nothing else, so playing it costs one browse first. */
+  async function play(id) {
+    if (busy) return;
+    busy = id;
+    playError = "";
+    try {
+      await playAlbumById(id);
+    } catch (reason) {
+      playError = String(reason || "Could not play this release.");
+    } finally {
+      busy = "";
+    }
   }
 
   /* ---- Recent searches ------------------------------------------------
@@ -156,9 +176,14 @@
   {:else}
     <div class="search-split">
       {#if top}
+        {@const topTone = coverTone(top.cover_url, top.id)}
         <div>
           <div class="section-head"><h2 class="section-title">Top result</h2></div>
-          <button class="top-result" onclick={openTop}>
+          <!-- The one big coloured object on a results page. Search has no
+               subject of its own to take a header wash from, but the top
+               result IS a subject, so the panel around it takes that record's
+               colour rather than being the fourth grey rectangle on screen. -->
+          <button class="top-result" style:--tone-wash={topTone.wash} onclick={openTop}>
             <Cover
               src={top.cover_url}
               id={top.id}
@@ -185,7 +210,7 @@
               <button class="link-more" onclick={() => navigate("search-songs", search.query)}>See all</button>
             {/if}
           </div>
-          <TrackList tracks={visibleTracks} playFrom={playTrack} showAlbum={false} showHead={false} />
+          <TrackList tracks={visibleTracks} playFrom={playTrack} showAlbum={false} showHead={false} resetsScroll={false} />
         </div>
       {/if}
     </div>
@@ -195,16 +220,38 @@
         <div class="section-head"><h2 class="section-title">Albums</h2></div>
         <div class="grid">
           {#each albums as al (al.id)}
-            <button class="card" onclick={() => navigate("album", al.id)}>
-              <span class="card-art">
+            {@const tone = coverTone(al.cover_url, al.id)}
+            <div class="card" style:--tone-glow={tone.glow}>
+              <div class="card-art">
                 <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />
-                <span class="card-play"><Icon name="play" size={15} /></span>
-              </span>
-              <span class="card-name">{al.name}</span>
-              <span class="card-sub">{#if al.year}{al.year} · {/if}{al.artist_names.join(", ")}</span>
-            </button>
+                <button
+                  class="card-open"
+                  aria-label={`Open ${al.name}`}
+                  onclick={() => navigate("album", al.id)}
+                ></button>
+                <button
+                  class="card-play"
+                  aria-label={`Play ${al.name}`}
+                  title={`Play ${al.name}`}
+                  disabled={!!busy}
+                  onclick={() => play(al.id)}
+                >
+                  <Icon name={busy === al.id ? "more" : "play"} size={15} />
+                </button>
+              </div>
+              <button class="card-copy" onclick={() => navigate("album", al.id)}>
+                <span class="card-name">{al.name}</span>
+                <!-- One expression, not two adjacent ones: `{year} · {names}`
+                     across an {#if} loses the space after the middot, which is
+                     why these read as "2019 ·Ceramic Hands". -->
+                <span class="card-sub"
+                  >{[al.year || null, al.artist_names.join(", ")].filter(Boolean).join(" · ")}</span
+                >
+              </button>
+            </div>
           {/each}
         </div>
+        {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
       </div>
     {/if}
 
@@ -213,12 +260,18 @@
         <div class="section-head"><h2 class="section-title">Artists</h2></div>
         <div class="grid">
           {#each artists as ar (ar.id)}
-            <button class="card" onclick={() => navigate("artist", ar.id)}>
+            {@const tone = coverTone(ar.cover_url, ar.id)}
+            <!-- No play button here, and that is not an omission: an artist is
+                 not a record. The whole card opens, which is the same rule the
+                 others follow with the exception removed. -->
+            <button class="card" style:--tone-glow={tone.glow} onclick={() => navigate("artist", ar.id)}>
               <span class="card-art">
                 <Cover src={ar.cover_url} id={ar.id} name={ar.name} fill circle />
               </span>
-              <span class="card-name">{ar.name}</span>
-              <span class="card-sub">Artist</span>
+              <span class="card-copy">
+                <span class="card-name">{ar.name}</span>
+                <span class="card-sub">Artist</span>
+              </span>
             </button>
           {/each}
         </div>
