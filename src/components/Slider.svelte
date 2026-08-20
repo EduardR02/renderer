@@ -22,22 +22,51 @@
   } = $props();
 
   let track = $state(null);
+  let trackGeometry = null;
+  let trackWidth = $state(0);
   let drag = $state(null);
   let hover = $state(null);
   const display = $derived(drag !== null ? drag : value);
   const p = $derived(max > min ? Math.min(1, Math.max(0, (display - min) / (max - min))) : 0);
   const hoverP = $derived(
-    hover !== null && max > min ? Math.min(1, Math.max(0, (hover - min) / (max - min))) : p
+    hover !== null && max > min ? Math.min(1, Math.max(0, (hover - min) / (max - min))) : 0
   );
   const valueText = $derived(formatValue ? formatValue(display) : null);
   const tooltipId = $derived(`${kind}-slider-tooltip`);
 
+  function refreshGeometry(element = track) {
+    if (!element) {
+      trackGeometry = null;
+      trackWidth = 0;
+      return;
+    }
+    const r = element.getBoundingClientRect();
+    trackGeometry = { left: r.left, width: r.width };
+    trackWidth = r.width;
+  }
+
   function fromClientX(x) {
-    if (!track) return min;
-    const r = track.getBoundingClientRect();
-    if (r.width <= 0) return min;
+    const r = trackGeometry;
+    if (!r || r.width <= 0) return min;
     return min + Math.min(1, Math.max(0, (x - r.left) / r.width)) * (max - min);
   }
+
+  $effect(() => {
+    const element = track;
+    if (!element) return;
+    const updateGeometry = () => {
+      trackGeometry = null;
+      refreshGeometry(element);
+    };
+    updateGeometry();
+    const resizeObserver = new ResizeObserver(updateGeometry);
+    resizeObserver.observe(element);
+    return () => {
+      resizeObserver.disconnect();
+      trackGeometry = null;
+      trackWidth = 0;
+    };
+  });
 
   function commit(v) {
     onCommit(Math.min(max, Math.max(min, v)));
@@ -45,6 +74,7 @@
 
   function onPointerDown(e) {
     e.preventDefault();
+    refreshGeometry();
     drag = fromClientX(e.clientX);
     hover = drag;
     onDragStart?.(drag);
@@ -56,6 +86,10 @@
     if (drag === null) return;
     drag = hover;
     onDragChange?.(drag);
+  }
+  function onPointerEnter(e) {
+    refreshGeometry();
+    hover = fromClientX(e.clientX);
   }
 
   function onPointerUp() {
@@ -85,6 +119,7 @@
 
 <span
   class={kind === "vol" ? "vol" : "rail-hit"}
+  style:--track-w="{trackWidth}px"
   role="slider"
   tabindex="0"
   aria-label={label}
@@ -96,7 +131,7 @@
   bind:this={track}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
-  onpointerenter={(e) => (hover = fromClientX(e.clientX))}
+  onpointerenter={onPointerEnter}
   onpointerleave={() => (hover = null)}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
@@ -106,7 +141,7 @@
     <span class="vol-rail"><span class="vol-fill" style:--p={p}></span></span>
   {:else}
     <span class="rail"><span class="rail-fill" style:--p={p}></span></span>
-    <span class="rail-knob" style:--pl="{p * 100}%"></span>
+    <span class="rail-knob" style:--p={p}></span>
     <span
       id={tooltipId}
       class="seek-tip"

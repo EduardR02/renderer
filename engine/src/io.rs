@@ -128,30 +128,43 @@ pub fn spawn_input_reader(sender: mpsc::UnboundedSender<Input>) {
 }
 
 fn decode_request(line: &str) -> Input {
-    let value: Value = match serde_json::from_str(line) {
-        Ok(value) => value,
-        Err(error) => {
-            return Input::Invalid {
-                request_id: String::new(),
-                error: format!("invalid JSON: {error}"),
-            };
-        }
-    };
-    let request_id = value
-        .get("request_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    match serde_json::from_value::<Request>(value) {
+    match serde_json::from_str::<Request>(line) {
         Ok(request) if request.request_id.is_empty() => Input::Invalid {
-            request_id,
+            request_id: String::new(),
             error: "request_id must not be empty".to_owned(),
         },
         Ok(request) => Input::Request(request),
-        Err(error) => Input::Invalid {
-            request_id,
-            error: format!("invalid request: {error}"),
-        },
+        Err(_) => {
+            // Valid requests take the direct typed path above, avoiding a
+            // complete Value tree plus a second traversal. On failure, parse
+            // through Value exactly as before so malformed JSON diagnostics
+            // and request-id recovery stay byte-for-byte compatible.
+            let value: Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Input::Invalid {
+                        request_id: String::new(),
+                        error: format!("invalid JSON: {error}"),
+                    };
+                }
+            };
+            let request_id = value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            match serde_json::from_value::<Request>(value) {
+                Ok(request) if request.request_id.is_empty() => Input::Invalid {
+                    request_id,
+                    error: "request_id must not be empty".to_owned(),
+                },
+                Ok(request) => Input::Request(request),
+                Err(error) => Input::Invalid {
+                    request_id,
+                    error: format!("invalid request: {error}"),
+                },
+            }
+        }
     }
 }
 
@@ -215,4 +228,33 @@ fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
 #[cfg(not(windows))]
 fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
     Ok(Box::new(io::stdout()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Input, decode_request};
+    use spotify_playback_engine::protocol::Command;
+
+    #[test]
+    fn valid_requests_decode_directly() {
+        match decode_request(r#"{"request_id":"request-7","type":"status"}"#) {
+            Input::Request(request) => {
+                assert_eq!(request.request_id, "request-7");
+                assert!(matches!(request.command, Command::Status));
+            }
+            other => panic!("expected a valid request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_requests_preserve_the_recoverable_request_id() {
+        match decode_request(r#"{"request_id":"request-8","type":"seek"}"#) {
+            Input::Invalid { request_id, error } => {
+                assert_eq!(request_id, "request-8");
+                assert!(error.starts_with("invalid request: "));
+                assert!(error.contains("position_ms"));
+            }
+            other => panic!("expected an invalid request, got {other:?}"),
+        }
+    }
 }

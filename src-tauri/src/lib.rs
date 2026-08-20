@@ -13,13 +13,6 @@ use tauri::Manager;
 use app::{AppState, data_dir, load_tracks_cache};
 use engine_client::EngineClient;
 
-// WebView2 can keep painting a correct GPU surface while DirectComposition
-// stops presenting it to the host HWND: CDP screenshots remain correct while
-// the actual window turns black after startup. `additionalBrowserArgs` in
-// tauri.conf disables only that presentation path. This is intentionally a
-// browser flag rather than an app-side repaint loop, which would burn CPU at
-// idle and still be racing the compositor.
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     log::init(app::logs_dir());

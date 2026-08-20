@@ -18,7 +18,7 @@
         "minWidth": 940,
         "minHeight": 560,
         "backgroundColor": "#121212",
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --remote-debugging-port=9222"
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
       }
     ],
     "security": {

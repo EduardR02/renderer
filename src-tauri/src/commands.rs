@@ -21,8 +21,8 @@ use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, Sta
 use crate::log;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
-    ArtistReleasePageDetail, CacheStats, LikedSongsDetail, PlaybackState, Playlist,
-    PlaylistDetail, SearchResult, Track, TrackCreditsDetail,
+    ArtistReleasePageDetail, CacheStats, LikedSongsDetail, Playlist, PlaylistDetail, SearchResult,
+    Track, TrackCreditsDetail,
 };
 
 // ---------------------------------------------------------------------------
@@ -154,13 +154,14 @@ pub async fn browse_playlist(
 ) -> Result<PlaylistDetail, String> {
     let cached = {
         let guard = state.lock();
-        guard.tracks_cache.iter().find(|entry| entry.id == id).cloned()
+        guard
+            .tracks_cache
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .map(|entry| playlist_detail_from_cache(&guard, entry))
     };
-    if let Some(entry) = cached {
-        let detail = {
-            let guard = state.lock();
-            playlist_detail_from_cache(&guard, &entry)
-        };
+    if let Some(detail) = cached {
         spawn_refresh_playlist(app, id);
         return Ok(detail);
     }
@@ -533,7 +534,7 @@ pub async fn consume_states(app: AppHandle) {
     // get_state). The ready-transition fetch below supersedes it.
     load_library_from_disk(&app);
 
-    let mut previous: Option<PlaybackState> = None;
+    let mut previous_identity: Option<(String, String)> = None;
     let mut last_error = String::new();
 
     loop {
@@ -557,11 +558,11 @@ pub async fn consume_states(app: AppHandle) {
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
 
-        let (became_ready, session_changed, auth_changed) = match &previous {
-            Some(prev) => (
-                state.auth_state == "ready" && prev.auth_state != "ready",
-                state.auth_state != prev.auth_state || state.username != prev.username,
-                state.auth_state != prev.auth_state,
+        let (became_ready, session_changed, auth_changed) = match &previous_identity {
+            Some((auth_state, username)) => (
+                state.auth_state == "ready" && auth_state.as_str() != "ready",
+                state.auth_state != auth_state.as_str() || state.username != username.as_str(),
+                state.auth_state != auth_state.as_str(),
             ),
             None => (state.auth_state == "ready", true, true),
         };
@@ -613,7 +614,7 @@ pub async fn consume_states(app: AppHandle) {
             spawn_refresh_library(app.clone());
         }
 
-        previous = Some(state);
+        previous_identity = Some((state.auth_state, state.username));
     }
 }
 

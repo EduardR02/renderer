@@ -210,7 +210,13 @@
               <button class="link-more" onclick={() => navigate("search-songs", search.query)}>See all</button>
             {/if}
           </div>
-          <TrackList tracks={visibleTracks} playFrom={playTrack} showAlbum={false} showHead={false} resetsScroll={false} />
+          <TrackList
+            tracks={visibleTracks}
+            playFrom={playTrack}
+            showAlbum={false}
+            showHead={false}
+            disableWindowing
+          />
         </div>
       {/if}
     </div>

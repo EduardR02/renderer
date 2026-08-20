@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from "svelte";
   import { api } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Icon from "../components/Icon.svelte";
@@ -45,7 +46,7 @@
   $effect(() => {
     if (requestedInitial) return;
     requestedInitial = true;
-    loadPage();
+    untrack(() => loadPage());
   });
 
   function playFrom(index) {

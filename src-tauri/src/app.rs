@@ -188,6 +188,13 @@ pub struct PlaylistTracksCache {
     pub playlists: Vec<PlaylistTracksEntry>,
 }
 
+#[derive(Serialize)]
+struct PlaylistTracksCacheRef<'a> {
+    version: u32,
+    saved_at: Option<i64>,
+    playlists: &'a [PlaylistTracksEntry],
+}
+
 pub fn load_tracks_cache(dir: &Path) -> Vec<PlaylistTracksEntry> {
     let bytes = match std::fs::read(dir.join("playlist_tracks_cache.json")) {
         Ok(bytes) => bytes,
@@ -210,10 +217,10 @@ pub fn load_tracks_cache(dir: &Path) -> Vec<PlaylistTracksEntry> {
 }
 
 pub fn save_tracks_cache(dir: &Path, playlists: &[PlaylistTracksEntry]) {
-    let cache = PlaylistTracksCache {
+    let cache = PlaylistTracksCacheRef {
         version: 1,
         saved_at: Some(now_secs()),
-        playlists: playlists.to_vec(),
+        playlists,
     };
     write_json_atomic(dir.join("playlist_tracks_cache.json"), &cache);
 }
@@ -232,7 +239,10 @@ pub fn upsert_tracks_cache(entries: &mut Vec<PlaylistTracksEntry>, entry: Playli
 
 /// Combines cached tracks with the library playlist metadata into the full
 /// detail payload the UI renders.
-pub fn playlist_detail_from_cache(state: &AppState, entry: &PlaylistTracksEntry) -> PlaylistDetail {
+pub fn playlist_detail_from_cache(
+    state: &AppState,
+    entry: PlaylistTracksEntry,
+) -> PlaylistDetail {
     let meta = state.playlists.iter().find(|playlist| playlist.id == entry.id);
     let mut playlist = meta.cloned().unwrap_or_else(|| Playlist {
         id: entry.id.clone(),
@@ -240,14 +250,14 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: &PlaylistTracksEntry)
         ..Playlist::default()
     });
     playlist.tracks_total = entry.tracks.len() as u32;
-    playlist.snapshot_id = entry.revision.clone();
+    playlist.snapshot_id = entry.revision;
     // These tracks are what the detail page renders, so its candidates come
     // from them rather than from whatever revision the library entry was last
     // browsed at — candidates and revision always travel together.
     playlist.cover_urls = cover_urls_from_tracks(&entry.tracks);
     PlaylistDetail {
         playlist,
-        tracks: entry.tracks.clone(),
+        tracks: entry.tracks,
     }
 }
 
@@ -526,7 +536,7 @@ mod tests {
             revision: "rev".into(),
             tracks: vec![track("t")],
         };
-        let detail = playlist_detail_from_cache(&state, &entry);
+        let detail = playlist_detail_from_cache(&state, entry);
         assert_eq!(detail.playlist.id, "p1");
         assert_eq!(detail.playlist.uri, "spotify:playlist:p1");
         assert_eq!(detail.playlist.snapshot_id, "rev");
@@ -547,7 +557,7 @@ mod tests {
                 track_with_cover("c", "cover-b"),
             ],
         };
-        let detail = playlist_detail_from_cache(&state, &entry);
+        let detail = playlist_detail_from_cache(&state, entry);
         assert_eq!(detail.playlist.cover_urls, vec!["cover-a", "cover-b"]);
     }
 

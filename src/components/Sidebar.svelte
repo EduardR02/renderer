@@ -21,6 +21,8 @@
 
   $effect(() => {
     const query = filterQuery;
+    filteredLibrary.length;
+    library.length;
     const list = libList;
     if (!list) return;
 
@@ -29,22 +31,26 @@
        rows that are actually visible after this query. */
     if (query) list.scrollTop = 0;
 
+    let frame = 0;
     const updateFades = () => {
+      frame = 0;
       const maxScroll = Math.max(0, list.scrollHeight - list.clientHeight);
       fadeTop = list.scrollTop > 1;
       fadeBottom = list.scrollTop < maxScroll - 1;
     };
+    const scheduleFades = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(updateFades);
+    };
 
-    queueMicrotask(updateFades);
-    list.addEventListener("scroll", updateFades, { passive: true });
-    const resizeObserver = new ResizeObserver(updateFades);
+    scheduleFades();
+    list.addEventListener("scroll", scheduleFades, { passive: true });
+    const resizeObserver = new ResizeObserver(scheduleFades);
     resizeObserver.observe(list);
-    const mutationObserver = new MutationObserver(updateFades);
-    mutationObserver.observe(list, { childList: true, subtree: true });
     return () => {
-      list.removeEventListener("scroll", updateFades);
+      list.removeEventListener("scroll", scheduleFades);
       resizeObserver.disconnect();
-      mutationObserver.disconnect();
+      if (frame) cancelAnimationFrame(frame);
     };
   });
 

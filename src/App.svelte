@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from "svelte";
   import {
     initEvents,
     route,
@@ -41,7 +42,7 @@
   $effect(() => {
     playback.current_index;
     playback.queue.length;
-    maybeBackfillLazyQueue().catch(() => {});
+    untrack(() => maybeBackfillLazyQueue().catch(() => {}));
   });
 
   /* Whether decorative animation is allowed to run at all. A background window

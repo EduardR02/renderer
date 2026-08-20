@@ -299,7 +299,7 @@ impl EngineClient {
             let mut pending = self.pending.lock().await;
             pending.insert(request_id.clone(), sender);
         }
-        let line = build_line(&request_id, kind, &args);
+        let line = build_line(&request_id, kind, args);
         if let Err(error) = self.write_line(&line) {
             let mut pending = self.pending.lock().await;
             pending.remove(&request_id);
@@ -602,7 +602,7 @@ impl EngineClient {
     pub fn shutdown_engine(&self) {
         log::info("engine shutdown requested");
         self.shutting_down.store(true, Ordering::SeqCst);
-        let line = build_line(&self.next_request_id(), "shutdown", &Value::Null);
+        let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
         let _ = self.write_line(&line);
         std::thread::sleep(Duration::from_millis(400));
         if let Some(mut child) = self.process.lock().take() {
@@ -748,14 +748,24 @@ fn parse_line(value: Value) -> Option<Line> {
             }
         },
         _ => {
-            let request_id = value
-                .get("request_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-            let error = value.get("error").and_then(Value::as_str).map(str::to_owned);
-            let data = value.get("data").cloned();
+            let Value::Object(mut object) = value else {
+                return Some(Line::Reply {
+                    request_id: String::new(),
+                    ok: false,
+                    error: None,
+                    data: None,
+                });
+            };
+            let request_id = match object.remove("request_id") {
+                Some(Value::String(request_id)) => request_id,
+                _ => String::new(),
+            };
+            let ok = matches!(object.remove("ok"), Some(Value::Bool(true)));
+            let error = match object.remove("error") {
+                Some(Value::String(error)) => Some(error),
+                _ => None,
+            };
+            let data = object.remove("data");
             Some(Line::Reply {
                 request_id,
                 ok,
@@ -787,14 +797,12 @@ fn rotate_if_large(path: &Path) {
     }
 }
 
-fn build_line(request_id: &str, kind: &str, args: &Value) -> String {
+fn build_line(request_id: &str, kind: &str, args: Value) -> String {
     let mut object = Map::new();
     object.insert("request_id".to_owned(), Value::String(request_id.to_owned()));
     object.insert("type".to_owned(), Value::String(kind.to_owned()));
-    if let Some(fields) = args.as_object() {
-        for (key, value) in fields {
-            object.insert(key.clone(), value.clone());
-        }
+    if let Value::Object(fields) = args {
+        object.extend(fields);
     }
     serde_json::to_string(&Value::Object(object)).expect("request serialization cannot fail")
 }
@@ -863,6 +871,50 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         })
+    }
+
+    #[test]
+    fn request_lines_keep_protocol_and_payload_fields() {
+        let line = build_line(
+            "request-7",
+            "play_queue",
+            serde_json::json!({
+                "queue": [{"uri": "spotify:track:abc"}],
+                "index": 0,
+                "position_ms": 12,
+            }),
+        );
+        let value: Value = serde_json::from_str(&line).expect("request line is JSON");
+        assert_eq!(value["request_id"], "request-7");
+        assert_eq!(value["type"], "play_queue");
+        assert_eq!(value["queue"][0]["uri"], "spotify:track:abc");
+        assert_eq!(value["index"], 0);
+        assert_eq!(value["position_ms"], 12);
+    }
+
+    #[test]
+    fn reply_lines_keep_error_and_data_fields() {
+        let reply = parse_line(serde_json::json!({
+            "type": "browse_playlist",
+            "request_id": "request-8",
+            "ok": false,
+            "error": "browse failed",
+            "data": {"tracks": [{"id": "track-1"}]},
+        }));
+        match reply {
+            Some(Line::Reply {
+                request_id,
+                ok,
+                error,
+                data,
+            }) => {
+                assert_eq!(request_id, "request-8");
+                assert!(!ok);
+                assert_eq!(error.as_deref(), Some("browse failed"));
+                assert_eq!(data.unwrap()["tracks"][0]["id"], "track-1");
+            }
+            _ => panic!("reply fields stay on the reply path"),
+        }
     }
 
     #[test]

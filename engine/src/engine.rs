@@ -1056,13 +1056,15 @@ impl Engine {
         if percent > 100 {
             return Err("volume percent must be between 0 and 100".to_owned());
         }
+        if self.state.volume == percent {
+            return Ok(false);
+        }
         let volume = percent_to_volume(percent);
         self.mixer
             .as_ref()
             .ok_or_else(|| "the software mixer is unavailable".to_owned())?
             .set_volume(volume);
         self.cache.save_volume(volume);
-        self.player()?.emit_volume_changed_event(volume);
         // The audible volume lives on the rodio sink (per-packet attenuation
         // is disabled); apply it there so the change is heard immediately.
         crate::audio::set_sink_volume(volume);
@@ -1072,20 +1074,21 @@ impl Engine {
     }
 
     fn set_shuffle(&mut self, enabled: bool) -> Result<bool, String> {
+        if self.state.shuffle == enabled {
+            return Ok(false);
+        }
         self.state.shuffle = enabled;
         self.history.clear();
         self.rebuild_shuffle_pool();
-        self.player()?.emit_shuffle_changed_event(enabled);
         self.preload_next();
         Ok(true)
     }
 
     fn set_repeat(&mut self, mode: RepeatMode) -> Result<bool, String> {
+        if self.state.repeat == mode {
+            return Ok(false);
+        }
         self.state.repeat = mode;
-        self.player()?.emit_repeat_changed_event(
-            mode == RepeatMode::Context,
-            mode == RepeatMode::Track,
-        );
         self.preload_next();
         Ok(true)
     }
@@ -1538,6 +1541,31 @@ mod tests {
         engine.state = playback_state(240_000);
         engine.play_request_id = Some(7);
         engine
+    }
+
+    #[test]
+    fn same_value_setters_are_no_ops() {
+        let (mut engine, _) = test_engine();
+        engine.history.push(3);
+        engine.shuffle_pool.push(4);
+
+        assert_eq!(engine.set_volume(50), Ok(false));
+        assert_eq!(engine.set_shuffle(false), Ok(false));
+        assert_eq!(engine.set_repeat(RepeatMode::Off), Ok(false));
+        assert_eq!(engine.history, vec![3]);
+        assert_eq!(engine.shuffle_pool, vec![4]);
+    }
+
+    #[test]
+    fn changed_shuffle_and_repeat_values_still_update_state() {
+        let (mut engine, _) = test_engine();
+        engine.history.push(3);
+
+        assert_eq!(engine.set_shuffle(true), Ok(true));
+        assert!(engine.state.shuffle);
+        assert!(engine.history.is_empty());
+        assert_eq!(engine.set_repeat(RepeatMode::Context), Ok(true));
+        assert_eq!(engine.state.repeat, RepeatMode::Context);
     }
 
     #[test]

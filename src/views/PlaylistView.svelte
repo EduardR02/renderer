@@ -44,7 +44,7 @@
   const sortedTracks = $derived.by(() => {
     // No sort is the common case and the list can be thousands long; the
     // comparator below would run and decide nothing.
-    if (sortState.key === null) return tracks;
+    if (sortState.key === null || (sortState.key === "order" && sortState.direction === "asc")) return tracks;
     const direction = sortState.direction === "asc" ? 1 : -1;
     return tracks
       .map((track, originalIndex) => ({ track, originalIndex }))
@@ -107,7 +107,19 @@
 
   /* Fallback for a playlist the backend has not swept yet: derive the mosaic
      candidates from the tracks we already have on screen. */
-  const artPool = $derived([...new Set(tracks.map((t) => t.cover_url).filter(Boolean))].slice(0, 4));
+  const artPool = $derived.by(() => {
+    if (pl?.cover_url) return [];
+    const covers = [];
+    const seen = new Set();
+    for (const track of tracks) {
+      const cover = track?.cover_url;
+      if (!cover || seen.has(cover)) continue;
+      seen.add(cover);
+      covers.push(cover);
+      if (covers.length === 4) break;
+    }
+    return covers;
+  });
 
   /**
    * The page's colour, read out of the artwork.

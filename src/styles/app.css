@@ -1529,7 +1529,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .rail-fill { position: absolute; inset: 0; background: var(--accent-grad);
   transform-origin: left; transform: scaleX(var(--p, 0)); }
 .rail-knob {
-  position: absolute; top: 50%; left: var(--pl, 0%); width: 10px; height: 10px;
+  position: absolute; top: 50%; left: 0; width: 10px; height: 10px;
+  transform: translate3d(calc(var(--p, 0) * var(--track-w, 0px)), 0, 0);
   margin: -5px 0 0 -5px; border-radius: 50%; background: var(--fg);
   box-shadow: 0 2px 6px rgba(0,0,0,.5); opacity: 0;
   transition: opacity var(--d1) var(--ease);

@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from "svelte";
   import {
     playback,
     ui,
@@ -25,7 +26,8 @@
      the track. Only ever while the panel is mounted — it is opt-in — and the
      store caches per track id, so scrubbing back and forth costs one request. */
   $effect(() => {
-    if (current) loadTrackCredits(current);
+    const track = current;
+    if (track) untrack(() => loadTrackCredits(track));
   });
 
   /** Groups worth showing inline; the rest live behind "all credits". */

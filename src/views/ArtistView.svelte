@@ -253,9 +253,9 @@
     {#if top.length}
       <div class="section">
         <div class="section-head"><h2 class="section-title">Popular</h2></div>
-        <!-- resetsScroll: this list is one section of a longer page, so it must
-             not yank the shared pane scroller when it mounts. -->
-        <TrackList tracks={top} playFrom={playTop} showAlbum={false} showPlays resetsScroll={false} />
+        <!-- Popular is a bounded section of a longer page, so it renders all
+             rows and owns no shared-pane scroll/resize pipeline. -->
+        <TrackList tracks={top} playFrom={playTop} showAlbum={false} showPlays disableWindowing />
       </div>
     {/if}
 
@@ -355,7 +355,7 @@
                 showArt={false}
                 showHead={false}
                 showPlays
-                resetsScroll={false}
+                disableWindowing
               />
             </div>
           </article>

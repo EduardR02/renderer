@@ -188,6 +188,26 @@ export const session = $state({ auth_state: null, username: null, error: null })
    queue and rebuilding its Svelte proxies once a second. */
 
 const playhead = $state({ base_ms: 0, at: 0, now: 0 });
+let playheadTimer = null;
+
+function startPlayheadTicker() {
+  if (playheadTimer !== null) return;
+  playhead.now = performance.now();
+  playheadTimer = setInterval(() => {
+    playhead.now = performance.now();
+  }, 250);
+}
+
+function stopPlayheadTicker() {
+  if (playheadTimer === null) return;
+  clearInterval(playheadTimer);
+  playheadTimer = null;
+}
+
+function syncPlayheadTicker(playing) {
+  if (playing) startPlayheadTicker();
+  else stopPlayheadTicker();
+}
 
 /** Pins the playhead to `ms` as of right now; projection restarts from here. */
 function anchorPlayhead(ms) {
@@ -208,10 +228,12 @@ export function positionMs() {
 
 export function applyPlayback(payload) {
   if (!payload) return;
+  const wasPlaying = playback.playing;
   for (const key of Object.keys(playback)) {
     if (key in payload) playback[key] = payload[key];
   }
   if ("position_ms" in payload) anchorPlayhead(payload.position_ms);
+  if (playback.playing !== wasPlaying) syncPlayheadTicker(playback.playing);
 }
 
 export function applySession(payload) {
@@ -630,6 +652,7 @@ export function togglePlay() {
   const at = positionMs();
   playback.playing = !playback.playing;
   anchorPlayhead(at);
+  syncPlayheadTicker(playback.playing);
   invoke(playback.playing ? "play" : "pause").catch(() => {});
 }
 
@@ -669,9 +692,4 @@ export async function initEvents() {
     .then((playlists) => setLibrary(playlists))
     .catch(() => {});
 
-  // Advance the projected playhead. 250ms reads as smooth on a progress bar
-  // and touches exactly one number; nothing else in the tree invalidates.
-  setInterval(() => {
-    if (playback.playing) playhead.now = performance.now();
-  }, 250);
 }

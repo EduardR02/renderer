@@ -12,12 +12,12 @@
   }
 
   /* ---------------- Windowed rendering ----------------
-     Same scheme as TrackList: a 2000-item queue is 2000 grid rows, each with
-     a cover and three buttons — enough DOM to make layout and paint slow. Rows
-     are a fixed --row-h, so the visible slice follows from the scroll offset
-     alone and the rest is two spacer divs. The scroller is an ancestor
-     (.scroll in App.svelte), not this component, so the offset has to be read
-     from it rather than from a local scrollTop.
+     Same scheme as TrackList: a fixed-height body preserves the queue's full
+     geometry while an absolute-index-keyed window is translated through it.
+     Sliding by one row retains every overlapping row/Cover subtree and only
+     removes and adds the boundary rows. The scroller is an ancestor (.scroll
+     in App.svelte), not this component, so the offset has to be read from it
+     rather than from a local scrollTop.
      The queue differs from a playlist table in one way: the engine re-sends
      the whole queue (a fresh array) on every change, so identity changes on
      the queue's own edits too. Those keep the window — a move/remove/play-from
@@ -109,7 +109,7 @@
 
   /*
    * Runs before the new rows are patched into the DOM, so an edit cannot
-   * briefly render a stale spacer range. Edits of the same queue keep the
+   * briefly render a stale retained range. Edits of the same queue keep the
    * position (clamped to the new length); a queue that no longer shows the
    * visible tracks resets the shared pane scroll to the top.
    */
@@ -194,76 +194,76 @@
         <span></span>
       </div>
 
-      <div bind:this={bodyEl} style="overflow-anchor: none">
-        {#if firstRow > 0}<div aria-hidden="true" style:height="{firstRow * ROW_H}px"></div>{/if}
+      <div
+        bind:this={bodyEl}
+        style="overflow-anchor: none; position: relative"
+        style:height="{queue.length * ROW_H}px"
+      >
+        <div
+          style="position: absolute; inset: 0 0 auto"
+          style:transform="translateY({firstRow * ROW_H}px)"
+        >
+          <!-- Absolute-index keys retain all overlapping rows when the window
+               slides. Queue action indexes remain the original queue indexes. -->
+          {#each visible as track, k (firstRow + k)}
+            {@const i = firstRow + k}
+            <div
+              class="tl-row"
+              class:current={i === playback.current_index}
+              role="button"
+              tabindex="-1"
+              ondblclick={() => playAt(i)}
+            >
+              <span class="c-idx">
+                <span class="n">{i + 1}</span>
+                <span class="eq"><i></i><i></i><i></i><i></i></span>
+                <button class="go" title="Play from here" onclick={() => playAt(i)}>
+                  <Icon name={i === playback.current_index && playback.playing ? "pause" : "play"} size={12} />
+                </button>
+              </span>
 
-        <!-- Unkeyed on purpose: as the window slides, Svelte patches the
-             existing row nodes in place instead of destroying and recreating
-             them. The original index is the window offset plus the position
-             within it, so play/current/remove/move always target the real
-             queue entry. -->
-        {#each visible as track, k}
-          {@const i = firstRow + k}
-          <div
-            class="tl-row"
-            class:current={i === playback.current_index}
-            role="button"
-            tabindex="-1"
-            ondblclick={() => playAt(i)}
-          >
-            <span class="c-idx">
-              <span class="n">{i + 1}</span>
-              <span class="eq"><i></i><i></i><i></i><i></i></span>
-              <button class="go" title="Play from here" onclick={() => playAt(i)}>
-                <Icon name={i === playback.current_index && playback.playing ? "pause" : "play"} size={12} />
-              </button>
-            </span>
-
-            <Cover
-              src={track.cover_url}
-              id={track.album_id || track.uri}
-              name={track.album_name || track.name}
-              size={36}
-              class="c-art"
-            />
-
-            <span class="c-title">
-              <span class="t-name">{track.name}</span>
-              <ArtistLinks
-                class="t-artists"
-                names={track.artist_names}
-                ids={track.artist_ids ?? []}
-                id={track.artist_id}
+              <Cover
+                src={track.cover_url}
+                id={track.album_id || track.uri}
+                name={track.album_name || track.name}
+                size={36}
+                class="c-art"
               />
-            </span>
 
-            <span class="c-time">{formatTime(track.duration_ms)}</span>
+              <span class="c-title">
+                <span class="t-name">{track.name}</span>
+                <ArtistLinks
+                  class="t-artists"
+                  names={track.artist_names}
+                  ids={track.artist_ids ?? []}
+                  id={track.artist_id}
+                />
+              </span>
 
-            <span class="q-actions">
-              <button
-                title="Move up"
-                disabled={i === 0}
-                onclick={() => api.moveQueue(i, i - 1).catch(() => {})}
-              >
-                <Icon name="chevron-up" size={15} />
-              </button>
-              <button
-                title="Move down"
-                disabled={i === queue.length - 1}
-                onclick={() => api.moveQueue(i, i + 1).catch(() => {})}
-              >
-                <Icon name="chevron-down" size={15} />
-              </button>
-              <button class="danger" title="Remove from queue" onclick={() => api.removeQueue(i).catch(() => {})}>
-                <Icon name="x" size={14} />
-              </button>
-            </span>
-          </div>
-        {/each}
+              <span class="c-time">{formatTime(track.duration_ms)}</span>
 
-        {#if lastRow < queue.length}
-          <div aria-hidden="true" style:height="{(queue.length - lastRow) * ROW_H}px"></div>
-        {/if}
+              <span class="q-actions">
+                <button
+                  title="Move up"
+                  disabled={i === 0}
+                  onclick={() => api.moveQueue(i, i - 1).catch(() => {})}
+                >
+                  <Icon name="chevron-up" size={15} />
+                </button>
+                <button
+                  title="Move down"
+                  disabled={i === queue.length - 1}
+                  onclick={() => api.moveQueue(i, i + 1).catch(() => {})}
+                >
+                  <Icon name="chevron-down" size={15} />
+                </button>
+                <button class="danger" title="Remove from queue" onclick={() => api.removeQueue(i).catch(() => {})}>
+                  <Icon name="x" size={14} />
+                </button>
+              </span>
+            </div>
+          {/each}
+        </div>
       </div>
     </div>
   {:else}
