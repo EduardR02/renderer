@@ -8,6 +8,7 @@
     navigate,
     route,
     positionMs,
+    ui,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
@@ -134,6 +135,14 @@
   </div>
 
   <div class="p-right">
+    <button
+      class="btn-icon"
+      class:on={ui.nowPlayingOpen}
+      title="Now playing details"
+      onclick={() => (ui.nowPlayingOpen = !ui.nowPlayingOpen)}
+    >
+      <Icon name="panel" size={18} />
+    </button>
     <button
       class="btn-icon"
       class:on={route.name === "queue"}

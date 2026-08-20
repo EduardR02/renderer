@@ -5,11 +5,13 @@
     stats,
     cacheStats,
     refreshCacheStats,
+    clearCache,
     api,
     openAuthUrl,
     isLoggedOut,
   } from "../lib/state.svelte.js";
   import Icon from "../components/Icon.svelte";
+  import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import { formatBytes } from "../lib/time.js";
 
   const username = $derived(playback.username || session.username);
@@ -18,6 +20,40 @@
   /* `status` is a fire-and-forget ping: the engine answers on the event
      channel, not in the response, so all this can report is reachability. */
   let ping = $state("idle");
+  let clearTarget = $state(null);
+  let clearing = $state(false);
+  let clearError = $state("");
+
+  const clearCopy = $derived(
+    clearTarget === "audio"
+      ? {
+          title: "Clear audio cache?",
+          message: "Playback will stop and the current queue will be cleared. Downloaded audio will be fetched again when needed.",
+        }
+      : {
+          title: "Clear cover cache?",
+          message: "Cached artwork will be removed and downloaded again as pages are opened.",
+        },
+  );
+
+  function requestClear(kind) {
+    clearTarget = kind;
+    clearError = "";
+  }
+
+  async function confirmClear() {
+    if (!clearTarget || clearing) return;
+    clearing = true;
+    clearError = "";
+    try {
+      await clearCache(clearTarget);
+      clearTarget = null;
+    } catch (error) {
+      clearError = String(error || "Could not clear the cache.");
+    } finally {
+      clearing = false;
+    }
+  }
 
   function checkEngine() {
     ping = "checking";
@@ -107,6 +143,7 @@
               Unavailable
             {/if}
           </span>
+          <button class="btn-ghost" onclick={() => requestClear("audio")}>Clear</button>
         </div>
       </div>
       <div class="set-row" data-cache-stat="covers">
@@ -124,6 +161,7 @@
               Unavailable
             {/if}
           </span>
+          <button class="btn-ghost" onclick={() => requestClear("covers")}>Clear</button>
         </div>
       </div>
       <div class="set-row">
@@ -166,3 +204,20 @@
     </div>
   </div>
 </section>
+
+{#if clearTarget}
+  <ConfirmDialog
+    open
+    title={clearCopy.title}
+    message={clearCopy.message}
+    confirmLabel="Clear cache"
+    busyLabel="Clearing…"
+    busy={clearing}
+    error={clearError}
+    onConfirm={confirmClear}
+    onCancel={() => {
+      clearTarget = null;
+      clearError = "";
+    }}
+  />
+{/if}

@@ -10,9 +10,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app::{
     AppState, PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH,
-    carry_local_fields, compute_cache_stats, data_dir, load_playlist_list, now_secs,
-    order_by_last_played, playlist_detail_from_cache, save_playlist_list, save_tracks_cache,
-    touch_playlist_played, upsert_playlist, upsert_tracks_cache,
+    carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
+    load_playlist_list, now_secs, order_by_last_played, playlist_detail_from_cache,
+    save_playlist_list, save_tracks_cache, touch_playlist_played, upsert_playlist,
+    upsert_tracks_cache,
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
@@ -369,6 +370,38 @@ pub async fn get_cache_stats(state: State<'_, Mutex<AppState>>) -> Result<CacheS
         .await
         .map_err(|error| format!("could not measure the caches: {error}"))?;
     state.lock().cache_stats = Some((now, stats));
+    Ok(stats)
+}
+
+/// Clears one cache after an explicit Settings confirmation. Clearing audio
+/// first stops playback and empties the queue so no decoder/download task can
+/// keep a cache file open while Windows removes it. Credentials, volume,
+/// playlist metadata, and diagnostic logs are outside both target directories.
+#[tauri::command]
+pub async fn clear_cache(
+    kind: String,
+    state: State<'_, Mutex<AppState>>,
+    client: State<'_, Arc<EngineClient>>,
+) -> Result<CacheStats, String> {
+    let (root, keep): (std::path::PathBuf, &'static [&'static str]) = match kind.as_str() {
+        "audio" => {
+            // A logged-out/not-yet-ready engine has no active audio handles;
+            // failure to empty that already-empty queue is harmless.
+            let _ = client.play_queue(&[], 0, 0).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (engine_state_dir().join("audio"), &["cache-version"])
+        }
+        "covers" => (data_dir().join("covers"), &[]),
+        _ => return Err("cache kind must be 'audio' or 'covers'".to_owned()),
+    };
+    tauri::async_runtime::spawn_blocking(move || clear_cache_directory(&root, keep))
+        .await
+        .map_err(|error| format!("could not clear the {kind} cache: {error}"))??;
+
+    let stats = tauri::async_runtime::spawn_blocking(compute_cache_stats)
+        .await
+        .map_err(|error| format!("could not measure caches after clearing: {error}"))?;
+    state.lock().cache_stats = Some((now_secs(), stats));
     Ok(stats)
 }
 

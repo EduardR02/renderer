@@ -414,6 +414,7 @@
     title="Delete playlist?"
     message={`“${pl?.name ?? "This playlist"}” will be removed from your library. This cannot be undone.`}
     confirmLabel="Delete playlist"
+    busyLabel="Deleting…"
     busy={deleting}
     error={deleteError}
     onConfirm={deletePlaylist}

@@ -9,9 +9,19 @@
   let libList = $state(null);
   let fadeTop = $state(false);
   let fadeBottom = $state(false);
+  let filtering = $state(false);
+  let filterQuery = $state("");
+  let filterInput = $state(null);
+
+  const filteredLibrary = $derived.by(() => {
+    const query = filterQuery.trim().toLocaleLowerCase();
+    if (!query) return library;
+    return library.filter((playlist) => playlist.name?.toLocaleLowerCase().includes(query));
+  });
 
   $effect(() => {
-    library.length;
+    filteredLibrary.length;
+    filterQuery;
     const list = libList;
     if (!list) return;
 
@@ -34,6 +44,27 @@
   $effect(() => {
     if (creating) field?.focus();
   });
+
+  $effect(() => {
+    if (filtering) queueMicrotask(() => filterInput?.focus());
+  });
+
+  function startCreate() {
+    filtering = false;
+    filterQuery = "";
+    creating = true;
+  }
+
+  function startFilter() {
+    creating = false;
+    newName = "";
+    filtering = true;
+  }
+
+  function closeFilter() {
+    filtering = false;
+    filterQuery = "";
+  }
 
   function commitCreate() {
     const name = newName.trim();
@@ -64,10 +95,39 @@
 
   <div class="lib">
     <div class="lib-head">
-      <span class="label">Library</span>
-      <button class="btn-icon" title="New playlist" onclick={() => (creating = true)}>
-        <Icon name="plus" size={14} />
-      </button>
+      {#if filtering}
+        <div class="lib-filter">
+          <Icon name="search" size={13} />
+          <input
+            bind:this={filterInput}
+            bind:value={filterQuery}
+            aria-label="Filter library"
+            placeholder="Filter library"
+            spellcheck="false"
+            onkeydown={(event) => event.key === "Escape" && closeFilter()}
+          />
+          <button class="lib-filter-close" title="Clear library filter" onclick={closeFilter}>
+            <Icon name="x" size={11} />
+          </button>
+        </div>
+      {:else}
+        <span class="label">Library</span>
+        <div class="lib-head-actions">
+          <button
+            class="btn-icon"
+            title="Filter library"
+            onpointerdown={(event) => {
+              if (creating) event.preventDefault();
+            }}
+            onclick={startFilter}
+          >
+            <Icon name="search" size={13} />
+          </button>
+          <button class="btn-icon" title="New playlist" onclick={startCreate}>
+            <Icon name="plus" size={14} />
+          </button>
+        </div>
+      {/if}
     </div>
 
     {#if creating}
@@ -90,7 +150,7 @@
     {/if}
 
     <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} bind:this={libList}>
-      {#each library as pl (pl.id)}
+      {#each filteredLibrary as pl (pl.id)}
         <button
           class="lib-row"
           class:active={route.name === "playlist" && route.id === pl.id}
@@ -102,6 +162,9 @@
           {#if pl.tracks_total}<span class="lib-count">{pl.tracks_total}</span>{/if}
         </button>
       {/each}
+      {#if filterQuery.trim() && !filteredLibrary.length}
+        <p class="lib-filter-empty">No matching playlists</p>
+      {/if}
     </div>
   </div>
 

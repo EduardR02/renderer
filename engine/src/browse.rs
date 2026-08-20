@@ -40,14 +40,11 @@
 //!   rather than `portrait`. Both were previously left unread, which is why
 //!   every artist rendered as a monogram tile. See [`hit_image`] and
 //!   [`artist_portrait`].
-//! - Play counts are *not* available on any endpoint this engine uses:
-//!   `spotify.metadata.Track` carries `popularity` (0-100) but no count, the
-//!   searchDesktop track hit has no `playcount` field, and the
-//!   extended-metadata `STREAM_COUNT` extension answers a per-entity 404 for
-//!   track, album and artist URIs alike (verified live 2026-08-19). The
-//!   official client reads them from a separate pathfinder persisted query,
-//!   and pathfinder rejects non-persisted documents with 400, so surfacing
-//!   playcounts would mean tracking a second rotating query hash.
+//! - Play counts: the dead extended-metadata `STREAM_COUNT` enum entry is not
+//!   used by Spotify's client. Album rows come from the persisted pathfinder
+//!   `queryAlbumTracks` document; artist Popular counts are recovered from the
+//!   first top track's `getTrack` document, whose first-artist discography
+//!   carries the same top-track play counts in one response.
 
 use std::collections::{HashMap, HashSet};
 
@@ -182,6 +179,7 @@ pub fn track_ref(track: &Track) -> TrackRef {
         album_name: track.album.name.clone(),
         cover_url: cover_url(&track.album.covers).unwrap_or_default(),
         duration_ms: u32::try_from(track.duration).unwrap_or(0),
+        play_count: None,
         added_at: None,
     }
 }
@@ -772,7 +770,12 @@ pub async fn album_browse(
     let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}"))
         .map_err(|error| format!("invalid album id: {error}"))?;
     let album: Album = metadata_get(session, &uri, "album").await?;
-    let tracks = fetch_tracks(session, album.tracks()).await?;
+    let album_track_count = album.tracks().count();
+    let mut tracks = fetch_tracks(session, album.tracks()).await?;
+    match album_playcounts(session, &uri_of(&album.id), album_track_count).await {
+        Ok(counts) => apply_playcounts(&mut tracks, &counts),
+        Err(error) => eprintln!("album play counts unavailable: {error}"),
+    }
     Ok(spotify_playback_engine::protocol::AlbumBrowse {
         id: id_of(&album.id),
         uri: uri_of(&album.id),
@@ -857,7 +860,17 @@ pub async fn artist_browse(
         .map_err(|error| format!("invalid artist id: {error}"))?;
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
     let top_tracks = artist.top_tracks.for_country(&session.country());
-    let top_tracks = fetch_tracks(session, top_tracks.iter()).await?;
+    let mut top_tracks = fetch_tracks(session, top_tracks.iter()).await?;
+    if let Some(seed) = top_tracks
+        .iter()
+        .find(|track| track.artist_id == id)
+        .or_else(|| top_tracks.first())
+    {
+        match artist_top_playcounts(session, &seed.uri).await {
+            Ok(counts) => apply_playcounts(&mut top_tracks, &counts),
+            Err(error) => eprintln!("artist play counts unavailable: {error}"),
+        }
+    }
 
     let groups: [Vec<SpotifyUri>; 4] = [
         artist.albums_current().cloned().collect(),
@@ -906,64 +919,12 @@ pub async fn artist_browse(
 }
 
 // ---------------------------------------------------------------------------
-// track credits (track-credits-view)
+// track credits (queryTrackCreditsGroupedModal)
 // ---------------------------------------------------------------------------
 
-/// The spclient endpoint behind the official client's Credits dialog.
-///
-/// Contributors arrive with their source `spotify:artist:{id}` URI. A valid
-/// Spotify artist id is retained for the frontend's external songwriter link;
-/// missing or malformed URIs stay unlinked. No role or id is synthesized.
-const TRACK_CREDITS_ENDPOINT: &str = "https://spclient.wg.spotify.com/track-credits-view/v0/track";
-
-/// Raw JSON of the credits response. Every field is optional so a renamed or
-/// missing one degrades to an empty section rather than failing the request.
-#[derive(Default, Deserialize)]
-#[allow(non_snake_case)] // service field names
-struct CreditsJson {
-    #[serde(default)]
-    trackUri: Option<String>,
-    #[serde(default)]
-    trackTitle: Option<String>,
-    #[serde(default)]
-    roleCredits: Vec<CreditRoleJson>,
-    /// The licensor the credits came from, e.g. `Republic Records`. The
-    /// official client shows this under the role groups; dropping it made our
-    /// dialog look emptier than the service's for the same track.
-    #[serde(default)]
-    source: Option<CreditSourceJson>,
-}
-
-#[derive(Default, Deserialize)]
-struct CreditSourceJson {
-    #[serde(default)]
-    value: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-#[allow(non_snake_case)] // service field names
-struct CreditRoleJson {
-    #[serde(default)]
-    roleTitle: Option<String>,
-    #[serde(default)]
-    artists: Vec<CreditArtistJson>,
-}
-
-#[derive(Default, Deserialize)]
-struct CreditArtistJson {
-    /// Absent for contributors with no source URI that can yield a valid
-    /// external songwriter id.
-    #[serde(default)]
-    uri: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    subroles: Vec<String>,
-}
-
 /// Spotify ids are opaque 22-character base62 values. Restricting the id to
-/// that alphabet and length keeps malformed source URIs from becoming links
-/// or URL path data. The original URI is still retained for diagnostics.
+/// that alphabet and length keeps a malformed source URI from becoming URL
+/// path data. The original URI is still retained for diagnostics.
 fn credit_artist_id(uri: &str) -> String {
     let Some(id) = uri.strip_prefix("spotify:artist:") else {
         return String::new();
@@ -972,46 +933,6 @@ fn credit_artist_id(uri: &str) -> String {
         id.to_owned()
     } else {
         String::new()
-    }
-}
-
-fn credit_artist(raw: &CreditArtistJson) -> CreditArtist {
-    let uri = raw.uri.clone().unwrap_or_default();
-    CreditArtist {
-        // This id is used only for the external songwriter URL. It is never
-        // an in-app artist route, and invalid/missing source ids stay empty.
-        id: credit_artist_id(&uri),
-        uri,
-        name: raw.name.clone().unwrap_or_default(),
-        subroles: raw.subroles.clone(),
-    }
-}
-
-/// Maps the credits payload, dropping role groups and contributors that
-/// carry no name at all — an unnamed credit is nothing to render.
-fn track_credits_from_json(parsed: &CreditsJson) -> TrackCredits {
-    TrackCredits {
-        track_uri: parsed.trackUri.clone().unwrap_or_default(),
-        track_name: parsed.trackTitle.clone().unwrap_or_default(),
-        roles: parsed
-            .roleCredits
-            .iter()
-            .map(|role| CreditRole {
-                title: role.roleTitle.clone().unwrap_or_default(),
-                artists: role
-                    .artists
-                    .iter()
-                    .map(credit_artist)
-                    .filter(|artist| !artist.name.is_empty())
-                    .collect(),
-            })
-            .filter(|role| !role.artists.is_empty())
-            .collect(),
-        source: parsed
-            .source
-            .as_ref()
-            .and_then(|source| source.value.clone())
-            .unwrap_or_default(),
     }
 }
 
@@ -1030,82 +951,213 @@ pub async fn track_credits_browse(session: &Session, id: &str) -> Result<TrackCr
     if track_id.is_empty() {
         return Err("invalid track id".to_owned());
     }
-    let url = format!("{TRACK_CREDITS_ENDPOINT}/{track_id}/credits");
+    let track_uri = format!("spotify:track:{track_id}");
 
-    let token = session
-        .login5()
-        .auth_token()
-        .await
-        .map_err(|error| format!("credits authentication failed: {error}"))?;
-    let mut builder = Request::builder()
-        .method(Method::GET)
-        .uri(&url)
-        .header("Accept", "application/json")
-        .header(
-            "Authorization",
-            format!("{} {}", token.token_type, token.access_token),
-        );
-    if let Ok(client_token) = session.spclient().client_token().await {
-        builder = builder.header("client-token", client_token.as_str());
-    }
-    let request = builder
-        .body(Bytes::new())
-        .map_err(|error| format!("credits request construction failed: {error}"))?;
-
-    let backoffs = backoff_sequence(
-        BROWSE_RETRY_ATTEMPTS,
-        BROWSE_BACKOFF_BASE_MS,
-        BROWSE_BACKOFF_MAX_MS,
-    );
-    let mut attempt = 0usize;
-    let payload = loop {
-        match session.http_client().request_body(request.clone()).await {
-            Ok(bytes) => break bytes,
-            Err(error) => {
-                let transient = browse_error_is_transient(error.kind, http_status_of(&error));
-                if !transient || attempt >= backoffs.len() {
-                    return Err(format!(
-                        "credits request failed after {} attempt(s) (last error: {error})",
-                        attempt + 1,
-                    ));
-                }
-                let backoff = backoffs[attempt];
-                eprintln!(
-                    "credits request failed ({error}); retrying in {backoff} ms (attempt {}/{})",
-                    attempt + 1,
-                    backoffs.len() + 1,
-                );
-                tokio::time::sleep(Duration::from_millis(backoff)).await;
-                attempt += 1;
-            }
-        }
-    };
-
-    log_raw_credits_once(&payload);
-    let parsed: CreditsJson = serde_json::from_slice(&payload)
+    // The GraphQL operation the official client uses. There is deliberately no
+    // fallback to the older `track-credits-view` REST endpoint: it returns
+    // three fixed role groups instead of the full contributor list, and no
+    // external links at all, so falling back to it would quietly restore both
+    // of the defects this replaced. A rotated persisted-query hash should
+    // surface as "credits unavailable" and get the hash updated, not hide
+    // behind a thinner answer that looks like it worked.
+    let payload = pathfinder_post(session, &track_credits_body(&track_uri), "credits").await?;
+    let parsed: CreditsQueryJson = serde_json::from_slice(&payload)
         .map_err(|error| format!("unparseable credits response: {error}"))?;
-    Ok(track_credits_from_json(&parsed))
+    let credits = track_credits_from_query(&parsed, &track_uri);
+    if credits.roles.is_empty() {
+        return Err("Spotify returned no credits for this track".to_owned());
+    }
+    Ok(credits)
 }
 
-/// Dumps the first credits response verbatim, once per run.
-///
-/// [`CreditsJson`] keeps only `uri`, `name` and `subroles` per contributor, and
-/// the `uri` is a `spotify:artist:` one. The songwriter portal the official
-/// client links to is a *different* namespace: Max Martin is
-/// `artists.spotify.com/songwriter/1T7Hkfs6QmizPlOCzs08LS`, and
-/// `open.spotify.com/artist/1T7Hkfs6QmizPlOCzs08LS` is a 404. So the artist id
-/// cannot be the songwriter id, and building the link from it produces a page
-/// that does not exist — which is exactly what the credits dialog was doing.
-///
-/// Whatever the correct id is has to be a field we are dropping. Rather than
-/// guess at names, this prints what the service actually sends so the struct
-/// can be extended against real data.
-fn log_raw_credits_once(payload: &[u8]) {
-    static LOGGED: std::sync::Once = std::sync::Once::new();
-    LOGGED.call_once(|| match std::str::from_utf8(payload) {
-        Ok(text) => eprintln!("raw track-credits response: {text}"),
-        Err(error) => eprintln!("track-credits response was not utf-8: {error}"),
-    });
+
+/// Persisted-query hash for `queryTrackCreditsGroupedModal`, the operation
+/// behind the official desktop client's Credits dialog (read out of its own
+/// bundle, `xpui-root-dialogs.js`, client 1.2.96.518).
+const TRACK_CREDITS_QUERY_HASH: &str =
+    "f135fb9be58a72d041ab5d214d817021a272405d883860468e2627afb01a3ca9";
+
+/// The official client's contributor limit. It pages with an offset, but one
+/// request of 100 covers every track worth showing a dialog for.
+const TRACK_CREDITS_CONTRIBUTOR_LIMIT: u32 = 100;
+
+fn track_credits_body(track_uri: &str) -> String {
+    serde_json::json!({
+        "extensions": {
+            "persistedQuery": { "sha256Hash": TRACK_CREDITS_QUERY_HASH, "version": 1 },
+        },
+        "operationName": "queryTrackCreditsGroupedModal",
+        "variables": {
+            "trackUri": track_uri,
+            "contributorsLimit": TRACK_CREDITS_CONTRIBUTOR_LIMIT,
+            "contributorsOffset": 0,
+        },
+    })
+    .to_string()
+}
+
+/// Raw JSON of the credits GraphQL response. Optional throughout so a renamed
+/// or missing field degrades to a thinner dialog rather than an error.
+#[derive(Default, Deserialize)]
+struct CreditsQueryJson {
+    #[serde(default)]
+    data: Option<CreditsDataJson>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // service field names
+struct CreditsDataJson {
+    #[serde(default)]
+    trackUnion: Option<TrackUnionJson>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct TrackUnionJson {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    creditsTrait: Option<CreditsTraitJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct CreditsTraitJson {
+    #[serde(default)]
+    contributors: Option<ContributorItemsJson>,
+    #[serde(default)]
+    sources: Option<SourceItemsJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct ContributorItemsJson {
+    #[serde(default)]
+    items: Vec<ContributorJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SourceItemsJson {
+    #[serde(default)]
+    items: Vec<NamedJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct NamedJson {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct ContributorJson {
+    #[serde(default)]
+    name: Option<String>,
+    /// Singular here, unlike the REST view's `subroles` array: the flat list
+    /// carries one entry per person *per role*, and grouping merges them.
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    uri: Option<String>,
+    /// The external link the official client opens — for writers this is the
+    /// `artists.spotify.com/songwriter/<id>` page. The client never builds
+    /// this URL; the server supplies it finished, which is the only reason
+    /// songwriter links are possible at all (that id space is not the artist
+    /// one, and nothing in the payload maps between them).
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    reference: Option<ReferenceJson>,
+    #[serde(default)]
+    roleGroup: Option<NamedJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct ReferenceJson {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// Groups the flat contributor list the way the official dialog does: bucket
+/// by `roleGroup` name in first-seen order, then merge repeats of the same
+/// person within a bucket, accumulating their roles.
+fn track_credits_from_query(parsed: &CreditsQueryJson, track_uri: &str) -> TrackCredits {
+    let track = parsed
+        .data
+        .as_ref()
+        .and_then(|data| data.trackUnion.as_ref());
+    let credits = track.and_then(|track| track.creditsTrait.as_ref());
+
+    let mut roles: Vec<CreditRole> = Vec::new();
+    for item in credits.iter().flat_map(|credits| {
+        credits
+            .contributors
+            .as_ref()
+            .map(|contributors| contributors.items.as_slice())
+            .unwrap_or_default()
+    }) {
+        let Some(name) = item.name.clone().filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let group_title = item
+            .roleGroup
+            .as_ref()
+            .and_then(|group| group.name.clone())
+            .unwrap_or_else(|| "Other".to_owned());
+        let group = match roles.iter_mut().find(|role| role.title == group_title) {
+            Some(existing) => existing,
+            None => {
+                roles.push(CreditRole {
+                    title: group_title,
+                    artists: Vec::new(),
+                });
+                roles.last_mut().expect("just pushed")
+            }
+        };
+
+        let role = item.role.clone().unwrap_or_default();
+        let uri = item.uri.clone().unwrap_or_default();
+        let url = item
+            .url
+            .clone()
+            .or_else(|| item.reference.as_ref().and_then(|reference| reference.url.clone()))
+            .unwrap_or_default();
+        if let Some(existing) = group.artists.iter_mut().find(|artist| {
+            (!uri.is_empty() && artist.uri == uri)
+                || (uri.is_empty() && artist.uri.is_empty() && artist.name == name)
+        }) {
+            if !role.is_empty() && !existing.subroles.contains(&role) {
+                existing.subroles.push(role);
+            }
+            if existing.url.is_empty() && !url.is_empty() {
+                existing.url = url;
+            }
+            continue;
+        }
+        group.artists.push(CreditArtist {
+            id: credit_artist_id(&uri),
+            uri,
+            url,
+            name,
+            subroles: if role.is_empty() { Vec::new() } else { vec![role] },
+        });
+    }
+
+    TrackCredits {
+        track_uri: track_uri.to_owned(),
+        track_name: track.and_then(|track| track.name.clone()).unwrap_or_default(),
+        roles,
+        source: credits
+            .and_then(|credits| credits.sources.as_ref())
+            .map(|sources| {
+                sources
+                    .items
+                    .iter()
+                    .filter_map(|source| source.name.clone())
+                    .filter(|name| !name.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1390,6 +1442,7 @@ fn track_ref_from_hit(hit: &SearchTrackHitJson) -> TrackRef {
                 .as_ref()
                 .and_then(|duration| duration.totalMilliseconds.as_ref()),
         ),
+        play_count: None,
         added_at: None,
     }
 }
@@ -1453,6 +1506,229 @@ const SEARCH_DESKTOP_HASHES: &[&str] = &[
 /// search.
 const PATHFINDER_ENDPOINT: &str = "https://api-partner.spotify.com/pathfinder/v2/query";
 
+/// Persisted documents used by Spotify 1.2.96.518 for the play-count-bearing
+/// album and track pages. Like search and credits, these are client artefacts:
+/// a future rotation produces no counts (and one diagnostic) rather than
+/// inventing or silently retaining stale values.
+const ALBUM_TRACKS_QUERY_HASH: &str =
+    "b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10";
+const GET_TRACK_QUERY_HASH: &str =
+    "1a2f0cce77c90a4a5b1730beecc4da7e34290d684324c16663bf09a268ebce48";
+const ALBUM_TRACKS_PAGE_SIZE: usize = 50;
+
+#[derive(Default, Deserialize)]
+struct AlbumCountsResponse {
+    #[serde(default)]
+    data: Option<AlbumCountsData>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct AlbumCountsData {
+    #[serde(default)]
+    albumUnion: Option<AlbumCountsUnion>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct AlbumCountsUnion {
+    #[serde(default)]
+    tracksV2: Option<PlaycountItems>,
+}
+
+#[derive(Default, Deserialize)]
+struct PlaycountItems {
+    #[serde(default)]
+    items: Option<Vec<PlaycountItem>>,
+}
+
+#[derive(Default, Deserialize)]
+struct PlaycountItem {
+    #[serde(default)]
+    track: Option<PlaycountTrack>,
+}
+
+#[derive(Default, Deserialize)]
+struct PlaycountTrack {
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    playcount: Option<serde_json::Value>,
+}
+
+#[derive(Default, Deserialize)]
+struct GetTrackCountsResponse {
+    #[serde(default)]
+    data: Option<GetTrackCountsData>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct GetTrackCountsData {
+    #[serde(default)]
+    trackUnion: Option<GetTrackCountsUnion>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct GetTrackCountsUnion {
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    playcount: Option<serde_json::Value>,
+    #[serde(default)]
+    firstArtist: Option<ArtistItems>,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistItems {
+    #[serde(default)]
+    items: Option<Vec<ArtistDiscographyItem>>,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistDiscographyItem {
+    #[serde(default)]
+    discography: Option<ArtistDiscography>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct ArtistDiscography {
+    #[serde(default)]
+    topTracks: Option<PlaycountItems>,
+}
+
+fn playcount_value(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|value| match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => text.parse().ok(),
+        _ => None,
+    })
+}
+
+fn collect_playcount_items(items: &PlaycountItems, counts: &mut HashMap<String, u64>) {
+    for track in items
+        .items
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| item.track.as_ref())
+    {
+        let Some(uri) = track.uri.as_ref().filter(|uri| !uri.is_empty()) else {
+            continue;
+        };
+        let Some(count) = playcount_value(track.playcount.as_ref()).filter(|count| *count > 0)
+        else {
+            continue;
+        };
+        counts.insert(uri.clone(), count);
+    }
+}
+
+fn apply_playcounts(tracks: &mut [TrackRef], counts: &HashMap<String, u64>) {
+    for track in tracks {
+        track.play_count = counts.get(&track.uri).copied();
+    }
+}
+
+fn album_tracks_body(album_uri: &str, offset: usize, limit: usize) -> String {
+    serde_json::json!({
+        "extensions": {
+            "persistedQuery": { "sha256Hash": ALBUM_TRACKS_QUERY_HASH, "version": 1 },
+        },
+        "operationName": "queryAlbumTracks",
+        "variables": { "uri": album_uri, "offset": offset, "limit": limit },
+    })
+    .to_string()
+}
+
+async fn album_playcounts(
+    session: &Session,
+    album_uri: &str,
+    track_count: usize,
+) -> Result<HashMap<String, u64>, String> {
+    if track_count == 0 {
+        return Ok(HashMap::new());
+    }
+    let mut counts = HashMap::new();
+    let mut offset = 0;
+    while offset < track_count {
+        let limit = (track_count - offset).min(ALBUM_TRACKS_PAGE_SIZE);
+        let body = album_tracks_body(album_uri, offset, limit);
+        let payload = pathfinder_post(session, &body, "album play counts").await?;
+        let parsed: AlbumCountsResponse = serde_json::from_slice(&payload)
+            .map_err(|error| format!("unparseable album play-count response: {error}"))?;
+        if let Some(items) = parsed
+            .data
+            .as_ref()
+            .and_then(|data| data.albumUnion.as_ref())
+            .and_then(|album| album.tracksV2.as_ref())
+        {
+            collect_playcount_items(items, &mut counts);
+        }
+        offset += limit;
+    }
+    if counts.is_empty() {
+        return Err("Spotify returned no play counts for this album".to_owned());
+    }
+    Ok(counts)
+}
+
+fn get_track_body(track_uri: &str) -> String {
+    serde_json::json!({
+        "extensions": {
+            "persistedQuery": { "sha256Hash": GET_TRACK_QUERY_HASH, "version": 1 },
+        },
+        "operationName": "getTrack",
+        "variables": { "uri": track_uri, "includeVideoAssociationItems": false },
+    })
+    .to_string()
+}
+
+async fn artist_top_playcounts(
+    session: &Session,
+    seed_track_uri: &str,
+) -> Result<HashMap<String, u64>, String> {
+    let payload = pathfinder_post(
+        session,
+        &get_track_body(seed_track_uri),
+        "artist play counts",
+    )
+    .await?;
+    let parsed: GetTrackCountsResponse = serde_json::from_slice(&payload)
+        .map_err(|error| format!("unparseable artist play-count response: {error}"))?;
+    let mut counts = HashMap::new();
+    let track = parsed
+        .data
+        .as_ref()
+        .and_then(|data| data.trackUnion.as_ref())
+        .ok_or_else(|| "Spotify returned no track data for this artist".to_owned())?;
+    if let (Some(uri), Some(count)) = (
+        track.uri.as_ref().filter(|uri| !uri.is_empty()),
+        playcount_value(track.playcount.as_ref()).filter(|count| *count > 0),
+    ) {
+        counts.insert(uri.clone(), count);
+    }
+    if let Some(items) = track
+        .firstArtist
+        .as_ref()
+        .and_then(|artist| artist.items.as_deref())
+    {
+        for top_tracks in items
+            .iter()
+            .filter_map(|item| item.discography.as_ref())
+            .filter_map(|discography| discography.topTracks.as_ref())
+        {
+            collect_playcount_items(top_tracks, &mut counts);
+        }
+    }
+    if counts.is_empty() {
+        return Err("Spotify returned no play counts for this artist".to_owned());
+    }
+    Ok(counts)
+}
+
 /// Builds the `searchDesktop` request body. The variables mirror what the
 /// official client sends; the persisted-query hash selects the document.
 fn search_desktop_body(query: &str, limit: usize, hash: &str) -> String {
@@ -1473,16 +1749,18 @@ fn search_desktop_body(query: &str, limit: usize, hash: &str) -> String {
     .to_string()
 }
 
-/// One pathfinder searchDesktop attempt for a given hash: POST with the
+/// One pathfinder attempt for a given persisted-query body: POST with the
 /// session's login5 bearer + client token, transient failures retried with
 /// the bounded backoff. A client error (e.g. a 400 persisted-query
-/// rejection) fails fast so the caller can fall back to the previous hash.
-async fn search_desktop_once(session: &Session, body: &str) -> Result<Vec<u8>, String> {
+/// rejection) fails fast so the caller can fall back to another hash.
+///
+/// `what` names the operation in error and retry messages only.
+async fn pathfinder_post(session: &Session, body: &str, what: &str) -> Result<Vec<u8>, String> {
     let token = session
         .login5()
         .auth_token()
         .await
-        .map_err(|error| format!("search authentication failed: {error}"))?;
+        .map_err(|error| format!("{what} authentication failed: {error}"))?;
     let mut builder = Request::builder()
         .method(Method::POST)
         .uri(PATHFINDER_ENDPOINT)
@@ -1496,7 +1774,7 @@ async fn search_desktop_once(session: &Session, body: &str) -> Result<Vec<u8>, S
     }
     let request = builder
         .body(Bytes::from(body.to_owned()))
-        .map_err(|error| format!("search request construction failed: {error}"))?;
+        .map_err(|error| format!("{what} request construction failed: {error}"))?;
 
     let backoffs = backoff_sequence(
         BROWSE_RETRY_ATTEMPTS,
@@ -1511,13 +1789,13 @@ async fn search_desktop_once(session: &Session, body: &str) -> Result<Vec<u8>, S
                 let transient = browse_error_is_transient(error.kind, http_status_of(&error));
                 if !transient || attempt >= backoffs.len() {
                     return Err(format!(
-                        "search request failed after {} attempt(s) (last error: {error})",
+                        "{what} request failed after {} attempt(s) (last error: {error})",
                         attempt + 1,
                     ));
                 }
                 let backoff = backoffs[attempt];
                 eprintln!(
-                    "search request failed ({error}); retrying in {backoff} ms (attempt {}/{})",
+                    "{what} request failed ({error}); retrying in {backoff} ms (attempt {}/{})",
                     attempt + 1,
                     backoffs.len() + 1,
                 );
@@ -1545,7 +1823,7 @@ pub async fn search_browse(
     let mut last_error = String::new();
     for hash in SEARCH_DESKTOP_HASHES {
         let body = search_desktop_body(query.trim(), limit, hash);
-        let payload = match search_desktop_once(session, &body).await {
+        let payload = match pathfinder_post(session, &body, "search").await {
             Ok(payload) => payload,
             Err(error) => {
                 last_error = error;
@@ -2016,68 +2294,214 @@ mod tests {
     }
 
     #[test]
-    fn track_credits_map_the_live_response_shape() {
-        // Trimmed from a real /v0/track/{id}/credits response.
+    fn track_credits_group_the_flat_contributor_list() {
+        // Shaped after the official client's own consumption of
+        // `queryTrackCreditsGroupedModal`: one flat list, one role per entry,
+        // grouped and deduped on this side.
         let body = r#"{
-            "label": "Credits",
-            "trackUri": "spotify:track:1BxfuPKGuaTgP7aM0Bbdwr",
-            "trackTitle": "Cruel Summer",
-            "roleCredits": [
-                {"roleTitle": "Performers", "artists": [
-                    {"uri": "spotify:artist:06HL4z0CvFAxyc27GXpf02", "name": "Taylor Swift", "subroles": ["main artist"], "weight": 9.0}
-                ]},
-                {"roleTitle": "Writers", "artists": [
-                    {"uri": "spotify:artist:2XecPkCBJp99480lrtKlIp", "name": "Annie Clark", "subroles": ["composer", "lyricist"], "weight": 6.0},
-                    {"name": "Uncredited Ghost", "subroles": ["composer"]}
-                ]},
-                {"roleTitle": "Producers", "artists": []},
-                {"roleTitle": "Nameless", "artists": [{"uri": "spotify:artist:x"}]}
-            ]
+            "data": {
+                "trackUnion": {
+                    "__typename": "Track",
+                    "name": "Cruel Summer",
+                    "creditsTrait": {
+                        "contributors": {"items": [
+                            {"name": "Taylor Swift", "role": "main artist", "uri": "spotify:artist:06HL4z0CvFAxyc27GXpf02", "roleGroup": {"name": "Performers"}},
+                            {"name": "Annie Clark", "role": "composer", "uri": "spotify:artist:2XecPkCBJp99480lrtKlIp", "roleGroup": {"name": "Writers"}},
+                            {"name": "Annie Clark", "role": "lyricist", "uri": "spotify:artist:2XecPkCBJp99480lrtKlIp", "url": "https://artists.spotify.com/songwriter/1pTJCipDqvUaFmILQLnMsC", "roleGroup": {"name": "Writers"}},
+                            {"name": "Annie Clark", "role": "composer", "uri": "spotify:artist:06HL4z0CvFAxyc27GXpf02", "roleGroup": {"name": "Writers"}},
+                            {"name": "Uncredited Ghost", "role": "composer", "roleGroup": {"name": "Writers"}},
+                            {"name": "Linked By Reference", "role": "producer", "reference": {"url": "https://example.invalid/ref"}, "roleGroup": {"name": "Producers"}},
+                            {"name": "Ungrouped Person", "role": "engineer"},
+                            {"role": "nameless", "roleGroup": {"name": "Writers"}}
+                        ]},
+                        "sources": {"items": [{"name": "Republic Records"}, {"name": "Big Machine"}]}
+                    }
+                }
+            }
         }"#;
-        let parsed: CreditsJson = serde_json::from_str(body).unwrap();
-        let credits = track_credits_from_json(&parsed);
+        let parsed: CreditsQueryJson = serde_json::from_str(body).unwrap();
+        let credits = track_credits_from_query(&parsed, "spotify:track:1BxfuPKGuaTgP7aM0Bbdwr");
 
         assert_eq!(credits.track_uri, "spotify:track:1BxfuPKGuaTgP7aM0Bbdwr");
         assert_eq!(credits.track_name, "Cruel Summer");
-        // The empty "Producers" group and the group whose only contributor has
-        // no name are both dropped: neither renders as anything.
-        assert_eq!(credits.roles.len(), 2);
+        // Sources is a list here, unlike the single value the retired v0 view
+        // returned.
+        assert_eq!(credits.source, "Republic Records, Big Machine");
 
-        assert_eq!(credits.roles[0].title, "Performers");
-        assert_eq!(credits.roles[0].artists[0].id, "06HL4z0CvFAxyc27GXpf02");
-        assert_eq!(credits.roles[0].artists[0].subroles, vec!["main artist"]);
+        // Groups appear in first-seen order, and a contributor with no
+        // roleGroup still has to land somewhere.
+        let titles: Vec<&str> = credits.roles.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles, vec!["Performers", "Writers", "Producers", "Other"]);
 
         let writers = &credits.roles[1];
-        assert_eq!(writers.title, "Writers");
-        assert_eq!(writers.artists[0].id, "2XecPkCBJp99480lrtKlIp");
+        // The two Annie Clark entries are one person with two roles, not two
+        // rows -- this merging is the whole reason the flat list is grouped
+        // here rather than rendered as it arrives.
+        assert_eq!(writers.artists[0].name, "Annie Clark");
         assert_eq!(writers.artists[0].subroles, vec!["composer", "lyricist"]);
-        // A contributor without a valid source id keeps their name and
-        // roles, so the frontend renders them as plain text.
-        assert_eq!(writers.artists[1].name, "Uncredited Ghost");
-        assert_eq!(writers.artists[1].id, "");
-        assert_eq!(writers.artists[1].uri, "");
+        assert_eq!(writers.artists[0].id, "2XecPkCBJp99480lrtKlIp");
+        assert_eq!(
+            writers.artists[0].url,
+            "https://artists.spotify.com/songwriter/1pTJCipDqvUaFmILQLnMsC",
+            "the songwriter link is taken verbatim from the service, never built"
+        );
+
+        // No name is nothing to render.
+        assert_eq!(writers.artists.len(), 3);
+        assert_eq!(writers.artists[1].name, "Annie Clark");
+        assert_eq!(writers.artists[1].id, "06HL4z0CvFAxyc27GXpf02");
+        assert_eq!(writers.artists[2].name, "Uncredited Ghost");
+        assert_eq!(writers.artists[2].url, "", "no link when the service sends none");
+        assert_eq!(writers.artists[2].id, "");
+
+        // `reference.url` is the documented fallback for the external link.
+        assert_eq!(credits.roles[2].artists[0].url, "https://example.invalid/ref");
     }
 
     #[test]
     fn credit_ids_are_only_taken_from_valid_artist_uris() {
-        // Only the source artist URI provides an id. Songwriter URIs and
-        // malformed/short path values stay unlinked rather than becoming
-        // arbitrary songwriter URLs.
-        let songwriter: CreditArtistJson = serde_json::from_str(
-            r#"{"uri": "spotify:songwriter:1pTJCipDqvUaFmILQLnMsC", "name": "Annie Clark"}"#,
-        )
-        .unwrap();
-        let mapped = credit_artist(&songwriter);
-        assert_eq!(mapped.id, "", "a songwriter uri is not an artist id");
-        assert_eq!(mapped.uri, "spotify:songwriter:1pTJCipDqvUaFmILQLnMsC");
-        assert_eq!(mapped.name, "Annie Clark");
-
+        // The id is used for nothing but diagnostics now -- links come from the
+        // service's own `url` -- but a malformed URI must still never turn into
+        // path data.
         assert_eq!(
             credit_artist_id("spotify:artist:2XecPkCBJp99480lrtKlIp"),
             "2XecPkCBJp99480lrtKlIp"
         );
+        assert_eq!(
+            credit_artist_id("spotify:songwriter:1pTJCipDqvUaFmILQLnMsC"),
+            "",
+            "a songwriter uri is not an artist id"
+        );
         assert_eq!(credit_artist_id("spotify:artist:x"), "");
         assert_eq!(credit_artist_id("spotify:artist:bad/id"), "");
+    }
+
+    #[test]
+    fn playcount_queries_match_the_official_persisted_documents() {
+        let album: serde_json::Value =
+            serde_json::from_str(&album_tracks_body("spotify:album:abc", 300, 17)).unwrap();
+        assert_eq!(album["operationName"], "queryAlbumTracks");
+        assert_eq!(album["extensions"]["persistedQuery"]["sha256Hash"], ALBUM_TRACKS_QUERY_HASH);
+        assert_eq!(album["variables"]["uri"], "spotify:album:abc");
+        assert_eq!(album["variables"]["offset"], 300);
+        assert_eq!(album["variables"]["limit"], 17);
+
+        let track: serde_json::Value =
+            serde_json::from_str(&get_track_body("spotify:track:def")).unwrap();
+        assert_eq!(track["operationName"], "getTrack");
+        assert_eq!(track["extensions"]["persistedQuery"]["sha256Hash"], GET_TRACK_QUERY_HASH);
+        assert_eq!(track["variables"]["uri"], "spotify:track:def");
+        assert_eq!(track["variables"]["includeVideoAssociationItems"], false);
+    }
+
+    #[test]
+    fn album_playcounts_accept_strings_numbers_and_missing_values() {
+        let body = r#"{
+            "data": {"albumUnion": {"tracksV2": {"items": [
+                {"track": {"uri": "spotify:track:one", "playcount": "1234567"}},
+                {"track": {"uri": "spotify:track:two", "playcount": 42}},
+                {"track": {"uri": "spotify:track:zero", "playcount": "0"}},
+                {"track": {"uri": "spotify:track:missing"}},
+                {"track": null}
+            ]}}}
+        }"#;
+        let parsed: AlbumCountsResponse = serde_json::from_str(body).unwrap();
+        let mut counts = HashMap::new();
+        collect_playcount_items(
+            parsed
+                .data
+                .as_ref()
+                .and_then(|data| data.albumUnion.as_ref())
+                .and_then(|album| album.tracksV2.as_ref())
+                .unwrap(),
+            &mut counts,
+        );
+        assert_eq!(counts.get("spotify:track:one"), Some(&1_234_567));
+        assert_eq!(counts.get("spotify:track:two"), Some(&42));
+        assert!(!counts.contains_key("spotify:track:zero"));
+        assert!(!counts.contains_key("spotify:track:missing"));
+    }
+
+    #[test]
+    fn get_track_supplies_the_artist_popular_counts_in_one_response() {
+        let body = r#"{
+            "data": {"trackUnion": {
+                "uri": "spotify:track:seed",
+                "playcount": "999",
+                "firstArtist": {"items": [{"discography": {"topTracks": {"items": [
+                    {"track": {"uri": "spotify:track:seed", "playcount": "999"}},
+                    {"track": {"uri": "spotify:track:other", "playcount": "123"}}
+                ]}}}]}
+            }}
+        }"#;
+        let parsed: GetTrackCountsResponse = serde_json::from_str(body).unwrap();
+        let mut counts = HashMap::new();
+        let track = parsed
+            .data
+            .as_ref()
+            .and_then(|data| data.trackUnion.as_ref())
+            .unwrap();
+        counts.insert(
+            track.uri.clone().unwrap(),
+            playcount_value(track.playcount.as_ref()).unwrap(),
+        );
+        collect_playcount_items(
+            track
+                .firstArtist
+                .as_ref()
+                .and_then(|artist| artist.items.as_deref())
+                .and_then(|items| items[0].discography.as_ref())
+                .and_then(|discography| discography.topTracks.as_ref())
+                .unwrap(),
+            &mut counts,
+        );
+
+        let mut tracks = vec![
+            TrackRef {
+                uri: "spotify:track:seed".to_owned(),
+                ..TrackRef::default()
+            },
+            TrackRef {
+                uri: "spotify:track:other".to_owned(),
+                ..TrackRef::default()
+            },
+        ];
+        apply_playcounts(&mut tracks, &counts);
+        assert_eq!(tracks[0].play_count, Some(999));
+        assert_eq!(tracks[1].play_count, Some(123));
+    }
+
+    #[test]
+    fn playcount_json_tolerates_null_unavailable_entities() {
+        for body in [
+            r#"{"data": null}"#,
+            r#"{"data": {"albumUnion": null}}"#,
+            r#"{"data": {"albumUnion": {"tracksV2": null}}}"#,
+            r#"{"data": {"albumUnion": {"tracksV2": {"items": null}}}}"#,
+        ] {
+            let parsed: AlbumCountsResponse = serde_json::from_str(body).unwrap();
+            let items = parsed
+                .data
+                .as_ref()
+                .and_then(|data| data.albumUnion.as_ref())
+                .and_then(|album| album.tracksV2.as_ref());
+            let mut counts = HashMap::new();
+            if let Some(items) = items {
+                collect_playcount_items(items, &mut counts);
+            }
+            assert!(counts.is_empty());
+        }
+
+        let parsed: GetTrackCountsResponse = serde_json::from_str(
+            r#"{"data": {"trackUnion": {"firstArtist": null}}}"#,
+        )
+        .unwrap();
+        assert!(parsed
+            .data
+            .as_ref()
+            .and_then(|data| data.trackUnion.as_ref())
+            .and_then(|track| track.firstArtist.as_ref())
+            .is_none());
     }
 
     #[test]

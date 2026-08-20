@@ -23,6 +23,10 @@ pub struct TrackRef {
     pub album_name: String,
     pub cover_url: String,
     pub duration_ms: u32,
+    /// Lifetime Spotify play count when the browse surface supplies it.
+    /// Album rows and artist Popular rows do; playlists/search/queue do not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub play_count: Option<u64>,
     /// Unix timestamp in milliseconds when this item was added to a
     /// playlist. This is populated only by playlist browsing; tracks from
     /// albums, search, and playback queues leave it absent.
@@ -42,6 +46,7 @@ impl Default for TrackRef {
             album_name: String::new(),
             cover_url: String::new(),
             duration_ms: 0,
+            play_count: None,
             added_at: None,
         }
     }
@@ -100,13 +105,14 @@ pub enum Command {
     BrowsePlaylist {
         id: String,
     },
-    /// Album metadata and tracks via the extended-metadata album endpoint.
+    /// Album metadata/tracks plus play counts from the official pathfinder
+    /// album query.
     /// Responded to with a `browse_album` message.
     BrowseAlbum {
         id: String,
     },
-    /// Artist metadata, top tracks, and albums via the extended-metadata
-    /// artist endpoint. Responded to with a `browse_artist` message.
+    /// Artist metadata, top tracks, releases, and Popular play counts.
+    /// Responded to with a `browse_artist` message.
     BrowseArtist {
         id: String,
     },
@@ -116,10 +122,9 @@ pub enum Command {
         query: String,
         limit: usize,
     },
-    /// Songwriter/producer/performer credits for one track via the spclient
-    /// track-credits-view endpoint. Responded to with a
-    /// `browse_track_credits` message. Fetched on demand only — nothing else
-    /// in the app needs credits, and it is one request per track.
+    /// Songwriter/producer/performer credits through the official pathfinder
+    /// grouped-credits query. Responded to with a `browse_track_credits`
+    /// message. Fetched on demand only.
     BrowseTrackCredits {
         id: String,
     },
@@ -321,18 +326,22 @@ pub struct ArtistBrowse {
 
 /// One contributor in a track's credits.
 ///
-/// `id` is the validated Spotify artist id from the source credit URI. The
-/// frontend uses it only as the suffix of the external
-/// `https://artists.spotify.com/songwriter/{id}` URL; it must never navigate
-/// to the in-app artist view with this value. `id` is empty when the source
-/// contributor has no valid link. `subroles` are the service's own labels
-/// (`"composer"`, `"lyricist"`, `"producer"`, `"main artist"`, ...) and may be
-/// empty.
+/// `id` is the validated Spotify artist id from the source credit URI and is
+/// retained for identity/diagnostics only. External contributor pages come
+/// finished in `url`; the songwriter id namespace is not the artist one.
+/// `subroles` are the service's own labels (`"composer"`, `"lyricist"`,
+/// `"producer"`, `"main artist"`, ...) and may be empty.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CreditArtist {
     pub id: String,
     pub uri: String,
+    /// External page for this contributor, supplied finished by the service —
+    /// for writers, their `artists.spotify.com/songwriter/<id>` page. Empty
+    /// when the service gives none. Never constructed here: the songwriter id
+    /// space is not the artist one and nothing in the payload maps between
+    /// them.
+    pub url: String,
     pub name: String,
     pub subroles: Vec<String>,
 }

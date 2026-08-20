@@ -16,6 +16,8 @@
     ];
   });
   const hasReleases = $derived(releaseSections.some((section) => section.items.length));
+  const RELEASE_PREVIEW = 8;
+  const expandedSections = $state({});
 
   /* Seeds the banner's fallback gradient off the same hash as the artwork, so
      an artist with no portrait still gets a stable colour rather than a hole. */
@@ -80,16 +82,26 @@
     {#if top.length}
       <div class="section">
         <div class="section-head"><h2 class="section-title">Popular</h2></div>
-        <TrackList tracks={top} {playFrom} showAlbum={false} />
+        <TrackList tracks={top} {playFrom} showAlbum={false} showPlays />
       </div>
     {/if}
 
     {#each releaseSections as section (section.key)}
       {#if section.items.length}
         <div class="section" data-release-group={section.key}>
-          <div class="section-head"><h2 class="section-title">{section.title}</h2></div>
+          <div class="section-head">
+            <h2 class="section-title">
+              {section.title}<span class="section-count">{section.items.length}</span>
+            </h2>
+            {#if section.items.length > RELEASE_PREVIEW}
+              <button
+                class="link-more"
+                onclick={() => (expandedSections[section.key] = !expandedSections[section.key])}
+              >{expandedSections[section.key] ? "Show less" : "See all"}</button>
+            {/if}
+          </div>
           <div class="grid">
-            {#each section.items as al (al.id)}
+            {#each section.items.slice(0, expandedSections[section.key] ? undefined : RELEASE_PREVIEW) as al (al.id)}
               <button class="card" onclick={() => navigate("album", al.id)}>
                 <span class="card-art">
                   <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />

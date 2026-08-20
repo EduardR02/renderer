@@ -81,7 +81,7 @@
       <!-- No album column and no per-row thumbnail: the art is already the
            largest thing on the page, and every row would repeat it. -->
       <div style="margin-top:var(--s6)">
-        <TrackList {tracks} {playFrom} showAlbum={false} showArt={false} />
+        <TrackList {tracks} {playFrom} showAlbum={false} showArt={false} showPlays />
       </div>
     {:else}
       <div class="empty">

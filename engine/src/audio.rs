@@ -577,15 +577,11 @@ fn create_stream(
     // the same config it hands cpal (`OutputStream::open`), so whatever config
     // wins here, the mixer's conversion target matches the rate the device
     // actually opened at.
-    let mut stream = match rodio::OutputStreamBuilder::default()
+    let builder = rodio::OutputStreamBuilder::default()
         .with_device(cpal_device)
         .with_config(&config.config())
-        .with_sample_format(sample_format)
-        .open_stream()
-    {
-        Ok(exact_stream) => exact_stream,
-        Err(_) => rodio::OutputStreamBuilder::default().open_stream_or_fallback()?,
-    };
+        .with_sample_format(sample_format);
+    let mut stream = builder.open_stream_or_fallback()?;
 
     // Disable logging on stream drop.
     stream.log_on_drop(false);
@@ -608,8 +604,9 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
     // invisible: which rate the device actually opened at, and therefore
     // whether anything is being resampled at all.
     eprintln!(
-        "audio output: {} Hz {:?}, decoder {} Hz, {}",
+        "audio output: {} Hz, {} channels, {:?}; decoder {} Hz stereo, {}",
         output_rate,
+        stream.config().channel_count(),
         stream.config().sample_format(),
         SAMPLE_RATE,
         match &resampler {

@@ -36,6 +36,9 @@ pub struct Track {
     pub album_name: String,
     pub cover_url: String,
     pub duration_ms: u32,
+    /// Lifetime Spotify play count on surfaces whose official payload carries
+    /// it (albums and artist Popular). Missing everywhere else.
+    pub play_count: Option<u64>,
     /// Unix timestamp in milliseconds when this playlist item was added.
     /// Absent for tracks sourced from albums, search, or legacy caches.
     pub added_at: Option<i64>,
@@ -54,6 +57,7 @@ impl From<TrackRef> for Track {
             album_name: track.album_name,
             cover_url: track.cover_url,
             duration_ms: track.duration_ms,
+            play_count: track.play_count,
             added_at: track.added_at,
         }
     }
@@ -72,6 +76,7 @@ impl From<&TrackRef> for Track {
             album_name: track.album_name.clone(),
             cover_url: track.cover_url.clone(),
             duration_ms: track.duration_ms,
+            play_count: track.play_count,
             added_at: track.added_at,
         }
     }
@@ -90,6 +95,7 @@ impl From<Track> for TrackRef {
             album_name: track.album_name,
             cover_url: track.cover_url,
             duration_ms: track.duration_ms,
+            play_count: track.play_count,
             added_at: track.added_at,
         }
     }
@@ -412,6 +418,10 @@ impl From<SearchBrowse> for SearchResult {
 pub struct Contributor {
     pub id: String,
     pub uri: String,
+    /// External page for this contributor, supplied finished by the service.
+    /// The frontend opens it verbatim and never builds one; empty means the
+    /// name renders as plain text.
+    pub url: String,
     pub name: String,
     /// The service's own labels, kept verbatim for truthful per-person detail.
     pub subroles: Vec<String>,
@@ -422,6 +432,7 @@ impl From<CreditArtist> for Contributor {
         Self {
             id: artist.id,
             uri: artist.uri,
+            url: artist.url,
             name: artist.name,
             subroles: artist.subroles,
         }

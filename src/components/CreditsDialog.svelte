@@ -1,4 +1,5 @@
 <script>
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { credits, closeCredits } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
 
@@ -26,28 +27,27 @@
   }
 
   /**
-   * Contributors are plain text: there is currently nowhere correct to send
-   * them.
+   * Opens a contributor's page and leaves the dialog up.
    *
-   * The wanted destination is the songwriter portal the official client links
-   * to, `artists.spotify.com/songwriter/<id>`. That is a *different id space*
-   * from the artist ids the credits endpoint returns, measured on Max Martin:
+   * The URL is whatever the service supplied on the contributor — for writers,
+   * their `artists.spotify.com/songwriter/<id>` page. It is never constructed
+   * here, and cannot be: that id space is not the artist one. Max Martin
+   * arrives in the credits payload as artist `1rjeVTt9Ra1ldvN7SpeK0G`, which
+   * 500s on the songwriter portal, while his real songwriter page is
+   * `1T7Hkfs6QmizPlOCzs08LS`. Nothing maps between them — the official client
+   * opens a server-supplied `url` too, for exactly this reason.
    *
-   * | id                       | source            | songwriter portal |
-   * |--------------------------|-------------------|-------------------|
-   * | `1rjeVTt9Ra1ldvN7SpeK0G` | the credits reply | HTTP 500          |
-   * | `1T7Hkfs6QmizPlOCzs08LS` | the official app  | his real profile  |
-   *
-   * So building the songwriter URL from the credit's artist id — what this did
-   * originally — produced a broken link for every contributor. The official
-   * client must resolve the mapping with a call we do not make; the credits
-   * payload contains no songwriter id in any field.
-   *
-   * Linking to `open.spotify.com/artist/<id>` instead would resolve, but it is
-   * not worth doing: every artist here is already one click away from the track
-   * row, so it adds nothing and disguises the missing feature. `id` stays on
-   * the payload for whenever the real endpoint is found.
+   * Closing on click was wrong: a credits list is read across, several names at
+   * a time, and dismissing it after the first throws away the reading position.
+   * The browser takes focus anyway.
    */
+  async function openContributor(url) {
+    try {
+      await openUrl(url);
+    } catch (error) {
+      console.error("Could not open the contributor page", error);
+    }
+  }
 
   function formatRole(role) {
     if (typeof role !== "string") return "";
@@ -101,7 +101,15 @@
               {#each group.contributors ?? [] as contributor, index (`${contributor.id || contributor.uri || contributor.name}-${index}`)}
                 <li>
                   <div class="credit-name">
-                    <span class="credit-plain">{contributor.name}</span>
+                    {#if contributor.url}
+                      <button
+                        class="credit-link"
+                        aria-label={`Open ${contributor.name} in your browser`}
+                        onclick={() => openContributor(contributor.url)}
+                      >{contributor.name}</button>
+                    {:else}
+                      <span class="credit-plain">{contributor.name}</span>
+                    {/if}
                   </div>
                   {#if contributor.subroles?.length}
                     <div class="credit-details" aria-label="Credit roles">

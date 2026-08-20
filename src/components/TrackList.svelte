@@ -25,6 +25,8 @@
     /** Playlist tables may give artists and added dates their own columns. */
     showArtist = false,
     showAdded = false,
+    /** Official desktop surfaces expose lifetime plays on albums/Popular. */
+    showPlays = false,
     sortKey = null,
     sortDirection = "asc",
     onSort = null,
@@ -35,6 +37,7 @@
     month: "short",
     day: "numeric",
   });
+  const playCountFormatter = new Intl.NumberFormat();
 
   function formatAddedAt(value) {
     const timestamp = Number(value);
@@ -42,6 +45,11 @@
     const date = new Date(timestamp);
     if (!Number.isFinite(date.getTime())) return "—";
     return addedDateFormatter.format(date);
+  }
+
+  function formatPlayCount(value) {
+    const count = Number(value);
+    return Number.isFinite(count) && count > 0 ? playCountFormatter.format(count) : "";
   }
 
   function activateSort(key) {
@@ -280,6 +288,7 @@
   class:no-album={!showAlbum}
   class:album-page={!showArt}
   class:playlist-sort={showAdded}
+  class:has-plays={showPlays}
   style="overflow-anchor: none"
 >
   {#if showHead}
@@ -326,6 +335,7 @@
           onclick={() => activateSort("added")}
         >Added {#if sortKey === "added"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
       {/if}
+      {#if showPlays}<span class="tl-plays-head">Plays</span>{/if}
       <span></span>
       <button
         class="tl-sort-btn tl-sort-duration"
@@ -403,6 +413,10 @@
 
       {#if showAdded}
         <span class="c-added">{formatAddedAt(track.added_at)}</span>
+      {/if}
+
+      {#if showPlays}
+        <span class="c-plays">{formatPlayCount(track.play_count)}</span>
       {/if}
 
       <span class="c-like">

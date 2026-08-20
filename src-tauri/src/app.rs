@@ -342,6 +342,39 @@ pub fn compute_cache_stats() -> CacheStats {
     }
 }
 
+/// Removes cached content below one exact app-owned directory while retaining
+/// named bookkeeping files such as the audio cache's layout marker.
+///
+/// Callers resolve the root (`engine/audio` or `covers`) before entering this
+/// helper; no user input becomes a path. A partial clear is reported instead
+/// of pretending success when Windows still has a file open.
+pub fn clear_cache_directory(root: &Path, keep: &[&str]) -> Result<(), String> {
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("could not create cache directory {}: {error}", root.display()))?;
+    let entries = std::fs::read_dir(root)
+        .map_err(|error| format!("could not read cache directory {}: {error}", root.display()))?;
+    let mut failures = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if keep.iter().any(|kept| name.eq_ignore_ascii_case(kept)) {
+            continue;
+        }
+        let path = entry.path();
+        let result = match entry.file_type() {
+            Ok(kind) if kind.is_dir() && !kind.is_symlink() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(error) = result {
+            failures.push(format!("{}: {error}", path.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not remove {} cache item(s): {}", failures.len(), failures.join("; ")))
+    }
+}
+
 pub fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -606,6 +639,26 @@ mod tests {
 
         // A directory that was never created reads as empty, not as an error.
         assert_eq!(directory_usage(&dir.join("missing")), CacheUsage::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_a_cache_keeps_only_explicit_bookkeeping() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotify-renderer-clear-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let shard = dir.join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(dir.join("cache-version"), "2\n").unwrap();
+        std::fs::write(dir.join("loose-cover"), b"cover").unwrap();
+        std::fs::write(shard.join("song"), b"audio").unwrap();
+
+        clear_cache_directory(&dir, &["cache-version"]).unwrap();
+        assert!(dir.join("cache-version").exists());
+        assert!(!dir.join("loose-cover").exists());
+        assert!(!shard.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

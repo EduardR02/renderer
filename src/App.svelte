@@ -11,6 +11,7 @@
     isLoggedOut,
     goBack,
     goForward,
+    ui,
   } from "./lib/state.svelte.js";
   import IconSprite from "./components/IconSprite.svelte";
   import Icon from "./components/Icon.svelte";
@@ -18,6 +19,7 @@
   import PlayerBar from "./components/PlayerBar.svelte";
   import TopBar from "./components/TopBar.svelte";
   import CreditsDialog from "./components/CreditsDialog.svelte";
+  import NowPlayingPanel from "./components/NowPlayingPanel.svelte";
   import LibraryView from "./views/LibraryView.svelte";
   import PlaylistView from "./views/PlaylistView.svelte";
   import AlbumView from "./views/AlbumView.svelte";
@@ -125,7 +127,7 @@
 
 <IconSprite />
 
-<div class="app" class:anim-paused={!playback.playing || !focused}>
+<div class="app" class:anim-paused={!playback.playing || !focused} class:has-inspector={ui.nowPlayingOpen}>
   <Sidebar />
 
   <main class="pane">
@@ -160,6 +162,10 @@
       {/if}
     </div>
   </main>
+
+  {#if ui.nowPlayingOpen}
+    <NowPlayingPanel />
+  {/if}
 
   <PlayerBar />
 </div>

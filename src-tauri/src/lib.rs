@@ -61,6 +61,7 @@ pub fn run() {
             commands::get_state,
             commands::get_cover,
             commands::get_cache_stats,
+            commands::clear_cache,
             commands::touch_playlist,
         ])
         .setup(|app| {

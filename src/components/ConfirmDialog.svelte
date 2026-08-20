@@ -4,6 +4,7 @@
     title,
     message,
     confirmLabel = "Confirm",
+    busyLabel = "Working…",
     busy = false,
     error = "",
     onConfirm,
@@ -57,7 +58,7 @@
     <div class="dialog-actions">
       <button class="btn-ghost" bind:this={cancelButton} disabled={busy} onclick={cancel}>Cancel</button>
       <button class="btn-danger" disabled={busy} onclick={onConfirm}>
-        {busy ? "Deleting…" : confirmLabel}
+        {busy ? busyLabel : confirmLabel}
       </button>
     </div>
   </div>

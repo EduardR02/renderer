@@ -63,7 +63,7 @@ export function goForward() {
   applyEntry(history.entries[history.cursor]);
 }
 
-export const ui = $state({ searchFocusTick: 0 });
+export const ui = $state({ searchFocusTick: 0, nowPlayingOpen: false });
 
 export function focusSearch() {
   if (route.name !== "search") navigate("search");
@@ -156,7 +156,7 @@ export const search = $state({ query: "", results: null, submitted: false, busy:
  * On-demand track credits surface state. The payload is kept as the backend
  * returns it (`TrackCreditsDetail`): groups retain their source-provided
  * headings, contributors retain every returned name and subrole, and a
- * non-empty contributor `id` is eligible only for an external songwriter URL.
+ * contributor URLs are opened verbatim and never constructed from artist ids.
  */
 export const credits = $state({
   open: false,
@@ -338,6 +338,20 @@ export function refreshCacheStats() {
   return request;
 }
 
+export async function clearCache(kind) {
+  const payload = await api.clearCache(kind);
+  cacheStats.audio = payload?.audio ?? null;
+  cacheStats.covers = payload?.covers ?? null;
+  cacheStats.updatedAt = Date.now();
+  cacheStats.error = null;
+  if (kind === "covers") {
+    coverCache.clear();
+    coverPending.clear();
+    stats.coversResolved = 0;
+  }
+  return payload;
+}
+
 /**
  * Turns the engine's `cover://<sha1>` into a URL the webview will actually
  * fetch. A bare custom scheme is not one of them: Tauri exposes custom
@@ -423,6 +437,7 @@ export const api = {
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
+  clearCache: (kind) => invoke("clear_cache", { kind }),
   browsePlaylists: () => invoke("browse_playlists"),
   browsePlaylist: (id) => invoke("browse_playlist", { id }),
   browseAlbum: (id) => invoke("browse_album", { id }),
