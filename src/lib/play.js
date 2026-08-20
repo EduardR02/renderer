@@ -20,6 +20,21 @@ export async function playAlbumById(id) {
   await api.playQueue(tracks, 0);
 }
 
+/**
+ * Liked Songs from a card, without opening the page.
+ *
+ * The collection is paginated and the page owns its own cursor, so this plays
+ * the first page and stops there — deliberately. Anything else would mean
+ * walking an unbounded collection before a single note came out, which is the
+ * exact cost the lazy queue exists to avoid.
+ */
+export async function playLikedSongs() {
+  const page = await api.browseLikedSongs(null);
+  const tracks = page?.tracks ?? [];
+  if (!tracks.length) throw new Error("No liked songs came back.");
+  await api.playQueue(tracks, 0);
+}
+
 export async function playPlaylistById(id) {
   const playlist = await api.browsePlaylist(id);
   const tracks = playlist?.tracks ?? [];

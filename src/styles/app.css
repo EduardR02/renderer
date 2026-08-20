@@ -283,6 +283,25 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .app.has-inspector { grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--inspector-w); }
 
+/* =====================================================================
+   NARROW WINDOW — the chrome gives ground before the content does.
+
+   The window's floor is 940px. With the inspector open that left the reading
+   pane 332px wide: 240 of rail, 336 of inspector and four gutters, all fixed,
+   against a pane that was the only thing asked to absorb the difference. A
+   playlist table cannot be built in 332px and neither can anything else.
+
+   So below 1180 the two pieces of permanent furniture step down — the rail to
+   a size that still holds "Driving North at…" and a count, the inspector to
+   the narrowest column its 1:1 artwork and two-line credits still work in —
+   and the pane gets the 68px back. It is the right trade: the rail and the
+   inspector are both about something you already know, and the pane is where
+   you are reading.
+   ===================================================================== */
+@media (max-width: 1180px) {
+  :root { --sidebar-w: 212px; --inspector-w: 296px; --pane-pad: 18px; }
+}
+
 /* ---------------------------------------------------------------- sidebar */
 .sidebar {
   grid-row: 1;
@@ -428,17 +447,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   content: ""; position: absolute; left: var(--s2); right: var(--s2); top: calc(var(--s1) * -1);
   height: 1px; background: var(--line);
 }
-/* The one warm object in a cool rail. Rose leads because this row IS the saved
-   collection. Love is not in it at all — love means risk, nothing else. */
-/* Pale rose into ink rose, not rose into foam. Mixing a warm and a cool of
-   near-equal lightness in sRGB lands on grey — the old second stop resolved to
-   #c0c6ca — so the tile was half rose and half nothing. A ramp within one hue
-   keeps all 1024 pixels of it saying the same word. */
-.liked-mini {
-  display: grid; place-items: center; width: 32px; height: 32px; border-radius: var(--r1);
-  background: linear-gradient(150deg, var(--rose), var(--rose-ink));
-  color: var(--bg-0); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .14);
-}
+/* The 32px tile that used to live here — a flat pale rose square with a dark
+   heart punched out of it — was a SECOND drawing of the Liked Songs mark, and
+   it did not match the one on the collection page. Both are now LikedMark. */
 
 .sidebar-foot { padding: var(--s2) 0 var(--s3); }
 
@@ -628,7 +639,18 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* ---------------------------------------------------------------- topbar */
 .topbar {
   position: sticky; top: 0; z-index: 30;
-  display: grid; grid-template-columns: auto 1fr auto;
+  /* `auto 1fr auto` let the search field keep its 260px minimum whatever
+     happened, so on a 332px pane the field ran 48px past the edge of the pane
+     and straight under the sticky page title.
+
+     The field is now a real track rather than a fixed width, and the ceiling
+     is `min(340px, 40%)` rather than 340px flat. That second term is what
+     stops it eating the title: a grid gives non-flexible tracks their growth
+     limit BEFORE an `fr` gets anything, so a plain `minmax(152px, 340px)` took
+     every pixel it could and left the title an ellipsis. A proportional
+     ceiling makes the two shrink together instead. */
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(152px, min(340px, 40%));
   align-items: center; gap: var(--s4);
   height: var(--topbar-h); padding: 0 var(--pane-pad);
   /* Passthrough glass, and it is back on purpose.
@@ -712,9 +734,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
 }
 
+/* The field fills its grid track, which is where the sizing now lives. */
 .searchbox {
-  display: flex; align-items: center; gap: var(--s2); flex: none;
-  width: clamp(260px, 26vw, 360px); height: 32px; padding: 0 var(--s3);
+  display: flex; align-items: center; gap: var(--s2); min-width: 0;
+  width: 100%; height: 32px; padding: 0 var(--s3);
   border-radius: var(--r2); background: var(--bg-2);
   border: 1px solid transparent; color: var(--fg-2);
   transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
@@ -723,6 +746,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .searchbox input {
   flex: 1; min-width: 0; height: 100%; border: 0; background: none;
   outline: none; font-size: var(--t-13); color: var(--fg);
+  /* The field shrinks with the pane, so its placeholder has to end rather
+     than be sliced through a letter. */
+  text-overflow: ellipsis;
 }
 .searchbox input::placeholder { color: var(--fg-2); }
 
@@ -990,6 +1016,32 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   box-shadow: 0 10px 26px -6px color-mix(in srgb, var(--foam) 52%, transparent);
 }
 .play-lg:active:not(:disabled) { background: var(--accent-lo); transform: scale(0.96); }
+/* =====================================================================
+   THE ONE ROSE BUTTON
+
+   Foam is what you can DO; rose is what is YOURS. On every page in the app
+   those are two different objects, so the primary action is foam. Liked Songs
+   is the single page where they are the same thing — the collection IS you,
+   and pressing play on it is not an action performed on somebody else's
+   record.
+
+   It is also the treatment rose is actually good at. A 48px solid disc is
+   ~1800 square pixels of undiluted hue: area, not ink, which is the whole
+   distinction that decides where this colour can and cannot go. The shadow it
+   throws is rose too, over a page whose wash is already rose, so the top of
+   this page is one colour rather than a warm field with a cyan button on it.
+   ===================================================================== */
+.play-lg.saved {
+  background: var(--rose); color: var(--bg-0);
+  box-shadow: 0 8px 20px -6px color-mix(in srgb, var(--rose) 52%, transparent);
+}
+.play-lg.saved:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--rose) 76%, #ffffff);
+  box-shadow: 0 10px 26px -6px color-mix(in srgb, var(--rose) 62%, transparent);
+}
+.play-lg.saved:active:not(:disabled) {
+  background: color-mix(in srgb, var(--rose) 84%, var(--bg-0));
+}
 
 .btn-ghost {
   display: inline-flex; align-items: center; gap: var(--s2); flex: none;
@@ -1037,139 +1089,79 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .btn-icon.danger:hover { color: var(--danger); }
 
 /* Liked Songs is deliberately its own collection identity, without reusing a
-   generated purple/blue music-service tile. */
-.liked-head {
-  display: grid; grid-template-columns: 176px minmax(0, 1fr); align-items: end;
-  gap: var(--s6); padding: var(--s6) 0 var(--s5);
-}
-/* Dark with a rose light in it, not a pastel tile. Two pale accents filling a
-   176px square is candy — the same two accents as GLOW over a neutral dark
-   ground is the app. The heart is solid rose, which is the object you actually
-   read the colour off. */
-.liked-art {
-  display: grid; place-items: center; width: 176px; height: 176px;
-  border-radius: var(--r3); color: var(--rose);
-  /* The hot spot has to stay SATURATED. Rose at ~50% over a mid grey lands
-     around #806968 — same hue, but a dark low-chroma warm, which is exactly
-     the neighbourhood the greys were wrongly living in and reads as brown.
-     A strong peak falling off to near-black instead of to grey keeps it
-     unmistakably rose the whole way down. */
-  background:
-    radial-gradient(105% 105% at 22% 8%, color-mix(in srgb, var(--rose) 78%, transparent), transparent 68%),
-    radial-gradient(115% 125% at 106% 106%, color-mix(in srgb, var(--foam) 30%, transparent), transparent 68%),
-    #101010;
-  box-shadow: var(--ring), 0 18px 40px -16px color-mix(in srgb, var(--rose) 30%, transparent);
-}
+   generated purple/blue music-service tile. The mark itself is a component now
+   (LikedMark.svelte) rather than a page-only rule, because the rail was
+   drawing a second, different version of the same thing at 32px. */
 .liked-copy { min-width: 0; }
 .liked-copy .detail-title { margin-bottom: var(--s3); }
 .liked-actions > span { color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11); }
 .liked-tracks { margin-top: var(--s6); }
 .liked-loading { margin-top: var(--s6); }
 .liked-more { display: flex; flex-direction: column; align-items: center; gap: var(--s3); padding: var(--s6) 0; }
-@media (max-width: 760px) {
-  .liked-head { grid-template-columns: 112px minmax(0, 1fr); }
-  .liked-art { width: 112px; height: 112px; }
-}
 
 /* =====================================================================
    TRACK LIST
    ===================================================================== */
-/* Every track-grid column is either a fixed px or a minmax(0, …): an `auto`
-   min would let one long title widen the whole table. */
-.tl { --cols: 28px 36px minmax(0, 2.2fr) minmax(0, 1.7fr) 32px 52px 28px; }
-.tl.has-plays { --cols: 28px 36px minmax(0, 2.2fr) minmax(0, 1.7fr) 108px 32px 52px 28px; }
-.tl.no-album { --cols: 28px 36px minmax(0, 1fr) 32px 52px 28px; }
-.tl.album-page { --cols: 28px minmax(0, 1fr) 32px 52px 28px; }
-.tl.no-album.has-plays { --cols: 28px 36px minmax(0, 1fr) 108px 32px 52px 28px; }
-.tl.album-page.has-plays { --cols: 28px minmax(0, 1fr) 108px 32px 52px 28px; }
-/* queue: same row system, trailing cell is the reorder/remove cluster */
-.tl.queue { --cols: 28px 36px minmax(0, 1fr) 52px 96px; }
-.tl.playlist-sort {
-  --cols:
-    28px 36px
-    minmax(0, 1.8fr)
-    minmax(0, 1.2fr)
-    minmax(0, 1.2fr)
-    minmax(calc(var(--s9) + var(--s4)), 0.65fr)
-    32px 52px 28px;
-}
-.tl.playlist-sort.has-plays {
-  --cols:
-    28px 36px
-    minmax(0, 1.8fr)
-    minmax(0, 1.2fr)
-    minmax(0, 1.2fr)
-    minmax(calc(var(--s9) + var(--s4)), 0.65fr)
-    108px 32px 52px 28px;
-}
+/* =====================================================================
+   THE TRACK GRID
 
+   `--cols` is set INLINE by TrackList.svelte, from the same booleans that
+   decide which cells are rendered. It used to live here as nine class-keyed
+   declarations duplicated across two media-query blocks, and the duplication
+   is what broke it: a `:not()`-qualified rule outscored the playlist rule
+   inside those blocks, so a nine-cell playlist row was handed a six-column
+   template and wrapped three cells onto an implicit second row — the kebab
+   landing on the next row's play icon. A template that can disagree with the
+   cells is the defect; they now come from one place. See TrackList.svelte for
+   the drop order and the thresholds.
+
+   Only the queue keeps a template here, because QueueView writes its own row
+   markup and its five cells never change; it varies the sizes inline instead.
+   ===================================================================== */
 .tl-head, .tl-row {
   display: grid; grid-template-columns: var(--cols);
-  align-items: center; gap: var(--s4);
+  align-items: center; gap: var(--tl-gap, var(--s4));
   padding: 0 var(--s3);
 }
+/* At a narrow pane the gaps are a larger share of the row than any one
+   column, so they are the first thing to give. */
+.tl.dense { --tl-gap: var(--s3); }
 
-/* =====================================================================
-   NARROW PANE — drop columns rather than crush them.
-
-   Every flexible track column is a `minmax(0, …)`, which means that when the
-   pane runs out of room they do not overflow, they go to ZERO: at a 409px pane
-   (a 1000px window with the now-playing rail open) the playlist table rendered
-   as a column of thumbnails and dates with the song titles squeezed out
-   entirely. Correct by the grid's rules, and useless.
-
-   So the columns that are context — the album a track came from, when it was
-   added — are dropped, and the ones that are identity — the title, the artist
-   — keep the room. This is a media query and not a container query on purpose:
-   `container-type: inline-size` implies `contain: layout`, which would make
-   the pane a containing block for `position: fixed`, and the row menus are
-   positioned with viewport coordinates. The pane's width is exactly derivable
-   from the window anyway — sidebar, gutters, and the rail when it is open.
-   ===================================================================== */
-@media (max-width: 932px) {
-  .tl:not(.no-album):not(.album-page) { --cols: 28px 36px minmax(0, 1fr) 32px 52px 28px; }
-  .tl.has-plays:not(.no-album):not(.album-page) { --cols: 28px 36px minmax(0, 1fr) 108px 32px 52px 28px; }
-  .tl.playlist-sort { --cols: 28px 36px minmax(0, 1.6fr) minmax(0, 1fr) 32px 52px 28px; }
-  .tl.playlist-sort.has-plays {
-    --cols: 28px 36px minmax(0, 1.6fr) minmax(0, 1fr) 108px 32px 52px 28px;
-  }
-  .tl-head, .tl-row { gap: var(--s3); }
-  .tl-col-album, .tl-col-added, .c-album, .c-added { display: none; }
-}
-/* Same widths, arrived at with the inspector open: it takes 336px plus a gutter
-   out of the pane, so the pane crosses the same threshold 344px earlier. */
-@media (max-width: 1276px) {
-  .has-inspector .tl:not(.no-album):not(.album-page) { --cols: 28px 36px minmax(0, 1fr) 32px 52px 28px; }
-  .has-inspector .tl.has-plays:not(.no-album):not(.album-page) { --cols: 28px 36px minmax(0, 1fr) 108px 32px 52px 28px; }
-  .has-inspector .tl.playlist-sort { --cols: 28px 36px minmax(0, 1.6fr) minmax(0, 1fr) 32px 52px 28px; }
-  .has-inspector .tl.playlist-sort.has-plays {
-    --cols: 28px 36px minmax(0, 1.6fr) minmax(0, 1fr) 108px 32px 52px 28px;
-  }
-  .has-inspector .tl-head, .has-inspector .tl-row { gap: var(--s3); }
-  .has-inspector .tl-col-album,
-  .has-inspector .tl-col-added,
-  .has-inspector .c-album,
-  .has-inspector .c-added { display: none; }
-}
 .tl-head {
   position: sticky; top: var(--topbar-h); z-index: 20;
   height: 32px; margin-bottom: var(--s2);
   font-family: var(--font-small);
   font-size: var(--t-caps); font-weight: var(--w-semi); letter-spacing: var(--track-caps);
   text-transform: uppercase; color: var(--label);
-  /* Glass, not an opaque grey slab. This bar is sticky directly under the
-     topbar and a detail page's wash is a real colour now: filled with --bg-1 it
-     cut a flat grey stripe straight across the header colour. Same material as
-     the topbar, half the radius — it only has to separate itself from 48px
-     rows, not from a whole page. */
+  /* AT REST: nothing. Just tracked caps sitting on the page above the rows
+     they name, closed with a hairline — the same "space and a rule" grouping
+     the rest of the app uses.
+
+     It used to carry its glass fill at every scroll position, which on a
+     detail page laid a lighter rectangle across the header wash: a slab that
+     belonged to no layer, floating over a colour field for no reason. The bar
+     only has a job when rows are passing underneath it, so that is when it
+     gets a material. */
+  background: transparent;
+  box-shadow: inset 0 -1px 0 var(--line);
+  transition: background-color var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
+}
+/* STUCK: now it is covering rows, so it becomes the same glass as the topbar
+   directly above it — half the blur, because it only has to separate itself
+   from 48px rows rather than from a whole page. `.stuck` is set by an
+   IntersectionObserver in TrackList, never by a scroll timeline. */
+.tl-head.stuck {
   background: color-mix(in srgb, var(--bg-1) 68%, transparent);
   -webkit-backdrop-filter: blur(14px) saturate(1.7);
           backdrop-filter: blur(14px) saturate(1.7);
-  box-shadow: inset 0 -1px 0 var(--line);
+  box-shadow: inset 0 -1px 0 var(--line-2);
 }
 @supports not (backdrop-filter: blur(1px)) {
-  .tl-head { background: var(--bg-1); }
+  .tl-head.stuck { background: var(--bg-1); }
 }
+/* Zero-size, unpainted, unhittable. It only needs a position in the scrolled
+   content for the observer to watch — same device as `.topbar-sentinel`. */
+.tl-head-sentinel { height: 0; pointer-events: none; }
 .tl-sort-btn {
   display: inline-flex; align-items: center; gap: var(--s1);
   min-width: 0; max-width: 100%; height: calc(100% - var(--s1));
@@ -1341,12 +1333,21 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .q-actions button:hover:not(:disabled) { color: var(--fg); background: rgba(255, 255, 255, 0.07); }
 .q-actions button.danger:hover:not(:disabled) { color: var(--danger); }
 
-/* skeleton: static, no shimmer (a shimmer animates forever = wasted CPU) */
-.sk-row { display: grid; grid-template-columns: var(--cols); align-items: center; gap: var(--s4);
+/* Skeletons: static, never a shimmer. A shimmer animates for exactly as long
+   as the wait lasts, which is the idle cost this app exists to avoid — and it
+   draws the eye to the part of the screen with nothing in it.
+
+   A skeleton row is the same grid as a real row, at the same height, reading
+   the same `--cols`, so the list it stands in for lands without moving. */
+.sk-row { display: grid; grid-template-columns: var(--cols); align-items: center; gap: var(--tl-gap, var(--s4));
   height: var(--row-h); padding: 0 var(--s3); }
 .sk { background: var(--bg-2); border-radius: var(--r1); height: 10px; }
 .sk.art { height: 36px; width: 36px; border-radius: var(--r1); box-shadow: none; }
 .sk.a { width: 62%; } .sk.b { width: 38%; height: 8px; }
+/* The title cell is two lines in every real row — the name and the artists —
+   so its placeholder is two as well. One bar in a 48px row leaves an obviously
+   empty band where the second line is about to appear. */
+.sk-stack { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 
 /* =====================================================================
    CARDS
@@ -1423,6 +1424,18 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .card-open:focus-visible ~ .card-play { opacity: 1; transform: none; }
 .card-play:hover { background: var(--accent-hi); }
 .card-play:active { transform: scale(0.93); }
+/* The Liked Songs tile's button. Same argument as `.play-lg.saved`: this is
+   the one card in the app whose subject is the person using it. */
+.card-play.saved { background: var(--rose); color: var(--bg-0); }
+.card-play.saved:hover { background: color-mix(in srgb, var(--rose) 76%, #ffffff); }
+/* Its tile is a light source rather than a photograph, so the hover lift is
+   its own rose instead of a sampled cover tone. */
+.liked-card:hover .card-art > .liked-mark {
+  box-shadow:
+    var(--ring),
+    0 16px 26px -14px rgba(0, 0, 0, 0.9),
+    0 16px 40px -8px color-mix(in srgb, var(--rose) 46%, transparent);
+}
 /* Name and sub are one block with their own tight gap, so the card's 12px gap
    sits between the ARTWORK and the copy and nowhere else. This used to be a
    -8px margin cancelling that gap after the fact, which meant the two lines
@@ -1608,11 +1621,25 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* Native <dialog> supplies focus containment and Escape semantics; these
    rules only establish the app's restrained surface and action hierarchy. */
 .confirm-dialog {
+  position: relative; overflow: hidden;
   width: min(420px, calc(100vw - var(--s8)));
   max-width: none; margin: auto; padding: 0;
   border: 1px solid var(--line-2); border-radius: var(--r3);
-  background: var(--bg-2); color: var(--fg);
+  /* The sheet grey, not the raised grey. Same argument as the credits sheet:
+     a modal is lifted by its border and its shadow, and at --bg-2 it is the
+     brightest plane on screen and reads as a card rather than as a layer above
+     the page. These two were on different values for no reason. */
+  background: var(--bg-sheet); color: var(--fg);
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.72);
+}
+/* Every modal's top edge names the layer it belongs to — the credits sheet's
+   is gold because those are liner notes; this one's is love, because love in
+   this palette means one thing only: you cannot undo it. It is the first thing
+   you see and it says so before the heading does. */
+.confirm-dialog::before {
+  content: ""; position: absolute; inset: 0 0 auto; height: 2px; z-index: 2;
+  background: linear-gradient(90deg,
+    var(--love), color-mix(in srgb, var(--love) 45%, transparent) 72%, transparent);
 }
 .confirm-dialog::backdrop {
   background: color-mix(in srgb, var(--bg-0) 76%, transparent);
@@ -2004,6 +2031,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    SEARCH / CHIPS / EMPTY
    ===================================================================== */
 .search-intro { padding: var(--s3) 0 var(--s4); }
+/* A fixed slot, faded rather than inserted: the line has to be able to appear
+   and disappear on every keystroke without moving the results under it. */
+.search-status {
+  height: 16px; margin-top: var(--s2);
+  color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11);
+  opacity: 0; transition: opacity var(--d2) var(--ease);
+}
+.search-status.on { opacity: 1; }
 .results-head {
   display: flex; align-items: flex-end; justify-content: space-between; gap: var(--s6);
   padding: var(--s5) 0 var(--s7); border-bottom: 1px solid var(--line);
@@ -2065,7 +2100,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    ===================================================================== */
 .seg {
   display: inline-flex; align-items: center; gap: 2px; flex-wrap: wrap;
-  padding: 3px; border-radius: var(--rf);
+  padding: 3px;
+  /* Half the single-row height, not 999px. Both are a pill while the segments
+     fit on one line; when a narrow pane wraps them to two, `--rf` turns the
+     control into a 74px-tall lozenge with semicircular ends, and 18px leaves
+     a rounded rectangle that still looks like the same object. */
+  border-radius: 18px;
   background: var(--bg-2); border: 1px solid var(--line);
 }
 .seg-btn {
@@ -2118,6 +2158,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   text-align: left; width: 100%;
 }
 .top-result:hover { filter: brightness(1.28); }
+/* The panel's own loading frame: same box, no tone, and inert. Its
+   placeholders step UP a shade rather than down — at the raised grey they
+   would be the same colour as the panel and the box would read as empty. */
+.sk-top { background: var(--bg-2); cursor: default; }
+.sk-top .skeleton { background: var(--bg-3); }
 .top-result:focus-visible { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 45%, transparent); }
 .top-result .tr-name {
   display: block;
@@ -2133,6 +2178,22 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    them in the viewport makes an ordinary state look like a failure. */
 .empty { padding: var(--s6) 0; color: var(--fg-2); font-size: var(--t-13); max-width: 560px; }
 .empty .h { color: var(--fg); font-size: var(--t-15); margin-bottom: var(--s2); }
+/* A page that FAILED, as distinct from a page that is empty. Same left column
+   and the same single action, with a love-led rule so the difference is legible
+   before the sentence is read — the rest of the app uses that hue for exactly
+   one thing, and "this did not work" is it. The `.h` line stays neutral: an
+   error is not made clearer by being red, only louder. */
+.empty.failed {
+  padding-top: var(--s5);
+  border-top: 1px solid transparent;
+  border-image: linear-gradient(90deg,
+    color-mix(in srgb, var(--love) 62%, transparent), var(--line) 30%, var(--line)) 1;
+}
+.empty .why {
+  margin-top: var(--s2); color: var(--fg-3);
+  font-family: var(--font-small); font-size: var(--t-11);
+  overflow-wrap: anywhere;
+}
 
 /* artist banner */
 .banner {

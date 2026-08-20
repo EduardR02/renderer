@@ -1,13 +1,26 @@
 <script>
-  import { detail, api, playback, navigate, route, promotePlaylist, togglePlay } from "../lib/state.svelte.js";
+  import {
+    detail,
+    api,
+    playback,
+    navigate,
+    route,
+    promotePlaylist,
+    togglePlay,
+    ui,
+    retryDetail,
+  } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { formatTotal } from "../lib/time.js";
+  import { detailArtSize } from "../lib/layout.js";
 
   const pl = $derived(detail.playlist);
+  /* The cover gives way before the title does when the pane is narrow. */
+  const artSize = $derived(detailArtSize(ui.paneWidth));
   const tracks = $derived(pl?.tracks ?? []);
 
   const sortState = $state({ key: "order", direction: "asc" });
@@ -330,14 +343,56 @@
   style:--tone-wash-deep={tone.washDeep}
   style:--tone-glow={tone.glow}
 >
-  {#if !pl}
+  {#if detail.error && !pl}
+    <!-- The request failed, so this page stays a frame with an explanation in
+         it rather than a skeleton that never resolves. -->
     <header class="detail-head">
-      <span class="art lg skeleton" style="width:184px;height:184px"></span>
+      <span class="art lg skeleton" style:width="{artSize}px" style:height="{artSize}px"></span>
       <div>
-        <span class="skeleton line sm"></span>
-        <span class="skeleton line lg"></span>
+        <span class="tag">Playlist</span>
+        <h1 class="detail-title">Unavailable</h1>
       </div>
     </header>
+    <div class="empty failed">
+      <p class="h">This playlist could not be loaded.</p>
+      <p class="why">{detail.error}</p>
+      <div class="actions">
+        <button class="btn-ghost" onclick={retryDetail}>Try again</button>
+        <button class="btn-ghost" onclick={() => navigate("library")}>Back to your library</button>
+      </div>
+    </div>
+  {:else if !pl}
+    <header class="detail-head">
+      <span class="art lg skeleton" style:width="{artSize}px" style:height="{artSize}px"></span>
+      <!-- Tag, title, meta and the two controls, each at the size of the thing
+           that replaces it, so nothing moves when the playlist lands. -->
+      <div>
+        <span class="skeleton line sm" style="width:62px;height:19px;border-radius:var(--rf)"></span>
+        <span class="skeleton line lg" style="height:46px;width:min(440px,72%)"></span>
+        <span class="skeleton line sm" style="width:200px"></span>
+        <div class="actions">
+          <span class="skeleton" style="width:48px;height:48px;border-radius:var(--rf)"></span>
+          <span class="skeleton" style="width:104px;height:32px;border-radius:var(--r2)"></span>
+        </div>
+      </div>
+    </header>
+    <div
+      class="tl"
+      style="margin-top:var(--s6);--cols:28px 36px minmax(0,1fr) 52px"
+      aria-hidden="true"
+    >
+      {#each Array.from({ length: 9 }) as _, i (i)}
+        <div class="sk-row">
+          <span class="sk" style="width:12px"></span>
+          <span class="sk art"></span>
+          <span class="sk-stack">
+            <span class="sk a" style="width:{64 - ((i * 7) % 24)}%"></span>
+            <span class="sk b" style="width:{32 - ((i * 5) % 11)}%"></span>
+          </span>
+          <span class="sk" style="width:28px;justify-self:end"></span>
+        </div>
+      {/each}
+    </div>
   {:else}
     <header class="detail-head">
       <Cover
@@ -345,7 +400,7 @@
         srcs={pl.cover_urls?.length ? pl.cover_urls : artPool}
         id={pl.id}
         name={pl.name}
-        size={184}
+        size={artSize}
         lg
         raised
       />

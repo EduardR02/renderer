@@ -1,10 +1,28 @@
 <script>
-  import { playback, api, navigate, togglePlay } from "../lib/state.svelte.js";
+  import { playback, api, navigate, togglePlay, ui } from "../lib/state.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import ArtistLinks from "../components/ArtistLinks.svelte";
   import { formatTime, formatTotal } from "../lib/time.js";
+  import { observeStuck } from "../lib/sticky.js";
   const queue = $derived(playback.queue);
+
+  /* The queue row is the one track row the shared TrackList does not render:
+     its trailing cell is a reorder/remove cluster rather than a menu. Its five
+     cells never change, so only the artwork drops — below a 430px pane the
+     36px tile plus its gap is a sixth of the row and the title needs it more.
+     Same threshold and same source of truth as TrackList (`ui.paneWidth`); a
+     media query cannot see the inspector's 336px. */
+  const cols = $derived(
+    (ui.paneWidth || 1200) >= 430
+      ? "28px 36px minmax(0, 1fr) 52px 96px"
+      : "28px minmax(0, 1fr) 52px 96px",
+  );
+  const showArt = $derived((ui.paneWidth || 1200) >= 430);
+
+  let headSentinel = $state(null);
+  let headStuck = $state(false);
+  $effect(() => observeStuck(headSentinel, (stuck) => (headStuck = stuck)));
 
   function playAt(i) {
     if (i === playback.current_index) togglePlay();
@@ -185,10 +203,11 @@
   {#if queue.length}
     <!-- Same row system as every other track table; only the trailing cell
          differs, so a queue row and a playlist row line up exactly. -->
-    <div class="tl queue" style="overflow-anchor: none">
-      <div class="tl-head">
+    <div class="tl queue" style="overflow-anchor: none" style:--cols={cols}>
+      <div class="tl-head-sentinel" bind:this={headSentinel} aria-hidden="true"></div>
+      <div class="tl-head" class:stuck={headStuck}>
         <span style="text-align:right">#</span>
-        <span></span>
+        {#if showArt}<span></span>{/if}
         <span>Title</span>
         <span style="display:grid;justify-items:end"><Icon name="clock" size={13} /></span>
         <span></span>
@@ -222,13 +241,15 @@
                 </button>
               </span>
 
-              <Cover
-                src={track.cover_url}
-                id={track.album_id || track.uri}
-                name={track.album_name || track.name}
-                size={36}
-                class="c-art"
-              />
+              {#if showArt}
+                <Cover
+                  src={track.cover_url}
+                  id={track.album_id || track.uri}
+                  name={track.album_name || track.name}
+                  size={36}
+                  class="c-art"
+                />
+              {/if}
 
               <span class="c-title">
                 <span class="t-name">{track.name}</span>

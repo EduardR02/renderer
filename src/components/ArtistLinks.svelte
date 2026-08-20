@@ -15,15 +15,43 @@
   const linkIds = $derived(
     names.map((_, i) => (ids.length ? (ids[i] ?? "") : i === 0 ? id : ""))
   );
+
+  function activate(event, linkId) {
+    if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    event.stopPropagation();
+    navigate("artist", linkId);
+  }
 </script>
 
+<!--
+  These are SPANS, not buttons, and that is the whole reason this markup looks
+  the way it does.
+
+  Every container these sit in truncates with `text-overflow: ellipsis` — the
+  artist sub-line in a track row, the credit line in a player bar, the `.who`
+  cell in a detail header. An ellipsis is only ever drawn where the overflow
+  point falls in inline TEXT: a `<button>` is an atomic inline-level box
+  whatever its `display`, so the browser sliced it straight through a glyph and
+  drew nothing to say the line had been cut. With four credited artists in a
+  narrow column that is what you saw, on every row.
+
+  A span with `role="link"` and a key handler is a real control to the
+  accessibility tree and ordinary text to the line breaker, which is exactly
+  the combination this needs.
+-->
 <span class={cls}>
   {#each names as name, i}
     {#if i > 0}<span class="sep">, </span>{/if}
     {#if linkIds[i]}
-      <button class="artist-link" title="Go to {name}" onclick={() => navigate("artist", linkIds[i])}>
-        {name}
-      </button>
+      <span
+        class="artist-link"
+        role="link"
+        tabindex="0"
+        title="Go to {name}"
+        onclick={(event) => activate(event, linkIds[i])}
+        onkeydown={(event) => activate(event, linkIds[i])}
+      >{name}</span>
     {:else}
       <span>{name}</span>
     {/if}
@@ -32,8 +60,7 @@
 
 <style>
   .artist-link {
-    color: inherit;
-    font: inherit;
+    cursor: pointer;
     transition: color var(--d1) var(--ease);
   }
   .artist-link:hover {

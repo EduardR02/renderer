@@ -6,7 +6,6 @@
   import Cover from "./Cover.svelte";
 
   let dialog = $state(null);
-  let closeButton = $state(null);
   let query = $state("");
   const titleId = "credits-dialog-title";
 
@@ -40,7 +39,13 @@
       query = "";
       compact = !credits.loading && contributorCount(credits.data) < FILTERABLE_FROM;
       dialog.showModal();
-      queueMicrotask(() => closeButton?.focus());
+      /* Focus the SHEET, not the close button. Focusing Close drew a cyan
+         focus ring on the one control that dismisses the thing you just
+         opened, which is both a strange first impression and a strange first
+         suggestion. The dialog carries `tabindex="-1"` so it can hold focus
+         itself; Escape, the focus trap and tab order all still work, and the
+         first Tab lands on the filter or the first name. */
+      queueMicrotask(() => dialog?.focus());
     };
     // Re-entering when `loading` clears is the point: the payload landing
     // inside the grace window shows the sheet immediately, at the right width.
@@ -138,6 +143,7 @@
   class="credits-dialog"
   class:compact
   bind:this={dialog}
+  tabindex="-1"
   aria-labelledby={titleId}
   aria-busy={credits.loading}
   data-credits-surface
@@ -162,7 +168,7 @@
           {#if artistLine}<p>{artistLine}</p>{/if}
         </div>
       </div>
-      <button class="btn-icon" bind:this={closeButton} aria-label="Close credits" title="Close" onclick={close}>
+      <button class="btn-icon" aria-label="Close credits" title="Close" onclick={close}>
         <Icon name="x" size={16} />
       </button>
     </header>

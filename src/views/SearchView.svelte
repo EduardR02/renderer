@@ -9,7 +9,9 @@
 
   /* The query field lives in the topbar; this view only renders results. */
 
-  const SKELETON_ROWS = Array.from({ length: 6 });
+  /* Five, because five is what the loaded page shows (`visibleTracks`). A
+     loading state with the wrong row count is a loading state that reflows. */
+  const SKELETON_ROWS = Array.from({ length: 5 });
 
   const tracks = $derived(search.results?.tracks ?? []);
   const albums = $derived(search.results?.albums ?? []);
@@ -117,6 +119,11 @@
     <h1 class="page-title">
       {search.submitted && search.query ? `Results for “${search.query}”` : "Find something to play"}
     </h1>
+    <!-- Refining a query keeps the previous results on screen, which is right
+         — but then nothing on the page says a newer answer is coming. One
+         quiet line does, and it occupies a fixed slot so the results below it
+         do not shift when it appears. -->
+    <p class="search-status" class:on={search.busy && !!search.results}>Searching…</p>
   </div>
 
   {#if !search.submitted}
@@ -149,20 +156,71 @@
       </div>
     {/if}
   {:else if !search.results}
-    <!-- Static skeleton rows: a shimmer would animate for as long as the
-         request takes and cost frames the whole time. -->
-    <div class="tl no-album">
-      {#each SKELETON_ROWS as _, i (i)}
-        <div class="sk-row">
-          <span class="sk" style="width:12px"></span>
-          <span class="sk art"></span>
-          <span class="sk a"></span>
-          <span></span>
-          <span class="sk b"></span>
-          <span></span>
+    <!-- =================================================================
+         The frame the results arrive into.
+
+         This used to be six bare rows in a one-column strip, which shares no
+         geometry at all with what actually lands — a two-column split with a
+         top-result panel beside five songs, then a grid of albums, then a grid
+         of artists. So every search visibly rebuilt the page: the strip
+         vanished, three sections appeared, and the whole thing jumped.
+
+         Now the wait IS the page, with its content missing: same split, same
+         panel, same row heights, same card grid. Nothing moves when the
+         payload lands, which is the only thing a loading state is actually
+         for. Static, deliberately — a shimmer animates for exactly as long as
+         the request takes, which is the idle cost this app exists to avoid.
+         ================================================================= -->
+    <div class="search-split" aria-busy="true" aria-label="Searching">
+      <div>
+        <div class="section-head"><h2 class="section-title">Top result</h2></div>
+        <div class="top-result sk-top">
+          <span class="skeleton" style="width:92px;height:92px;border-radius:var(--r3)"></span>
+          <span style="min-width:0;display:block">
+            <span class="skeleton line" style="width:74%;height:24px;margin:0"></span>
+            <span class="skeleton line" style="width:44%;height:12px;margin:10px 0 0"></span>
+          </span>
         </div>
-      {/each}
+      </div>
+      <div>
+        <div class="section-head"><h2 class="section-title">Songs</h2></div>
+        <div class="tl" style="--cols:28px 36px minmax(0,1fr) 52px">
+          {#each SKELETON_ROWS as _, i (i)}
+            <div class="sk-row">
+              <span class="sk" style="width:12px"></span>
+              <span class="sk art"></span>
+              <span class="sk-stack">
+                <span class="sk a" style="width:{68 - ((i * 9) % 26)}%"></span>
+                <span class="sk b" style="width:{34 - ((i * 5) % 12)}%"></span>
+              </span>
+              <span class="sk" style="width:28px;justify-self:end"></span>
+            </div>
+          {/each}
+        </div>
+      </div>
     </div>
+
+    {#each ["Albums", "Artists"] as heading, section (heading)}
+      <div class="section" aria-hidden="true">
+        <div class="section-head"><h2 class="section-title">{heading}</h2></div>
+        <div class="grid">
+          {#each Array.from({ length: 6 }) as _, i (i)}
+            <div class="card">
+              <span
+                class="skeleton"
+                style="display:block;aspect-ratio:1;width:100%;border-radius:{section
+                  ? 'var(--rf)'
+                  : 'var(--r3)'}"
+              ></span>
+              <span class="card-copy">
+                <span class="skeleton line" style="width:{72 - ((i * 13) % 28)}%;height:12px;margin:0"></span>
+                <span class="skeleton line" style="width:40%;height:10px;margin:6px 0 0"></span>
+              </span>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/each}
   {:else if empty}
     <div class="empty">
       <p class="h">No results for “{search.query}”.</p>

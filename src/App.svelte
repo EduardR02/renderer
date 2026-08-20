@@ -3,10 +3,9 @@
   import {
     initEvents,
     route,
-    detail,
+    loadDetail,
     playback,
     credits,
-    api,
     togglePlay,
     focusSearch,
     isLoggedOut,
@@ -27,6 +26,7 @@
   import PlaylistView from "./views/PlaylistView.svelte";
   import AlbumView from "./views/AlbumView.svelte";
   import ArtistView from "./views/ArtistView.svelte";
+  import DiscographyView from "./views/DiscographyView.svelte";
   import SearchView from "./views/SearchView.svelte";
   import SearchSongsView from "./views/SearchSongsView.svelte";
   import QueueView from "./views/QueueView.svelte";
@@ -35,6 +35,26 @@
 
   $effect(() => {
     initEvents();
+  });
+
+  /* The content pane's own width, published for the track table.
+     A ResizeObserver rather than a window resize listener, because the pane
+     also changes width when the inspector opens and the window does not; and
+     rather than a media query, because the arithmetic that turns a window
+     width into a pane width was being written out by hand and got it wrong.
+     This is the only layout read outside a scroll handler and it fires only
+     when the pane actually changes size. */
+  let paneEl = $state(null);
+  $effect(() => {
+    const node = paneEl;
+    if (!node) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const width = Math.round(entry.contentRect.width);
+      if (width !== ui.paneWidth) ui.paneWidth = width;
+    });
+    observer.observe(node);
+    ui.paneWidth = Math.round(node.getBoundingClientRect().width);
+    return () => observer.disconnect();
   });
 
   // Dynamic album/catalogue queues stay small. The next bounded page is
@@ -63,27 +83,15 @@
     };
   });
 
-  // Fetch detail data when a detail route becomes active. Browse commands use
-  // their return value as the sole payload path; the sequence guard prevents a
-  // slower response for a previous route from replacing the current page.
-  let browseSeq = 0;
+  /* Fetch detail data when a detail route becomes active. The fetch itself
+     lives in the state module so that a failed page's "Try again" is literally
+     the same call. `untrack` because loadDetail reads `detail` to decide
+     whether the artist payload is already the right one, and this effect must
+     depend on the ROUTE and nothing else. */
   $effect(() => {
-    const { name, id } = route;
-    const seq = ++browseSeq;
-    if (!id) return;
-    if (name === "playlist") {
-      api.browsePlaylist(id).then((payload) => {
-        if (seq === browseSeq) detail.playlist = payload ?? null;
-      }).catch(() => {});
-    } else if (name === "album") {
-      api.browseAlbum(id).then((payload) => {
-        if (seq === browseSeq) detail.album = payload ?? null;
-      }).catch(() => {});
-    } else if (name === "artist") {
-      api.browseArtist(id).then((payload) => {
-        if (seq === browseSeq) detail.artist = payload ?? null;
-      }).catch(() => {});
-    }
+    const name = route.name;
+    const id = route.id;
+    untrack(() => loadDetail(name, id));
   });
 
   // Global shortcuts. Ignored while typing in inputs.
@@ -142,7 +150,7 @@
 <div class="app" class:anim-paused={!playback.playing || !focused} class:has-inspector={ui.nowPlayingOpen}>
   <Sidebar />
 
-  <main class="pane">
+  <main class="pane" bind:this={paneEl}>
     <div class="scroll">
       <TopBar />
 
@@ -171,6 +179,8 @@
         <AlbumView />
       {:else if route.name === "artist"}
         <ArtistView />
+      {:else if route.name === "discography"}
+        <DiscographyView />
       {:else if route.name === "queue"}
         <QueueView />
       {:else if route.name === "settings"}

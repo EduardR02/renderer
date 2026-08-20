@@ -1,7 +1,8 @@
 <script>
-  import { route, navigate, library, api, playback } from "../lib/state.svelte.js";
+  import { route, navigate, library, libraryState, api, playback } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
+  import LikedMark from "./LikedMark.svelte";
 
   let creating = $state(false);
   let newName = $state("");
@@ -188,7 +189,9 @@
         class:active={route.name === "liked"}
         onclick={() => navigate("liked")}
       >
-        <span class="liked-mini"><Icon name="heart-filled" size={14} /></span>
+        <!-- The same mark the collection page shows at 176px. It used to be a
+             different picture here, drawn by different CSS. -->
+        <LikedMark size={32} />
         <span class="lib-name">Liked Songs</span>
       </button>
       {#each filteredLibrary as pl (pl.id)}
@@ -203,8 +206,21 @@
           {#if pl.tracks_total}<span class="lib-count">{pl.tracks_total}</span>{/if}
         </button>
       {/each}
-      {#if filterQuery.trim() && !filteredLibrary.length}
+      {#if !libraryState.loaded && !library.length}
+        <!-- The rail's own loading frame. Rows at the real height with the
+             real tile and name geometry, so the list does not jump when the
+             library lands — the rail used to sit empty under a lone Liked
+             Songs row for the whole round trip. -->
+        {#each Array.from({ length: 8 }) as _, i (i)}
+          <div class="lib-row" aria-hidden="true">
+            <span class="skeleton" style="width:32px;height:32px;border-radius:var(--r1)"></span>
+            <span class="skeleton line" style="width:{78 - ((i * 13) % 34)}%;height:11px;margin:0"></span>
+          </div>
+        {/each}
+      {:else if filterQuery.trim() && !filteredLibrary.length}
         <p class="lib-filter-empty">No matching playlists</p>
+      {:else if libraryState.loaded && !library.length}
+        <p class="lib-filter-empty">No playlists in your library yet</p>
       {/if}
     </div>
   </div>

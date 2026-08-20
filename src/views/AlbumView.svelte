@@ -1,13 +1,16 @@
 <script>
-  import { detail, api } from "../lib/state.svelte.js";
+  import { detail, api, ui, navigate, retryDetail } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import ArtistLinks from "../components/ArtistLinks.svelte";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { formatTotal } from "../lib/time.js";
+  import { detailArtSize } from "../lib/layout.js";
 
   const album = $derived(detail.album);
+  /* The sleeve gives way before the title does when the pane is narrow. */
+  const artSize = $derived(detailArtSize(ui.paneWidth));
   const tracks = $derived(album?.tracks ?? []);
   const artistIds = $derived(album?.artist_ids ?? []);
   // Keep old/partial payloads useful: the primary track id can still link the
@@ -37,17 +40,55 @@
   style:--tone-wash-deep={tone.washDeep}
   style:--tone-glow={tone.glow}
 >
-  {#if !album}
+  {#if detail.error && !album}
+    <!-- The request failed, so this page stays a frame with an explanation in
+         it rather than a skeleton that never resolves. -->
     <header class="detail-head">
-      <span class="art lg skeleton" style="width:184px;height:184px"></span>
+      <span class="art lg skeleton" style:width="{artSize}px" style:height="{artSize}px"></span>
       <div>
-        <span class="skeleton line sm"></span>
-        <span class="skeleton line lg"></span>
+        <span class="tag">Album</span>
+        <h1 class="detail-title">Unavailable</h1>
       </div>
     </header>
+    <div class="empty failed">
+      <p class="h">This release could not be loaded.</p>
+      <p class="why">{detail.error}</p>
+      <div class="actions">
+        <button class="btn-ghost" onclick={retryDetail}>Try again</button>
+        <button class="btn-ghost" onclick={() => navigate("library")}>Back to your library</button>
+      </div>
+    </div>
+  {:else if !album}
+    <header class="detail-head">
+      <span class="art lg skeleton" style:width="{artSize}px" style:height="{artSize}px"></span>
+      <!-- The frame the record arrives into: tag, title, meta line and the
+           two controls, each at the size of the thing that replaces it, so
+           nothing on the page moves when the payload lands. -->
+      <div>
+        <span class="skeleton line sm" style="width:56px;height:19px;border-radius:var(--rf)"></span>
+        <span class="skeleton line lg" style="height:46px;width:min(420px,70%)"></span>
+        <span class="skeleton line sm" style="width:180px"></span>
+        <div class="actions">
+          <span class="skeleton" style="width:48px;height:48px;border-radius:var(--rf)"></span>
+          <span class="skeleton" style="width:104px;height:32px;border-radius:var(--r2)"></span>
+        </div>
+      </div>
+    </header>
+    <div class="tl" style="margin-top:var(--s6);--cols:28px minmax(0,1fr) 52px" aria-hidden="true">
+      {#each Array.from({ length: 8 }) as _, i (i)}
+        <div class="sk-row">
+          <span class="sk" style="width:12px"></span>
+          <span class="sk-stack">
+            <span class="sk a" style="width:{58 - ((i * 7) % 22)}%"></span>
+            <span class="sk b" style="width:{28 - ((i * 5) % 10)}%"></span>
+          </span>
+          <span class="sk" style="width:28px;justify-self:end"></span>
+        </div>
+      {/each}
+    </div>
   {:else}
     <header class="detail-head">
-      <Cover src={album.cover_url} id={album.id} name={album.name} size={184} lg raised />
+      <Cover src={album.cover_url} id={album.id} name={album.name} size={artSize} lg raised />
       <div>
         <span class="tag">Album</span>
         <h1 class="detail-title">{album.name}</h1>

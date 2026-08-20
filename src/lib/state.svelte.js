@@ -8,7 +8,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 /* ---------------- Navigation ---------------- */
 
-export const route = $state({ name: "library", id: null });
+export const route = $state({ name: "library", id: null, param: null });
 
 /**
  * Back/forward history as a plain stack plus a cursor. Deliberately not URL
@@ -16,7 +16,7 @@ export const route = $state({ name: "library", id: null });
  * the entire feature and costs no dependency.
  */
 const HISTORY_MAX = 50;
-const history = $state({ entries: [{ name: "library", id: null }], cursor: 0 });
+const history = $state({ entries: [{ name: "library", id: null, param: null }], cursor: 0 });
 
 export function canGoBack() {
   return history.cursor > 0;
@@ -26,29 +26,53 @@ export function canGoForward() {
   return history.cursor < history.entries.length - 1;
 }
 
-/** Clears stale detail so the target view shows its loading state. */
-function clearStaleDetail(name) {
-  if (name === "playlist") detail.playlist = null;
-  if (name === "album") detail.album = null;
-  if (name === "artist") detail.artist = null;
+/** The two routes that read one and the same `detail.artist` payload. */
+const ARTIST_ROUTES = new Set(["artist", "discography"]);
+
+/**
+ * Clears stale detail so the target view shows its loading state.
+ *
+ * The exception is the artist page and its discography, which are two
+ * presentations of ONE payload: an artist's page and its "see all" both need
+ * `detail.artist`, and blanking it on the way between them would make a
+ * navigation that adds no new data look like a page load. Called before the
+ * route is applied, so `route` still describes where we are coming FROM.
+ */
+function clearStaleDetail(entry) {
+  if (entry.name === "playlist") detail.playlist = null;
+  if (entry.name === "album") detail.album = null;
+  if (ARTIST_ROUTES.has(entry.name)) {
+    const sameArtist = ARTIST_ROUTES.has(route.name) && route.id === entry.id;
+    if (!sameArtist) detail.artist = null;
+  }
+  // A failure belongs to the page that produced it, never to the next one.
+  detail.error = "";
 }
 
 function applyEntry(entry) {
+  clearStaleDetail(entry);
   route.name = entry.name;
   route.id = entry.id;
-  clearStaleDetail(entry.name);
+  route.param = entry.param ?? null;
 }
 
-export function navigate(name, id = null) {
+/**
+ * `param` is a second, non-identifying coordinate — which discography segment
+ * is selected, for instance. It rides in the history entry so back and forward
+ * restore the view you actually left, but it is deliberately NOT part of the
+ * "are we already here" test: re-selecting the same page with a different
+ * segment is a real navigation.
+ */
+export function navigate(name, id = null, param = null) {
   const current = history.entries[history.cursor];
-  if (current && current.name === name && current.id === id) return;
+  if (current && current.name === name && current.id === id && current.param === param) return;
   // Navigating from the middle of the stack starts a new branch, so anything
   // ahead of the cursor is dropped.
   history.entries.splice(history.cursor + 1);
-  history.entries.push({ name, id });
+  history.entries.push({ name, id, param });
   if (history.entries.length > HISTORY_MAX) history.entries.shift();
   history.cursor = history.entries.length - 1;
-  applyEntry({ name, id });
+  applyEntry({ name, id, param });
 }
 
 export function goBack() {
@@ -63,7 +87,20 @@ export function goForward() {
   applyEntry(history.entries[history.cursor]);
 }
 
-export const ui = $state({ searchFocusTick: 0, nowPlayingOpen: false });
+/**
+ * `paneWidth` is the measured inner width of the content pane, published by
+ * App.svelte from a ResizeObserver.
+ *
+ * It exists because the track table has to choose its columns from the space
+ * it actually has, and that space is not the window: it is the window minus
+ * the rail, minus the inspector when it is open, minus three gutters. Media
+ * queries were doing that arithmetic by hand in two duplicated blocks and got
+ * it wrong (see TrackList). A container query is not an option either —
+ * `container-type: inline-size` implies `contain: layout`, which would make
+ * the pane a containing block for `position: fixed` and reposition every row
+ * menu. One observed number, read on resize and never on scroll.
+ */
+export const ui = $state({ searchFocusTick: 0, nowPlayingOpen: false, paneWidth: 0 });
 
 export function focusSearch() {
   if (route.name !== "search") navigate("search");
@@ -260,7 +297,62 @@ export function isLoggedOut() {
 /* ---------------- Browse data ---------------- */
 
 export const library = $state([]);
-export const detail = $state({ playlist: null, album: null, artist: null });
+/**
+ * Whether the library has been ANSWERED, as distinct from being empty.
+ *
+ * An empty array means both "still on its way" and "you have no playlists",
+ * and those want opposite treatments: a frame of the rows that are coming, or
+ * a sentence explaining that there are none. Without this flag every cold
+ * start showed "No playlists yet" for the length of the round trip, which is
+ * an error message for a state that is not an error.
+ */
+export const libraryState = $state({ loaded: false });
+/**
+ * The payload behind the current detail route, plus why there isn't one.
+ *
+ * `error` is not decoration. Every detail view renders a skeleton while its
+ * payload is null, and the browse commands used to swallow their rejections —
+ * so an engine that was down left a playlist page showing placeholder rows
+ * for ever, with nothing on screen to say the request had failed or any way
+ * to try it again. A missing payload has two causes and they need two
+ * different screens.
+ */
+export const detail = $state({ playlist: null, album: null, artist: null, error: "" });
+
+let browseSeq = 0;
+
+/**
+ * Fetches the payload for a detail route. Lives here rather than in App so
+ * that a view's "Try again" is the same call the navigation made, rather than
+ * a second implementation of it.
+ *
+ * The sequence guard is what stops a slow answer for a page you have already
+ * left from painting over the page you are on.
+ */
+export function loadDetail(name = route.name, id = route.id) {
+  if (!id) return;
+  // The artist page and its discography share one payload; arriving at either
+  // with it already loaded is the common case and must not refetch.
+  if ((name === "artist" || name === "discography") && detail.artist?.id === id) return;
+  const seq = ++browseSeq;
+  detail.error = "";
+  const settle = (key) => (payload) => {
+    if (seq === browseSeq) detail[key] = payload ?? null;
+  };
+  const fail = (reason) => {
+    if (seq === browseSeq) detail.error = String(reason || "Nothing came back from the engine.");
+  };
+  if (name === "playlist") api.browsePlaylist(id).then(settle("playlist")).catch(fail);
+  else if (name === "album") api.browseAlbum(id).then(settle("album")).catch(fail);
+  else if (name === "artist" || name === "discography") {
+    api.browseArtist(id).then(settle("artist")).catch(fail);
+  }
+}
+
+/** The same request the route made, for a failed page's one action. */
+export function retryDetail() {
+  loadDetail(route.name, route.id);
+}
 export const search = $state({ query: "", results: null, submitted: false, busy: false });
 
 /**
@@ -356,6 +448,15 @@ export function queueSearch(query) {
     return;
   }
   search.busy = true;
+  /* `submitted` means "a query is in flight or has answered", and it is set
+     HERE rather than in the response handler. It used to be set only once
+     results came back, which made the search view's loading state literally
+     unreachable — the view checks `!submitted` first, so every search showed
+     the "nothing searched yet" empty state for the whole round trip and then
+     snapped straight to results. Existing results are deliberately NOT
+     cleared: refining a query keeps the previous answer on screen until the
+     new one lands, so only the first search of a session sees a skeleton. */
+  search.submitted = true;
   searchTimer = setTimeout(() => {
     const seq = ++searchSeq;
     api
@@ -363,7 +464,6 @@ export function queueSearch(query) {
       .then((result) => {
         if (seq !== searchSeq) return; // a newer query already answered
         search.results = result ?? null;
-        search.submitted = true;
       })
       .catch(() => {})
       .finally(() => {
@@ -425,6 +525,8 @@ export function closeCredits() {
 export function setLibrary(playlists) {
   library.length = 0;
   library.push(...(playlists ?? []));
+  // Any answer at all, including an empty one, ends the loading state.
+  libraryState.loaded = true;
 }
 /**
  * Optimistically promotes the playlist that supplied a play action.
@@ -690,6 +792,8 @@ export async function initEvents() {
   api
     .browsePlaylists()
     .then((playlists) => setLibrary(playlists))
-    .catch(() => {});
+    // A failed fetch is still an answer: leaving the rail in its loading frame
+    // forever is worse than saying there is nothing there.
+    .catch(() => (libraryState.loaded = true));
 
 }

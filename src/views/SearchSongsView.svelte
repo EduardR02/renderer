@@ -62,9 +62,19 @@
     {#if loading}<p class="inline-status" aria-live="polite">Loading more songs…</p>{/if}
     {#if error}<p class="inline-error results-error" role="alert">{error}</p>{/if}
   {:else if loading}
-    <div class="tl">
-      {#each Array.from({ length: 8 }) as _, index (index)}
-        <div class="sk-row"><span class="sk" style="width:12px"></span><span class="sk art"></span><span class="sk a"></span><span class="sk b"></span></div>
+    <!-- `--cols` is normally set by TrackList from the same booleans that pick
+         its cells; a standalone skeleton has to name its own. -->
+    <div class="tl" style="--cols:28px 36px minmax(0,1fr) 52px" aria-hidden="true">
+      {#each Array.from({ length: 10 }) as _, index (index)}
+        <div class="sk-row">
+          <span class="sk" style="width:12px"></span>
+          <span class="sk art"></span>
+          <span class="sk-stack">
+            <span class="sk a" style="width:{66 - ((index * 7) % 26)}%"></span>
+            <span class="sk b" style="width:{31 - ((index * 5) % 12)}%"></span>
+          </span>
+          <span class="sk" style="width:28px;justify-self:end"></span>
+        </div>
       {/each}
     </div>
   {:else}

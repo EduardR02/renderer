@@ -8,11 +8,13 @@
     isTrackLiked,
     library,
     openCredits,
+    ui,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
   import { formatTime } from "../lib/time.js";
+  import { observeStuck } from "../lib/sticky.js";
 
   let {
     tracks = [],
@@ -35,6 +37,82 @@
     sortDirection = "asc",
     onSort = null,
   } = $props();
+
+  /* =====================================================================
+     COLUMNS — one source of truth, in the component that renders the cells.
+
+     This used to be nine `--cols` declarations in app.css, duplicated across
+     two media-query blocks, and it was broken: inside those blocks
+     `.has-inspector .tl:not(.no-album):not(.album-page)` scores 0-4-0 and
+     `.has-inspector .tl.playlist-sort` only 0-3-0, so a playlist table got the
+     SIX-column template while it was still rendering nine cells. Grid does
+     exactly what it is told with that — cells seven, eight and nine wrap onto
+     an implicit second row inside a 48px-high box, which is why the kebab
+     landed on top of the next row's play icon and flickered under the pointer.
+     That was reachable at any window narrower than 1276px with the now-playing
+     rail open, which is most of the sizes this app is used at.
+
+     A template that can disagree with the cells is the bug, so the two are now
+     computed from the same booleans, here, and the CSS just reads `--cols`.
+
+     The DROP ORDER is a design decision and is written out below rather than
+     encoded in breakpoints scattered through a stylesheet. Space is taken from
+     CONTEXT before IDENTITY:
+
+       1. Added      — when you saved it matters least
+       2. Album      — where it came from
+       3. Plays      — how popular it is
+       4. Artist     — not lost: the column folds back UNDER the title, which
+                       is the same two-line row every other list in the app
+                       already uses
+       5. Artwork    — last, and only in the extreme (a 940px window with the
+                       inspector open leaves the pane 332px wide)
+
+     Nothing ever wraps and nothing is ever squeezed to zero: every elastic
+     column is a minmax(0, …) and every cell truncates.
+     ===================================================================== */
+  const COL = {
+    /* Widths, in the order the cells appear in the row. */
+    idx: "28px",
+    art: "36px",
+    plays: "108px",
+    like: "32px",
+    time: "52px",
+    more: "28px",
+  };
+
+  /* Pane width, in CSS px, below which each column stops earning its keep.
+     Measured against the pane rather than the window — see `ui.paneWidth`. */
+  const NEEDS = { added: 780, album: 640, plays: 540, artist: 560, art: 430 };
+  /* Below this the 16px column gap becomes 12px: at a narrow pane the gaps are
+     a bigger share of the row than any single column. */
+  const DENSE_BELOW = 780;
+
+  const pane = $derived(ui.paneWidth || 1200);
+  const colArt = $derived(showArt && pane >= NEEDS.art);
+  const colArtist = $derived(showArtist && pane >= NEEDS.artist);
+  const colAlbum = $derived(showAlbum && pane >= NEEDS.album);
+  const colAdded = $derived(showAdded && pane >= NEEDS.added);
+  const colPlays = $derived(showPlays && pane >= NEEDS.plays);
+  const dense = $derived(pane < DENSE_BELOW);
+
+  const cols = $derived.by(() => {
+    const list = [COL.idx];
+    if (colArt) list.push(COL.art);
+    /* The title carries the row. It gets the largest share when it shares the
+       elastic space, and all of it when it does not. */
+    const elastic = (colArtist ? 1 : 0) + (colAlbum ? 1 : 0) + (colAdded ? 1 : 0);
+    list.push(elastic ? "minmax(0, 2.2fr)" : "minmax(0, 1fr)");
+    if (colArtist) list.push("minmax(0, 1.4fr)");
+    if (colAlbum) list.push("minmax(0, 1.6fr)");
+    /* A date has a natural minimum — "12 Aug 2026" — and truncating it to
+       "12 Au…" tells you nothing, so this column has a floor rather than a
+       share it can be squeezed out of. */
+    if (colAdded) list.push("minmax(84px, 0.8fr)");
+    if (colPlays) list.push(COL.plays);
+    list.push(COL.like, COL.time, COL.more);
+    return list.join(" ");
+  });
 
   const addedDateFormatter = new Intl.DateTimeFormat(undefined, {
     year: "numeric",
@@ -98,12 +176,27 @@
     else playFrom(i);
   }
 
+  /**
+   * Roughly how tall the menu can get: seven items at 30px, separator, and
+   * the 4px padding. An estimate is enough — it only decides which SIDE of the
+   * button the menu opens on, and being a few pixels out changes nothing.
+   * Measuring the real height would mean rendering it offscreen first, which
+   * is a layout read and a frame of flicker for no gain.
+   */
+  const MENU_MAX_H = 232;
+
   function openRowMenu(e, track, i) {
     e.stopPropagation();
     const r = e.currentTarget.getBoundingClientRect();
     menu.open = true;
     menu.x = Math.min(r.right - 216, window.innerWidth - 224);
-    menu.y = r.bottom + 4;
+    /* Flip above the button when there is not room below it. Rows near the
+       bottom of a long playlist are exactly where this menu is used most, and
+       it was opening downward unconditionally — off the bottom of the window,
+       with its own scrollbar, so "Remove from this playlist" was unreachable
+       without scrolling inside a menu that had nowhere to go. */
+    const below = window.innerHeight - r.bottom - 8;
+    menu.y = below >= MENU_MAX_H ? r.bottom + 4 : Math.max(8, r.top - 4 - MENU_MAX_H);
     menu.track = track;
     menu.index = i;
     picker.open = false;
@@ -114,7 +207,9 @@
     picker.open = true;
     picker.track = menu.track;
     picker.x = Math.max(8, menu.x - 228);
-    picker.y = menu.y;
+    // The picker is as tall as the library, so it is clamped to the viewport
+    // rather than aligned to the menu it came from.
+    picker.y = Math.min(menu.y, Math.max(8, window.innerHeight - MENU_MAX_H - 8));
   }
 
   function addToPlaylist(playlist) {
@@ -258,6 +353,13 @@
     };
   });
 
+  /* The column heads are type on the page until rows start passing under
+     them; see observeStuck for why this is an observer and not a scroll
+     timeline or a scroll handler. */
+  let headSentinel = $state(null);
+  let headStuck = $state(false);
+  $effect(() => observeStuck(headSentinel, (stuck) => (headStuck = stuck)));
+
   $effect(() => {
     if (!menu.open && !picker.open) return;
     const onDown = (e) => {
@@ -299,7 +401,7 @@
         </button>
       </span>
 
-      {#if showArt}
+      {#if colArt}
         <Cover
           src={track.cover_url}
           id={track.album_id || track.uri}
@@ -311,7 +413,10 @@
 
       <span class="c-title">
         <span class="t-name">{track.name}</span>
-        {#if !showArtist}
+        {#if !colArtist}
+          <!-- When the artist column is dropped the names come back under the
+               title rather than disappearing: who made it is identity, and the
+               two-line row is what every other list in the app already uses. -->
           <ArtistLinks
             class="t-artists"
             names={track.artist_names}
@@ -321,7 +426,7 @@
         {/if}
       </span>
 
-      {#if showArtist}
+      {#if colArtist}
         <span class="c-artist">
           <ArtistLinks
             names={track.artist_names}
@@ -331,7 +436,7 @@
         </span>
       {/if}
 
-      {#if showAlbum}
+      {#if colAlbum}
         <!-- Always rendered, even when it repeats the title (single-track
              releases). Blanking those cells leaves holes that read as data
              that failed to load, which is worse than mild redundancy. -->
@@ -340,11 +445,11 @@
         </button>
       {/if}
 
-      {#if showAdded}
+      {#if colAdded}
         <span class="c-added">{formatAddedAt(track.added_at)}</span>
       {/if}
 
-      {#if showPlays}
+      {#if colPlays}
         <span class="c-plays">{formatPlayCount(track.play_count)}</span>
       {/if}
 
@@ -375,14 +480,14 @@
 
 <div
   class="tl"
-  class:no-album={!showAlbum}
-  class:album-page={!showArt}
-  class:playlist-sort={showAdded}
-  class:has-plays={showPlays}
+  class:dense
   style="overflow-anchor: none"
+  style:--cols={cols}
 >
   {#if showHead}
-    <div class="tl-head">
+    <!-- Parked where the head starts sticking; see the observer above. -->
+    <div class="tl-head-sentinel" bind:this={headSentinel} aria-hidden="true"></div>
+    <div class="tl-head" class:stuck={headStuck}>
       <button
         class="tl-sort-btn"
         class:active={sortKey === "order"}
@@ -390,7 +495,7 @@
         aria-pressed={sortKey === "order"}
         onclick={() => activateSort("order")}
       ># {#if sortKey === "order"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
-      {#if showArt}<span></span>{/if}
+      {#if colArt}<span></span>{/if}
       <button
         class="tl-sort-btn"
         class:active={sortKey === "title"}
@@ -398,7 +503,7 @@
         aria-pressed={sortKey === "title"}
         onclick={() => activateSort("title")}
       >Title {#if sortKey === "title"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
-      {#if showArtist}
+      {#if colArtist}
         <button
           class="tl-sort-btn"
           class:active={sortKey === "artist"}
@@ -407,25 +512,25 @@
           onclick={() => activateSort("artist")}
         >Artist {#if sortKey === "artist"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
       {/if}
-      {#if showAlbum}
+      {#if colAlbum}
         <button
-          class="tl-sort-btn tl-col-album"
+          class="tl-sort-btn"
           class:active={sortKey === "album"}
           aria-label={sortAriaLabel("album", "album")}
           aria-pressed={sortKey === "album"}
           onclick={() => activateSort("album")}
         >Album {#if sortKey === "album"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
       {/if}
-      {#if showAdded}
+      {#if colAdded}
         <button
-          class="tl-sort-btn tl-col-added"
+          class="tl-sort-btn"
           class:active={sortKey === "added"}
           aria-label={sortAriaLabel("added", "date added")}
           aria-pressed={sortKey === "added"}
           onclick={() => activateSort("added")}
         >Added {#if sortKey === "added"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
       {/if}
-      {#if showPlays}<span class="tl-plays-head">Plays</span>{/if}
+      {#if colPlays}<span class="tl-plays-head">Plays</span>{/if}
       <span></span>
       <button
         class="tl-sort-btn tl-sort-duration"

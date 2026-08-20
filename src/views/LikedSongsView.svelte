@@ -1,15 +1,20 @@
 <script>
   import { untrack } from "svelte";
-  import { api } from "../lib/state.svelte.js";
+  import { api, ui } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Icon from "../components/Icon.svelte";
+  import LikedMark from "../components/LikedMark.svelte";
   import { paletteFor } from "../lib/covertone.svelte.js";
+  import { detailArtSize } from "../lib/layout.js";
 
   /* Rose's own hue, rebuilt at the header's fixed dark. Every other detail
      page takes its colour from artwork; this collection has none, and does not
      want any — it is the one page in the app that is about YOU rather than
      about a record, so it gets the palette's "yours" hue at full strength. */
   const ROSE_TONE = paletteFor(21, 0.105);
+
+  /* Same rule as every other detail header: the artwork gives way first. */
+  const artSize = $derived(detailArtSize(ui.paneWidth));
 
   let tracks = $state([]);
   let nextCursor = $state(null);
@@ -60,8 +65,8 @@
   style:--tone-wash-deep={ROSE_TONE.washDeep}
   style:--tone-glow={ROSE_TONE.glow}
 >
-  <header class="liked-head">
-    <div class="liked-art" aria-hidden="true"><Icon name="heart-filled" size={42} /></div>
+  <header class="liked-head detail-head">
+    <LikedMark size={artSize} />
     <div class="liked-copy">
       <span class="tag saved">Your collection</span>
       <h1 class="detail-title">Liked Songs</h1>
@@ -73,7 +78,18 @@
   </header>
 
   <div class="actions liked-actions">
-    <button class="play-lg" title="Play Liked Songs" disabled={!tracks.length} onclick={() => playFrom(0)}>
+    <!-- ROSE, not foam, and this is the one page where that is right: the
+         palette's rule is that foam is what you can DO and rose is what is
+         YOURS, and on every other page those are different objects. Here the
+         thing you press and the thing it belongs to are the same collection.
+         A 48px solid disc is also exactly the kind of surface rose can carry —
+         area, not ink. -->
+    <button
+      class="play-lg saved"
+      title="Play Liked Songs"
+      disabled={!tracks.length}
+      onclick={() => playFrom(0)}
+    >
       <Icon name="play" size={19} />
     </button>
     <span>Read-only Spotify collection</span>
@@ -84,9 +100,17 @@
       <TrackList {tracks} {playFrom} showLike={false} />
     </div>
   {:else if loading}
-    <div class="tl liked-loading">
-      {#each Array.from({ length: 8 }) as _, index (index)}
-        <div class="sk-row"><span class="sk" style="width:12px"></span><span class="sk art"></span><span class="sk a"></span><span class="sk b"></span></div>
+    <div class="tl liked-loading" style="--cols:28px 36px minmax(0,1fr) 52px" aria-hidden="true">
+      {#each Array.from({ length: 10 }) as _, index (index)}
+        <div class="sk-row">
+          <span class="sk" style="width:12px"></span>
+          <span class="sk art"></span>
+          <span class="sk-stack">
+            <span class="sk a" style="width:{66 - ((index * 7) % 26)}%"></span>
+            <span class="sk b" style="width:{31 - ((index * 5) % 12)}%"></span>
+          </span>
+          <span class="sk" style="width:28px;justify-self:end"></span>
+        </div>
       {/each}
     </div>
   {:else if error}

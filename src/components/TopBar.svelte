@@ -63,7 +63,9 @@
         ? (detail.album?.name ?? "")
         : route.name === "artist"
           ? (detail.artist?.name ?? "")
-          : ""
+          : route.name === "discography"
+            ? (detail.artist ? `${detail.artist.name} / Discography` : "")
+            : ""
   );
 
   /**
@@ -100,9 +102,12 @@
     </button>
   </div>
 
-  <!-- Fades in once the sentinel above has scrolled out of the pane. -->
+  <!-- Fades in once the sentinel above has scrolled out of the pane. Below a
+       620px pane it is dropped rather than squeezed: it repeats a heading that
+       is a few pixels up the page, and the search field beside it does not
+       repeat anything. -->
   <div class="topbar-title" class:has={!!title}>
-    {#if title}
+    {#if title && ui.paneWidth >= 620}
       <button class="topbar-play" title={playback.playing ? "Pause" : "Play"} onclick={togglePlay}>
         <Icon name={playback.playing ? "pause" : "play"} size={12} />
       </button>
