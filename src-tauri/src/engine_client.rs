@@ -665,9 +665,14 @@ impl EngineClient {
         parse_data(reply, "browse_search")
     }
 
-    pub async fn create_playlist(&self, name: &str) -> Result<(), String> {
-        let _ = self.request("edit_create_playlist", json!({"name": name})).await?;
-        Ok(())
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+    ) -> Result<spotify_playback_engine::protocol::PlaylistRef, String> {
+        let reply = self
+            .request("edit_create_playlist", json!({"name": name}))
+            .await?;
+        parse_data(reply, "edit_create_playlist")
     }
 
     pub async fn rename_playlist(&self, id: &str, name: &str) -> Result<(), String> {

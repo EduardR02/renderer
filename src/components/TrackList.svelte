@@ -42,6 +42,8 @@
     /** Optional always-visible trailing action used by compact recommendation lists. */
     rowActionLabel = null,
     onRowAction = null,
+    /** Optional per-row guard for an always-visible trailing action. */
+    rowActionDisabled = null,
   } = $props();
 
   /* =====================================================================
@@ -500,9 +502,10 @@
         {#if rowActionLabel && onRowAction}
           <button
             style="width:56px;opacity:1"
-            title={rowActionLabel}
+            title={rowActionDisabled?.(track, i) ? "Adding…" : rowActionLabel}
+            disabled={!!rowActionDisabled?.(track, i)}
             onclick={() => onRowAction(track, i)}
-          >{rowActionLabel}</button>
+          >{rowActionDisabled?.(track, i) ? "Adding…" : rowActionLabel}</button>
         {:else}
           <button title="More options" onclick={(e) => openRowMenu(e, track, i)}>
             <Icon name="more" size={15} />

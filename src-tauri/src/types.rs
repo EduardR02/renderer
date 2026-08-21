@@ -285,6 +285,8 @@ impl From<PlaylistBrowse> for PlaylistDetail {
 pub struct RadioDetail {
     pub seed: Track,
     pub tracks: Vec<Track>,
+    pub seed_kind: String,
+    pub seed_artist: Option<Artist>,
 }
 
 impl From<RadioBrowse> for RadioDetail {
@@ -292,6 +294,8 @@ impl From<RadioBrowse> for RadioDetail {
         Self {
             seed: browse.seed.into(),
             tracks: browse.tracks.into_iter().map(Track::from).collect(),
+            seed_kind: browse.seed_kind,
+            seed_artist: browse.seed_artist.map(Artist::from),
         }
     }
 }

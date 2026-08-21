@@ -237,7 +237,7 @@ pub async fn browse_artist_catalogue(
                 &id,
                 release_types.as_deref().unwrap_or_default(),
                 offset.unwrap_or(0),
-                limit.unwrap_or(4).clamp(1, 6),
+                limit.unwrap_or(4).clamp(1, 7),
             )
             .await?,
     ))
@@ -281,10 +281,11 @@ pub async fn create_playlist(
     app: AppHandle,
     client: State<'_, Arc<EngineClient>>,
     name: String,
-) -> Result<(), String> {
-    client.create_playlist(&name).await?;
+) -> Result<Playlist, String> {
+    let reference = client.create_playlist(&name).await?;
+    let playlist = Playlist::from(&reference);
     spawn_refresh_library(app);
-    Ok(())
+    Ok(playlist)
 }
 
 #[tauri::command]

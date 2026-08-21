@@ -4,7 +4,8 @@
     libraryState,
     navigate,
     ui,
-    isMadeForYouPlaylist,
+    personalizedPlaylistRank,
+    isDjPlaylist,
   } from "../lib/state.svelte.js";
   import { playPlaylistById, playLikedSongs } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
@@ -25,8 +26,18 @@
    * `last_activity` for the sidebar; listening history is the explicit
    * exception and is copied/sorted by `last_played` here.
    */
+  const uniqueLibrary = $derived.by(() => {
+    const seen = new Set();
+    return library.filter((playlist) => {
+      const id = playlist?.id;
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  });
+
   const recentlyPlayed = $derived.by(() =>
-    library
+    uniqueLibrary
       .filter((playlist) => Number.isFinite(Number(playlist?.last_played)))
       .slice()
       .sort((left, right) => Number(right.last_played) - Number(left.last_played)),
@@ -42,18 +53,55 @@
 
   const recentShelf = $derived(recentlyPlayed.slice(0, cardsPerRow));
   const recentIds = $derived(new Set(recentShelf.map((playlist) => playlist.id)));
-  const madeForYouCandidates = $derived(
-    library.filter((playlist) => isMadeForYouPlaylist(playlist) && !recentIds.has(playlist.id)),
+  /*
+   * There is no confirmed current Home/space persisted query yet. Keep this
+   * fallback entirely rootlist-backed: the classifier only sees playlists
+   * answered by the authenticated library browse, then the stable rank puts
+   * the canonical shelves first without inventing any missing mixes.
+   */
+  const madeForYouCandidates = $derived.by(() => {
+    const ranked = [];
+    const seen = new Set();
+    for (const playlist of uniqueLibrary) {
+      if (
+        !playlist?.id ||
+        seen.has(playlist.id) ||
+        recentIds.has(playlist.id) ||
+        isDjPlaylist(playlist)
+      ) {
+        continue;
+      }
+      const rank = personalizedPlaylistRank(playlist);
+      if (rank === null) continue;
+      seen.add(playlist.id);
+      ranked.push({ playlist, rank });
+    }
+    ranked.sort((left, right) => left.rank - right.rank);
+    return ranked.map(({ playlist }) => playlist);
+  });
+  let madeForYouExpanded = $state(false);
+  const madeForYouInitialCount = $derived(cardsPerRow * 2);
+  const madeForYou = $derived(
+    madeForYouExpanded
+      ? madeForYouCandidates
+      : madeForYouCandidates.slice(0, madeForYouInitialCount),
   );
-  const madeForYou = $derived(madeForYouCandidates.slice(0, cardsPerRow));
+  const canExpandMadeForYou = $derived(
+    madeForYouCandidates.length > madeForYouInitialCount,
+  );
   const shownIds = $derived(
-    new Set([...recentShelf, ...madeForYou].map((playlist) => playlist.id)),
+    new Set([
+      ...recentShelf,
+      // Keep the collapsed shelf's hidden cards out of Your library too:
+      // Show all should reveal them in one canonical place, not duplicate them.
+      ...madeForYouCandidates,
+    ].map((playlist) => playlist.id)),
   );
   const remainingLibrary = $derived(
-    library.filter((playlist) => !shownIds.has(playlist.id)),
+    uniqueLibrary.filter((playlist) => !shownIds.has(playlist.id)),
   );
 
-  const tonePlaylist = $derived(recentShelf[0] ?? library[0] ?? null);
+  const tonePlaylist = $derived(recentShelf[0] ?? uniqueLibrary[0] ?? null);
   const tone = $derived(
     coverTone(
       tonePlaylist?.cover_url || tonePlaylist?.cover_urls?.[0] || "",
@@ -174,10 +222,24 @@
 
   {#if madeForYou.length}
     <div class="section home-shelf-section">
-      <div class="section-head"><h2 class="section-title">Made for you</h2></div>
+      <div class="section-head">
+        <h2 class="section-title">Made for you</h2>
+        {#if canExpandMadeForYou}
+          <button
+            class="btn-ghost"
+            type="button"
+            aria-controls="made-for-you-grid"
+            aria-expanded={madeForYouExpanded}
+            onclick={() => (madeForYouExpanded = !madeForYouExpanded)}
+          >
+            {madeForYouExpanded ? "Show less" : "Show all"}
+          </button>
+        {/if}
+      </div>
       <div
+        id="made-for-you-grid"
         class="grid home-shelf"
-        style={`--shelf-columns:${Math.max(2, madeForYou.length)}`}
+        style={`--shelf-columns:${cardsPerRow}`}
       >
         {#each madeForYou as pl (pl.id)}
           {@render playlistCard(pl)}
@@ -186,7 +248,7 @@
     </div>
   {/if}
 
-  {#if library.length}
+  {#if uniqueLibrary.length}
     <div
       class="section"
       class:home-first={!recentShelf.length && !madeForYou.length}
@@ -232,13 +294,12 @@
 
 <style>
   /*
-   * Shelves reuse the exact card object and cover interactions from `.grid`,
-   * but reserve one responsive row. The count comes from the pane width so a
-   * narrow inspector never wraps a shelf into a second line.
+   * Shelves reuse the exact card object and cover interactions from `.grid`.
+   * The column count follows the pane width, so Made for you starts at two
+   * responsive rows and can reveal the rest without changing card geometry.
    */
   .grid.home-shelf {
     grid-template-columns: repeat(var(--shelf-columns), minmax(0, 1fr));
-    overflow: hidden;
   }
 
 

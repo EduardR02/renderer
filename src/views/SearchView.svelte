@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { search, api, navigate, focusSearch, queueSearch } from "../lib/state.svelte.js";
+  import { search, api, navigate, focusSearch, queueSearch, retrySearch } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -97,7 +97,6 @@
 
   function rerun(q) {
     search.query = q;
-    search.results = null;
     remember(q);
     queueSearch(q);
   }
@@ -156,6 +155,14 @@
         </div>
       </div>
     {/if}
+  {:else if search.error && !search.results}
+    <div class="empty failed" role="alert">
+      <p class="h">Search couldn't load.</p>
+      <p class="why">{search.error}</p>
+      <div class="actions">
+        <button class="btn-ghost" onclick={retrySearch}>Try again</button>
+      </div>
+    </div>
   {:else if !search.results}
     <!-- =================================================================
          The frame the results arrive into.
@@ -232,6 +239,12 @@
         </button>
       </div>
     </div>
+    {#if search.error}
+      <p class="inline-error" role="status">
+        {search.error}
+        <button class="link-more" onclick={retrySearch}>Try again</button>
+      </p>
+    {/if}
   {:else}
     <div class="search-split">
       {#if top}
@@ -279,6 +292,12 @@
         </div>
       {/if}
     </div>
+    {#if search.error}
+      <p class="inline-error" role="status">
+        {search.error}
+        <button class="link-more" onclick={retrySearch}>Try again</button>
+      </p>
+    {/if}
 
     {#if albums.length}
       <div class="section">

@@ -4,6 +4,7 @@
     detail,
     search,
     queueSearch,
+    submitSearch,
     ui,
     api,
     playback,
@@ -60,7 +61,11 @@
     route.name === "playlist"
       ? (detail.playlist?.name ?? "")
       : route.name === "radio"
-        ? (detail.radio?.seed?.name ? `${detail.radio.seed.name} Radio` : "")
+        ? (detail.radio?.seed_kind === "artist"
+          ? `${detail.radio.seed_artist?.name ?? "Artist"} Radio`
+          : detail.radio?.seed?.name
+            ? `${detail.radio.seed.name} Radio`
+            : "")
         : route.name === "album"
           ? (detail.album?.name ?? "")
           : route.name === "artist"
@@ -81,12 +86,12 @@
     queueSearch(search.query);
   }
 
-  /** Enter just skips the remaining debounce; the query is already in flight. */
+  /** Enter skips the remaining debounce without duplicating an in-flight call. */
   function onSubmit(e) {
     e.preventDefault();
     if (!search.query.trim()) return;
     if (route.name !== "search") navigate("search");
-    queueSearch(search.query);
+    submitSearch(search.query);
   }
 </script>
 

@@ -580,12 +580,39 @@ async fn fetch_playlist_tracks(
 const MAX_RADIO_RECOMMENDATIONS: usize = 50;
 const MAX_PLAYLIST_RECOMMENDATIONS: usize = 10;
 
+/// Apollo returns a broad ranked candidate set, but playlist recommendations
+/// only need enough metadata to fill the visible ten-item shelf. Keeping this
+/// bound below one metadata batch preserves rank while avoiding needless
+/// resolutions for candidates that can never be shown.
+const MAX_PLAYLIST_METADATA_CANDIDATES: usize = 20;
+
 const APOLLO_REQUEST_COUNT: usize = 50;
 
 enum InspiredBySource {
     Tracks(Vec<SpotifyUri>),
     Playlist(SpotifyUri),
 }
+enum RadioSeed {
+    Track(SpotifyUri),
+    Artist(SpotifyUri),
+}
+
+/// The frontend keeps one `radio` route and prefixes artist seeds so the
+/// command/model stay shared without making a track id ambiguous.
+fn parse_radio_seed(raw: &str) -> Result<RadioSeed, String> {
+    if let Some(id) = raw.strip_prefix("artist:") {
+        let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
+            .map_err(|error| format!("invalid radio seed artist id: {error}"))?;
+        if !matches!(uri, SpotifyUri::Artist { .. }) {
+            return Err("radio seed artist id was not an artist URI".to_owned());
+        }
+        return Ok(RadioSeed::Artist(uri));
+    }
+    track_uri(&format!("spotify:track:{raw}"))
+        .map(RadioSeed::Track)
+        .ok_or_else(|| "invalid radio seed track id".to_owned())
+}
+
 
 fn track_uri(raw: &str) -> Option<SpotifyUri> {
     let uri = SpotifyUri::from_uri(raw).ok()?;
@@ -685,11 +712,10 @@ fn ranked_radio_tracks(seed: TrackRef, recommendations: Vec<TrackRef>) -> Vec<Tr
     tracks
 }
 
-/// A distinct, playlist-like song radio. Fetching it never starts playback;
-/// the frontend explicitly supplies this ordered context to `play_queue`.
-pub async fn radio_browse(session: &Session, id: &str) -> Result<RadioBrowse, String> {
-    let seed_uri = track_uri(&format!("spotify:track:{id}"))
-        .ok_or_else(|| "invalid radio seed track id".to_owned())?;
+async fn track_radio_browse(
+    session: &Session,
+    seed_uri: SpotifyUri,
+) -> Result<RadioBrowse, String> {
     let bytes = session
         .spclient()
         .get_radio_for_track(&seed_uri)
@@ -727,7 +753,68 @@ pub async fn radio_browse(session: &Session, id: &str) -> Result<RadioBrowse, St
     }
     let seed = resolved.remove(0);
     let tracks = ranked_radio_tracks(seed.clone(), resolved);
-    Ok(RadioBrowse { seed, tracks })
+    Ok(RadioBrowse {
+        seed,
+        tracks,
+        seed_kind: "track".to_owned(),
+        seed_artist: None,
+    })
+}
+
+/// Artist radio uses the Apollo station context directly. Its first resolved
+/// station item is the playable seed, preserving server rank while the artist
+/// reference supplies the route label.
+async fn artist_radio_browse(
+    session: &Session,
+    artist_uri: SpotifyUri,
+) -> Result<RadioBrowse, String> {
+    let artist: Artist = metadata_get(session, &artist_uri, "artist radio artist").await?;
+    let artist_id = id_of(&artist_uri);
+    let context = format!("spotify:station:artist:{artist_id}");
+    let bytes = session
+        .spclient()
+        .get_apollo_station(
+            "stations",
+            &context,
+            Some(APOLLO_REQUEST_COUNT),
+            Vec::new(),
+            false,
+        )
+        .await
+        .map_err(|error| format!("artist radio for {context} failed: {error}"))?;
+    let candidates = parse_apollo_tracks(&bytes)?;
+    let candidates = dedupe_uris(candidates.iter())
+        .into_iter()
+        .take(MAX_RADIO_RECOMMENDATIONS);
+    let uris = candidates.collect::<Vec<_>>();
+    let mut resolved = fetch_tracks(session, uris.iter()).await?;
+    if resolved.is_empty() {
+        return Err("artist radio returned no playable tracks".to_owned());
+    }
+    let seed = resolved.remove(0);
+    let tracks = ranked_radio_tracks(seed.clone(), resolved);
+    let portrait_url = artist_portrait(&artist);
+    let seed_artist = ArtistRef {
+        id: artist_id,
+        uri: uri_of(&artist.id),
+        name: artist.name,
+        portrait_url,
+    };
+    Ok(RadioBrowse {
+        seed,
+        tracks,
+        seed_kind: "artist".to_owned(),
+        seed_artist: Some(seed_artist),
+    })
+}
+
+/// Song and artist radio share one route/model but use distinct server
+/// contexts. Neither browse path starts playback; the client owns that action.
+pub async fn radio_browse(session: &Session, id: &str) -> Result<RadioBrowse, String> {
+    match parse_radio_seed(id)? {
+        RadioSeed::Track(uri) => track_radio_browse(session, uri).await,
+        RadioSeed::Artist(uri) => artist_radio_browse(session, uri).await,
+    }
 }
 
 /// Manual/lazy recommendations for a playlist. This is deliberately not
@@ -760,7 +847,7 @@ pub async fn playlist_recommendations_browse(
     let candidates = dedupe_uris(candidates.iter())
         .into_iter()
         .filter(|candidate| !existing.contains(&id_of(candidate)))
-        .take(APOLLO_REQUEST_COUNT)
+        .take(MAX_PLAYLIST_METADATA_CANDIDATES)
         .collect::<Vec<_>>();
     let mut tracks = fetch_tracks(session, candidates.iter()).await?;
     tracks.truncate(MAX_PLAYLIST_RECOMMENDATIONS);
@@ -2205,7 +2292,9 @@ const SEARCH_DESKTOP_HASHES: &[&str] = &[
 /// The pathfinder GraphQL endpoint the official web/desktop client uses for
 /// search.
 const PATHFINDER_ENDPOINT: &str = "https://api-partner.spotify.com/pathfinder/v2/query";
-const ARTIST_OVERVIEW_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const ARTIST_OVERVIEW_SUCCESS_TTL: Duration = Duration::from_secs(5 * 60);
+const ARTIST_OVERVIEW_FAILURE_TTL: Duration = Duration::from_secs(30);
+const ARTIST_OVERVIEW_CACHE_CAPACITY: usize = 64;
 
 /// Persisted `queryArtistOverview` documents newest first. Each historical
 /// document keeps the exact variable shape it was captured with; GraphQL
@@ -2271,13 +2360,21 @@ struct ArtistOverviewCache {
 }
 
 impl ArtistOverviewCache {
+    fn ttl(value: &Option<ArtistOverviewQuery>) -> Duration {
+        if value.is_some() {
+            ARTIST_OVERVIEW_SUCCESS_TTL
+        } else {
+            ARTIST_OVERVIEW_FAILURE_TTL
+        }
+    }
+
     fn get(
         &mut self,
         key: &ArtistOverviewCacheKey,
         now: Instant,
     ) -> Option<Option<ArtistOverviewQuery>> {
         let entry = self.entries.get(key)?;
-        if now.duration_since(entry.fetched_at) >= ARTIST_OVERVIEW_CACHE_TTL {
+        if now.duration_since(entry.fetched_at) >= Self::ttl(&entry.value) {
             self.entries.remove(key);
             return None;
         }
@@ -2291,8 +2388,18 @@ impl ArtistOverviewCache {
         now: Instant,
     ) {
         self.entries.retain(|_, entry| {
-            now.duration_since(entry.fetched_at) < ARTIST_OVERVIEW_CACHE_TTL
+            now.duration_since(entry.fetched_at) < Self::ttl(&entry.value)
         });
+        if !self.entries.contains_key(&key) && self.entries.len() >= ARTIST_OVERVIEW_CACHE_CAPACITY {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
         self.entries.insert(key, ArtistOverviewCacheEntry { fetched_at: now, value });
     }
 }
@@ -3981,7 +4088,7 @@ mod tests {
     }
 
     #[test]
-    fn artist_overview_cache_models_positive_negative_and_expired_entries() {
+    fn artist_overview_cache_models_positive_negative_expiry_and_capacity() {
         let now = Instant::now();
         let key = ArtistOverviewCacheKey {
             artist_id: "artist".to_owned(),
@@ -4002,7 +4109,7 @@ mod tests {
             Some("Cached")
         );
         assert!(cache
-            .get(&key, now + ARTIST_OVERVIEW_CACHE_TTL)
+            .get(&key, now + ARTIST_OVERVIEW_SUCCESS_TTL)
             .is_none());
 
         cache.insert(key.clone(), None, now);
@@ -4012,6 +4119,38 @@ mod tests {
                 .is_some_and(|value| value.is_none()),
             "a failed rotation is a cache hit too"
         );
+        assert!(cache
+            .get(&key, now + ARTIST_OVERVIEW_FAILURE_TTL)
+            .is_none());
+
+        let mut bounded = ArtistOverviewCache::default();
+        let first_key = ArtistOverviewCacheKey {
+            artist_id: "artist-0".to_owned(),
+            schema_hash: ARTIST_OVERVIEW_SCHEMAS[0].hash,
+        };
+        for index in 0..ARTIST_OVERVIEW_CACHE_CAPACITY {
+            bounded.insert(
+                ArtistOverviewCacheKey {
+                    artist_id: format!("artist-{index}"),
+                    schema_hash: ARTIST_OVERVIEW_SCHEMAS[0].hash,
+                },
+                None,
+                now + Duration::from_millis(index as u64),
+            );
+        }
+        assert_eq!(bounded.entries.len(), ARTIST_OVERVIEW_CACHE_CAPACITY);
+        let newest_key = ArtistOverviewCacheKey {
+            artist_id: "artist-new".to_owned(),
+            schema_hash: ARTIST_OVERVIEW_SCHEMAS[0].hash,
+        };
+        bounded.insert(
+            newest_key.clone(),
+            None,
+            now + Duration::from_millis(ARTIST_OVERVIEW_CACHE_CAPACITY as u64),
+        );
+        assert_eq!(bounded.entries.len(), ARTIST_OVERVIEW_CACHE_CAPACITY);
+        assert!(!bounded.entries.contains_key(&first_key));
+        assert!(bounded.entries.contains_key(&newest_key));
     }
 
     #[test]
@@ -4625,6 +4764,22 @@ mod tests {
         assert_eq!(uri_of(&tracks[2]), "spotify:track:1123456789ABCDEFGHIJKL");
         assert!(matches!(tracks[1], SpotifyUri::Track { .. }));
         assert!(parse_apollo_tracks(br#"{"tracks":"wrong"}"#).is_err());
+    }
+
+    #[test]
+    fn radio_seed_parser_distinguishes_track_and_artist_contexts() {
+        let RadioSeed::Track(track) = parse_radio_seed("0123456789ABCDEFGHIJKL").unwrap() else {
+            panic!("plain ids must remain song-radio seeds");
+        };
+        assert_eq!(uri_of(&track), "spotify:track:0123456789ABCDEFGHIJKL");
+
+        let RadioSeed::Artist(artist) =
+            parse_radio_seed("artist:0123456789ABCDEFGHIJKL").unwrap()
+        else {
+            panic!("artist-prefixed ids must select artist radio");
+        };
+        assert_eq!(uri_of(&artist), "spotify:artist:0123456789ABCDEFGHIJKL");
+        assert!(parse_radio_seed("artist:not-an-id").is_err());
     }
 
     #[test]

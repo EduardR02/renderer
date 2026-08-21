@@ -4,7 +4,10 @@
     playback,
     togglePlay,
     api,
+    navigate,
+    promotePlaylist,
     retryDetail,
+    route,
     ui,
   } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -17,13 +20,57 @@
   const radio = $derived(detail.radio);
   const seed = $derived(radio?.seed ?? null);
   const tracks = $derived(radio?.tracks ?? []);
-  const title = $derived(seed?.name ? `${seed.name} Radio` : "Song Radio");
-  const tone = $derived(coverTone(seed?.cover_url ?? "", seed?.id ?? "radio"));
+  const artistRadio = $derived(
+    route.id?.startsWith("artist:") || radio?.seed_kind === "artist",
+  );
+  const seedArtist = $derived(radio?.seed_artist ?? null);
+  const tag = $derived(artistRadio ? "Artist Radio" : "Song Radio");
+  const title = $derived(
+    artistRadio
+      ? `${seedArtist?.name ?? "Artist"} Radio`
+      : seed?.name
+        ? `${seed.name} Radio`
+        : "Song Radio",
+  );
+  const radioArtSources = $derived.by(() => {
+    // RadioBrowse currently has track/artist contexts. Keep any future
+    // playlist-backed context on its official cover instead of mosaicing it.
+    if (!radio || !["track", "artist"].includes(radio.seed_kind)) return [];
+    return [...new Set(tracks.map((track) => track?.cover_url).filter(Boolean))].slice(0, 4);
+  });
+  const fallbackCover = $derived(
+    artistRadio ? seedArtist?.cover_url || seed?.cover_url || "" : seed?.cover_url || "",
+  );
+  const coverId = $derived(
+    artistRadio ? seedArtist?.id || seed?.id || "" : seed?.album_id || seed?.id || "",
+  );
+  const coverName = $derived(
+    artistRadio ? seedArtist?.name || seed?.name || "" : seed?.album_name || seed?.name || "",
+  );
+  const tone = $derived(coverTone(fallbackCover, coverId || "radio"));
   const artSize = $derived(detailArtSize(ui.paneWidth));
 
   const playingThis = $derived.by(() => {
     if (!tracks.length || playback.queue.length !== tracks.length) return false;
     return tracks.every((track, index) => playback.queue[index]?.uri === track.uri);
+  });
+
+  // Keep a successful create id when adding tracks fails. A retry then
+  // completes the same playlist instead of creating a duplicate.
+  let saveState = $state({
+    routeId: "__unset__",
+    busy: false,
+    playlistId: null,
+    error: "",
+  });
+
+  $effect(() => {
+    const routeId = route.id;
+    if (saveState.routeId === routeId) return;
+    saveState.routeId = routeId;
+    saveState.busy = false;
+    saveState.playlistId = null;
+    saveState.error = "";
   });
 
   function playFrom(index) {
@@ -44,6 +91,35 @@
     api.setShuffle(true).catch(() => {});
     api.playQueue(tracks, 0).catch(() => {});
   }
+
+  async function saveAsPlaylist() {
+    if (saveState.busy || !radio || !tracks.length) return;
+    const uris = tracks.map((track) => track?.uri);
+    if (uris.some((uri) => !uri)) {
+      saveState.error = "This radio contains a track without a Spotify URI.";
+      return;
+    }
+
+    saveState.busy = true;
+    saveState.error = "";
+    try {
+      let playlistId = saveState.playlistId;
+      if (!playlistId) {
+        const created = await api.createPlaylist(title);
+        playlistId = created?.id;
+        if (!playlistId) throw new Error("Playlist creation returned no id.");
+        saveState.playlistId = playlistId;
+      }
+      await api.addPlaylistTracks(playlistId, uris);
+      promotePlaylist(playlistId);
+      api.touchPlaylistActivity(playlistId).catch(() => {});
+      navigate("playlist", playlistId);
+    } catch (reason) {
+      saveState.error = String(reason?.message ?? reason ?? "Could not save this radio.");
+    } finally {
+      saveState.busy = false;
+    }
+  }
 </script>
 
 <section
@@ -56,12 +132,12 @@
     <header class="detail-head">
       <span class="art lg skeleton" style:width="{artSize}px" style:height="{artSize}px"></span>
       <div>
-        <span class="tag">Song Radio</span>
+        <span class="tag">{tag}</span>
         <h1 class="detail-title">Unavailable</h1>
       </div>
     </header>
     <div class="empty failed">
-      <p class="h">This song radio could not be loaded.</p>
+      <p class="h">This {artistRadio ? "artist" : "song"} radio could not be loaded.</p>
       <p class="why">{detail.error}</p>
       <div class="actions">
         <button class="btn-ghost" onclick={retryDetail}>Try again</button>
@@ -92,15 +168,16 @@
   {:else}
     <header class="detail-head">
       <Cover
-        src={seed.cover_url}
-        id={seed.album_id || seed.id}
-        name={seed.album_name || seed.name}
+        src={radioArtSources.length >= 4 ? "" : fallbackCover}
+        srcs={radioArtSources}
+        id={coverId}
+        name={coverName}
         size={artSize}
         lg
         raised
       />
       <div>
-        <span class="tag">Song Radio</span>
+        <span class="tag">{tag}</span>
         <h1 class="detail-title">{title}</h1>
         <p class="detail-meta">
           <span class="who">Spotify</span>
@@ -121,7 +198,13 @@
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
             <Icon name="shuffle" size={14} />Shuffle
           </button>
+          <button class="btn-ghost" onclick={saveAsPlaylist} disabled={!tracks.length || saveState.busy}>
+            {saveState.busy ? "Saving…" : saveState.playlistId ? "Retry save" : "Save as playlist"}
+          </button>
         </div>
+        {#if saveState.error}
+          <p class="inline-error" role="alert">{saveState.error}</p>
+        {/if}
       </div>
     </header>
 
@@ -130,7 +213,9 @@
         <TrackList {tracks} {playFrom} showArtist />
       </div>
     {:else}
-      <div class="empty"><p>No recommendations are available for this song.</p></div>
+      <div class="empty">
+        <p>No recommendations are available for this {artistRadio ? "artist" : "song"}.</p>
+      </div>
     {/if}
   {/if}
 </section>

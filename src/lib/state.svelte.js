@@ -266,26 +266,38 @@ export function positionMs() {
 
 export function applyPlayback(payload) {
   if (!payload) return;
+  const loggedOut = observeSearchSession(payload);
   const wasPlaying = playback.playing;
   for (const key of Object.keys(playback)) {
     if (key in payload) playback[key] = payload[key];
   }
+  if (loggedOut) {
+    playback.username = null;
+    session.username = null;
+  }
   if ("position_ms" in payload) anchorPlayhead(payload.position_ms);
   if (playback.playing !== wasPlaying) syncPlayheadTicker(playback.playing);
+  maybeStartDeferredSearch();
 }
 
 export function applySession(payload) {
   if (!payload) return;
+  const loggedOut = observeSearchSession(payload);
   if (payload.auth_state != null) {
     session.auth_state = payload.auth_state;
     playback.auth_state = payload.auth_state;
   }
-  if (payload.username != null) {
+  if (loggedOut) {
+    session.username = null;
+    playback.username = null;
+  } else if (payload.username != null) {
     session.username = payload.username;
     playback.username = payload.username;
   }
   if (payload.error != null) session.error = payload.error;
+  maybeStartDeferredSearch();
 }
+
 
 export function isLoggedOut() {
   // The engine emits `needs_login` (with a fresh auth_url) when no session
@@ -355,7 +367,7 @@ export function loadDetail(name = route.name, id = route.id) {
 export function retryDetail() {
   loadDetail(route.name, route.id);
 }
-export const search = $state({ query: "", results: null, submitted: false, busy: false });
+export const search = $state({ query: "", results: null, submitted: false, busy: false, error: null });
 
 /**
  * On-demand track credits surface state. The payload is kept as the backend
@@ -432,46 +444,284 @@ export const SEARCH_LIMIT = 10;
  */
 const SEARCH_DEBOUNCE_MS = 220;
 
+const SEARCH_WAITING_MESSAGE = "Search is waiting for Spotify to connect.";
+const SEARCH_FAILURE_MESSAGE = "Search could not load. Try again.";
+
 let searchTimer = null;
 let searchSeq = 0;
+let searchSessionEpoch = 0;
+let currentSearch = null;
+let deferredSearch = null;
+const searchRequests = new Map();
+const LOGGED_OUT_AUTH_STATES = new Set(["logged_out", "needs_login"]);
+let observedSearchSession = {
+  known: false,
+  authState: null,
+  username: "",
+  loggedOut: false,
+};
+
+function searchRequestKey(epoch, seq) {
+  return `${epoch}:${seq}`;
+}
+
+function resetSearchForSession() {
+  clearTimeout(searchTimer);
+  searchTimer = null;
+  searchSeq += 1;
+  currentSearch = null;
+  deferredSearch = null;
+  searchRequests.clear();
+  search.query = "";
+  search.results = null;
+  search.submitted = false;
+  search.busy = false;
+  search.error = null;
+}
 
 /**
- * Runs a search after the debounce, discarding replies that arrive out of
- * order. Without the sequence guard a slow early query can land after a fast
- * later one and overwrite fresher results with staler ones.
+ * Session events arrive separately from playback state events. Observe both,
+ * but only invalidate once for a real logout or an identity change. The first
+ * username after startup is not a transition: a query typed while the engine
+ * was still authenticating must survive until that first session becomes ready.
  */
-export function queueSearch(query) {
-  const q = query.trim();
+function observeSearchSession(payload) {
+  if (!payload) return false;
+  const hasAuthState = Object.prototype.hasOwnProperty.call(payload, "auth_state");
+  const hasUsername = Object.prototype.hasOwnProperty.call(payload, "username");
+  const authState = hasAuthState ? payload.auth_state ?? null : observedSearchSession.authState;
+  const rawUsername = hasUsername
+    ? String(payload.username ?? "").trim()
+    : observedSearchSession.username;
+  // A partial session event carrying the first username is itself evidence
+  // that authentication completed; do not let a prior needs_login snapshot
+  // erase the deferred query before the matching ready event arrives.
+  const loggedOut = hasAuthState
+    ? LOGGED_OUT_AUTH_STATES.has(authState)
+    : hasUsername
+      ? !rawUsername && !!observedSearchSession.username
+      : observedSearchSession.loggedOut;
+  const username = loggedOut ? "" : rawUsername;
+  const previous = observedSearchSession;
+
+  if (previous.known) {
+    const actualLogout =
+      loggedOut &&
+      !previous.loggedOut &&
+      (!!previous.username || previous.authState === "ready");
+    const accountTransition =
+      !!username &&
+      !!previous.username &&
+      username !== previous.username;
+    if (actualLogout || accountTransition) {
+      searchSessionEpoch += 1;
+      resetSearchForSession();
+      clearPlaylistRecommendationsCache();
+    }
+  }
+
+  observedSearchSession = { known: true, authState, username, loggedOut };
+  return loggedOut;
+}
+
+function isSearchReady() {
+  return playback.ready === true && playback.auth_state === "ready";
+}
+
+function searchErrorMessage(reason) {
+  if (typeof reason === "string" && reason.trim()) return reason;
+  if (reason?.message) return reason.message;
+  return SEARCH_FAILURE_MESSAGE;
+}
+
+function searchIsCurrent(query, seq, epoch) {
+  return (
+    currentSearch?.q === query &&
+    currentSearch?.seq === seq &&
+    currentSearch?.epoch === epoch &&
+    epoch === searchSessionEpoch
+  );
+}
+
+function requestIsCurrent(request) {
+  return (
+    request.epoch === searchSessionEpoch &&
+    searchIsCurrent(request.q, request.seq, request.epoch) &&
+    searchRequests.get(request.key) === request
+  );
+}
+
+function runSearch(query, seq, epoch) {
+  if (!searchIsCurrent(query, seq, epoch)) return;
+  if (!isSearchReady()) {
+    deferredSearch = { q: query, seq, epoch };
+    search.busy = false;
+    search.error = SEARCH_WAITING_MESSAGE;
+    return;
+  }
+
+  const key = searchRequestKey(epoch, seq);
+  const existing = searchRequests.get(key);
+  if (existing) {
+    // A readiness event or an explicit submit can arrive more than once. Keep
+    // the one request and leave any deferred token intact until it settles.
+    search.busy = true;
+    search.error = null;
+    return;
+  }
+
+  const request = { q: query, seq, epoch, key };
+  searchRequests.set(key, request);
+  search.busy = true;
+  search.error = null;
+
+  let promise;
+  try {
+    promise = api.search(query);
+  } catch (reason) {
+    promise = Promise.reject(reason);
+  }
+
+  Promise.resolve(promise)
+    .then((result) => {
+      if (!requestIsCurrent(request)) return;
+      if (result == null) {
+        search.error = SEARCH_FAILURE_MESSAGE;
+        return;
+      }
+      search.results = result;
+      search.error = null;
+    })
+    .catch((reason) => {
+      if (!requestIsCurrent(request)) return;
+      if (!isSearchReady()) {
+        deferredSearch = { q: query, seq, epoch };
+        search.error = SEARCH_WAITING_MESSAGE;
+      } else {
+        search.error = searchErrorMessage(reason);
+      }
+    })
+    .finally(() => {
+      if (searchRequests.get(request.key) === request) searchRequests.delete(request.key);
+      if (searchIsCurrent(request.q, request.seq, request.epoch)) {
+        search.busy = false;
+      }
+      // If readiness returned while this request was still cleaning up,
+      // retry only after the old entry has been removed. This also keeps a
+      // deferred q1 alive when q1→q2→q1 creates a fresh request token.
+      if (isSearchReady()) maybeStartDeferredSearch();
+    });
+}
+
+function maybeStartDeferredSearch() {
+  const pending = deferredSearch;
+  if (!pending) return;
+  if (!searchIsCurrent(pending.q, pending.seq, pending.epoch)) {
+    deferredSearch = null;
+    return;
+  }
+  if (!isSearchReady()) return;
+  // Keep the deferred token until the prior request's finally has removed its
+  // epoch+sequence entry. Clearing it here would lose the readiness retry.
+  if (searchRequests.has(searchRequestKey(pending.epoch, pending.seq))) return;
+  deferredSearch = null;
+  runSearch(pending.q, pending.seq, pending.epoch);
+}
+
+function enqueueSearch(query, force = false) {
+  const q = String(query ?? "").trim();
+  const current = currentSearch;
+
+  // Input events may call this for the same value more than once. A retry for
+  // an errored query is the only same-value call that should start over.
+  if (q && current?.q === q && current.epoch === searchSessionEpoch && !force) {
+    const key = searchRequestKey(current.epoch, current.seq);
+    if (
+      searchTimer !== null ||
+      (deferredSearch?.q === q && deferredSearch?.seq === current.seq) ||
+      searchRequests.has(key)
+    ) {
+      return;
+    }
+    if (!search.error) return;
+    force = true;
+  }
+  if (q && current?.q === q && current.epoch === searchSessionEpoch && force) {
+    const key = searchRequestKey(current.epoch, current.seq);
+    if (
+      searchTimer !== null ||
+      (deferredSearch?.q === q && deferredSearch?.seq === current.seq) ||
+      searchRequests.has(key)
+    ) {
+      return;
+    }
+  }
+
   clearTimeout(searchTimer);
+  searchTimer = null;
   if (!q) {
+    searchSeq += 1;
+    currentSearch = null;
+    deferredSearch = null;
     search.submitted = false;
     search.results = null;
     search.busy = false;
+    search.error = null;
     return;
   }
-  search.busy = true;
-  /* `submitted` means "a query is in flight or has answered", and it is set
-     HERE rather than in the response handler. It used to be set only once
-     results came back, which made the search view's loading state literally
-     unreachable — the view checks `!submitted` first, so every search showed
-     the "nothing searched yet" empty state for the whole round trip and then
-     snapped straight to results. Existing results are deliberately NOT
-     cleared: refining a query keeps the previous answer on screen until the
-     new one lands, so only the first search of a session sees a skeleton. */
+
+  const seq = ++searchSeq;
+  const epoch = searchSessionEpoch;
+  currentSearch = { q, seq, epoch };
+  deferredSearch = null;
   search.submitted = true;
+  search.busy = true;
+  search.error = null;
+  /* `submitted` is set HERE rather than in the response handler. Otherwise
+     the view checks `!submitted` first and the loading state is unreachable.
+     Existing results deliberately stay visible while a refinement is pending. */
   searchTimer = setTimeout(() => {
-    const seq = ++searchSeq;
-    api
-      .search(q)
-      .then((result) => {
-        if (seq !== searchSeq) return; // a newer query already answered
-        search.results = result ?? null;
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (seq === searchSeq) search.busy = false;
-      });
+    searchTimer = null;
+    runSearch(q, seq, epoch);
   }, SEARCH_DEBOUNCE_MS);
+}
+
+export function queueSearch(query) {
+  enqueueSearch(query);
+}
+
+/** Submit skips the remaining debounce without duplicating an in-flight call. */
+export function submitSearch(query) {
+  const raw = String(query ?? "");
+  search.query = raw;
+  const q = raw.trim();
+  if (!q) {
+    enqueueSearch("");
+    return;
+  }
+  if (
+    !currentSearch ||
+    currentSearch.q !== q ||
+    currentSearch.epoch !== searchSessionEpoch
+  ) {
+    enqueueSearch(q);
+  }
+  clearTimeout(searchTimer);
+  searchTimer = null;
+  const current = currentSearch;
+  if (!current) return;
+  const key = searchRequestKey(current.epoch, current.seq);
+  if (searchRequests.has(key)) {
+    search.busy = true;
+    search.error = null;
+    return;
+  }
+  runSearch(current.q, current.seq, current.epoch);
+}
+
+export function retrySearch() {
+  const q = search.query.trim();
+  if (q) enqueueSearch(q, true);
 }
 
 /**
@@ -558,6 +808,40 @@ export function classifyLibraryPlaylist(playlist) {
 
 export function isMadeForYouPlaylist(playlist) {
   return classifyLibraryPlaylist(playlist) !== null;
+}
+/**
+ * Stable Home ordering for the personalized playlists that are already in the
+ * authenticated rootlist. Spotify can add more named algorithmic playlists
+ * over time, so known-but-unprioritized kinds remain visible after the three
+ * shelves the Home surface promises.
+ *
+ * The return value is a sort key, not a display label. `null` means that the
+ * playlist is not a known personalized item and should stay in the library
+ * grid. Daily Mixes 1-6 get their own ordered band; later mixes are treated as
+ * other personalized items rather than displacing the requested six.
+ */
+export function personalizedPlaylistRank(playlist) {
+  const kind = classifyLibraryPlaylist(playlist);
+  if (!kind) return null;
+  if (kind === "release-radar") return 0;
+  if (kind === "daily-mix") {
+    const name = String(typeof playlist === "string" ? playlist : playlist?.name ?? "")
+      .trim()
+      .replace(/\s+/g, " ")
+      .toLowerCase();
+    const number = Number(name.match(/^daily mix (\d+)$/)?.[1]);
+    if (Number.isInteger(number) && number >= 1 && number <= 6) return number;
+    return 200 + (Number.isInteger(number) ? number : 99);
+  }
+  if (kind === "discover-weekly") return 100;
+  return 300;
+}
+
+/** The DJ shelf is not a user playlist recommendation and never belongs on Home. */
+export function isDjPlaylist(playlist) {
+  const raw = typeof playlist === "string" ? playlist : playlist?.name;
+  const name = String(raw ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  return /^dj(?:\b|$)/.test(name);
 }
 
 function activityNow() {
@@ -806,6 +1090,117 @@ export const api = {
   logout: () => invoke("logout"),
   getState: () => invoke("get_state"),
 };
+/**
+ * Session-scoped recommendation cache.
+ *
+ * Recommendations are tied to the playlist revision returned by
+ * `browse_playlist`; a revision change must never reuse tracks from the old
+ * snapshot. Entries keep the resolved tracks and, while a request is pending,
+ * its promise so separate consumers share one server call. Rejections remove
+ * the entry instead of turning a transient failure into a permanent miss.
+ */
+const RECOMMENDATIONS_CACHE_MAX = 64;
+const playlistRecommendationsCache = new Map();
+
+function playlistRecommendationsKey(id, revision) {
+  return `${id}\u0000${revision ?? ""}`;
+}
+
+function trimRecommendationCache() {
+  while (playlistRecommendationsCache.size > RECOMMENDATIONS_CACHE_MAX) {
+    playlistRecommendationsCache.delete(playlistRecommendationsCache.keys().next().value);
+  }
+}
+
+function storeRecommendationCacheEntry(key, playlistId, revision, entry) {
+  // A playlist has one current snapshot in the cache. Removing older
+  // revisions also drops their pending promises, so a slow old response
+  // cannot repopulate data after a newer browse payload arrived.
+  for (const [candidateKey, candidate] of playlistRecommendationsCache) {
+    if (candidate.playlistId === playlistId && candidateKey !== key) {
+      playlistRecommendationsCache.delete(candidateKey);
+    }
+  }
+  playlistRecommendationsCache.delete(key);
+  playlistRecommendationsCache.set(key, { playlistId, revision, ...entry });
+  trimRecommendationCache();
+}
+
+function touchRecommendationCache(key, entry) {
+  playlistRecommendationsCache.delete(key);
+  playlistRecommendationsCache.set(key, entry);
+}
+
+function clearPlaylistRecommendationsCache() {
+  playlistRecommendationsCache.clear();
+}
+
+export function loadPlaylistRecommendations(id, revision = "", { force = false } = {}) {
+  const playlistId = String(id ?? "").trim();
+  if (!playlistId) return Promise.resolve([]);
+
+  const snapshot = String(revision ?? "");
+  const key = playlistRecommendationsKey(playlistId, snapshot);
+  const cached = playlistRecommendationsCache.get(key);
+
+  // A refresh invalidates resolved data, but never duplicates an already
+  // running request. The latter is important when an explicit refresh lands
+  // at the same time as the near-footer observer.
+  if (cached?.promise) {
+    touchRecommendationCache(key, cached);
+    return cached.promise;
+  }
+  if (cached && !force) {
+    touchRecommendationCache(key, cached);
+    return Promise.resolve(cached.tracks);
+  }
+  if (force) playlistRecommendationsCache.delete(key);
+
+  let response;
+  try {
+    response = api.browsePlaylistRecommendations(playlistId);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+
+  const request = Promise.resolve(response)
+    .then((payload) => {
+      const tracks = Array.isArray(payload?.tracks) ? payload.tracks : [];
+      const current = playlistRecommendationsCache.get(key);
+      if (current?.promise === request) {
+        storeRecommendationCacheEntry(key, playlistId, snapshot, { tracks });
+      }
+      return tracks;
+    })
+    .catch((error) => {
+      // Errors are deliberately not cached: a later near-footer demand or
+      // explicit refresh gets a chance to recover from startup/transient
+      // engine failures.
+      if (playlistRecommendationsCache.get(key)?.promise === request) {
+        playlistRecommendationsCache.delete(key);
+      }
+      throw error;
+    });
+
+  storeRecommendationCacheEntry(key, playlistId, snapshot, { promise: request });
+  return request;
+}
+
+/** Remove an URI after a successful Add so revisiting the route cannot restore it. */
+export function removePlaylistRecommendation(id, revision = "", uri) {
+  const playlistId = String(id ?? "").trim();
+  const recommendationUri = String(uri ?? "").trim();
+  if (!playlistId || !recommendationUri) return false;
+  const snapshot = String(revision ?? "");
+  const key = playlistRecommendationsKey(playlistId, snapshot);
+  const cached = playlistRecommendationsCache.get(key);
+  if (!cached || cached.promise || !Array.isArray(cached.tracks)) return false;
+  const tracks = cached.tracks.filter((track) => track?.uri !== recommendationUri);
+  if (tracks.length === cached.tracks.length) return false;
+  storeRecommendationCacheEntry(key, playlistId, snapshot, { tracks });
+  return true;
+}
+
 
 /** Optimistic play/pause flip; reconciled by the next `state` event. */
 export function togglePlay() {

@@ -130,7 +130,8 @@ pub enum Command {
     BrowsePlaylist {
         id: String,
     },
-    /// Seed track plus server-ranked recommendations from inspired-by.
+    /// Song or artist radio with server-ranked playable tracks. Plain ids use
+    /// inspired-by song radio; an `artist:` prefix selects Apollo artist radio.
     /// Responded to with a `browse_radio` message.
     BrowseRadio {
         id: String,
@@ -307,13 +308,26 @@ pub struct PlaylistBrowse {
     pub tracks: Vec<TrackRef>,
 }
 
-/// A song-radio context. `tracks[0]` is always `seed`; recommendations follow
-/// in server rank order and never repeat the seed or one another.
+/// A playlist-like radio context. `tracks[0]` is always the first playable
+/// item in server rank order; recommendations follow without repeats.
+///
+/// `seed_kind` is `"track"` for the inspired-by song route and `"artist"` for
+/// the Apollo artist station route. Artist radio has no playable artist seed,
+/// so `seed` is the station's first ranked track and `seed_artist` carries the
+/// label shown by the client.
+///
+/// Radio responses intentionally carry no follower, like, or listener count.
+/// The inspired-by/Apollo payloads expose aggregate-looking fields whose
+/// semantics are not confirmed for this context; rendering them would invent
+/// a metric rather than report a known value.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RadioBrowse {
     pub seed: TrackRef,
     pub tracks: Vec<TrackRef>,
+    pub seed_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed_artist: Option<ArtistRef>,
 }
 
 /// Optional recommendations displayed below a playlist. This payload is
@@ -596,8 +610,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AuthState, BrowseResponse, Command, PlaylistRecommendations, PlaylistRef, PositionEvent,
-        RadioBrowse, RepeatMode, Request, Response, SearchBrowse, StateEvent, TrackRef,
+        AuthState, ArtistRef, BrowseResponse, Command, PlaylistRecommendations, PlaylistRef,
+        PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse, StateEvent,
+        TrackRef,
     };
 
     #[test]
@@ -1096,6 +1111,17 @@ mod tests {
             Command::BrowseRadio { ref id } if id == "0123456789ABCDEFGHIJKL"
         ));
 
+        let artist_radio: Request = serde_json::from_value(json!({
+            "request_id": "request-artist-radio",
+            "type": "browse_radio",
+            "id": "artist:0123456789ABCDEFGHIJKL",
+        }))
+        .unwrap();
+        assert!(matches!(
+            artist_radio.command,
+            Command::BrowseRadio { ref id } if id == "artist:0123456789ABCDEFGHIJKL"
+        ));
+
         let recommendations: Request = serde_json::from_value(json!({
             "request_id": "request-recommendations",
             "type": "browse_playlist_recommendations",
@@ -1117,6 +1143,8 @@ mod tests {
         let payload = RadioBrowse {
             seed: seed.clone(),
             tracks: vec![seed],
+            seed_kind: "track".to_owned(),
+            seed_artist: None,
         };
         let response = serde_json::to_value(BrowseResponse {
             kind: "browse_radio",
@@ -1129,6 +1157,38 @@ mod tests {
         assert_eq!(response["type"], "browse_radio");
         assert_eq!(response["data"]["seed"]["name"], "Seed");
         assert_eq!(response["data"]["tracks"][0]["name"], "Seed");
+        assert_eq!(response["data"]["seed_kind"], "track");
+        assert!(response["data"].get("seed_artist").is_none());
+
+        let artist_payload = RadioBrowse {
+            seed: TrackRef {
+                id: "1123456789ABCDEFGHIJKL".to_owned(),
+                uri: "spotify:track:1123456789ABCDEFGHIJKL".to_owned(),
+                name: "Ranked first".to_owned(),
+                ..TrackRef::default()
+            },
+            tracks: Vec::new(),
+            seed_kind: "artist".to_owned(),
+            seed_artist: Some(ArtistRef {
+                id: "artist-id".to_owned(),
+                uri: "spotify:artist:artist-id".to_owned(),
+                name: "Artist".to_owned(),
+                portrait_url: None,
+            }),
+        };
+        let artist_response = serde_json::to_value(BrowseResponse {
+            kind: "browse_radio",
+            request_id: "request-artist-radio",
+            ok: true,
+            error: None,
+            data: Some(&artist_payload),
+        })
+        .unwrap();
+        assert_eq!(artist_response["data"]["seed_kind"], "artist");
+        assert_eq!(artist_response["data"]["seed_artist"]["name"], "Artist");
+        assert!(artist_response["data"].get("followers").is_none());
+        assert!(artist_response["data"].get("likes").is_none());
+        assert!(artist_response["data"].get("listeners").is_none());
 
         let optional = PlaylistRecommendations {
             playlist_id: "1123456789ABCDEFGHIJKL".to_owned(),

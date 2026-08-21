@@ -10,6 +10,8 @@
     ui,
     session,
     retryDetail,
+    loadPlaylistRecommendations,
+    removePlaylistRecommendation,
   } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
@@ -162,8 +164,10 @@
   let deleting = $state(false);
   let deleteError = $state("");
   let recommendations = $state([]);
+  const recommendationAdds = $state({});
   const recommendationState = $state({
     id: null,
+    revision: "",
     requested: false,
     loading: false,
     hidden: false,
@@ -190,13 +194,14 @@
     return () => document.removeEventListener("pointerdown", onPointerDown);
   });
 
-  // Recommendation data is page-local by design. A different playlist id
-  // discards it immediately rather than turning this optional surface into a
-  // second application cache.
+  // Recommendation tracks live in the session cache. A different playlist or
+  // snapshot starts a new lazy demand without carrying rows across routes.
   $effect(() => {
     const id = pl?.id ?? null;
-    if (recommendationState.id === id) return;
+    const revision = pl?.snapshot_id ?? "";
+    if (recommendationState.id === id && recommendationState.revision === revision) return;
     recommendationState.id = id;
+    recommendationState.revision = revision;
     recommendationState.requested = false;
     recommendationState.loading = false;
     recommendationState.hidden = false;
@@ -206,12 +211,13 @@
   $effect(() => {
     const node = recommendationFooter;
     const id = pl?.id;
+    const revision = pl?.snapshot_id ?? "";
     if (!node || !id || recommendationState.hidden || recommendationState.requested) return;
     const root = node.closest(".scroll");
     if (!root) return;
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (entry.isIntersecting) requestRecommendations(id);
+        if (entry.isIntersecting) requestRecommendations(id, revision);
       },
       { root, rootMargin: "0px 0px 480px 0px" },
     );
@@ -219,48 +225,83 @@
     return () => observer.disconnect();
   });
 
-  async function requestRecommendations(expectedId = pl?.id) {
+  async function requestRecommendations(
+    expectedId = pl?.id,
+    expectedRevision = pl?.snapshot_id ?? "",
+    { force = false } = {},
+  ) {
+    const revision = expectedRevision ?? "";
     if (
       !expectedId ||
       recommendationState.id !== expectedId ||
-      recommendationState.requested ||
-      recommendationState.loading
+      recommendationState.revision !== revision ||
+      recommendationState.loading ||
+      (recommendationState.requested && !force)
     ) return;
     recommendationState.requested = true;
     recommendationState.loading = true;
+    recommendationState.hidden = false;
     try {
-      const payload = await api.browsePlaylistRecommendations(expectedId);
-      if (recommendationState.id !== expectedId || route.name !== "playlist" || route.id !== expectedId) return;
-      recommendations = payload?.tracks ?? [];
+      const tracks = await loadPlaylistRecommendations(expectedId, revision, { force });
+      if (
+        recommendationState.id !== expectedId ||
+        recommendationState.revision !== revision ||
+        route.name !== "playlist" ||
+        route.id !== expectedId
+      ) return;
+      recommendations = tracks;
       recommendationState.hidden = recommendations.length === 0;
     } catch {
-      // Endpoint failure belongs only to this optional footer. The playlist
-      // itself remains fully usable and no global/page error is produced.
-      if (recommendationState.id === expectedId) recommendationState.hidden = true;
+      // An optional footer failure never invalidates the playlist. Leave an
+      // existing successful set visible during a failed forced refresh.
+      if (recommendationState.id === expectedId && recommendationState.revision === revision) {
+        recommendationState.hidden = recommendations.length === 0;
+      }
     } finally {
-      if (recommendationState.id === expectedId) recommendationState.loading = false;
+      if (recommendationState.id === expectedId && recommendationState.revision === revision) {
+        recommendationState.loading = false;
+      }
     }
   }
+
 
   function playRecommendation(index) {
     if (!recommendations[index]) return;
     api.playQueue(recommendations, index).catch(() => {});
   }
 
+  function recommendationAddKey(id, uri) {
+    return `${id}\u0000${uri}`;
+  }
+
+  function recommendationAddDisabled(track) {
+    const id = recommendationState.id;
+    const uri = String(track?.uri ?? "").trim();
+    return !!id && !!uri && !!recommendationAdds[recommendationAddKey(id, uri)];
+  }
+
   async function addRecommendation(track) {
     const id = pl?.id;
-    if (!id || !editable || !track?.uri) return;
+    const revision = pl?.snapshot_id ?? "";
+    const uri = String(track?.uri ?? "").trim();
+    if (!id || !editable || !uri) return;
+    const key = recommendationAddKey(id, uri);
+    if (recommendationAdds[key]) return;
+    recommendationAdds[key] = true;
     try {
-      await api.addPlaylistTracks(id, [track.uri]);
+      await api.addPlaylistTracks(id, [uri]);
+      removePlaylistRecommendation(id, revision, uri);
       // A recommendation add is library activity, never playback.
       promotePlaylist(id);
       api.touchPlaylistActivity(id).catch(() => {});
-      if (recommendationState.id === id) {
-        recommendations = recommendations.filter((candidate) => candidate.uri !== track.uri);
+      if (recommendationState.id === id && recommendationState.revision === revision) {
+        recommendations = recommendations.filter((candidate) => candidate.uri !== uri);
         recommendationState.hidden = recommendations.length === 0;
       }
     } catch {
       // Keep the recommendation in place so a failed direct Add can be retried.
+    } finally {
+      delete recommendationAdds[key];
     }
   }
   /**
@@ -612,11 +653,21 @@
         <section class="section" aria-labelledby="playlist-recommendations-title">
           <div class="section-head">
             <h2 class="section-title" id="playlist-recommendations-title">Recommended</h2>
-            {#if !recommendationState.requested}
-              <button class="link-more" onclick={() => requestRecommendations(pl.id)}>Load recommendations</button>
+            {#if recommendationState.requested}
+              <button
+                class="link-more"
+                disabled={recommendationState.loading}
+                onclick={() => requestRecommendations(pl.id, pl.snapshot_id, { force: true })}
+              >
+                {recommendationState.loading ? "Refreshing…" : "Refresh"}
+              </button>
+            {:else}
+              <button class="link-more" onclick={() => requestRecommendations(pl.id, pl.snapshot_id)}>
+                Load recommendations
+              </button>
             {/if}
           </div>
-          {#if recommendationState.loading}
+          {#if recommendationState.loading && !recommendations.length}
             <div class="tl" style="--cols:28px 36px minmax(0,1fr) 52px" aria-label="Loading recommendations">
               {#each Array.from({ length: 4 }) as _, i (i)}
                 <div class="sk-row">
@@ -639,6 +690,7 @@
               allowAddToPlaylist={false}
               disableWindowing
               rowActionLabel={editable ? "Add" : null}
+              rowActionDisabled={editable ? recommendationAddDisabled : null}
               onRowAction={editable ? addRecommendation : null}
             />
           {/if}
@@ -648,10 +700,6 @@
   {/if}
 </section>
 {#if deleteOpen && editable}
-  <ConfirmDialog
-    open
-    title="Delete playlist?"
-    message={`“${pl?.name ?? "This playlist"}” will be removed from your library. This cannot be undone.`}
     confirmLabel="Delete playlist"
     busyLabel="Deleting…"
     busy={deleting}

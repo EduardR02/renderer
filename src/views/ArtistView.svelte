@@ -19,11 +19,11 @@
    * The shelf is ONE row, not four. The pre-redesign page stacked a separate
    * shelf for Albums, Singles, Compilations and Appears-on, each with its own
    * "Show all", which asked the same question four times. The segmented toggle
-   * asks it once and swaps what is under it, and the selection travels with
-   * "See all" so the reader opens on what you were looking at.
-   *
-   * Every release on the shelf comes out of the artist payload, which already
-   * carries per-type summaries. Switching segments costs nothing.
+   * asks it once and swaps what is under it. "See all" carries a regular
+   * catalogue selection into the reader; ranked Popular releases open the
+   * reader on "All" because that order only exists in this overview payload.
+   * Every release on the shelf comes out of the artist payload. Regular groups
+   * carry per-type summaries; ranked Popular releases come from the overview.
    */
   const artist = $derived(detail.artist);
   const top = $derived(artist?.top_tracks ?? []);
@@ -79,30 +79,53 @@
 
   /** Empty groups are not offered: a dead tab is a worse answer than no tab. */
   const segments = $derived(
-    GROUPS.filter((g) => g.id === "all" || (counts[g.id] ?? 0) > 0).map((g) => ({
-      ...g,
-      count: g.id === "all" ? releaseTotal : (counts[g.id] ?? 0),
-    })),
+    [
+      ...(popularReleases.length ? [{ id: "popular", label: "Popular releases" }] : []),
+      ...GROUPS,
+    ]
+      .filter(
+        (g) =>
+          g.id === "all" ||
+          g.id === "popular" ||
+          (counts[g.id] ?? 0) > 0,
+      )
+      .map((g) => ({
+        ...g,
+        count:
+          g.id === "all"
+            ? releaseTotal
+            : g.id === "popular"
+              ? popularReleases.length
+              : (counts[g.id] ?? 0),
+      })),
   );
 
-  let group = $state("all");
+  let group = $state("popular");
 
   const requestedShelfWidths = new Set();
+  let shelfRetry = $state(0);
   let shelfError = $state("");
   let shelfErrorKey = $state("");
 
   /* The artist changed under us — a link from a track row, say. Start the new
-     artist on "All" rather than on whatever segment the last one was left on,
-     which may not even exist here. */
+     artist on its ranked releases when the overview provides them, otherwise
+     fall back to the balanced "All" shelf. */
   let seenArtist = null;
   $effect(() => {
     if (artist?.id === seenArtist) return;
     seenArtist = artist?.id ?? null;
-    group = "all";
+    group = popularReleases.length ? "popular" : "all";
     shelfExtras = {};
     requestedShelfWidths.clear();
+    shelfRetry = 0;
     shelfError = "";
     shelfErrorKey = "";
+  });
+
+  /* An overview may be refreshed independently of the catalogue payload. Do
+     not leave the selector on a segment whose server-ranked data disappeared. */
+  $effect(() => {
+    if (!popularReleases.length && group === "popular") group = "all";
   });
 
   /** The label for a release's own group, used as its subtext on the shelf. */
@@ -116,13 +139,20 @@
   /**
    * What the shelf shows for the current segment.
    *
-   * A named segment shows that group in the order the engine returned it,
-   * which is catalogue order. "All" is the exception and cannot be: a
-   * concatenation of four lists would be eleven albums followed by whatever
-   * fits, so it is the most recent releases across every type instead — which
-   * is what a highlight row on an artist page is for.
+   * Named catalogue segments show that group in the order the engine returned
+   * it. Ranked Popular releases use the overview's server order. "All" is the
+   * exception and cannot be: a concatenation of four lists would be eleven
+   * albums followed by whatever fits, so it is the most recent releases across
+   * every type instead — which is what a highlight row on an artist page is
+   * for.
    */
   const shelf = $derived.by(() => {
+    if (group === "popular") {
+      return popularReleases.map((release) => ({
+        release,
+        kind: release.artist_names?.join(", ") || "Release",
+      }));
+    }
     if (group !== "all") {
       return (groupLists[group] ?? []).map((release) => ({ release, kind: KIND_LABEL[group] }));
     }
@@ -148,35 +178,33 @@
     return Math.max(2, Math.min(7, n));
   });
   const visibleShelf = $derived(shelf.slice(0, perRow));
-  const visiblePopularReleases = $derived(popularReleases.slice(0, perRow));
   const visibleRelatedArtists = $derived(relatedArtists.slice(0, perRow));
 
   /**
-   * A named shelf starts with lightweight AlbumRefs. If that group cannot fill
-   * this pane's one row, resolve just enough full catalogue entries to fill it.
-   * Requests are keyed by the required width so a resize can widen the shelf
-   * once without re-requesting the same artist/group/width.
+   * A named shelf starts with lightweight AlbumRefs. Hydrate one bounded
+   * seven-card page per artist/group; narrower panes reuse and slice it rather
+   * than turning every resize into another request.
    */
 
   $effect(() => {
     const id = artist?.id;
-    if (!id || group === "all") return;
+    if (!id || group === "all" || group === "popular") return;
 
     const selected = GROUPS.find((candidate) => candidate.id === group);
-    const needed = Math.min(perRow, counts[group] ?? 0);
+    const target = Math.min(7, counts[group] ?? 0);
     const loaded = (groupLists[group] ?? []).length;
-    if (!selected || needed <= 0 || loaded >= needed) return;
+    if (!selected || target <= 0 || loaded >= target) return;
 
-    const requestKey = `${id}:${group}:${needed}`;
+    const requestKey = `${id}:${group}:${shelfRetry}`;
     if (requestedShelfWidths.has(requestKey)) return;
     requestedShelfWidths.add(requestKey);
 
     const viewKey = `${id}:${group}`;
     shelfError = "";
     shelfErrorKey = "";
-    loadCataloguePage(id, selected.types, 0, perRow)
+    loadCataloguePage(id, selected.types, 0, 7)
       .then((page) => {
-        if (artist?.id !== id || group !== selected.id) return;
+        if (artist?.id !== id) return;
 
         const existing = shelfExtras[viewKey] ?? [];
         const known = new Set(
@@ -193,6 +221,7 @@
         if (additions.length) shelfExtras[viewKey] = [...existing, ...additions];
       })
       .catch((reason) => {
+        requestedShelfWidths.delete(requestKey);
         if (artist?.id !== id || group !== selected.id) return;
         shelfErrorKey = viewKey;
         shelfError = String(reason || "Could not load more of this catalogue.");
@@ -203,6 +232,17 @@
     const key = `${artist?.id ?? ""}:${group}`;
     return shelfErrorKey === key ? shelfError : "";
   });
+
+  function retryShelf() {
+    if (!currentShelfError) return;
+    shelfError = "";
+    shelfErrorKey = "";
+    shelfRetry += 1;
+  }
+
+  function openDiscography() {
+    navigate("discography", artist.id, group === "popular" ? "all" : group);
+  }
 
   /* Popular opens at five. Ten rows of a table before you reach the covers
      buries the thing the page is actually for. */
@@ -218,6 +258,10 @@
     if (!top.length) return;
     api.setShuffle(true).catch(() => {});
     api.playQueue(top, 0).catch(() => {});
+  }
+
+  function openArtistRadio() {
+    if (artist?.id) navigate("radio", `artist:${artist.id}`);
   }
 
   /* A shelf card knows an id and nothing else, so playing it costs one browse
@@ -328,6 +372,9 @@
       <button class="btn-ghost" onclick={shuffleTop} disabled={!top.length}>
         <Icon name="shuffle" size={14} />Shuffle
       </button>
+      <button class="btn-ghost" onclick={openArtistRadio} disabled={!artist?.id}>
+        Artist Radio
+      </button>
     </div>
 
     {#if top.length}
@@ -352,7 +399,7 @@
           <h2 class="section-title" id="dx-title">
             Discography<span class="section-count tnum">{releaseTotal}</span>
           </h2>
-          <button class="link-more" onclick={() => navigate("discography", artist.id, group)}>
+          <button class="link-more" onclick={openDiscography}>
             See all<Icon name="fwd" size={12} />
           </button>
         </div>
@@ -409,7 +456,7 @@
           {#if shelf.length > visibleShelf.length}
             <!-- The count is the point: it says how much is behind the link,
                  so "See all" is an informed click rather than a guess. -->
-            <button class="shelf-more" onclick={() => navigate("discography", artist.id, group)}>
+            <button class="shelf-more" onclick={openDiscography}>
               {shelf.length - visibleShelf.length} more<Icon name="fwd" size={12} />
             </button>
           {/if}
@@ -420,48 +467,10 @@
           </p>
         {/if}
         {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
-        {#if currentShelfError}<p class="inline-error" role="alert">{currentShelfError}</p>{/if}
-      </section>
-    {/if}
-
-    {#if visiblePopularReleases.length}
-      <section class="section" aria-labelledby="popular-releases-title">
-        <div class="section-head">
-          <h2 class="section-title" id="popular-releases-title">Popular releases</h2>
-        </div>
-        <div class="shelf" style:--per-row={perRow}>
-          {#each visiblePopularReleases as release (release.id)}
-            {@const tone = coverTone(release.cover_url, release.id)}
-            <div class="card" style:--tone-glow={tone.glow}>
-              <div class="card-art">
-                <Cover src={release.cover_url} id={release.id} name={release.name} fill lg />
-                <button
-                  class="card-open"
-                  aria-label={`Open ${release.name}`}
-                  onclick={() => navigate("album", release.id)}
-                ></button>
-                <button
-                  class="card-play"
-                  aria-label={`Play ${release.name}`}
-                  title={`Play ${release.name}`}
-                  disabled={!!busy}
-                  onclick={() => playRelease(release.id)}
-                >
-                  <Icon name={busy === release.id ? "more" : "play"} size={15} />
-                </button>
-              </div>
-              <button class="card-copy" onclick={() => navigate("album", release.id)}>
-                <span class="card-name">{release.name}</span>
-                <span class="card-sub"
-                  >{[
-                    release.year || null,
-                    release.artist_names?.join(", ") || "Release",
-                  ].filter(Boolean).join(" · ")}</span
-                >
-              </button>
-            </div>
-          {/each}
-        </div>
+        {#if currentShelfError}
+          <p class="inline-error" role="alert">{currentShelfError}</p>
+          <button class="link-more" onclick={retryShelf}>Try again</button>
+        {/if}
       </section>
     {/if}
 
