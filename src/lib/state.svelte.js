@@ -40,6 +40,7 @@ const ARTIST_ROUTES = new Set(["artist", "discography"]);
  */
 function clearStaleDetail(entry) {
   if (entry.name === "playlist") detail.playlist = null;
+  if (entry.name === "radio") detail.radio = null;
   if (entry.name === "album") detail.album = null;
   if (ARTIST_ROUTES.has(entry.name)) {
     const sameArtist = ARTIST_ROUTES.has(route.name) && route.id === entry.id;
@@ -317,7 +318,7 @@ export const libraryState = $state({ loaded: false });
  * to try it again. A missing payload has two causes and they need two
  * different screens.
  */
-export const detail = $state({ playlist: null, album: null, artist: null, error: "" });
+export const detail = $state({ playlist: null, radio: null, album: null, artist: null, error: "" });
 
 let browseSeq = 0;
 
@@ -343,6 +344,7 @@ export function loadDetail(name = route.name, id = route.id) {
     if (seq === browseSeq) detail.error = String(reason || "Nothing came back from the engine.");
   };
   if (name === "playlist") api.browsePlaylist(id).then(settle("playlist")).catch(fail);
+  else if (name === "radio") api.browseRadio(id).then(settle("radio")).catch(fail);
   else if (name === "album") api.browseAlbum(id).then(settle("album")).catch(fail);
   else if (name === "artist" || name === "discography") {
     api.browseArtist(id).then(settle("artist")).catch(fail);
@@ -522,27 +524,83 @@ export function closeCredits() {
 }
 
 
+/* ------------------------------------------------------------------ */
+/* Library activity                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Names Spotify uses for its algorithmic/personalized playlists. This is
+ * deliberately local and explicit: Home must classify the already-loaded
+ * rootlist without making a recommendation request or treating every
+ * playlist as personalized by accident.
+ */
+const MADE_FOR_YOU_RULES = Object.freeze([
+  ["discover-weekly", /^discover weekly$/],
+  ["release-radar", /^release radar$/],
+  ["daily-mix", /^daily mix \d+$/],
+  ["on-repeat", /^on repeat$/],
+  ["repeat-rewind", /^repeat rewind$/],
+  ["time-capsule", /^time capsule$/],
+  ["daylist", /\bdaylist\b/],
+  ["your-top-songs", /^your top songs \d{4}$/],
+]);
+
+/**
+ * Returns the canonical personalized-playlist kind, or `null` for an ordinary
+ * library playlist. Callers pass either a Playlist object or a name string.
+ */
+export function classifyLibraryPlaylist(playlist) {
+  const raw = typeof playlist === "string" ? playlist : playlist?.name;
+  const name = String(raw ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  if (!name) return null;
+  return MADE_FOR_YOU_RULES.find(([, pattern]) => pattern.test(name))?.[0] ?? null;
+}
+
+export function isMadeForYouPlaylist(playlist) {
+  return classifyLibraryPlaylist(playlist) !== null;
+}
+
+function activityNow() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function activityValue(playlist) {
+  const value = Number(playlist?.last_activity);
+  return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY;
+}
+
 export function setLibrary(playlists) {
+  const ordered = [...(playlists ?? [])];
+  ordered.sort((left, right) => {
+    const a = activityValue(left);
+    const b = activityValue(right);
+    return a === b ? 0 : b - a;
+  });
   library.length = 0;
-  library.push(...(playlists ?? []));
+  library.push(...ordered);
   // Any answer at all, including an empty one, ends the loading state.
+  // Sidebar and all library-derived views now share activity order even when
+  // the first payload came from an older on-disk snapshot.
   libraryState.loaded = true;
 }
+
 /**
- * Optimistically promotes the playlist that supplied a play action.
+ * Optimistically promotes a playlist after a successful local action.
  *
- * The backend persists the timestamp through `touch_playlist`, but it does
- * not emit a library snapshot for this small local ordering change. Moving
- * the existing object in the reactive array keeps the sidebar responsive
- * without inferring ownership from a track URI (the same track can be in
- * several playlists).
+ * `played` is true only for a completed play-queue command. Every other
+ * promotion is library activity only, so adding/editing a playlist can never
+ * create a fake Home listening-history entry.
  */
-export function promotePlaylist(id) {
+export function promotePlaylist(id, { played = false } = {}) {
   if (!id) return false;
   const index = library.findIndex((playlist) => playlist?.id === id);
   if (index < 0) return false;
+  const playlist = library[index];
+  const at = activityNow();
+  playlist.last_activity = at;
+  if (played) playlist.last_played = at;
   if (index === 0) return true;
-  const [playlist] = library.splice(index, 1);
+  library.splice(index, 1);
   library.unshift(playlist);
   return true;
 }
@@ -721,6 +779,7 @@ export const api = {
   browseArtistCatalogue: (id, releaseTypes = ["albums", "singles"], offset = 0, limit = 4) =>
     invoke("browse_artist_catalogue", { id, releaseTypes, offset, limit }),
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
+  touchPlaylistActivity: (id) => invoke("touch_playlist_activity", { id }),
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
   clearCache: (kind) => invoke("clear_cache", { kind }),
@@ -729,6 +788,8 @@ export const api = {
   browsePlaylists: () => invoke("browse_playlists"),
   browseLikedSongs: (cursor = null) => invoke("browse_liked_songs", { cursor }),
   browsePlaylist: (id) => invoke("browse_playlist", { id }),
+  browseRadio: (id) => invoke("browse_radio", { id }),
+  browsePlaylistRecommendations: (id) => invoke("browse_playlist_recommendations", { id }),
   browseAlbum: (id) => invoke("browse_album", { id }),
   browseArtist: (id) => invoke("browse_artist", { id }),
   browseArtistReleases: (id, releaseTypes = [], offset = 0, limit = 20) =>
@@ -749,6 +810,7 @@ export const api = {
 /** Optimistic play/pause flip; reconciled by the next `state` event. */
 export function togglePlay() {
   if (!playback.queue.length) return;
+  if (playback.current_index < 0 || playback.queue[playback.current_index]?.unavailable) return;
   // Capture where the playhead actually is before the flip, so resuming
   // projects from there rather than from the last engine sync.
   const at = positionMs();

@@ -8,9 +8,10 @@
 use serde::{Deserialize, Serialize};
 
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistCataloguePage, ArtistRef, ArtistReleaseCounts,
-    ArtistReleasePage, ArtistReleases, CreditArtist, CreditRole, LikedSongsPage, PlaylistBrowse,
-    PlaylistRef, SearchBrowse, TrackCredits, TrackRef,
+    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistCataloguePage, ArtistOverview, ArtistRef,
+    ArtistReleaseCounts, ArtistReleasePage, ArtistReleases, ArtistTopCity, CreditArtist,
+    CreditRole, LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse,
+    SearchBrowse, TrackCredits, TrackRef,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -43,6 +44,10 @@ pub struct Track {
     /// Unix timestamp in milliseconds when this playlist item was added.
     /// Absent for tracks sourced from albums, search, or legacy caches.
     pub added_at: Option<i64>,
+    /// Stable metadata/account restriction. Runtime player/network failures
+    /// never mutate this persisted field.
+    pub unavailable: bool,
+    pub unavailable_reason: Option<String>,
 }
 
 impl From<TrackRef> for Track {
@@ -60,6 +65,8 @@ impl From<TrackRef> for Track {
             duration_ms: track.duration_ms,
             play_count: track.play_count,
             added_at: track.added_at,
+            unavailable: track.unavailable,
+            unavailable_reason: track.unavailable_reason,
         }
     }
 }
@@ -79,6 +86,8 @@ impl From<&TrackRef> for Track {
             duration_ms: track.duration_ms,
             play_count: track.play_count,
             added_at: track.added_at,
+            unavailable: track.unavailable,
+            unavailable_reason: track.unavailable_reason.clone(),
         }
     }
 }
@@ -98,6 +107,8 @@ impl From<Track> for TrackRef {
             duration_ms: track.duration_ms,
             play_count: track.play_count,
             added_at: track.added_at,
+            unavailable: track.unavailable,
+            unavailable_reason: track.unavailable_reason,
         }
     }
 }
@@ -140,15 +151,22 @@ pub struct Playlist {
     /// library listing did not carry a revision.
     pub snapshot_id: String,
     /// Unix seconds when playback was last started *from* this playlist, or
-    /// `None` for one that never has been. Set only by the `touch_playlist`
-    /// command, which the frontend calls with the playlist the user played
-    /// from; merely opening a playlist does not count.
+    /// `None` for one that never has been. Set only after a successful
+    /// `play_queue` from this playlist, via the `touch_playlist` command.
     ///
-    /// The library is ordered by it (see [`crate::app::order_by_last_played`]),
-    /// so the distinction matters: a never-played playlist keeps its rootlist
-    /// position instead of sorting as though it had been played at the epoch.
+    /// Home's "Recently played" shelf is ordered by this field. It is never
+    /// changed merely by opening, adding to, or otherwise editing a playlist.
     /// Local to this app — Spotify has no equivalent and none is sent.
     pub last_played: Option<i64>,
+    /// Unix seconds when this playlist was last used in the library, or
+    /// `None` for one with no local activity. A successful add-to-playlist or
+    /// play stamps it through its corresponding local command.
+    ///
+    /// Sidebar and library ordering use this field rather than
+    /// [`last_played`], so a playlist can be promoted by an add without
+    /// appearing in Home's listening history.
+    /// Local to this app — Spotify has no equivalent and none is sent.
+    pub last_activity: Option<i64>,
 }
 
 impl From<&PlaylistRef> for Playlist {
@@ -172,6 +190,7 @@ impl From<&PlaylistRef> for Playlist {
             cover_urls: Vec::new(),
             snapshot_id: String::new(),
             last_played: None,
+            last_activity: None,
         }
     }
 }
@@ -254,8 +273,41 @@ impl From<PlaylistBrowse> for PlaylistDetail {
                 // A browse cannot know this; the library entry keeps it (see
                 // `upsert_playlist`).
                 last_played: None,
+                last_activity: None,
             },
             tracks,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RadioDetail {
+    pub seed: Track,
+    pub tracks: Vec<Track>,
+}
+
+impl From<RadioBrowse> for RadioDetail {
+    fn from(browse: RadioBrowse) -> Self {
+        Self {
+            seed: browse.seed.into(),
+            tracks: browse.tracks.into_iter().map(Track::from).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PlaylistRecommendationsDetail {
+    pub playlist_id: String,
+    pub tracks: Vec<Track>,
+}
+
+impl From<PlaylistRecommendations> for PlaylistRecommendationsDetail {
+    fn from(recommendations: PlaylistRecommendations) -> Self {
+        Self {
+            playlist_id: recommendations.playlist_id,
+            tracks: recommendations.tracks.into_iter().map(Track::from).collect(),
         }
     }
 }
@@ -436,6 +488,66 @@ impl From<ArtistReleases> for ArtistReleaseGroups {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct ArtistTopCityDetail {
+    pub city: String,
+    pub country: String,
+    pub region: String,
+    pub listeners: Option<u64>,
+}
+
+impl From<ArtistTopCity> for ArtistTopCityDetail {
+    fn from(city: ArtistTopCity) -> Self {
+        Self {
+            city: city.city,
+            country: city.country,
+            region: city.region,
+            listeners: city.listeners,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ArtistOverviewDetail {
+    pub biography: Option<String>,
+    pub popularity: Option<u32>,
+    pub followers: Option<u64>,
+    pub monthly_listeners: Option<u64>,
+    pub world_rank: Option<u32>,
+    pub top_cities: Vec<ArtistTopCityDetail>,
+    pub popular_releases: Vec<Album>,
+    pub related_artists: Vec<Artist>,
+}
+
+impl From<ArtistOverview> for ArtistOverviewDetail {
+    fn from(overview: ArtistOverview) -> Self {
+        Self {
+            biography: overview.biography,
+            popularity: overview.popularity,
+            followers: overview.followers,
+            monthly_listeners: overview.monthly_listeners,
+            world_rank: overview.world_rank,
+            top_cities: overview
+                .top_cities
+                .into_iter()
+                .map(ArtistTopCityDetail::from)
+                .collect(),
+            popular_releases: overview
+                .popular_releases
+                .into_iter()
+                .map(Album::from)
+                .collect(),
+            related_artists: overview
+                .related_artists
+                .into_iter()
+                .map(Artist::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ArtistDetail {
     #[serde(flatten)]
     pub artist: Artist,
@@ -443,6 +555,7 @@ pub struct ArtistDetail {
     pub releases: ArtistReleaseGroups,
     pub release_counts: ArtistReleaseTotals,
     pub releases_next_offset: Option<usize>,
+    pub overview: Option<ArtistOverviewDetail>,
 }
 
 impl From<ArtistBrowse> for ArtistDetail {
@@ -458,6 +571,7 @@ impl From<ArtistBrowse> for ArtistDetail {
             releases: browse.releases.into(),
             release_counts: browse.release_counts.into(),
             releases_next_offset: browse.releases_next_offset,
+            overview: browse.overview.map(ArtistOverviewDetail::from),
         }
     }
 }
@@ -468,6 +582,8 @@ pub struct SearchResult {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
     pub artists: Vec<Artist>,
+    #[serde(default)]
+    pub playlists: Vec<Playlist>,
 }
 
 impl From<SearchBrowse> for SearchResult {
@@ -476,6 +592,7 @@ impl From<SearchBrowse> for SearchResult {
             tracks: browse.tracks.into_iter().map(Track::from).collect(),
             albums: browse.albums.into_iter().map(Album::from).collect(),
             artists: browse.artists.into_iter().map(Artist::from).collect(),
+            playlists: browse.playlists.iter().map(Playlist::from).collect(),
         }
     }
 }
@@ -758,5 +875,80 @@ mod tests {
             serde_json::from_str(r#"{"id":"p1","name":"Mixtape","cover_url":""}"#).unwrap();
         assert_eq!(playlist.id, "p1");
         assert!(playlist.cover_urls.is_empty());
+    }
+
+    #[test]
+    fn search_result_maps_playlist_references_and_defaults_legacy_payloads() {
+        let result = SearchResult::from(SearchBrowse {
+            playlists: vec![PlaylistRef {
+                id: "0123456789ABCDEFGHIJKL".into(),
+                uri: "spotify:playlist:0123456789ABCDEFGHIJKL".into(),
+                name: "Public Mix".into(),
+                owner_id: "alice".into(),
+                owner_name: "Alice Example".into(),
+                cover_url: Some("https://i.scdn.co/image/cover".into()),
+                track_count: Some(42),
+            }],
+            ..SearchBrowse::default()
+        });
+        assert_eq!(
+            result.playlists,
+            vec![Playlist {
+                id: "0123456789ABCDEFGHIJKL".into(),
+                uri: "spotify:playlist:0123456789ABCDEFGHIJKL".into(),
+                name: "Public Mix".into(),
+                owner: "Alice Example".into(),
+                owner_id: "alice".into(),
+                cover_url: "https://i.scdn.co/image/cover".into(),
+                tracks_total: 42,
+                ..Playlist::default()
+            }]
+        );
+
+        let legacy: SearchResult =
+            serde_json::from_str(r#"{"tracks":[],"albums":[],"artists":[]}"#).unwrap();
+        assert!(legacy.playlists.is_empty());
+    }
+
+    #[test]
+    fn artist_overview_survives_the_engine_to_frontend_conversion() {
+        let overview = ArtistOverview {
+            biography: Some("Biography".into()),
+            popularity: Some(77),
+            followers: Some(1_200),
+            monthly_listeners: Some(3_400),
+            world_rank: Some(42),
+            top_cities: vec![ArtistTopCity {
+                city: "London".into(),
+                country: "GB".into(),
+                region: "England".into(),
+                listeners: Some(900),
+            }],
+            popular_releases: vec![AlbumRef {
+                id: "album".into(),
+                uri: "spotify:album:album".into(),
+                name: "Popular".into(),
+                artist_names: vec!["Artist".into()],
+                artist_ids: vec!["artist".into()],
+                cover_url: Some("cover".into()),
+                year: Some(2024),
+            }],
+            related_artists: vec![ArtistRef {
+                id: "related".into(),
+                uri: "spotify:artist:related".into(),
+                name: "Related".into(),
+                portrait_url: Some("portrait".into()),
+            }],
+        };
+
+        let frontend = ArtistOverviewDetail::from(overview);
+        assert_eq!(frontend.biography.as_deref(), Some("Biography"));
+        assert_eq!(frontend.top_cities[0].listeners, Some(900));
+        assert_eq!(frontend.popular_releases[0].artist_ids, vec!["artist"]);
+        assert_eq!(frontend.related_artists[0].cover_url, "portrait");
+        let json = serde_json::to_value(frontend).unwrap();
+        assert_eq!(json["monthly_listeners"], 3_400);
+        assert_eq!(json["popular_releases"][0]["name"], "Popular");
+        assert_eq!(json["related_artists"][0]["name"], "Related");
     }
 }

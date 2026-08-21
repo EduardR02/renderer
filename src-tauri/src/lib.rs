@@ -36,6 +36,8 @@ pub fn run() {
             commands::search,
             commands::browse_playlists,
             commands::browse_playlist,
+            commands::browse_radio,
+            commands::browse_playlist_recommendations,
             commands::browse_album,
             commands::browse_artist,
             commands::browse_artist_releases,
@@ -58,6 +60,7 @@ pub fn run() {
             commands::get_app_settings,
             commands::set_audio_cache_limit,
             commands::touch_playlist,
+            commands::touch_playlist_activity,
         ])
         .setup(|app| {
             let state = Mutex::new(AppState::new(data_dir()));

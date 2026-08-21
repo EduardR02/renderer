@@ -12,17 +12,18 @@ use crate::app::{
     AppSettings, AppState, PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS,
     LIBRARY_LENGTH,
     carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
-    load_app_settings, load_playlist_list, now_secs, order_by_last_played,
+    load_app_settings, load_playlist_list, now_secs, order_by_last_activity,
     playlist_detail_from_cache, save_app_settings, save_playlist_list, save_tracks_cache,
-    touch_playlist_played, upsert_playlist, upsert_tracks_cache,
+    touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, upsert_playlist,
+    upsert_tracks_cache,
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
-    ArtistReleasePageDetail, CacheStats, LikedSongsDetail, Playlist, PlaylistDetail, SearchResult,
-    Track, TrackCreditsDetail,
+    ArtistReleasePageDetail, CacheStats, LikedSongsDetail, Playlist, PlaylistDetail,
+    PlaylistRecommendationsDetail, RadioDetail, SearchResult, Track, TrackCreditsDetail,
 };
 
 // ---------------------------------------------------------------------------
@@ -166,6 +167,24 @@ pub async fn browse_playlist(
         return Ok(detail);
     }
     fetch_playlist(&state, &client, &id).await
+}
+
+#[tauri::command]
+pub async fn browse_radio(
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+) -> Result<RadioDetail, String> {
+    Ok(client.browse_radio(&id).await?.into())
+}
+
+/// Optional and strictly on-demand: this command is never called from
+/// `browse_playlist`, cached, emitted, or allowed to affect playback state.
+#[tauri::command]
+pub async fn browse_playlist_recommendations(
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+) -> Result<PlaylistRecommendationsDetail, String> {
+    Ok(client.browse_playlist_recommendations(&id).await?.into())
 }
 
 #[tauri::command]
@@ -350,9 +369,7 @@ pub async fn login(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn logout(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
-    client.logout().await?;
-    client.clear_restore_pending().await;
-    Ok(())
+    client.logout().await
 }
 
 // ---------------------------------------------------------------------------
@@ -374,22 +391,14 @@ pub async fn get_cover(url: String) -> Result<String, String> {
     covers::get_cover(&url).await
 }
 
-/// Records that the user started playback *from* playlist `id`, which is what
-/// the library's most-recent-first ordering is built on.
+/// Records that a successful playback started *from* playlist `id`.
 ///
-/// The frontend calls this because only the frontend knows the answer. A play
-/// command carries track URIs, and the same track sits in any number of
-/// playlists, so nothing on this side could work out which playlist a play
-/// came from — it could only guess. The view the user pressed play in is the
-/// unambiguous source, so it passes the id.
+/// The frontend calls this because only it knows the answer. A play command
+/// carries track URIs, and the same track sits in any number of playlists, so
+/// the backend cannot infer the source. `touch_playlist` updates both
+/// `last_played` (Home listening history) and `last_activity` (library order).
 ///
-/// Browsing a playlist deliberately does not count: looking at something is
-/// not using it.
-///
-/// The re-ordered library is persisted but *not* re-emitted. Promoting a row
-/// the instant it is played would slide it to the top under the user's
-/// cursor; the new order is picked up at the next natural library refresh or
-/// at the next launch instead.
+/// Browsing or editing a playlist deliberately does not count as playback.
 #[tauri::command]
 pub async fn touch_playlist(
     state: State<'_, Mutex<AppState>>,
@@ -399,7 +408,36 @@ pub async fn touch_playlist(
         let mut guard = state.lock();
         if !touch_playlist_played(&mut guard.playlists, &id, now_secs()) {
             // Playback started somewhere that is not a followed playlist (an
-            // album, an artist page): nothing to order.
+            // album, an artist page): no local timestamp should be invented.
+            return Ok(());
+        }
+        (
+            guard.data_dir.clone(),
+            PlaylistListCache {
+                version: 1,
+                fetched_at: guard.playlists_fetched_at,
+                me_id: guard.me_id.clone(),
+                playlists: guard.playlists.clone(),
+            },
+        )
+    };
+    save_playlist_list(&dir, &cache);
+    Ok(())
+}
+
+/// Records a successful add-to-playlist for playlist `id`.
+///
+/// This is intentionally separate from [`touch_playlist`]: adding a track
+/// promotes sidebar/library activity but must not create a Home
+/// "Recently played" item. Failed add commands never reach this command.
+#[tauri::command]
+pub async fn touch_playlist_activity(
+    state: State<'_, Mutex<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    let (dir, cache) = {
+        let mut guard = state.lock();
+        if !stamp_playlist_activity(&mut guard.playlists, &id, now_secs()) {
             return Ok(());
         }
         (
@@ -558,6 +596,22 @@ pub async fn consume_states(app: AppHandle) {
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
 
+        // A fresh child reports an authenticated but empty state before its
+        // queue/settings are restored. Start restoration once and suppress
+        // that blank state plus every intermediate setter state. EngineClient
+        // clears the plan only when the final state matches.
+        if let Some(snapshot) = client.begin_pending_restore(&state) {
+            if let Err(error) = restore_playback(&client, &snapshot).await {
+                log::warn(&format!("could not restore playback: {error}"));
+                client.retry_pending_restore();
+                let _ = client.status().await;
+            }
+            continue;
+        }
+        if client.restore_is_pending() && state.auth_state == "ready" {
+            continue;
+        }
+
         let (became_ready, session_changed, auth_changed) = match &previous_identity {
             Some((auth_state, username)) => (
                 state.auth_state == "ready" && auth_state.as_str() != "ready",
@@ -578,15 +632,8 @@ pub async fn consume_states(app: AppHandle) {
             log::error(&format!("engine error: {}", state.error));
         }
 
-        // A respawned engine becomes ready with a blank session; put the
-        // pre-crash playback back before anything else sees it.
-        if let Some(snapshot) = client.take_restore_pending().await {
-            if state.auth_state == "ready" {
-                restore_playback(&client, &snapshot).await;
-            } else {
-                client.put_restore_pending(snapshot).await;
-            }
-        }
+        // Restoration is handled before identity and AppState projection
+        // above, so no blank-ready state reaches either consumer.
 
         {
             let guard = app.state::<Mutex<AppState>>();
@@ -618,26 +665,24 @@ pub async fn consume_states(app: AppHandle) {
     }
 }
 
-/// Re-applies the pre-crash queue/volume/shuffle/repeat to a fresh engine.
-async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) {
-    if !snapshot.queue.is_empty() {
-        let index = snapshot
-            .current_index
-            .unwrap_or(0)
-            .min(snapshot.queue.len().saturating_sub(1));
-        if let Err(error) =
-            client.play_queue(&snapshot.queue, index, snapshot.position_ms).await
-        {
-            log::warn(&format!(
-                "could not restore the queue after engine restart: {error}"
-            ));
-        }
+/// Applies settings before installing the paused queue. Normal startup ends
+/// here; crash recovery alone follows with Play when the captured state was
+/// playing.
+async fn restore_playback(
+    client: &EngineClient,
+    snapshot: &RestoreSnapshot,
+) -> Result<(), String> {
+    client.set_volume(snapshot.volume).await?;
+    client.set_shuffle(snapshot.shuffle).await?;
+    client.set_repeat(&snapshot.repeat).await?;
+    let index = snapshot.current_index.unwrap_or(0);
+    client
+        .restore_queue(&snapshot.queue, index, snapshot.position_ms)
+        .await?;
+    if snapshot.resume_playing && snapshot.current_index.is_some() {
+        client.play().await?;
     }
-    if let Err(error) = client.set_volume(snapshot.volume).await {
-        log::warn(&format!("could not restore volume: {error}"));
-    }
-    let _ = client.set_shuffle(snapshot.shuffle).await;
-    let _ = client.set_repeat(&snapshot.repeat).await;
+    Ok(())
 }
 
 /// Hydrates `AppState` from the on-disk library snapshot (instant first
@@ -645,7 +690,13 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) {
 /// is spawned separately once the engine reports ready.
 fn load_library_from_disk(app: &AppHandle) {
     let dir = data_dir();
-    let playlists = load_playlist_list(&dir);
+    let mut playlists = load_playlist_list(&dir);
+    if let Some(cache) = playlists.as_mut() {
+        // Old ephemeral caches may have been written in another order. The
+        // sidebar and library always consume activity order, even before the
+        // first authenticated refresh arrives.
+        order_by_last_activity(&mut cache.playlists);
+    }
     {
         let guard = app.state::<Mutex<AppState>>();
         let mut guard = guard.lock();
@@ -756,8 +807,8 @@ async fn fetch_library(
         (guard.data_dir.clone(), guard.me_id.clone())
     };
     // Rootlist order is only the tiebreaker; the fetch arrives in it, so the
-    // sort has to happen after the timestamps are carried over.
-    order_by_last_played(&mut playlists);
+    // activity sort has to happen after local timestamps are carried over.
+    order_by_last_activity(&mut playlists);
     save_playlist_list(
         &dir,
         &PlaylistListCache {
@@ -812,6 +863,7 @@ async fn fetch_playlist(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PlaybackState;
 
     #[test]
     fn library_retry_delay_doubles_from_5s_and_caps_at_60s() {

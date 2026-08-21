@@ -1189,6 +1189,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: background-color var(--d1) var(--ease);
 }
 .tl-row:hover { background: rgba(255, 255, 255, 0.045); }
+.tl-row.unavailable { cursor: default; }
+.tl-row.unavailable > :not(.c-more):not(.q-actions) { opacity: 0.42; }
+.tl-row.unavailable:hover { background: transparent; }
+.tl-row.unavailable .go:disabled { color: var(--fg-3); cursor: not-allowed; }
 /* The playing row is the one row in a list of fifty that has to be findable
    without reading. A left-anchored accent wash does that at a glance, where a
    recoloured title alone only worked once you were already looking at it. */

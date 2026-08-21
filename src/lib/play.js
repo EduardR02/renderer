@@ -39,9 +39,10 @@ export async function playPlaylistById(id) {
   const playlist = await api.browsePlaylist(id);
   const tracks = playlist?.tracks ?? [];
   if (!tracks.length) throw new Error("This playlist has no playable songs.");
-  // Same bookkeeping the playlist page does: library order is most recently
-  // *played*, and a card is as much a play action as the big button is.
-  promotePlaylist(id);
-  api.touchPlaylist(id).catch(() => {});
+  // Queue first: a failed play must not create either a Home listening-history
+  // stamp or a library-activity promotion. A card is as much a play source as
+  // the playlist page's big button.
   await api.playQueue(tracks, 0);
+  promotePlaylist(id, { played: true });
+  api.touchPlaylist(id).catch(() => {});
 }

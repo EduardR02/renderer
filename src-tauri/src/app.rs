@@ -41,6 +41,52 @@ impl Default for AppSettings {
     }
 }
 
+pub const PLAYBACK_STATE_VERSION: u32 = 1;
+
+/// App-owned durable playback state. Deliberately excludes `playing`: every
+/// normal process start restores paused, while crash-only resume intent stays
+/// in memory in `EngineClient`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PlaybackSnapshot {
+    pub version: u32,
+    pub queue: Vec<Track>,
+    pub current_index: Option<usize>,
+    pub position_ms: u32,
+    pub volume: u8,
+    pub shuffle: bool,
+    pub repeat: String,
+}
+
+impl PlaybackSnapshot {
+    pub fn from_playback(state: &PlaybackState) -> Self {
+        Self {
+            version: PLAYBACK_STATE_VERSION,
+            queue: state.queue.clone(),
+            current_index: state.current_index,
+            position_ms: state.position_ms,
+            volume: state.volume,
+            shuffle: state.shuffle,
+            repeat: state.repeat.clone(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.version == PLAYBACK_STATE_VERSION
+            && self.volume <= 100
+            && matches!(self.repeat.as_str(), "off" | "context" | "track")
+            && self.current_index.is_none_or(|index| index < self.queue.len())
+            && (!self.queue.is_empty() || self.current_index.is_none())
+            && self.queue.iter().all(|track| {
+                track.uri.starts_with("spotify:track:")
+                    && (track.duration_ms > 0 || track.unavailable)
+            })
+            && match self.current_index {
+                Some(index) => self.position_ms <= self.queue[index].duration_ms,
+                None => self.position_ms == 0,
+            }
+    }
+}
+
 /// Managed application state. Only the contract fields are serialized; the
 /// cache bookkeeping and the data dir are internal.
 #[derive(Debug, Serialize)]
@@ -138,6 +184,41 @@ pub fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(settings)
         .map_err(|error| format!("could not serialize settings: {error}"))?;
     std::fs::write(path, bytes).map_err(|error| format!("could not save settings: {error}"))
+}
+
+fn playback_state_path(dir: &Path) -> PathBuf {
+    dir.join("playback_state.json")
+}
+
+fn load_playback_snapshot_from(dir: &Path) -> Option<PlaybackSnapshot> {
+    let snapshot: PlaybackSnapshot =
+        serde_json::from_slice(&std::fs::read(playback_state_path(dir)).ok()?).ok()?;
+    snapshot.is_valid().then_some(snapshot)
+}
+
+pub fn load_playback_snapshot() -> Option<PlaybackSnapshot> {
+    load_playback_snapshot_from(&data_dir())
+}
+
+fn save_playback_snapshot_to(dir: &Path, snapshot: &PlaybackSnapshot) -> Result<(), String> {
+    if !snapshot.is_valid() {
+        return Err("refusing to persist an invalid playback snapshot".to_owned());
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("could not create playback state directory: {error}"))?;
+    write_json_atomic_result(playback_state_path(dir), snapshot)
+}
+
+pub fn save_playback_snapshot(snapshot: &PlaybackSnapshot) -> Result<(), String> {
+    save_playback_snapshot_to(&data_dir(), snapshot)
+}
+
+pub fn clear_playback_snapshot() -> Result<(), String> {
+    match std::fs::remove_file(playback_state_path(&data_dir())) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not clear playback state: {error}")),
+    }
 }
 
 /// Diagnostic logs: `%LOCALAPPDATA%\SpotifyRenderer\logs` — the app's own
@@ -263,13 +344,14 @@ pub fn playlist_detail_from_cache(
 
 /// Upserts a playlist into the in-memory library list.
 ///
-/// A browsed playlist knows nothing about when it was last played from, so an
-/// incoming `None` never overwrites a stored timestamp: the background
-/// refresh that follows every browse would otherwise erase a stamp written
-/// moments earlier.
+/// A browsed playlist knows nothing about when it was last played or used in
+/// the library, so incoming `None`s never overwrite stored timestamps: the
+/// background refresh that follows every browse would otherwise erase a stamp
+/// written moments earlier.
 pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
     if let Some(existing) = playlists.iter_mut().find(|entry| entry.id == playlist.id) {
         playlist.last_played = playlist.last_played.or(existing.last_played);
+        playlist.last_activity = playlist.last_activity.or(existing.last_activity);
         *existing = playlist;
     } else {
         playlists.push(playlist);
@@ -277,58 +359,65 @@ pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
 }
 
 /// Copies the fields the rootlist cannot produce — the revision, the derived
-/// cover candidates, and the last-played timestamp — from the previous
+/// cover candidates, and the local activity timestamps — from the previous
 /// library snapshot onto a freshly fetched one.
 ///
 /// The rootlist carries none of them, so a plain replacement would blank all
-/// three on every library refresh. For the candidates that is not merely
+/// four local fields on every library refresh. For the candidates that is not
 /// cosmetic: they are derived from a browse of the playlist itself, so a wipe
 /// would drop the sidebar and home-grid mosaics back to monogram tiles until
-/// each playlist happens to be browsed again. For `last_played` a wipe would
-/// reset the library to rootlist order at the first refresh after startup,
-/// which is exactly the ordering the timestamp exists to replace.
+/// each playlist happens to be browsed again. The timestamps likewise must
+/// survive refresh so the sidebar does not jump back to rootlist order and
+/// Home does not lose its listening history.
 pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
     for playlist in fresh.iter_mut() {
         if let Some(old) = previous.iter().find(|entry| entry.id == playlist.id) {
             playlist.cover_urls = old.cover_urls.clone();
             playlist.snapshot_id = old.snapshot_id.clone();
             playlist.last_played = old.last_played;
+            playlist.last_activity = old.last_activity;
         }
     }
 }
 
-/// Sorts the library most-recently-played-from first.
+/// Sorts the library most-recently-used first.
 ///
-/// Playlists never played from keep their rootlist order behind the rest: the
-/// sort is stable and their key is the minimum, so an untouched library reads
-/// exactly as the rootlist returned it.
-///
-/// This ordering is entirely ours. Spotify has no such notion and none is
-/// wanted here, so the timestamps live only in `playlist_list.json` and are
-/// never sent anywhere.
-pub fn order_by_last_played(playlists: &mut [Playlist]) {
+/// Playlists with no local activity keep their rootlist order behind the
+/// active ones: the sort is stable and their key is the minimum. This is the
+/// order consumed by both the sidebar and Home's remaining-library grid.
+pub fn order_by_last_activity(playlists: &mut [Playlist]) {
     playlists.sort_by_key(|playlist| {
-        std::cmp::Reverse(playlist.last_played.unwrap_or(i64::MIN))
+        std::cmp::Reverse(playlist.last_activity.unwrap_or(i64::MIN))
     });
 }
 
-/// Stamps `id` as played from at `at` and re-sorts the library so it leads.
+/// Stamps `id` as used in the library at `at` and re-sorts the list.
 ///
-/// Deliberately *not* driven by opening a playlist: browsing one is not using
-/// it, and the owner wants the library to reflect what gets played. Which
-/// playlist a play came from is also not derivable here — the same track sits
-/// in many playlists, so a track URI cannot identify its origin — which is
-/// why the caller passes the id explicitly rather than anything inferring it.
+/// This is used for a successful add-to-playlist. It deliberately does not
+/// touch `last_played`, so a library edit cannot create a fake listening-
+/// history entry on Home.
+pub fn touch_playlist_activity(playlists: &mut Vec<Playlist>, id: &str, at: i64) -> bool {
+    let Some(playlist) = playlists.iter_mut().find(|entry| entry.id == id) else {
+        return false;
+    };
+    playlist.last_activity = Some(at);
+    order_by_last_activity(playlists);
+    true
+}
+
+/// Stamps `id` as played from at `at`, updating both local recency fields.
 ///
-/// Returns false when the id is not in the library — playback started from an
-/// album, an artist page, or a playlist the user does not follow — in which
-/// case nothing changed and the caller can skip persisting.
+/// Deliberately not driven by opening a playlist: browsing one is not using
+/// it. Which playlist a play came from is also not derivable from a track URI —
+/// the same track sits in many playlists — which is why the caller passes the
+/// id explicitly.
 pub fn touch_playlist_played(playlists: &mut Vec<Playlist>, id: &str, at: i64) -> bool {
     let Some(playlist) = playlists.iter_mut().find(|entry| entry.id == id) else {
         return false;
     };
     playlist.last_played = Some(at);
-    order_by_last_played(playlists);
+    playlist.last_activity = Some(at);
+    order_by_last_activity(playlists);
     true
 }
 
@@ -455,6 +544,56 @@ fn write_json_atomic<T: Serialize>(path: PathBuf, value: &T) {
     let _ = std::fs::rename(&temp, &path);
 }
 
+fn write_json_atomic_result<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("could not serialize {}: {error}", path.display()))?;
+    let temp = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&temp)
+        .map_err(|error| format!("could not create {}: {error}", temp.display()))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
+    replace_file_atomically(&temp, &path)
+        .map_err(|error| format!("could not replace {}: {error}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -469,6 +608,56 @@ mod tests {
             uri: format!("spotify:track:{id}"),
             ..Track::default()
         }
+    }
+
+    #[test]
+    fn playback_snapshot_round_trips_and_replaces_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotify-renderer-playback-state-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut snapshot = PlaybackSnapshot {
+            version: PLAYBACK_STATE_VERSION,
+            queue: vec![Track {
+                id: "0123456789ABCDEFGHIJKL".to_owned(),
+                uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+                duration_ms: 240_000,
+                ..Track::default()
+            }],
+            current_index: Some(0),
+            position_ms: 42_000,
+            volume: 37,
+            shuffle: true,
+            repeat: "context".to_owned(),
+        };
+        save_playback_snapshot_to(&dir, &snapshot).unwrap();
+        assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
+
+        snapshot.position_ms = 84_000;
+        save_playback_snapshot_to(&dir, &snapshot).unwrap();
+        assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot));
+        assert!(!playback_state_path(&dir).with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_or_unknown_playback_snapshots_are_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotify-renderer-bad-playback-state-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(playback_state_path(&dir), b"{not-json").unwrap();
+        assert!(load_playback_snapshot_from(&dir).is_none());
+        std::fs::write(
+            playback_state_path(&dir),
+            br#"{"version":99,"queue":[],"current_index":null,"position_ms":0,"volume":50,"shuffle":false,"repeat":"off"}"#,
+        )
+        .unwrap();
+        assert!(load_playback_snapshot_from(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn track_with_cover(id: &str, cover_url: &str) -> Track {
@@ -562,14 +751,15 @@ mod tests {
     }
 
     #[test]
-    fn a_library_refresh_carries_the_local_fields_forward() {
+    fn a_library_refresh_carries_local_fields_forward() {
         // The rootlist supplies none of them, and losing the candidates would
         // drop every browsed playlist's mosaic back to a monogram tile until
-        // it is browsed again.
+        // it is browsed again. Both timestamps are local-only as well.
         let previous = vec![Playlist {
             cover_urls: vec!["cover-a".into(), "cover-b".into()],
             snapshot_id: "rev-a".into(),
             last_played: Some(1_000),
+            last_activity: Some(2_000),
             ..playlist("p1")
         }];
         let mut fresh = vec![playlist("p1"), playlist("p2")];
@@ -577,38 +767,53 @@ mod tests {
         assert_eq!(fresh[0].cover_urls, vec!["cover-a", "cover-b"]);
         assert_eq!(fresh[0].snapshot_id, "rev-a");
         assert_eq!(fresh[0].last_played, Some(1_000));
+        assert_eq!(fresh[0].last_activity, Some(2_000));
         // A playlist the previous snapshot never had stays empty — it has
-        // never been browsed — and keeps its rootlist place.
+        // never been browsed or used — and keeps its rootlist place.
         assert!(fresh[1].cover_urls.is_empty());
         assert_eq!(fresh[1].last_played, None);
+        assert_eq!(fresh[1].last_activity, None);
     }
 
     #[test]
-    fn the_library_is_ordered_most_recently_played_first() {
+    fn the_library_is_ordered_most_recently_active_first() {
         let mut playlists = vec![
             playlist("never-a"),
-            Playlist { last_played: Some(100), ..playlist("old") },
+            Playlist {
+                last_played: Some(900),
+                last_activity: Some(100),
+                ..playlist("old")
+            },
             playlist("never-b"),
-            Playlist { last_played: Some(300), ..playlist("newest") },
-            Playlist { last_played: Some(200), ..playlist("middle") },
+            Playlist {
+                last_played: Some(100),
+                last_activity: Some(300),
+                ..playlist("newest")
+            },
+            Playlist {
+                last_played: Some(500),
+                last_activity: Some(200),
+                ..playlist("middle")
+            },
         ];
-        order_by_last_played(&mut playlists);
+        order_by_last_activity(&mut playlists);
         let ids: Vec<&str> = playlists.iter().map(|entry| entry.id.as_str()).collect();
-        // Played ones by recency, then the never-played ones in rootlist order.
+        // Library activity, not listening history, controls this order.
         assert_eq!(ids, vec!["newest", "middle", "old", "never-a", "never-b"]);
     }
 
     #[test]
-    fn playing_from_a_playlist_stamps_it_and_moves_it_to_the_front() {
+    fn playing_from_a_playlist_stamps_played_and_activity_and_moves_it_to_the_front() {
         let mut playlists = vec![playlist("p1"), playlist("p2"), playlist("p3")];
         assert!(touch_playlist_played(&mut playlists, "p3", 500));
         assert_eq!(playlists[0].id, "p3");
         assert_eq!(playlists[0].last_played, Some(500));
+        assert_eq!(playlists[0].last_activity, Some(500));
         // The untouched ones keep rootlist order behind it.
         assert_eq!(playlists[1].id, "p1");
         assert_eq!(playlists[2].id, "p2");
 
-        // A later open of a different playlist takes the lead in turn.
+        // A later play from a different playlist takes the lead in turn.
         assert!(touch_playlist_played(&mut playlists, "p1", 600));
         let ids: Vec<&str> = playlists.iter().map(|entry| entry.id.as_str()).collect();
         assert_eq!(ids, vec!["p1", "p3", "p2"]);
@@ -620,18 +825,58 @@ mod tests {
     }
 
     #[test]
-    fn a_background_refresh_cannot_erase_a_play_stamp() {
+    fn adding_to_a_playlist_stamps_activity_without_creating_listening_history() {
+        let mut playlists = vec![
+            Playlist {
+                last_played: Some(100),
+                last_activity: Some(100),
+                ..playlist("played")
+            },
+            playlist("added"),
+        ];
+        assert!(touch_playlist_activity(&mut playlists, "added", 200));
+        assert_eq!(playlists[0].id, "added");
+        assert_eq!(playlists[0].last_activity, Some(200));
+        assert_eq!(playlists[0].last_played, None);
+        assert_eq!(playlists[1].last_played, Some(100));
+        assert_eq!(playlists[1].last_activity, Some(100));
+
+        // A missing playlist cannot create either kind of stamp.
+        assert!(!touch_playlist_activity(&mut playlists, "not-followed", 300));
+    }
+
+    #[test]
+    fn a_background_refresh_cannot_erase_activity_stamps() {
         // fetch_playlist upserts the browsed playlist, which carries no
         // timestamp; without the guard in upsert_playlist that would undo the
-        // stamp written moments earlier by touch_playlist.
-        let mut playlists = vec![Playlist { last_played: Some(900), ..playlist("p1") }];
-        upsert_playlist(&mut playlists, Playlist { snapshot_id: "rev-b".into(), ..playlist("p1") });
+        // stamps written moments earlier by touch commands.
+        let mut playlists = vec![Playlist {
+            last_played: Some(900),
+            last_activity: Some(950),
+            ..playlist("p1")
+        }];
+        upsert_playlist(
+            &mut playlists,
+            Playlist {
+                snapshot_id: "rev-b".into(),
+                ..playlist("p1")
+            },
+        );
         assert_eq!(playlists[0].last_played, Some(900));
+        assert_eq!(playlists[0].last_activity, Some(950));
         assert_eq!(playlists[0].snapshot_id, "rev-b");
 
-        // An explicit newer timestamp still wins.
-        upsert_playlist(&mut playlists, Playlist { last_played: Some(1_000), ..playlist("p1") });
+        // Explicit newer timestamps still win independently.
+        upsert_playlist(
+            &mut playlists,
+            Playlist {
+                last_played: Some(1_000),
+                last_activity: Some(1_100),
+                ..playlist("p1")
+            },
+        );
         assert_eq!(playlists[0].last_played, Some(1_000));
+        assert_eq!(playlists[0].last_activity, Some(1_100));
     }
 
     #[test]
@@ -650,15 +895,15 @@ mod tests {
         assert_eq!(cache.playlists.len(), 1);
         assert_eq!(cache.playlists[0].snapshot_id, "rev-a");
         assert!(cache.playlists[0].cover_urls.is_empty());
-        // Written before `last_played` existed: it reads as never-opened, so
-        // the playlist keeps its rootlist position instead of sorting to the
-        // epoch.
+        // Written before either local timestamp existed: it reads as never
+        // used, so the playlist keeps its rootlist position and does not
+        // invent a Home listening-history entry.
         assert_eq!(cache.playlists[0].last_played, None);
+        assert_eq!(cache.playlists[0].last_activity, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
     #[test]
-    fn the_last_played_stamp_survives_a_save_and_load_round_trip() {
+    fn local_activity_stamps_survive_a_save_and_load_round_trip() {
         let dir = std::env::temp_dir().join(format!("spotify-renderer-lru-{}", now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         save_playlist_list(
@@ -668,14 +913,20 @@ mod tests {
                 fetched_at: Some(42),
                 me_id: "me".to_owned(),
                 playlists: vec![
-                    Playlist { last_played: Some(1_700), ..playlist("opened") },
+                    Playlist {
+                        last_played: Some(1_700),
+                        last_activity: Some(1_800),
+                        ..playlist("opened")
+                    },
                     playlist("never"),
                 ],
             },
         );
         let cache = load_playlist_list(&dir).expect("the cache round-trips");
         assert_eq!(cache.playlists[0].last_played, Some(1_700));
+        assert_eq!(cache.playlists[0].last_activity, Some(1_800));
         assert_eq!(cache.playlists[1].last_played, None);
+        assert_eq!(cache.playlists[1].last_activity, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

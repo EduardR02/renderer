@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TrackRef {
@@ -32,6 +36,12 @@ pub struct TrackRef {
     /// albums, search, and playback queues leave it absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub added_at: Option<i64>,
+    /// A stable, server- or account-policy restriction. Transient playback
+    /// failures never set this field.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unavailable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 impl Default for TrackRef {
     fn default() -> Self {
@@ -48,6 +58,8 @@ impl Default for TrackRef {
             duration_ms: 0,
             play_count: None,
             added_at: None,
+            unavailable: false,
+            unavailable_reason: None,
         }
     }
 }
@@ -64,6 +76,13 @@ pub struct Request {
 pub enum Command {
     Status,
     PlayQueue {
+        queue: Vec<TrackRef>,
+        index: usize,
+        position_ms: u32,
+    },
+    /// Installs a paused queue/playhead without asking librespot to load audio.
+    /// The current item is loaded only when a later `play` arrives.
+    RestoreQueue {
         queue: Vec<TrackRef>,
         index: usize,
         position_ms: u32,
@@ -111,14 +130,24 @@ pub enum Command {
     BrowsePlaylist {
         id: String,
     },
+    /// Seed track plus server-ranked recommendations from inspired-by.
+    /// Responded to with a `browse_radio` message.
+    BrowseRadio {
+        id: String,
+    },
+    /// Optional, on-demand recommendations for one playlist. Ordinary
+    /// playlist browse never invokes this endpoint.
+    BrowsePlaylistRecommendations {
+        id: String,
+    },
     /// Album metadata/tracks plus play counts from the official pathfinder
     /// album query.
     /// Responded to with a `browse_album` message.
     BrowseAlbum {
         id: String,
     },
-    /// Artist metadata, top tracks, releases, and Popular play counts.
-    /// Responded to with a `browse_artist` message.
+    /// Artist metadata, top tracks, releases, Popular play counts, and the
+    /// optional pathfinder overview. Responded to with `browse_artist`.
     BrowseArtist {
         id: String,
     },
@@ -278,6 +307,25 @@ pub struct PlaylistBrowse {
     pub tracks: Vec<TrackRef>,
 }
 
+/// A song-radio context. `tracks[0]` is always `seed`; recommendations follow
+/// in server rank order and never repeat the seed or one another.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RadioBrowse {
+    pub seed: TrackRef,
+    pub tracks: Vec<TrackRef>,
+}
+
+/// Optional recommendations displayed below a playlist. This payload is
+/// intentionally separate from [`PlaylistBrowse`] so opening a playlist has
+/// zero radio-Apollo cost.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PlaylistRecommendations {
+    pub playlist_id: String,
+    pub tracks: Vec<TrackRef>,
+}
+
 /// Album reference inside browse responses.
 ///
 /// `year` is the release year and is deliberately the only date field: the
@@ -372,6 +420,42 @@ pub struct ArtistCataloguePage {
     pub next_offset: Option<usize>,
 }
 
+/// One city in an artist's listener ranking. Every field comes from the
+/// artist-overview document; absent listener counts are omitted rather than
+/// represented as zero.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ArtistTopCity {
+    pub city: String,
+    pub country: String,
+    pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listeners: Option<u64>,
+}
+
+/// Optional facts and recommendations that augment the metadata4 artist page.
+///
+/// This stays a separate object because the pathfinder overview document is a
+/// best-effort enhancement. Metadata4 can still supply biography, popularity,
+/// and related artists when every persisted-query hash has rotated.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ArtistOverview {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub biography: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub popularity: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monthly_listeners: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub world_rank: Option<u32>,
+    pub top_cities: Vec<ArtistTopCity>,
+    pub popular_releases: Vec<AlbumRef>,
+    pub related_artists: Vec<ArtistRef>,
+}
+
 /// Payload of a successful [`Command::BrowseArtist`] response.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArtistBrowse {
@@ -385,6 +469,8 @@ pub struct ArtistBrowse {
     pub release_counts: ArtistReleaseCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub releases_next_offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overview: Option<ArtistOverview>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -440,11 +526,14 @@ pub struct TrackCredits {
 }
 
 /// Payload of a successful [`Command::BrowseSearch`] response.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct SearchBrowse {
     pub tracks: Vec<TrackRef>,
     pub albums: Vec<AlbumRef>,
     pub artists: Vec<ArtistRef>,
+    #[serde(default)]
+    pub playlists: Vec<PlaylistRef>,
 }
 
 /// Envelope for every `browse_*` response: the payload travels in `data` on
@@ -506,8 +595,10 @@ pub struct PositionEvent {
 mod tests {
     use serde_json::json;
 
-    use super::{AuthState, BrowseResponse, Command, PlaylistRef, PositionEvent, RepeatMode, Request, Response,
-                SearchBrowse, StateEvent, TrackRef};
+    use super::{
+        AuthState, BrowseResponse, Command, PlaylistRecommendations, PlaylistRef, PositionEvent,
+        RadioBrowse, RepeatMode, Request, Response, SearchBrowse, StateEvent, TrackRef,
+    };
 
     #[test]
     fn edit_commands_deserialize_from_the_line_protocol() {
@@ -730,6 +821,33 @@ mod tests {
     }
 
     #[test]
+    fn restore_queue_and_legacy_track_availability_deserialize_cleanly() {
+        let restore: Request = serde_json::from_value(json!({
+            "request_id": "request-restore",
+            "type": "restore_queue",
+            "queue": [{
+                "uri": "spotify:track:0123456789ABCDEFGHIJKL",
+                "duration_ms": 240000
+            }],
+            "index": 0,
+            "position_ms": 42000
+        }))
+        .unwrap();
+        let Command::RestoreQueue {
+            queue,
+            index,
+            position_ms,
+        } = restore.command
+        else {
+            panic!("restore_queue must parse as its dedicated command");
+        };
+        assert_eq!(index, 0);
+        assert_eq!(position_ms, 42_000);
+        assert!(!queue[0].unavailable);
+        assert!(queue[0].unavailable_reason.is_none());
+    }
+
+    #[test]
     fn browse_commands_deserialize_from_the_line_protocol() {
         let playlists: Request = serde_json::from_value(json!({
             "request_id": "request-11",
@@ -826,6 +944,7 @@ mod tests {
             }],
             albums: Vec::new(),
             artists: Vec::new(),
+            playlists: playlists.clone(),
         };
 
         let success = serde_json::to_value(BrowseResponse {
@@ -856,9 +975,29 @@ mod tests {
                         "duration_ms": 0
                     }],
                     "albums": [],
-                    "artists": []
+                    "artists": [],
+                    "playlists": [{
+                        "id": "0123456789ABCDEFGHIJKL",
+                        "uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
+                        "name": "Road Trip",
+                        "owner_id": "alice",
+                        "owner_name": "",
+                        "cover_url": "https://i.scdn.co/image/0123",
+                        "track_count": 42
+                    }]
                 }
             })
+        );
+
+        let legacy: SearchBrowse = serde_json::from_value(json!({
+            "tracks": [],
+            "albums": [],
+            "artists": []
+        }))
+        .unwrap();
+        assert!(
+            legacy.playlists.is_empty(),
+            "old search payloads default the new playlist section"
         );
 
         let failure = serde_json::to_value(BrowseResponse::<SearchBrowse> {
@@ -943,5 +1082,67 @@ mod tests {
         })
         .unwrap();
         assert!(logged_out.get("username").is_none());
+    }
+    #[test]
+    fn radio_commands_and_payloads_match_the_line_protocol() {
+        let radio: Request = serde_json::from_value(json!({
+            "request_id": "request-radio",
+            "type": "browse_radio",
+            "id": "0123456789ABCDEFGHIJKL",
+        }))
+        .unwrap();
+        assert!(matches!(
+            radio.command,
+            Command::BrowseRadio { ref id } if id == "0123456789ABCDEFGHIJKL"
+        ));
+
+        let recommendations: Request = serde_json::from_value(json!({
+            "request_id": "request-recommendations",
+            "type": "browse_playlist_recommendations",
+            "id": "1123456789ABCDEFGHIJKL",
+        }))
+        .unwrap();
+        assert!(matches!(
+            recommendations.command,
+            Command::BrowsePlaylistRecommendations { ref id }
+                if id == "1123456789ABCDEFGHIJKL"
+        ));
+
+        let seed = TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            name: "Seed".to_owned(),
+            ..TrackRef::default()
+        };
+        let payload = RadioBrowse {
+            seed: seed.clone(),
+            tracks: vec![seed],
+        };
+        let response = serde_json::to_value(BrowseResponse {
+            kind: "browse_radio",
+            request_id: "request-radio",
+            ok: true,
+            error: None,
+            data: Some(&payload),
+        })
+        .unwrap();
+        assert_eq!(response["type"], "browse_radio");
+        assert_eq!(response["data"]["seed"]["name"], "Seed");
+        assert_eq!(response["data"]["tracks"][0]["name"], "Seed");
+
+        let optional = PlaylistRecommendations {
+            playlist_id: "1123456789ABCDEFGHIJKL".to_owned(),
+            tracks: Vec::new(),
+        };
+        let response = serde_json::to_value(BrowseResponse {
+            kind: "browse_playlist_recommendations",
+            request_id: "request-recommendations",
+            ok: true,
+            error: None,
+            data: Some(&optional),
+        })
+        .unwrap();
+        assert_eq!(response["data"]["playlist_id"], "1123456789ABCDEFGHIJKL");
+        assert_eq!(response["data"]["tracks"], json!([]));
     }
 }

@@ -25,6 +25,7 @@
   $effect(() => observeStuck(headSentinel, (stuck) => (headStuck = stuck)));
 
   function playAt(i) {
+    if (queue[i]?.unavailable) return;
     if (i === playback.current_index) togglePlay();
     else api.playQueueIndex(i).catch(() => {});
   }
@@ -229,14 +230,22 @@
             <div
               class="tl-row"
               class:current={i === playback.current_index}
+              class:unavailable={track.unavailable}
               role="button"
+              aria-disabled={track.unavailable ? "true" : undefined}
+              title={track.unavailable ? (track.unavailable_reason || "Unavailable") : undefined}
               tabindex="-1"
               ondblclick={() => playAt(i)}
             >
               <span class="c-idx">
                 <span class="n">{i + 1}</span>
                 <span class="eq"><i></i><i></i><i></i><i></i></span>
-                <button class="go" title="Play from here" onclick={() => playAt(i)}>
+                <button
+                  class="go"
+                  title={track.unavailable ? (track.unavailable_reason || "Unavailable") : "Play from here"}
+                  disabled={track.unavailable}
+                  onclick={() => playAt(i)}
+                >
                   <Icon name={i === playback.current_index && playback.playing ? "pause" : "play"} size={12} />
                 </button>
               </span>

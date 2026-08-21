@@ -24,6 +24,7 @@
   import LibraryView from "./views/LibraryView.svelte";
   import LikedSongsView from "./views/LikedSongsView.svelte";
   import PlaylistView from "./views/PlaylistView.svelte";
+  import RadioView from "./views/RadioView.svelte";
   import AlbumView from "./views/AlbumView.svelte";
   import ArtistView from "./views/ArtistView.svelte";
   import DiscographyView from "./views/DiscographyView.svelte";
@@ -175,6 +176,8 @@
         <LikedSongsView />
       {:else if route.name === "playlist"}
         <PlaylistView />
+      {:else if route.name === "radio"}
+        <RadioView />
       {:else if route.name === "album"}
         <AlbumView />
       {:else if route.name === "artist"}

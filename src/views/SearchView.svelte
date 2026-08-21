@@ -1,7 +1,7 @@
 <script>
   import { untrack } from "svelte";
   import { search, api, navigate, focusSearch, queueSearch } from "../lib/state.svelte.js";
-  import { playAlbumById } from "../lib/play.js";
+  import { playAlbumById, playPlaylistById } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
@@ -15,8 +15,9 @@
 
   const tracks = $derived(search.results?.tracks ?? []);
   const albums = $derived(search.results?.albums ?? []);
+  const playlists = $derived(search.results?.playlists ?? []);
   const artists = $derived(search.results?.artists ?? []);
-  const empty = $derived(!tracks.length && !albums.length && !artists.length);
+  const empty = $derived(!tracks.length && !albums.length && !playlists.length && !artists.length);
   const visibleTracks = $derived(tracks.slice(0, 5));
 
   /* Top result: an artist beats an album beats a song. Whatever the query
@@ -45,14 +46,14 @@
 
   /* The card opens; only this button plays. A result card knows an id and
      nothing else, so playing it costs one browse first. */
-  async function play(id) {
+  async function play(id, load, failure) {
     if (busy) return;
     busy = id;
     playError = "";
     try {
-      await playAlbumById(id);
+      await load(id);
     } catch (reason) {
-      playError = String(reason || "Could not play this release.");
+      playError = String(reason || failure);
     } finally {
       busy = "";
     }
@@ -147,7 +148,7 @@
     {:else}
       <div class="empty">
         <p class="h">Nothing searched yet.</p>
-        <p class="sub">Songs, albums and artists all come back from one query.</p>
+        <p class="sub">Songs, albums, playlists and artists all come back from one query.</p>
         <div class="actions">
           <button class="btn-ghost" onclick={focusSearch}>
             <Icon name="search" size={14} />Search
@@ -161,9 +162,9 @@
 
          This used to be six bare rows in a one-column strip, which shares no
          geometry at all with what actually lands — a two-column split with a
-         top-result panel beside five songs, then a grid of albums, then a grid
-         of artists. So every search visibly rebuilt the page: the strip
-         vanished, three sections appeared, and the whole thing jumped.
+         top-result panel beside five songs, then grids of albums, playlists
+         and artists. So every search visibly rebuilt the page: the strip
+         vanished, four sections appeared, and the whole thing jumped.
 
          Now the wait IS the page, with its content missing: same split, same
          panel, same row heights, same card grid. Nothing moves when the
@@ -200,7 +201,7 @@
       </div>
     </div>
 
-    {#each ["Albums", "Artists"] as heading, section (heading)}
+    {#each ["Albums", "Playlists", "Artists"] as heading (heading)}
       <div class="section" aria-hidden="true">
         <div class="section-head"><h2 class="section-title">{heading}</h2></div>
         <div class="grid">
@@ -208,7 +209,7 @@
             <div class="card">
               <span
                 class="skeleton"
-                style="display:block;aspect-ratio:1;width:100%;border-radius:{section
+                style="display:block;aspect-ratio:1;width:100%;border-radius:{heading === 'Artists'
                   ? 'var(--rf)'
                   : 'var(--r3)'}"
               ></span>
@@ -298,7 +299,7 @@
                   aria-label={`Play ${al.name}`}
                   title={`Play ${al.name}`}
                   disabled={!!busy}
-                  onclick={() => play(al.id)}
+                  onclick={() => play(al.id, playAlbumById, "Could not play this release.")}
                 >
                   <Icon name={busy === al.id ? "more" : "play"} size={15} />
                 </button>
@@ -315,9 +316,58 @@
             </div>
           {/each}
         </div>
-        {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
       </div>
     {/if}
+
+    {#if playlists.length}
+      <div class="section">
+        <div class="section-head"><h2 class="section-title">Playlists</h2></div>
+        <div class="grid">
+          {#each playlists as pl (pl.id)}
+            {@const tone = coverTone(pl.cover_url || pl.cover_urls?.[0] || "", pl.id)}
+            <div class="card" style:--tone-glow={tone.glow}>
+              <div class="card-art">
+                <Cover
+                  src={pl.cover_url}
+                  srcs={pl.cover_urls ?? []}
+                  id={pl.id}
+                  name={pl.name}
+                  fill
+                  lg
+                />
+                <button
+                  class="card-open"
+                  aria-label={`Open ${pl.name}`}
+                  onclick={() => navigate("playlist", pl.id)}
+                ></button>
+                <button
+                  class="card-play"
+                  aria-label={`Play ${pl.name}`}
+                  title={`Play ${pl.name}`}
+                  disabled={!!busy}
+                  onclick={() => play(pl.id, playPlaylistById, "Could not play this playlist.")}
+                >
+                  <Icon name={busy === pl.id ? "more" : "play"} size={15} />
+                </button>
+              </div>
+              <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
+                <span class="card-name">{pl.name}</span>
+                <span class="card-sub"
+                  >{[
+                    pl.tracks_total ? `${pl.tracks_total} songs` : null,
+                    pl.owner ? `By ${pl.owner}` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ") || "Playlist"}</span
+                >
+              </button>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
 
     {#if artists.length}
       <div class="section">

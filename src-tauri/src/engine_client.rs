@@ -20,7 +20,10 @@ use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, watch};
 
-use crate::app::{engine_state_dir, load_app_settings};
+use crate::app::{
+    PlaybackSnapshot, clear_playback_snapshot, engine_state_dir, load_app_settings,
+    load_playback_snapshot, save_playback_snapshot,
+};
 use crate::log;
 use crate::types::{PlaybackState, Track};
 
@@ -76,8 +79,9 @@ pub enum StateLine {
     Position(PositionHeartbeat),
 }
 
-/// Playback settings to re-apply after the engine is respawned
-/// (`RestorePlaybackAfterRespawn`).
+/// Queue/settings captured either from the durable app snapshot (normal
+/// startup, always paused) or from the last fresh state before an unexpected
+/// child exit (resume only when that state was playing).
 #[derive(Debug, Clone)]
 pub struct RestoreSnapshot {
     pub queue: Vec<Track>,
@@ -86,10 +90,11 @@ pub struct RestoreSnapshot {
     pub volume: u8,
     pub shuffle: bool,
     pub repeat: String,
+    pub resume_playing: bool,
 }
 
-impl From<&PlaybackState> for RestoreSnapshot {
-    fn from(state: &PlaybackState) -> Self {
+impl RestoreSnapshot {
+    fn from_playback(state: &PlaybackState, resume_playing: bool) -> Self {
         Self {
             queue: state.queue.clone(),
             current_index: state.current_index,
@@ -97,8 +102,73 @@ impl From<&PlaybackState> for RestoreSnapshot {
             volume: state.volume,
             shuffle: state.shuffle,
             repeat: state.repeat.clone(),
+            resume_playing,
         }
+        .normalized()
     }
+
+    fn from_durable(snapshot: PlaybackSnapshot) -> Self {
+        Self {
+            queue: snapshot.queue,
+            current_index: snapshot.current_index,
+            position_ms: snapshot.position_ms,
+            volume: snapshot.volume,
+            shuffle: snapshot.shuffle,
+            repeat: snapshot.repeat,
+            resume_playing: false,
+        }
+        .normalized()
+    }
+
+    fn normalized(mut self) -> Self {
+        let requested = self.current_index.unwrap_or(0);
+        self.current_index = if self.queue.is_empty() {
+            None
+        } else {
+            (requested..self.queue.len())
+                .chain(0..requested.min(self.queue.len()))
+                .find(|index| !self.queue[*index].unavailable)
+        };
+        if self.current_index != Some(requested) {
+            self.position_ms = 0;
+        } else if let Some(index) = self.current_index {
+            self.position_ms = self.position_ms.min(self.queue[index].duration_ms);
+        }
+        self
+    }
+
+    pub fn matches(&self, state: &PlaybackState) -> bool {
+        let position_matches = if self.resume_playing {
+            state.position_ms.abs_diff(self.position_ms) <= 2_500
+        } else {
+            state.position_ms == self.position_ms
+        };
+        state.auth_state == "ready"
+            && state.queue == self.queue
+            && state.current_index == self.current_index
+            && state.volume == self.volume
+            && state.shuffle == self.shuffle
+            && state.repeat == self.repeat
+            && state.playing == self.resume_playing
+            && position_matches
+    }
+
+    fn durable(&self) -> PlaybackSnapshot {
+        let mut state = PlaybackState::default();
+        state.queue = self.queue.clone();
+        state.current_index = self.current_index;
+        state.position_ms = self.position_ms;
+        state.volume = self.volume;
+        state.shuffle = self.shuffle;
+        state.repeat = self.repeat.clone();
+        PlaybackSnapshot::from_playback(&state)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RestorePlan {
+    snapshot: RestoreSnapshot,
+    sent: bool,
 }
 
 pub struct EngineClient {
@@ -109,7 +179,7 @@ pub struct EngineClient {
     state_tx: tokio::sync::broadcast::Sender<StateLine>,
     exit_tx: watch::Sender<bool>,
     last_state: Mutex<Option<PlaybackState>>,
-    restore_pending: tokio::sync::Mutex<Option<RestoreSnapshot>>,
+    restore_pending: Mutex<Option<RestorePlan>>,
     next_request_id: AtomicU64,
     shutting_down: AtomicBool,
 }
@@ -120,6 +190,10 @@ impl EngineClient {
     pub fn start() -> Arc<Self> {
         let (state_tx, _) = tokio::sync::broadcast::channel(64);
         let (exit_tx, _) = watch::channel(false);
+        let restore_pending = load_playback_snapshot().map(|snapshot| RestorePlan {
+            snapshot: RestoreSnapshot::from_durable(snapshot),
+            sent: false,
+        });
         let client = Arc::new(Self {
             state_dir: engine_state_dir(),
             pending: tokio::sync::Mutex::new(HashMap::new()),
@@ -128,7 +202,7 @@ impl EngineClient {
             state_tx,
             exit_tx,
             last_state: Mutex::new(None),
-            restore_pending: tokio::sync::Mutex::new(None),
+            restore_pending: Mutex::new(restore_pending),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         });
@@ -144,19 +218,32 @@ impl EngineClient {
         self.state_tx.subscribe()
     }
 
-    /// Takes the restore snapshot captured at the last engine death, if any.
-    pub async fn take_restore_pending(&self) -> Option<RestoreSnapshot> {
-        self.restore_pending.lock().await.take()
+    /// Starts the pending restore exactly once, after a fresh engine reports
+    /// that authentication is ready. The plan remains stored until the engine
+    /// emits the matching final state.
+    pub fn begin_pending_restore(&self, state: &PlaybackState) -> Option<RestoreSnapshot> {
+        let mut pending = self.restore_pending.lock();
+        let plan = pending.as_mut()?;
+        if plan.sent || state.auth_state != "ready" {
+            return None;
+        }
+        plan.sent = true;
+        Some(plan.snapshot.clone())
     }
 
-    /// Puts a restore snapshot back (the fresh engine is not ready yet).
-    pub async fn put_restore_pending(&self, snapshot: RestoreSnapshot) {
-        *self.restore_pending.lock().await = Some(snapshot);
+    pub fn restore_is_pending(&self) -> bool {
+        self.restore_pending.lock().is_some()
     }
 
     /// Drops any pending restore (used after an explicit logout).
-    pub async fn clear_restore_pending(&self) {
-        *self.restore_pending.lock().await = None;
+    pub fn clear_restore_pending(&self) {
+        *self.restore_pending.lock() = None;
+    }
+
+    pub fn retry_pending_restore(&self) {
+        if let Some(plan) = self.restore_pending.lock().as_mut() {
+            plan.sent = false;
+        }
     }
 
     /// Respawn loop: waits for the reader thread to signal EOF, sleeps with
@@ -397,12 +484,22 @@ impl EngineClient {
         index: usize,
         position_ms: u32,
     ) -> Result<(), String> {
-        let queue: Vec<Value> = queue
-            .iter()
-            .map(|track| serde_json::to_value(track).unwrap_or(Value::Null))
-            .collect();
         self.request(
             "play_queue",
+            json!({"queue": queue, "index": index, "position_ms": position_ms}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn restore_queue(
+        &self,
+        queue: &[Track],
+        index: usize,
+        position_ms: u32,
+    ) -> Result<(), String> {
+        self.request(
+            "restore_queue",
             json!({"queue": queue, "index": index, "position_ms": position_ms}),
         )
         .await
@@ -416,21 +513,15 @@ impl EngineClient {
     }
 
     pub async fn add_queue(&self, track: &Track) -> Result<(), String> {
-        self.request(
-            "add_queue",
-            json!({"track": serde_json::to_value(track).map_err(|error| error.to_string())?}),
-        )
-        .await
-        .map(|_| ())
+        self.request("add_queue", json!({"track": track}))
+            .await
+            .map(|_| ())
     }
 
     pub async fn add_queue_batch(&self, tracks: &[Track]) -> Result<(), String> {
-        self.request(
-            "add_queue_batch",
-            json!({"tracks": tracks}),
-        )
-        .await
-        .map(|_| ())
+        self.request("add_queue_batch", json!({"tracks": tracks}))
+            .await
+            .map(|_| ())
     }
 
     pub async fn remove_queue(&self, index: usize) -> Result<(), String> {
@@ -450,7 +541,11 @@ impl EngineClient {
     }
 
     pub async fn logout(&self) -> Result<(), String> {
-        self.request("logout", Value::Null).await.map(|_| ())
+        self.request("logout", Value::Null).await?;
+        self.clear_restore_pending();
+        *self.last_state.lock() = None;
+        clear_playback_snapshot()?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -471,6 +566,24 @@ impl EngineClient {
     ) -> Result<spotify_playback_engine::protocol::PlaylistBrowse, String> {
         let reply = self.request("browse_playlist", json!({"id": id})).await?;
         parse_data(reply, "browse_playlist")
+    }
+
+    pub async fn browse_radio(
+        &self,
+        id: &str,
+    ) -> Result<spotify_playback_engine::protocol::RadioBrowse, String> {
+        let reply = self.request("browse_radio", json!({"id": id})).await?;
+        parse_data(reply, "browse_radio")
+    }
+
+    pub async fn browse_playlist_recommendations(
+        &self,
+        id: &str,
+    ) -> Result<spotify_playback_engine::protocol::PlaylistRecommendations, String> {
+        let reply = self
+            .request("browse_playlist_recommendations", json!({"id": id}))
+            .await?;
+        parse_data(reply, "browse_playlist_recommendations")
     }
 
     pub async fn browse_album(
@@ -598,9 +711,13 @@ impl EngineClient {
         Ok(())
     }
 
-    /// Graceful engine shutdown for app exit; falls back to a hard kill.
+    /// Persists one heartbeat-freshened snapshot, then gracefully stops the
+    /// engine. No playback mutation performs recurring full-queue disk writes.
     pub fn shutdown_engine(&self) {
         log::info("engine shutdown requested");
+        if let Err(error) = self.persist_playback_state() {
+            log::warn(&format!("could not persist playback state: {error}"));
+        }
         self.shutting_down.store(true, Ordering::SeqCst);
         let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
         let _ = self.write_line(&line);
@@ -612,18 +729,46 @@ impl EngineClient {
         *self.stdin.lock() = None;
     }
 
+    fn persist_playback_state(&self) -> Result<(), String> {
+        let snapshot = self
+            .last_state
+            .lock()
+            .as_ref()
+            .filter(|state| state.auth_state == "ready")
+            .map(PlaybackSnapshot::from_playback)
+            .or_else(|| {
+                self.restore_pending
+                    .lock()
+                    .as_ref()
+                    .map(|plan| plan.snapshot.durable())
+            });
+        match snapshot {
+            Some(snapshot) => save_playback_snapshot(&snapshot),
+            None => Ok(()),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Reader-thread callbacks
     // ------------------------------------------------------------------
 
     fn on_state(&self, state: &PlaybackState) {
-        *self.last_state.lock() = Some(state.clone());
+        let mut pending = self.restore_pending.lock();
+        let matched = pending
+            .as_ref()
+            .is_some_and(|plan| plan.sent && plan.snapshot.matches(state));
+        if matched {
+            *pending = None;
+        }
+        let suppress_snapshot = pending.is_some() && state.auth_state == "ready";
+        drop(pending);
+        if !suppress_snapshot {
+            *self.last_state.lock() = Some(state.clone());
+        }
         let _ = self.state_tx.send(StateLine::State(state.clone()));
     }
 
-    /// Applies a scalar position heartbeat: freshens only the playhead
-    /// scalars of the last known state in place (no queue clone, no
-    /// full-state comparison) and forwards the line in wire order.
+    /// Applies a scalar position heartbeat to the heartbeat-fresh last state.
     fn on_position(&self, heartbeat: PositionHeartbeat) {
         if let Some(last) = self.last_state.lock().as_mut() {
             last.position_ms = heartbeat.position_ms;
@@ -637,7 +782,6 @@ impl EngineClient {
             return;
         }
         log::warn("engine process exited (stdout closed)");
-        // Fail any in-flight requests so awaiters do not hang.
         let mut pending = self.pending.blocking_lock();
         for (_, sender) in pending.drain() {
             let _ = sender.send(EngineReply {
@@ -647,11 +791,15 @@ impl EngineClient {
             });
         }
         drop(pending);
-        // Capture what to restore once a fresh engine is ready again.
-        if let Some(last) = self.last_state.lock().clone() {
-            if last.auth_state == "ready" {
-                *self.restore_pending.blocking_lock() = Some(RestoreSnapshot::from(&last));
-            }
+        let last = self.last_state.lock().clone();
+        let mut restore = self.restore_pending.lock();
+        if let Some(last) = last.filter(|state| state.auth_state == "ready") {
+            *restore = Some(RestorePlan {
+                snapshot: RestoreSnapshot::from_playback(&last, last.playing),
+                sent: false,
+            });
+        } else if let Some(plan) = restore.as_mut() {
+            plan.sent = false;
         }
         *self.stdin.lock() = None;
         *self.process.lock() = None;
@@ -867,7 +1015,7 @@ mod tests {
             state_tx,
             exit_tx,
             last_state: Mutex::new(Some(state)),
-            restore_pending: tokio::sync::Mutex::new(None),
+            restore_pending: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         })
@@ -999,6 +1147,66 @@ mod tests {
             }
             StateLine::State(_) => panic!("heartbeat must not arrive as a full state"),
         }
+    }
+
+    #[test]
+    fn blank_ready_state_is_suppressed_until_restored_state_matches() {
+        let mut previous = PlaybackState::default();
+        previous.auth_state = "ready".to_owned();
+        previous.queue = vec![Track {
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        previous.current_index = Some(0);
+        previous.position_ms = 42_000;
+        previous.volume = 37;
+        previous.shuffle = true;
+        previous.repeat = "context".to_owned();
+        let client = client_with_last_state(previous.clone());
+        *client.restore_pending.lock() = Some(RestorePlan {
+            snapshot: RestoreSnapshot::from_playback(&previous, false),
+            sent: false,
+        });
+
+        let mut blank = PlaybackState::default();
+        blank.ready = true;
+        blank.auth_state = "ready".to_owned();
+        client.on_state(&blank);
+        assert_eq!(
+            client.last_state.lock().as_ref().unwrap().queue,
+            previous.queue,
+            "fresh-child blank state must not erase the crash snapshot"
+        );
+        let restore = client
+            .begin_pending_restore(&blank)
+            .expect("ready state starts restore");
+        assert!(!restore.resume_playing);
+        assert!(client.begin_pending_restore(&blank).is_none());
+
+        let mut restored = previous;
+        restored.playing = false;
+        client.on_state(&restored);
+        assert!(!client.restore_is_pending());
+        assert_eq!(
+            client.last_state.lock().as_ref().unwrap().position_ms,
+            42_000
+        );
+    }
+
+    #[test]
+    fn crash_snapshot_resumes_only_when_the_previous_state_was_playing() {
+        let mut state = PlaybackState::default();
+        state.auth_state = "ready".to_owned();
+        state.queue = vec![Track {
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            ..Track::default()
+        }];
+        state.current_index = Some(0);
+        state.playing = true;
+        assert!(RestoreSnapshot::from_playback(&state, state.playing).resume_playing);
+        state.playing = false;
+        assert!(!RestoreSnapshot::from_playback(&state, state.playing).resume_playing);
     }
 
     /// Finds a built engine binary: `SPOTIFY_ENGINE_PATH`, the workspace

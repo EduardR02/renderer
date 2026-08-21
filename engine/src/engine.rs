@@ -82,6 +82,13 @@ pub struct Engine {
     /// explicitly stopped; this flag makes the next Play command issue a
     /// fresh load instead of sending `play` to a dead loader.
     loading_failed: bool,
+    /// The queue/playhead is installed but no librespot load exists. This is
+    /// set by restore and by session teardown, and consumed by the next Play.
+    current_needs_load: bool,
+    /// Playback intent captured when an authenticated session dies. A normal
+    /// app startup restore never sets this; only an unexpected reconnect may
+    /// resume automatically.
+    resume_after_reconnect: bool,
     position_anchor: Option<(u32, Instant)>,
     /// When the last command-driven track change (PlayQueue/Next/Previous)
     /// was dispatched, for pacing rapid presses (see
@@ -191,6 +198,8 @@ impl Engine {
             session: None,
             play_request_id: None,
             loading_failed: false,
+            current_needs_load: false,
+            resume_after_reconnect: false,
             position_anchor: None,
             last_track_change: None,
             recent_track_changes: VecDeque::new(),
@@ -314,6 +323,7 @@ impl Engine {
             // First tick that sees the corpse: schedule, and tell the frontend
             // playback is down rather than letting loads fail one by one.
             self.next_reconnect = Some(now + self.reconnect_backoff);
+            self.resume_after_reconnect = self.state.playing;
             self.state.ready = false;
             self.state.playing = false;
             self.state.error =
@@ -375,6 +385,8 @@ impl Engine {
         self.state.duration_ms = 0;
         self.state.current_index = None;
         self.state.queue.clear();
+        self.current_needs_load = false;
+        self.resume_after_reconnect = false;
         self.shuffle_pool.clear();
         self.history.clear();
         self.state.error = None;
@@ -475,9 +487,17 @@ impl Engine {
         self.auth_running = false;
         match result {
             Ok(handles) => {
+                let had_queue = self.state.current_index.is_some();
+                let restored_volume = self.state.volume;
+                let resume = had_queue && self.resume_after_reconnect;
+                self.resume_after_reconnect = false;
                 self.state.ready = true;
                 self.state.auth_state = AuthState::Ready;
-                self.state.volume = handles.volume_percent;
+                self.state.volume = if had_queue {
+                    restored_volume
+                } else {
+                    handles.volume_percent
+                };
                 self.state.error = None;
                 // The attempt is spent: the URL it published no longer applies.
                 self.state.auth_url = None;
@@ -485,6 +505,21 @@ impl Engine {
                 self.player = Some(handles.player);
                 self.mixer = Some(handles.mixer);
                 self.session = Some(handles.session);
+                if had_queue {
+                    let volume = percent_to_volume(restored_volume);
+                    if let Some(mixer) = &self.mixer {
+                        mixer.set_volume(volume);
+                    }
+                    crate::audio::set_sink_volume(volume);
+                    self.current_needs_load = true;
+                    self.state.playing = resume;
+                    if resume {
+                        if let Err(error) = self.load_current(true) {
+                            self.state.playing = false;
+                            self.state.error = Some(error);
+                        }
+                    }
+                }
                 // A live session again: drop any reconnect schedule and reset
                 // the backoff so the next outage recovers quickly too.
                 self.next_reconnect = None;
@@ -611,7 +646,10 @@ impl Engine {
         // commands may wait a tick — no press is dropped.
         if matches!(
             &command,
-            Command::PlayQueue { .. } | Command::PlayQueueIndex { .. } | Command::Next | Command::Previous
+            Command::PlayQueue { .. }
+                | Command::PlayQueueIndex { .. }
+                | Command::Next
+                | Command::Previous
         ) {
             self.pace_track_change().await;
         }
@@ -622,6 +660,8 @@ impl Engine {
             | Command::Logout
             | Command::BrowsePlaylists { .. }
             | Command::BrowsePlaylist { .. }
+            | Command::BrowseRadio { .. }
+            | Command::BrowsePlaylistRecommendations { .. }
             | Command::BrowseAlbum { .. }
             | Command::BrowseArtist { .. }
             | Command::BrowseArtistReleases { .. }
@@ -640,6 +680,11 @@ impl Engine {
                 index,
                 position_ms,
             } => self.play_queue(queue, index, position_ms),
+            Command::RestoreQueue {
+                queue,
+                index,
+                position_ms,
+            } => self.restore_queue(queue, index, position_ms),
             Command::PlayQueueIndex { index } => self.play_queue_index(index),
             Command::Play => self.play(),
             Command::Pause => self.pause(),
@@ -826,41 +871,60 @@ impl Engine {
             .ok_or_else(|| "the local audio player is unavailable".to_owned())
     }
 
+    fn validate_queue(queue: &[TrackRef], index: usize) -> Result<(), String> {
+        if queue.is_empty() {
+            return (index == 0)
+                .then_some(())
+                .ok_or_else(|| "index must be zero for an empty queue".to_owned());
+        }
+        if index >= queue.len() {
+            return Err(format!("queue index {index} is out of range"));
+        }
+        for track in queue {
+            parse_track_uri(track)?;
+        }
+        Ok(())
+    }
+
+    fn install_empty_or_unavailable_queue(
+        &mut self,
+        queue: Vec<TrackRef>,
+    ) -> Result<bool, String> {
+        self.player()?.stop();
+        self.state.queue = queue;
+        self.state.current_index = None;
+        self.state.position_ms = 0;
+        self.state.duration_ms = 0;
+        self.state.playing = false;
+        self.history.clear();
+        self.shuffle_pool.clear();
+        self.state.error = None;
+        self.loading_failed = false;
+        self.current_needs_load = false;
+        self.recent_track_changes.clear();
+        self.recent_unavailable.clear();
+        Ok(true)
+    }
+
     fn play_queue(
         &mut self,
         queue: Vec<TrackRef>,
         index: usize,
         position_ms: u32,
     ) -> Result<bool, String> {
-        for track in &queue {
-            parse_track_uri(track)?;
-        }
-        if queue.is_empty() {
-            if index != 0 {
-                return Err("index must be zero for an empty queue".to_owned());
-            }
-            self.player()?.stop();
-            self.state.queue.clear();
-            self.state.current_index = None;
-            self.state.position_ms = 0;
-            self.state.duration_ms = 0;
-            self.state.playing = false;
-            self.history.clear();
-            self.shuffle_pool.clear();
-            self.state.error = None;
-            self.loading_failed = false;
-            self.recent_track_changes.clear();
-            self.recent_unavailable.clear();
-            return Ok(true);
-        }
-        if index >= queue.len() {
-            return Err(format!("queue index {index} is out of range"));
-        }
+        Self::validate_queue(&queue, index)?;
+        let Some(playable_index) = first_available_from(&queue, index) else {
+            return self.install_empty_or_unavailable_queue(queue);
+        };
 
         self.state.queue = queue;
-        self.state.current_index = Some(index);
-        self.state.duration_ms = self.state.queue[index].duration_ms;
-        self.update_position(position_ms);
+        self.state.current_index = Some(playable_index);
+        self.state.duration_ms = self.state.queue[playable_index].duration_ms;
+        self.update_position(if playable_index == index {
+            position_ms
+        } else {
+            0
+        });
         self.state.playing = true;
         self.state.error = None;
         self.history.clear();
@@ -872,9 +936,65 @@ impl Engine {
         Ok(true)
     }
 
+    /// Installs a validated queue and frozen playhead without touching the
+    /// audio loader. This is the only startup path: there is no paused load
+    /// whose decoder/output setup could produce an audible blip.
+    fn restore_queue(
+        &mut self,
+        queue: Vec<TrackRef>,
+        index: usize,
+        position_ms: u32,
+    ) -> Result<bool, String> {
+        Self::validate_queue(&queue, index)?;
+        if let Some(player) = &self.player {
+            player.stop();
+        }
+        let playable_index = if queue.is_empty() {
+            None
+        } else {
+            first_available_wrapping(&queue, index)
+        };
+        self.state.queue = queue;
+        self.state.current_index = playable_index;
+        self.state.duration_ms = playable_index
+            .map(|current| self.state.queue[current].duration_ms)
+            .unwrap_or(0);
+        self.update_position(if playable_index == Some(index) {
+            position_ms
+        } else {
+            0
+        });
+        self.state.playing = false;
+        self.state.error = None;
+        self.history.clear();
+        self.rebuild_shuffle_pool();
+        self.play_request_id = None;
+        self.loading_failed = false;
+        self.current_needs_load = playable_index.is_some();
+        self.recent_track_changes.clear();
+        self.recent_unavailable.clear();
+        Ok(true)
+    }
+
     fn play_queue_index(&mut self, index: usize) -> Result<bool, String> {
-        if index >= self.state.queue.len() {
-            return Err(format!("queue index {index} is out of range"));
+        let (duration_ms, unavailable_reason) = {
+            let track = self
+                .state
+                .queue
+                .get(index)
+                .ok_or_else(|| format!("queue index {index} is out of range"))?;
+            (
+                track.duration_ms,
+                track.unavailable.then(|| {
+                    track
+                        .unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "this track is permanently unavailable".to_owned())
+                }),
+            )
+        };
+        if let Some(reason) = unavailable_reason {
+            return Err(reason);
         }
         if let Some(current) = self.state.current_index {
             if current != index {
@@ -882,7 +1002,7 @@ impl Engine {
             }
         }
         self.state.current_index = Some(index);
-        self.state.duration_ms = self.state.queue[index].duration_ms;
+        self.state.duration_ms = duration_ms;
         self.update_position(0);
         self.state.playing = true;
         self.state.error = None;
@@ -902,10 +1022,11 @@ impl Engine {
         if self.seek_in_flight {
             self.seek_should_play = true;
         }
-        if self.loading_failed
+        if self.current_needs_load
+            || self.loading_failed
             || (self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms)
         {
-            if !self.loading_failed {
+            if !self.loading_failed && !self.current_needs_load {
                 self.state.position_ms = 0;
             }
             self.load_current(true)?;
@@ -929,7 +1050,7 @@ impl Engine {
         // `Unavailable` stops the player below, so a later pause must not send
         // `pause` to librespot's terminal Loading/Stopped state. Play will
         // issue a fresh load when requested.
-        if !self.loading_failed {
+        if !self.loading_failed && !self.current_needs_load {
             self.player()?.pause();
         }
         self.state.playing = false;
@@ -943,6 +1064,11 @@ impl Engine {
             return Err("the queue has no current track".to_owned());
         }
         let position = position_ms.min(self.state.duration_ms);
+        if self.current_needs_load {
+            self.update_position(position);
+            self.state.error = None;
+            return Ok(true);
+        }
         if self.loading_failed {
             // The failed loader was stopped by the Unavailable handler. A
             // seek is also a valid recovery request: load at the new offset
@@ -1009,13 +1135,20 @@ impl Engine {
             return None;
         }
         while let Some(index) = self.history.pop() {
-            if index < self.state.queue.len() {
+            if self
+                .state
+                .queue
+                .get(index)
+                .is_some_and(|track| !track.unavailable)
+            {
                 return Some(index);
             }
         }
         let current = self.state.current_index?;
-        if !self.state.shuffle && current > 0 && current <= self.state.queue.len() {
-            return Some(current - 1);
+        if !self.state.shuffle {
+            return (0..current)
+                .rev()
+                .find(|index| !self.state.queue[*index].unavailable);
         }
         None
     }
@@ -1137,11 +1270,21 @@ impl Engine {
                 self.play_request_id = None;
             }
             Some(current) if index == current => {
-                let replacement = current.min(self.state.queue.len() - 1);
-                self.state.current_index = Some(replacement);
-                self.state.duration_ms = self.state.queue[replacement].duration_ms;
+                let start = current.min(self.state.queue.len() - 1);
+                let replacement = first_available_wrapping(&self.state.queue, start);
+                self.state.current_index = replacement;
+                self.state.duration_ms = replacement
+                    .map(|replacement| self.state.queue[replacement].duration_ms)
+                    .unwrap_or(0);
                 self.update_position(0);
-                reload = true;
+                if replacement.is_some() {
+                    reload = true;
+                } else {
+                    self.player()?.stop();
+                    self.state.playing = false;
+                    self.play_request_id = None;
+                    self.current_needs_load = false;
+                }
             }
             Some(current) if index < current => self.state.current_index = Some(current - 1),
             Some(_) => {}
@@ -1182,11 +1325,11 @@ impl Engine {
         let track = self.state.queue.get(index).ok_or_else(|| {
             "the queue has no current track (index out of range)".to_owned()
         })?;
-        let uri = parse_track_uri(track)?;
+        let uri = playable_track_uri(track)?;
         let position_ms = self.state.position_ms;
         let next_uri = self
             .peek_next_index()
-            .and_then(|next| parse_track_uri(&self.state.queue[next]).ok());
+            .and_then(|next| playable_track_uri(&self.state.queue[next]).ok());
         self.play_request_id = None;
         self.seek_in_flight = false;
         self.seek_should_play = false;
@@ -1194,6 +1337,7 @@ impl Engine {
         // the recovery bookkeeping below mutates the engine.
         let player = Arc::clone(self.player()?);
         self.loading_failed = false;
+        self.current_needs_load = false;
         self.note_track_change(Instant::now());
         player.load(uri, start_playing, position_ms);
         if let Some(uri) = next_uri {
@@ -1213,29 +1357,60 @@ impl Engine {
 
     fn take_next_index(&mut self, at_end: bool) -> Option<usize> {
         let current = self.state.current_index?;
-        let queue_len = self.state.queue.len();
-        if at_end && self.state.repeat == RepeatMode::Track {
-            return (current < queue_len).then_some(current);
+        if at_end
+            && self.state.repeat == RepeatMode::Track
+            && self
+                .state
+                .queue
+                .get(current)
+                .is_some_and(|track| !track.unavailable)
+        {
+            return Some(current);
         }
         if self.state.shuffle {
             if self.shuffle_pool.is_empty() && self.state.repeat == RepeatMode::Context {
                 self.rebuild_shuffle_pool();
             }
-            return self.shuffle_pool.pop().filter(|index| *index < queue_len);
+            while let Some(index) = self.shuffle_pool.pop() {
+                if self
+                    .state
+                    .queue
+                    .get(index)
+                    .is_some_and(|track| !track.unavailable)
+                {
+                    return Some(index);
+                }
+            }
+            return None;
         }
-        sequential_next_index(current, queue_len, self.state.repeat)
+        sequential_available_index(&self.state.queue, current, self.state.repeat)
     }
 
     fn peek_next_index(&self) -> Option<usize> {
         let current = self.state.current_index?;
-        let queue_len = self.state.queue.len();
-        if self.state.repeat == RepeatMode::Track {
-            return (current < queue_len).then_some(current);
+        if self.state.repeat == RepeatMode::Track
+            && self
+                .state
+                .queue
+                .get(current)
+                .is_some_and(|track| !track.unavailable)
+        {
+            return Some(current);
         }
         if self.state.shuffle {
-            return self.shuffle_pool.last().copied().filter(|index| *index < queue_len);
+            return self
+                .shuffle_pool
+                .iter()
+                .rev()
+                .copied()
+                .find(|index| {
+                    self.state
+                        .queue
+                        .get(*index)
+                        .is_some_and(|track| !track.unavailable)
+                });
         }
-        sequential_next_index(current, queue_len, self.state.repeat)
+        sequential_available_index(&self.state.queue, current, self.state.repeat)
     }
 
     fn rebuild_shuffle_pool(&mut self) {
@@ -1244,9 +1419,9 @@ impl Engine {
             return;
         }
         let current = self.state.current_index;
-        self.shuffle_pool.extend(
-            (0..self.state.queue.len()).filter(|index| Some(*index) != current),
-        );
+        self.shuffle_pool.extend((0..self.state.queue.len()).filter(|index| {
+            Some(*index) != current && !self.state.queue[*index].unavailable
+        }));
         for index in (1..self.shuffle_pool.len()).rev() {
             let swap = (self.next_random() as usize) % (index + 1);
             self.shuffle_pool.swap(index, swap);
@@ -1419,6 +1594,7 @@ impl Engine {
         }
         self.play_request_id = None;
         self.loading_failed = false;
+        self.current_needs_load = self.state.current_index.is_some();
         self.seek_in_flight = false;
         self.seek_should_play = false;
         self.recent_track_changes.clear();
@@ -1439,6 +1615,41 @@ fn parse_track_uri(track: &TrackRef) -> Result<SpotifyUri, String> {
     Ok(uri)
 }
 
+fn playable_track_uri(track: &TrackRef) -> Result<SpotifyUri, String> {
+    if track.unavailable {
+        return Err(track
+            .unavailable_reason
+            .clone()
+            .unwrap_or_else(|| "this track is permanently unavailable".to_owned()));
+    }
+    parse_track_uri(track)
+}
+
+fn first_available_from(queue: &[TrackRef], start: usize) -> Option<usize> {
+    (start..queue.len()).find(|index| !queue[*index].unavailable)
+}
+
+fn first_available_wrapping(queue: &[TrackRef], start: usize) -> Option<usize> {
+    first_available_from(queue, start)
+        .or_else(|| (0..start.min(queue.len())).find(|index| !queue[*index].unavailable))
+}
+
+fn sequential_available_index(
+    queue: &[TrackRef],
+    current: usize,
+    repeat: RepeatMode,
+) -> Option<usize> {
+    first_available_from(queue, current.saturating_add(1)).or_else(|| {
+        (repeat == RepeatMode::Context)
+            .then(|| {
+                (0..=current.min(queue.len().saturating_sub(1)))
+                    .find(|index| !queue[*index].unavailable)
+            })
+            .flatten()
+    })
+}
+
+#[cfg(test)]
 fn sequential_next_index(
     current: usize,
     queue_len: usize,
@@ -1486,8 +1697,9 @@ mod tests {
     use librespot_core::SpotifyUri;
     use librespot_playback::player::PlayerEvent;
     use super::{
-        remap_current_index_after_move, sequential_next_index, track_change_wait, AuthSignal,
-        Engine, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
+        first_available_from, first_available_wrapping, remap_current_index_after_move,
+        sequential_available_index, sequential_next_index, track_change_wait, AuthSignal, Engine,
+        PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
         TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW,
     };
     use crate::io::ProtocolWriter;
@@ -1541,6 +1753,74 @@ mod tests {
         engine.state = playback_state(240_000);
         engine.play_request_id = Some(7);
         engine
+    }
+
+    fn unavailable_track(id: &str) -> TrackRef {
+        TrackRef {
+            id: id.to_owned(),
+            uri: format!("spotify:track:{id}"),
+            duration_ms: 180_000,
+            unavailable: true,
+            unavailable_reason: Some("not available in your country".to_owned()),
+            ..TrackRef::default()
+        }
+    }
+
+    #[test]
+    fn restore_installs_a_paused_unloaded_playhead_and_skips_a_blocked_index() {
+        let (mut engine, _) = test_engine();
+        engine.state.ready = true;
+        let playable = TrackRef {
+            uri: "spotify:track:1abcdefghijklmnopqrstu".to_owned(),
+            duration_ms: 240_000,
+            ..TrackRef::default()
+        };
+        let queue = vec![
+            unavailable_track("0abcdefghijklmnopqrstu"),
+            playable.clone(),
+        ];
+
+        assert_eq!(engine.restore_queue(queue, 0, 42_000), Ok(true));
+        assert_eq!(engine.state.current_index, Some(1));
+        assert_eq!(engine.state.position_ms, 0, "a skipped seed cannot keep its seek");
+        assert_eq!(engine.state.duration_ms, playable.duration_ms);
+        assert!(!engine.state.playing);
+        assert!(engine.current_needs_load);
+        assert!(engine.play_request_id.is_none());
+    }
+
+    #[test]
+    fn every_progression_strategy_skips_permanent_unavailability() {
+        let playable = TrackRef {
+            uri: "spotify:track:1abcdefghijklmnopqrstu".to_owned(),
+            ..TrackRef::default()
+        };
+        let queue = vec![
+            playable.clone(),
+            unavailable_track("2abcdefghijklmnopqrstu"),
+            unavailable_track("3abcdefghijklmnopqrstu"),
+            playable,
+        ];
+        assert_eq!(first_available_from(&queue, 1), Some(3));
+        assert_eq!(first_available_wrapping(&queue, 2), Some(3));
+        assert_eq!(
+            sequential_available_index(&queue, 0, RepeatMode::Off),
+            Some(3)
+        );
+        assert_eq!(
+            sequential_available_index(&queue, 3, RepeatMode::Context),
+            Some(0)
+        );
+
+        let blocked = vec![
+            unavailable_track("4abcdefghijklmnopqrstu"),
+            unavailable_track("5abcdefghijklmnopqrstu"),
+        ];
+        assert_eq!(first_available_from(&blocked, 0), None);
+        assert_eq!(
+            sequential_available_index(&blocked, 0, RepeatMode::Context),
+            None
+        );
     }
 
     #[test]
@@ -1643,6 +1923,10 @@ mod tests {
         assert!(!engine.state.playing);
         assert!(engine.loading_failed);
         assert!(engine.state.error.is_some());
+        assert!(
+            !engine.state.queue[0].unavailable,
+            "a runtime PlayerEvent::Unavailable must never poison metadata"
+        );
 
         // A retry gets a new player request id, then Loading clears the
         // failed-loader marker before playback begins.

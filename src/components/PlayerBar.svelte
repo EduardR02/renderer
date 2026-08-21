@@ -58,7 +58,15 @@
         />
       </button>
       <span class="p-meta">
-        <span class="p-title">{current.name}</span>
+        {#if current.album_id}
+          <button
+            class="p-title"
+            title="Go to album"
+            onclick={() => navigate("album", current.album_id)}
+          >{current.name}</button>
+        {:else}
+          <span class="p-title">{current.name}</span>
+        {/if}
         <ArtistLinks
           class="p-artists"
           names={current.artist_names}

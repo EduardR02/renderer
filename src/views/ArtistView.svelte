@@ -1,5 +1,5 @@
 <script>
-  import { detail, api, navigate, ui, retryDetail } from "../lib/state.svelte.js";
+  import { detail, api, navigate, ui, retryDetail, loadCataloguePage } from "../lib/state.svelte.js";
   import { playAlbumById } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -28,7 +28,51 @@
   const artist = $derived(detail.artist);
   const top = $derived(artist?.top_tracks ?? []);
   const counts = $derived(artist?.release_counts ?? {});
-  const groupLists = $derived(artist?.releases ?? {});
+  const overview = $derived(artist?.overview ?? null);
+  const popularReleases = $derived(overview?.popular_releases ?? []);
+  const relatedArtists = $derived(overview?.related_artists ?? []);
+  const topCities = $derived(overview?.top_cities ?? []);
+  const NUMBER_FORMAT = new Intl.NumberFormat();
+  const aboutStats = $derived.by(() => {
+    const facts = [];
+    if (overview?.monthly_listeners) {
+      facts.push({ value: NUMBER_FORMAT.format(overview.monthly_listeners), label: "Monthly listeners" });
+    }
+    if (overview?.followers) {
+      facts.push({ value: NUMBER_FORMAT.format(overview.followers), label: "Followers" });
+    }
+    if (overview?.world_rank) {
+      facts.push({ value: `#${NUMBER_FORMAT.format(overview.world_rank)}`, label: "Worldwide" });
+    }
+    if (overview?.popularity) {
+      facts.push({ value: `${overview.popularity}/100`, label: "Popularity" });
+    }
+    return facts;
+  });
+  let shelfExtras = $state({});
+
+  function mergeShelfReleases(primary, extras) {
+    const seen = new Set();
+    const merged = [];
+    for (const release of [...(primary ?? []), ...(extras ?? [])]) {
+      const id = release?.id;
+      if (id && seen.has(id)) continue;
+      if (id) seen.add(id);
+      merged.push(release);
+    }
+    return merged;
+  }
+
+  const groupLists = $derived.by(() => {
+    const base = artist?.releases ?? {};
+    const artistId = artist?.id ?? "";
+    return Object.fromEntries(
+      RELEASE_KEYS.map((key) => [
+        key,
+        mergeShelfReleases(base[key], shelfExtras[`${artistId}:${key}`]),
+      ]),
+    );
+  });
 
   const releaseTotal = $derived(RELEASE_KEYS.reduce((sum, k) => sum + (counts[k] ?? 0), 0));
   const hasReleases = $derived(releaseTotal > 0);
@@ -43,6 +87,10 @@
 
   let group = $state("all");
 
+  const requestedShelfWidths = new Set();
+  let shelfError = $state("");
+  let shelfErrorKey = $state("");
+
   /* The artist changed under us — a link from a track row, say. Start the new
      artist on "All" rather than on whatever segment the last one was left on,
      which may not even exist here. */
@@ -51,6 +99,10 @@
     if (artist?.id === seenArtist) return;
     seenArtist = artist?.id ?? null;
     group = "all";
+    shelfExtras = {};
+    requestedShelfWidths.clear();
+    shelfError = "";
+    shelfErrorKey = "";
   });
 
   /** The label for a release's own group, used as its subtext on the shelf. */
@@ -96,6 +148,61 @@
     return Math.max(2, Math.min(7, n));
   });
   const visibleShelf = $derived(shelf.slice(0, perRow));
+  const visiblePopularReleases = $derived(popularReleases.slice(0, perRow));
+  const visibleRelatedArtists = $derived(relatedArtists.slice(0, perRow));
+
+  /**
+   * A named shelf starts with lightweight AlbumRefs. If that group cannot fill
+   * this pane's one row, resolve just enough full catalogue entries to fill it.
+   * Requests are keyed by the required width so a resize can widen the shelf
+   * once without re-requesting the same artist/group/width.
+   */
+
+  $effect(() => {
+    const id = artist?.id;
+    if (!id || group === "all") return;
+
+    const selected = GROUPS.find((candidate) => candidate.id === group);
+    const needed = Math.min(perRow, counts[group] ?? 0);
+    const loaded = (groupLists[group] ?? []).length;
+    if (!selected || needed <= 0 || loaded >= needed) return;
+
+    const requestKey = `${id}:${group}:${needed}`;
+    if (requestedShelfWidths.has(requestKey)) return;
+    requestedShelfWidths.add(requestKey);
+
+    const viewKey = `${id}:${group}`;
+    shelfError = "";
+    shelfErrorKey = "";
+    loadCataloguePage(id, selected.types, 0, perRow)
+      .then((page) => {
+        if (artist?.id !== id || group !== selected.id) return;
+
+        const existing = shelfExtras[viewKey] ?? [];
+        const known = new Set(
+          [...(artist?.releases?.[selected.id] ?? []), ...existing]
+            .map((release) => release?.id)
+            .filter(Boolean),
+        );
+        const additions = [];
+        for (const release of page?.releases ?? []) {
+          if (!release?.id || known.has(release.id)) continue;
+          known.add(release.id);
+          additions.push(release);
+        }
+        if (additions.length) shelfExtras[viewKey] = [...existing, ...additions];
+      })
+      .catch((reason) => {
+        if (artist?.id !== id || group !== selected.id) return;
+        shelfErrorKey = viewKey;
+        shelfError = String(reason || "Could not load more of this catalogue.");
+      });
+  });
+
+  const currentShelfError = $derived.by(() => {
+    const key = `${artist?.id ?? ""}:${group}`;
+    return shelfErrorKey === key ? shelfError : "";
+  });
 
   /* Popular opens at five. Ten rows of a table before you reach the covers
      buries the thing the page is actually for. */
@@ -313,15 +420,84 @@
           </p>
         {/if}
         {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
+        {#if currentShelfError}<p class="inline-error" role="alert">{currentShelfError}</p>{/if}
       </section>
     {/if}
 
-    <!-- About. The engine returns no biography for an artist — there is no
-         such field anywhere between librespot's ARTIST_V4 and the frontend —
-         so rather than inventing prose, the slot holds the facts that ARE
-         real (the release totals, which are true totals and not page counts)
-         and says plainly that the text is missing. Wiring a biography later
-         is a matter of filling the empty column, not building the section. -->
+    {#if visiblePopularReleases.length}
+      <section class="section" aria-labelledby="popular-releases-title">
+        <div class="section-head">
+          <h2 class="section-title" id="popular-releases-title">Popular releases</h2>
+        </div>
+        <div class="shelf" style:--per-row={perRow}>
+          {#each visiblePopularReleases as release (release.id)}
+            {@const tone = coverTone(release.cover_url, release.id)}
+            <div class="card" style:--tone-glow={tone.glow}>
+              <div class="card-art">
+                <Cover src={release.cover_url} id={release.id} name={release.name} fill lg />
+                <button
+                  class="card-open"
+                  aria-label={`Open ${release.name}`}
+                  onclick={() => navigate("album", release.id)}
+                ></button>
+                <button
+                  class="card-play"
+                  aria-label={`Play ${release.name}`}
+                  title={`Play ${release.name}`}
+                  disabled={!!busy}
+                  onclick={() => playRelease(release.id)}
+                >
+                  <Icon name={busy === release.id ? "more" : "play"} size={15} />
+                </button>
+              </div>
+              <button class="card-copy" onclick={() => navigate("album", release.id)}>
+                <span class="card-name">{release.name}</span>
+                <span class="card-sub"
+                  >{[
+                    release.year || null,
+                    release.artist_names?.join(", ") || "Release",
+                  ].filter(Boolean).join(" · ")}</span
+                >
+              </button>
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
+    {#if visibleRelatedArtists.length}
+      <section class="section" aria-labelledby="related-title">
+        <div class="section-head">
+          <h2 class="section-title" id="related-title">Fans also like</h2>
+        </div>
+        <div class="shelf" style:--per-row={perRow}>
+          {#each visibleRelatedArtists as related (related.id)}
+            {@const tone = coverTone(related.cover_url, related.id)}
+            <button
+              class="card"
+              style:--tone-glow={tone.glow}
+              onclick={() => navigate("artist", related.id)}
+            >
+              <span class="card-art">
+                <Cover
+                  src={related.cover_url}
+                  id={related.id}
+                  name={related.name}
+                  fill
+                  circle
+                />
+              </span>
+              <span class="card-copy">
+                <span class="card-name">{related.name}</span>
+                <span class="card-sub">Artist</span>
+              </span>
+            </button>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
+
     <section class="section about" aria-labelledby="about-title">
       <h2 class="section-title" id="about-title">About {artist.name}</h2>
       <div class="about-body">
@@ -329,27 +505,51 @@
           <Cover src={artist.cover_url} id={artist.id} name={artist.name} size={148} lg raised />
         </div>
         <div class="about-copy">
-          {#if hasReleases}
+          {#if aboutStats.length || hasReleases}
             <dl class="about-stats">
+              {#each aboutStats as fact (fact.label)}
+                <div>
+                  <dt class="tnum">{fact.value}</dt>
+                  <dd class="caps">{fact.label}</dd>
+                </div>
+              {/each}
               {#each GROUPS.slice(1) as g (g.id)}
                 {#if (counts[g.id] ?? 0) > 0}
                   <div>
-                    <dt class="tnum">{counts[g.id]}</dt>
+                    <dt class="tnum">{NUMBER_FORMAT.format(counts[g.id])}</dt>
                     <dd class="caps">{g.label}</dd>
                   </div>
                 {/if}
               {/each}
             </dl>
           {/if}
-          <p class="about-empty">
-            No biography yet — the engine does not return one for an artist, so
-            there is nothing here to show.
-          </p>
+          {#if overview?.biography}
+            <p class="biography">{overview.biography}</p>
+          {/if}
+          {#if topCities.length}
+            <div class="top-cities">
+              <h3 class="caps">Top listening cities</h3>
+              <ol>
+                {#each topCities as city (`${city.city}:${city.region}:${city.country}`)}
+                  {@const place = [city.region, city.country].filter(Boolean).join(", ")}
+                  <li>
+                    <span>
+                      <strong>{city.city}</strong>
+                      {#if place}<small>{place}</small>{/if}
+                    </span>
+                    {#if city.listeners}
+                      <span class="city-listeners tnum">{NUMBER_FORMAT.format(city.listeners)}</span>
+                    {/if}
+                  </li>
+                {/each}
+              </ol>
+            </div>
+          {/if}
         </div>
       </div>
     </section>
 
-    {#if !top.length && !hasReleases}
+    {#if !top.length && !hasReleases && !popularReleases.length && !relatedArtists.length}
       <div class="empty">
         <p class="h">Nothing to show for this artist.</p>
         <p class="sub">The engine returned no popular songs or releases.</p>
@@ -401,12 +601,27 @@
     letter-spacing: -0.02em; line-height: 1; color: var(--fg);
   }
   .about-stats dd { margin: var(--s2) 0 0; }
-  .about-empty {
-    max-width: 58ch; padding-top: var(--s4); border-top: 1px solid var(--line);
-    color: var(--fg-2); font-size: var(--t-13); line-height: 1.5;
+  .biography {
+    max-width: 72ch; margin: 0; padding-top: var(--s4); border-top: 1px solid var(--line);
+    color: var(--fg-1); font-size: var(--t-13); line-height: 1.65; white-space: pre-line;
   }
+  .top-cities { max-width: 620px; margin-top: var(--s5); }
+  .top-cities h3 { margin: 0 0 var(--s2); color: var(--fg-2); }
+  .top-cities ol {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 var(--s6); margin: 0; padding: 0; list-style: none;
+  }
+  .top-cities li {
+    display: flex; align-items: baseline; justify-content: space-between; gap: var(--s3);
+    min-width: 0; padding: var(--s2) 0; border-bottom: 1px solid var(--line);
+    color: var(--fg-1); font-size: var(--t-12);
+  }
+  .top-cities strong { font-weight: var(--w-medium); }
+  .top-cities small { margin-left: var(--s2); color: var(--fg-3); font-size: var(--t-11); }
+  .city-listeners { flex: none; color: var(--fg-2); font-size: var(--t-11); }
 
   @media (max-width: 720px) {
     .about-body { grid-template-columns: minmax(0, 1fr); }
+    .top-cities ol { grid-template-columns: minmax(0, 1fr); }
   }
 </style>

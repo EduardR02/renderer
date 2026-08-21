@@ -59,13 +59,15 @@
   const title = $derived(
     route.name === "playlist"
       ? (detail.playlist?.name ?? "")
-      : route.name === "album"
-        ? (detail.album?.name ?? "")
-        : route.name === "artist"
-          ? (detail.artist?.name ?? "")
-          : route.name === "discography"
-            ? (detail.artist ? `${detail.artist.name} / Discography` : "")
-            : ""
+      : route.name === "radio"
+        ? (detail.radio?.seed?.name ? `${detail.radio.seed.name} Radio` : "")
+        : route.name === "album"
+          ? (detail.album?.name ?? "")
+          : route.name === "artist"
+            ? (detail.artist?.name ?? "")
+            : route.name === "discography"
+              ? (detail.artist ? `${detail.artist.name} / Discography` : "")
+              : ""
   );
 
   /**

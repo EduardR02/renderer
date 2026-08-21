@@ -8,6 +8,7 @@
     promotePlaylist,
     togglePlay,
     ui,
+    session,
     retryDetail,
   } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -22,6 +23,9 @@
   /* The cover gives way before the title does when the pane is narrow. */
   const artSize = $derived(detailArtSize(ui.paneWidth));
   const tracks = $derived(pl?.tracks ?? []);
+  const editable = $derived(
+    !!pl?.owner_id && !!session.username && pl.owner_id === session.username,
+  );
 
   const sortState = $state({ key: "order", direction: "asc" });
 
@@ -157,9 +161,17 @@
   let deleteOpen = $state(false);
   let deleting = $state(false);
   let deleteError = $state("");
+  let recommendations = $state([]);
+  const recommendationState = $state({
+    id: null,
+    requested: false,
+    loading: false,
+    hidden: false,
+  });
+  let recommendationFooter = $state(null);
 
   $effect(() => {
-    if (!renaming) return;
+    if (!renaming || !editable) return;
     queueMicrotask(() => {
       renameInput?.focus();
       renameInput?.select();
@@ -167,7 +179,7 @@
   });
 
   $effect(() => {
-    if (!menuOpen) return;
+    if (!menuOpen || !editable) return;
     queueMicrotask(() => menu?.querySelector('[role="menuitem"]')?.focus());
 
     function onPointerDown(event) {
@@ -177,27 +189,106 @@
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
   });
+
+  // Recommendation data is page-local by design. A different playlist id
+  // discards it immediately rather than turning this optional surface into a
+  // second application cache.
+  $effect(() => {
+    const id = pl?.id ?? null;
+    if (recommendationState.id === id) return;
+    recommendationState.id = id;
+    recommendationState.requested = false;
+    recommendationState.loading = false;
+    recommendationState.hidden = false;
+    recommendations = [];
+  });
+
+  $effect(() => {
+    const node = recommendationFooter;
+    const id = pl?.id;
+    if (!node || !id || recommendationState.hidden || recommendationState.requested) return;
+    const root = node.closest(".scroll");
+    if (!root) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) requestRecommendations(id);
+      },
+      { root, rootMargin: "0px 0px 480px 0px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  });
+
+  async function requestRecommendations(expectedId = pl?.id) {
+    if (
+      !expectedId ||
+      recommendationState.id !== expectedId ||
+      recommendationState.requested ||
+      recommendationState.loading
+    ) return;
+    recommendationState.requested = true;
+    recommendationState.loading = true;
+    try {
+      const payload = await api.browsePlaylistRecommendations(expectedId);
+      if (recommendationState.id !== expectedId || route.name !== "playlist" || route.id !== expectedId) return;
+      recommendations = payload?.tracks ?? [];
+      recommendationState.hidden = recommendations.length === 0;
+    } catch {
+      // Endpoint failure belongs only to this optional footer. The playlist
+      // itself remains fully usable and no global/page error is produced.
+      if (recommendationState.id === expectedId) recommendationState.hidden = true;
+    } finally {
+      if (recommendationState.id === expectedId) recommendationState.loading = false;
+    }
+  }
+
+  function playRecommendation(index) {
+    if (!recommendations[index]) return;
+    api.playQueue(recommendations, index).catch(() => {});
+  }
+
+  async function addRecommendation(track) {
+    const id = pl?.id;
+    if (!id || !editable || !track?.uri) return;
+    try {
+      await api.addPlaylistTracks(id, [track.uri]);
+      // A recommendation add is library activity, never playback.
+      promotePlaylist(id);
+      api.touchPlaylistActivity(id).catch(() => {});
+      if (recommendationState.id === id) {
+        recommendations = recommendations.filter((candidate) => candidate.uri !== track.uri);
+        recommendationState.hidden = recommendations.length === 0;
+      }
+    } catch {
+      // Keep the recommendation in place so a failed direct Add can be retried.
+    }
+  }
   /**
-   * Library ordering is most-recently-*played*, not most-recently-opened, and
-   * a track URI cannot say which playlist it was played from — the same track
-   * sits in many. This view is the only place that knows, so it reports it.
+   * A successful queue command is the playback event for this local history.
+   * The view knows the source playlist; the engine only receives track URIs and
+   * cannot infer which followed playlist they came from.
    */
   function markPlayed() {
     if (!pl) return;
-    // Reorder synchronously so the click is reflected before the persistence
-    // command returns. The backend remains the source of durable timestamps.
-    promotePlaylist(pl.id);
+    promotePlaylist(pl.id, { played: true });
     api.touchPlaylist(pl.id).catch(() => {});
+  }
+
+  function playQueue(queue, index) {
+    // Do not promote or persist a failed play. This keeps `last_played`
+    // exclusive to actual playback, rather than an attempted command.
+    return api.playQueue(queue, index).then(() => {
+      markPlayed();
+    });
   }
 
   function playFrom(i) {
     if (!pl) return;
     const queue = sortedTracks;
     if (!queue[i]) return;
-    markPlayed();
     // The displayed order is a local projection; enqueue that exact array so
     // a click after sorting still targets the row the user selected.
-    api.playQueue(queue, i).catch(() => {});
+    playQueue(queue, i).catch(() => {});
   }
 
   /**
@@ -231,16 +322,14 @@
     }
     const queue = sortedTracks;
     if (!queue.length) return;
-    markPlayed();
-    api.playQueue(queue, 0).catch(() => {});
+    playQueue(queue, 0).catch(() => {});
   }
 
   function shufflePlay() {
     const queue = sortedTracks;
     if (!queue.length) return;
-    markPlayed();
     api.setShuffle(true).catch(() => {});
-    api.playQueue(queue, 0).catch(() => {});
+    playQueue(queue, 0).catch(() => {});
   }
 
   function closeMenu(returnFocus = false) {
@@ -249,6 +338,7 @@
   }
 
   function toggleMenu() {
+    if (!editable) return;
     if (menuOpen) closeMenu(true);
     else menuOpen = true;
   }
@@ -279,6 +369,7 @@
   }
 
   function startRename() {
+    if (!editable) return;
     closeMenu();
     nameDraft = pl?.name ?? "";
     renameError = "";
@@ -294,7 +385,7 @@
 
   async function commitRename() {
     const n = nameDraft.trim();
-    if (!pl || renameSaving) return;
+    if (!pl || !editable || renameSaving) return;
     if (!n) {
       renameError = "Playlist name cannot be empty.";
       return;
@@ -316,13 +407,14 @@
   }
 
   function requestDelete() {
+    if (!editable) return;
     closeMenu();
     deleteError = "";
     deleteOpen = true;
   }
 
   async function deletePlaylist() {
-    if (!pl || deleting) return;
+    if (!pl || !editable || deleting) return;
     deleting = true;
     deleteError = "";
     try {
@@ -406,7 +498,7 @@
       />
       <div>
         <span class="tag">Playlist</span>
-        {#if renaming}
+        {#if renaming && editable}
           <form
             class="rename-form"
             aria-label="Rename playlist"
@@ -461,6 +553,7 @@
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
             <Icon name="shuffle" size={14} />Shuffle
           </button>
+          {#if editable}
           <div class="playlist-menu-wrap">
             <button
               class="btn-icon"
@@ -489,6 +582,7 @@
               </div>
             {/if}
           </div>
+          {/if}
         </div>
       </div>
     </header>
@@ -498,7 +592,7 @@
         <TrackList
           tracks={sortedTracks}
           {playFrom}
-          playlistId={pl.id}
+          playlistId={editable ? pl.id : null}
           showArtist
           showAdded
           sortKey={sortState.key}
@@ -512,9 +606,48 @@
         <p class="sub">Find something in Search and add it to this playlist.</p>
       </div>
     {/if}
+
+    <div bind:this={recommendationFooter} aria-hidden={recommendationState.hidden ? "true" : undefined}>
+      {#if !recommendationState.hidden}
+        <section class="section" aria-labelledby="playlist-recommendations-title">
+          <div class="section-head">
+            <h2 class="section-title" id="playlist-recommendations-title">Recommended</h2>
+            {#if !recommendationState.requested}
+              <button class="link-more" onclick={() => requestRecommendations(pl.id)}>Load recommendations</button>
+            {/if}
+          </div>
+          {#if recommendationState.loading}
+            <div class="tl" style="--cols:28px 36px minmax(0,1fr) 52px" aria-label="Loading recommendations">
+              {#each Array.from({ length: 4 }) as _, i (i)}
+                <div class="sk-row">
+                  <span class="sk" style="width:12px"></span>
+                  <span class="sk art"></span>
+                  <span class="sk-stack">
+                    <span class="sk a" style="width:{64 - ((i * 7) % 24)}%"></span>
+                    <span class="sk b" style="width:{32 - ((i * 5) % 11)}%"></span>
+                  </span>
+                  <span class="sk" style="width:28px;justify-self:end"></span>
+                </div>
+              {/each}
+            </div>
+          {:else if recommendations.length}
+            <TrackList
+              tracks={recommendations}
+              playFrom={playRecommendation}
+              showArtist
+              showHead={false}
+              allowAddToPlaylist={false}
+              disableWindowing
+              rowActionLabel={editable ? "Add" : null}
+              onRowAction={editable ? addRecommendation : null}
+            />
+          {/if}
+        </section>
+      {/if}
+    </div>
   {/if}
 </section>
-{#if deleteOpen}
+{#if deleteOpen && editable}
   <ConfirmDialog
     open
     title="Delete playlist?"

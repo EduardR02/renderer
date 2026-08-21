@@ -7,6 +7,7 @@
     toggleLiked,
     isTrackLiked,
     library,
+    promotePlaylist,
     openCredits,
     ui,
   } from "../lib/state.svelte.js";
@@ -31,11 +32,16 @@
     showPlays = false,
     /** Read-only collections can suppress the local-only heart affordance. */
     showLike = true,
+    /** Recommendation rows may forbid adding when the source playlist is read-only. */
+    allowAddToPlaylist = true,
     /** Render every row and install no shared-pane windowing machinery. */
     disableWindowing = false,
     sortKey = null,
     sortDirection = "asc",
     onSort = null,
+    /** Optional always-visible trailing action used by compact recommendation lists. */
+    rowActionLabel = null,
+    onRowAction = null,
   } = $props();
 
   /* =====================================================================
@@ -110,7 +116,7 @@
        share it can be squeezed out of. */
     if (colAdded) list.push("minmax(84px, 0.8fr)");
     if (colPlays) list.push(COL.plays);
-    list.push(COL.like, COL.time, COL.more);
+    list.push(COL.like, COL.time, rowActionLabel ? "56px" : COL.more);
     return list.join(" ");
   });
 
@@ -167,11 +173,13 @@
   });
 
   function onRowDblClick(i) {
+    if (tracks[i]?.unavailable) return;
     if (i === currentRow && playback.playing) togglePlay();
     else playFrom(i);
   }
 
   function onPlayIconClick(i) {
+    if (tracks[i]?.unavailable) return;
     if (i === currentRow) togglePlay();
     else playFrom(i);
   }
@@ -212,11 +220,22 @@
     picker.y = Math.min(menu.y, Math.max(8, window.innerHeight - MENU_MAX_H - 8));
   }
 
-  function addToPlaylist(playlist) {
+  async function addToPlaylist(playlist) {
     if (!picker.track) return;
-    api.addPlaylistTracks(playlist.id, [picker.track.uri]).catch(() => {});
+    const uri = picker.track.uri;
+    /* Close both menus before waiting on IPC so the picker never holds the
+       pointer hostage while the add is in flight. */
     picker.open = false;
     menu.open = false;
+    try {
+      await api.addPlaylistTracks(playlist.id, [uri]);
+      // An add is library activity, not playback. Failed adds never reach
+      // either promotion or the activity command.
+      promotePlaylist(playlist.id);
+      api.touchPlaylistActivity(playlist.id).catch(() => {});
+    } catch {
+      // A failed add must update neither timestamp.
+    }
   }
 
   /* ---------------- Windowed rendering ----------------
@@ -389,14 +408,22 @@
     <div
       class="tl-row"
       class:current={i === currentRow}
+      class:unavailable={track.unavailable}
       role="button"
+      aria-disabled={track.unavailable ? "true" : undefined}
+      title={track.unavailable ? (track.unavailable_reason || "Unavailable") : undefined}
       tabindex="-1"
       ondblclick={() => onRowDblClick(i)}
     >
       <span class="c-idx">
         <span class="n">{i + 1}</span>
         <span class="eq"><i></i><i></i><i></i><i></i></span>
-        <button class="go" title="Play" onclick={() => onPlayIconClick(i)}>
+        <button
+          class="go"
+          title={track.unavailable ? (track.unavailable_reason || "Unavailable") : "Play"}
+          disabled={track.unavailable}
+          onclick={() => onPlayIconClick(i)}
+        >
           <Icon name={i === currentRow && playback.playing ? "pause" : "play"} size={12} />
         </button>
       </span>
@@ -470,9 +497,17 @@
       <span class="c-time">{formatTime(track.duration_ms)}</span>
 
       <span class="c-more">
-        <button title="More options" onclick={(e) => openRowMenu(e, track, i)}>
-          <Icon name="more" size={15} />
-        </button>
+        {#if rowActionLabel && onRowAction}
+          <button
+            style="width:56px;opacity:1"
+            title={rowActionLabel}
+            onclick={() => onRowAction(track, i)}
+          >{rowActionLabel}</button>
+        {:else}
+          <button title="More options" onclick={(e) => openRowMenu(e, track, i)}>
+            <Icon name="more" size={15} />
+          </button>
+        {/if}
       </span>
     </div>
   {/each}
@@ -568,10 +603,17 @@
     <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track).catch(() => {}); }}>
       Add to queue
     </button>
-    <button class="menu-item" onclick={openPicker}>Add to playlist…</button>
+    {#if allowAddToPlaylist}
+      <button class="menu-item" onclick={openPicker}>Add to playlist…</button>
+    {/if}
     {#if menu.track?.id}
       <button class="menu-item" onclick={() => { menu.open = false; openCredits(menu.track); }}>
         View credits
+      </button>
+    {/if}
+    {#if menu.track?.id}
+      <button class="menu-item" onclick={() => { menu.open = false; navigate("radio", menu.track.id); }}>
+        Go to song radio
       </button>
     {/if}
     {#if menu.track?.album_id}

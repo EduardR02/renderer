@@ -17,7 +17,8 @@ use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use spotify_playback_engine::protocol::{
     AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistReleasePage, Command, LikedSongsPage,
-    PlaylistBrowse, PlaylistRef, Response, SearchBrowse, TrackCredits,
+    PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, Response, SearchBrowse,
+    TrackCredits,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -36,6 +37,14 @@ enum BrowseOutcome {
     Playlist {
         request_id: String,
         result: Result<PlaylistBrowse, String>,
+    },
+    Radio {
+        request_id: String,
+        result: Result<RadioBrowse, String>,
+    },
+    PlaylistRecommendations {
+        request_id: String,
+        result: Result<PlaylistRecommendations, String>,
     },
     Album {
         request_id: String,
@@ -250,6 +259,37 @@ async fn run(
                                     }
                                     Err(error) => {
                                         let _ = browse_sender.send(BrowseOutcome::Playlist { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
+                            Command::BrowseRadio { id } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::radio_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::Radio { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Radio { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
+                            Command::BrowsePlaylistRecommendations { id } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::playlist_recommendations_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::PlaylistRecommendations { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::PlaylistRecommendations {
+                                            request_id,
+                                            result: Err(error),
+                                        });
                                     }
                                 }
                             }
@@ -504,6 +544,16 @@ async fn run(
                         }
                         BrowseOutcome::Playlist { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_playlist", &result)?;
+                        }
+                        BrowseOutcome::Radio { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_radio", &result)?;
+                        }
+                        BrowseOutcome::PlaylistRecommendations { request_id, result } => {
+                            engine.send_browse_response(
+                                &request_id,
+                                "browse_playlist_recommendations",
+                                &result,
+                            )?;
                         }
                         BrowseOutcome::Album { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_album", &result)?;
