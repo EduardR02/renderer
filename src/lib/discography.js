@@ -14,15 +14,15 @@
  * everything looking for them.
  */
 export const GROUPS = [
-  { id: "all", label: "All", types: ["albums", "singles", "compilations", "appears_on"] },
+  { id: "all", label: "All", types: ["albums", "singles", "compilations"] },
   { id: "albums", label: "Albums", types: ["albums"] },
   { id: "singles", label: "Singles & EPs", types: ["singles"] },
   { id: "compilations", label: "Compilations", types: ["compilations"] },
-  { id: "appears_on", label: "Appears on", types: ["appears_on"] },
 ];
 
-/** The four keys `release_counts` carries, in the order they are offered. */
-export const RELEASE_KEYS = ["albums", "singles", "compilations", "appears_on"];
+/** The three main-catalogue keys `release_counts` carries. Appears-on is
+ * intentionally a separate artist surface, not a discography filter. */
+export const RELEASE_KEYS = ["albums", "singles", "compilations"];
 
 /**
  * The payload does not label a release, so the track count does — Spotify's

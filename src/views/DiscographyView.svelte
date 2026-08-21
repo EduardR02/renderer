@@ -35,7 +35,7 @@
   const counts = $derived(artist?.release_counts ?? {});
 
   const releaseTotal = $derived(
-    ["albums", "singles", "compilations", "appears_on"].reduce((sum, k) => sum + (counts[k] ?? 0), 0),
+    GROUPS[0].types.reduce((sum, type) => sum + (counts[type] ?? 0), 0),
   );
 
   /** Empty groups are not offered: a dead tab is a worse answer than no tab. */
@@ -106,27 +106,38 @@
   }
 
   /**
-   * The display order. Every entry keeps the index it has in `releases`,
-   * because that array is the playback context: the flat track index the queue
-   * is built from is a walk of the LOADED order, and re-sorting it for reading
-   * must not silently re-sort what "play from here" means.
+   * Display order is distinct from the playback context. The backend samples
+   * the three main groups in bounded pages; the default All reader then
+   * intersperses whatever has arrived by release year, keeping the server
+   * order for ties. Single-type pages retain their catalogue order.
    */
   const ordered = $derived.by(() => {
     const items = releases.map((release, index) => ({ release, index }));
+    if (sort === "catalogue" && group === "all") {
+      return items.sort((a, b) => {
+        const aYear = a.release.year;
+        const bYear = b.release.year;
+        if (aYear == null && bYear == null) return a.index - b.index;
+        if (aYear == null) return 1;
+        if (bYear == null) return -1;
+        return bYear - aYear || a.index - b.index;
+      });
+    }
     if (sort === "catalogue") return items;
     if (sort === "az") {
       return items.sort((a, b) =>
-        a.release.name.localeCompare(b.release.name, undefined, { sensitivity: "base" }),
+        a.release.name.localeCompare(b.release.name, undefined, { sensitivity: "base" }) ||
+        a.index - b.index,
       );
     }
     // Releases with no year sink to the bottom of either direction rather than
     // pretending to be from year zero.
     const dir = sort === "oldest" ? 1 : -1;
     return items.sort((a, b) => {
-      if (!a.release.year && !b.release.year) return 0;
-      if (!a.release.year) return 1;
-      if (!b.release.year) return -1;
-      return (a.release.year - b.release.year) * dir;
+      if (a.release.year == null && b.release.year == null) return a.index - b.index;
+      if (a.release.year == null) return 1;
+      if (b.release.year == null) return -1;
+      return (a.release.year - b.release.year) * dir || a.index - b.index;
     });
   });
 

@@ -30,6 +30,57 @@
   );
 
   const sortState = $state({ key: "order", direction: "asc" });
+  const SORT_STORAGE_PREFIX = "playlist-sort:";
+  const SORT_KEYS = new Set(["order", "title", "artist", "album", "added", "duration"]);
+  const SORT_DIRECTIONS = new Set(["asc", "desc"]);
+
+  function defaultSort() {
+    return { key: "order", direction: "asc" };
+  }
+
+  function readSort(id) {
+    const fallback = defaultSort();
+    if (!id) return fallback;
+    try {
+      const saved = JSON.parse(localStorage.getItem(`${SORT_STORAGE_PREFIX}${id}`) ?? "null");
+      if (
+        !saved ||
+        typeof saved !== "object" ||
+        (saved.key !== null && !SORT_KEYS.has(saved.key)) ||
+        !SORT_DIRECTIONS.has(saved.direction)
+      ) {
+        return fallback;
+      }
+      return { key: saved.key, direction: saved.direction };
+    } catch {
+      return fallback;
+    }
+  }
+
+  function writeSort(id, key, direction) {
+    if (
+      !id ||
+      (key !== null && !SORT_KEYS.has(key)) ||
+      !SORT_DIRECTIONS.has(direction)
+    ) {
+      return;
+    }
+    try {
+      localStorage.setItem(
+        `${SORT_STORAGE_PREFIX}${id}`,
+        JSON.stringify({ key, direction }),
+      );
+    } catch {
+      /* private mode / storage disabled: sorting remains session-local */
+    }
+  }
+
+  $effect(() => {
+    if (route.name !== "playlist" || !route.id) return;
+    const saved = readSort(route.id);
+    sortState.key = saved.key;
+    sortState.direction = saved.direction;
+  });
 
   function textSortValue(track, key) {
     if (key === "artist") {
@@ -113,6 +164,7 @@
    * require leaving the page.
    */
   function toggleSort(key) {
+    if (!SORT_KEYS.has(key)) return;
     if (sortState.key !== key) {
       sortState.key = key;
       sortState.direction = "asc";
@@ -122,6 +174,7 @@
       sortState.key = null;
       sortState.direction = "asc";
     }
+    writeSort(route.id, sortState.key, sortState.direction);
   }
 
   /* Fallback for a playlist the backend has not swept yet: derive the mosaic

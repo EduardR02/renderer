@@ -58,21 +58,27 @@
 
   /** Title shown in the bar once the detail header has scrolled away. */
   const title = $derived(
-    route.name === "playlist"
-      ? (detail.playlist?.name ?? "")
-      : route.name === "radio"
-        ? (detail.radio?.seed_kind === "artist"
-          ? `${detail.radio.seed_artist?.name ?? "Artist"} Radio`
-          : detail.radio?.seed?.name
-            ? `${detail.radio.seed.name} Radio`
-            : "")
-        : route.name === "album"
-          ? (detail.album?.name ?? "")
-          : route.name === "artist"
-            ? (detail.artist?.name ?? "")
-            : route.name === "discography"
-              ? (detail.artist ? `${detail.artist.name} / Discography` : "")
-              : ""
+    route.name === "made-for-you"
+      ? "Made for you"
+      : route.name === "playlist"
+        ? (detail.playlist?.name ?? "")
+        : route.name === "radio"
+          ? (detail.radio?.seed_kind === "artist"
+            ? `${detail.radio.seed_artist?.name ?? "Artist"} Radio`
+            : detail.radio?.seed?.name
+              ? `${detail.radio.seed.name} Radio`
+              : "")
+          : route.name === "album"
+            ? (detail.album?.name ?? "")
+            : route.name === "artist"
+              ? (detail.artist?.name ?? "")
+              : route.name === "discography"
+                ? (detail.artist ? `${detail.artist.name} / Discography` : "")
+                : route.name === "fans-also-like"
+                  ? (detail.artist ? `${detail.artist.name} / Fans also like` : "")
+                  : route.name === "appears-on"
+                    ? (detail.artist ? `${detail.artist.name} / Appears On` : "")
+                    : ""
   );
 
   /**

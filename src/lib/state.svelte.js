@@ -26,8 +26,8 @@ export function canGoForward() {
   return history.cursor < history.entries.length - 1;
 }
 
-/** The two routes that read one and the same `detail.artist` payload. */
-const ARTIST_ROUTES = new Set(["artist", "discography"]);
+/** The artist routes that read one and the same `detail.artist` payload. */
+const ARTIST_ROUTES = new Set(["artist", "discography", "fans-also-like", "appears-on"]);
 
 /**
  * Clears stale detail so the target view shows its loading state.
@@ -344,9 +344,9 @@ let browseSeq = 0;
  */
 export function loadDetail(name = route.name, id = route.id) {
   if (!id) return;
-  // The artist page and its discography share one payload; arriving at either
-  // with it already loaded is the common case and must not refetch.
-  if ((name === "artist" || name === "discography") && detail.artist?.id === id) return;
+  // The artist page and its auxiliary/discography views share one payload;
+  // arriving at any of them with it already loaded must not refetch.
+  if (ARTIST_ROUTES.has(name) && detail.artist?.id === id) return;
   const seq = ++browseSeq;
   detail.error = "";
   const settle = (key) => (payload) => {
@@ -358,7 +358,7 @@ export function loadDetail(name = route.name, id = route.id) {
   if (name === "playlist") api.browsePlaylist(id).then(settle("playlist")).catch(fail);
   else if (name === "radio") api.browseRadio(id).then(settle("radio")).catch(fail);
   else if (name === "album") api.browseAlbum(id).then(settle("album")).catch(fail);
-  else if (name === "artist" || name === "discography") {
+  else if (ARTIST_ROUTES.has(name)) {
     api.browseArtist(id).then(settle("artist")).catch(fail);
   }
 }
@@ -516,6 +516,7 @@ function observeSearchSession(payload) {
     if (actualLogout || accountTransition) {
       searchSessionEpoch += 1;
       resetSearchForSession();
+      resetPersonalizedDiscoveryForSession();
       clearPlaylistRecommendationsCache();
     }
   }
@@ -842,6 +843,239 @@ export function isDjPlaylist(playlist) {
   const raw = typeof playlist === "string" ? playlist : playlist?.name;
   const name = String(raw ?? "").trim().replace(/\s+/g, " ").toLowerCase();
   return /^dj(?:\b|$)/.test(name);
+}
+
+/* ------------------------------------------------------------------ */
+/* Personalized discovery                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Home's recommendation band is deliberately assembled from the same bounded
+ * search surface users can invoke themselves. The cache belongs to the
+ * authenticated session, not to a component instance: leaving and returning
+ * to Home must never fan out another set of searches.
+ */
+const PERSONALIZED_DISCOVERY_BACKOFF_MS = 5_000;
+const PERSONALIZED_DISCOVERY_QUERIES = Object.freeze(["Daily Mix", "Release Radar"]);
+const PERSONALIZED_SEARCH_LIMIT = 20;
+const PERSONALIZED_FAILURE_MESSAGE = "Personalized playlists could not load.";
+
+export const personalizedDiscovery = $state({
+  playlists: [],
+  status: "idle",
+  error: "",
+  retryAfter: 0,
+  sessionEpoch: searchSessionEpoch,
+});
+
+let personalizedDiscoveryPromise = null;
+
+function resetPersonalizedDiscoveryForSession() {
+  personalizedDiscoveryPromise = null;
+  personalizedDiscovery.playlists = [];
+  personalizedDiscovery.status = "idle";
+  personalizedDiscovery.error = "";
+  personalizedDiscovery.retryAfter = 0;
+  personalizedDiscovery.sessionEpoch = searchSessionEpoch;
+}
+
+function normalizedPlaylistName(value) {
+  return String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function personalizedSearchName(name) {
+  return /^daily mix [1-6]$/.test(name) ||
+    name === "release radar" ||
+    name === "discover weekly";
+}
+
+function playlistId(value) {
+  const direct = String(value?.id ?? "").trim();
+  if (direct) return direct;
+  const uri = String(value?.uri ?? "").trim();
+  return uri.match(/^spotify:playlist:([^:]+)$/)?.[1] ?? "";
+}
+
+function ownerValue(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function isSpotifyOwner(playlist) {
+  const identities = [
+    ["id", ownerValue(playlist?.owner_id)],
+    ["name", ownerValue(playlist?.owner_name)],
+    ["uri", ownerValue(playlist?.owner_uri)],
+    ["display", ownerValue(playlist?.owner)],
+  ].filter(([, value]) => value);
+  for (const [kind, raw] of identities) {
+    const value = raw.toLowerCase().replace(/\s+/g, " ").trim();
+    if (kind === "uri") {
+      if (!/(?:^|:)spotify$/.test(value)) return false;
+    } else if (!/^spotify(?:$|[\s_-])/.test(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function normalizeSearchPlaylist(value) {
+  if (!value || typeof value !== "object") return null;
+  const id = playlistId(value);
+  const name = String(value.name ?? "").trim().replace(/\s+/g, " ");
+  if (!id || !name || !personalizedSearchName(normalizedPlaylistName(name))) return null;
+  if (!isSpotifyOwner(value)) return null;
+  const ownerId = ownerValue(value.owner_id);
+  const ownerName = ownerValue(value.owner_name);
+  const owner = ownerValue(value.owner) || ownerName || ownerId;
+  const coverUrl = ownerValue(value.cover_url);
+  const coverUrls = Array.isArray(value.cover_urls)
+    ? value.cover_urls.filter((url) => typeof url === "string" && url.trim())
+    : [];
+  const count = Number(value.tracks_total ?? value.track_count);
+  return {
+    ...value,
+    id,
+    uri: ownerValue(value.uri) || `spotify:playlist:${id}`,
+    name,
+    owner,
+    owner_id: ownerId,
+    cover_url: coverUrl,
+    cover_urls: coverUrls,
+    tracks_total: Number.isFinite(count) && count > 0 ? Math.round(count) : 0,
+    last_played: value.last_played ?? null,
+    last_activity: value.last_activity ?? null,
+  };
+}
+
+function extractPersonalizedSearchPlaylists(result) {
+  const values = Array.isArray(result?.playlists) ? result.playlists : [];
+  return values.map(normalizeSearchPlaylist).filter(Boolean);
+}
+
+function dedupePlaylists(playlists) {
+  const seen = new Set();
+  const result = [];
+  for (const playlist of playlists) {
+    if (!playlist?.id || seen.has(playlist.id)) continue;
+    seen.add(playlist.id);
+    result.push(playlist);
+  }
+  return result;
+}
+
+function mergePlaylistMetadata(primary, supplement) {
+  return {
+    ...supplement,
+    ...primary,
+    uri: primary.uri || supplement.uri,
+    owner: primary.owner || supplement.owner,
+    owner_id: primary.owner_id || supplement.owner_id,
+    cover_url: primary.cover_url || supplement.cover_url,
+    cover_urls: primary.cover_urls?.length ? primary.cover_urls : supplement.cover_urls ?? [],
+    tracks_total: Number(primary.tracks_total) > 0
+      ? primary.tracks_total
+      : supplement.tracks_total ?? 0,
+  };
+}
+
+/**
+ * Merges the authenticated rootlist with the session's search answer. Rootlist
+ * metadata wins when it exists (it carries local activity), while search
+ * artwork/owner/count fields fill the gaps in a rootlist reference.
+ */
+export function mergePersonalizedPlaylists(rootlist = library) {
+  const byId = new Map();
+  for (const playlist of rootlist ?? []) {
+    if (
+      !playlist?.id ||
+      isDjPlaylist(playlist) ||
+      !isMadeForYouPlaylist(playlist)
+    ) {
+      continue;
+    }
+    byId.set(playlist.id, playlist);
+  }
+  for (const playlist of personalizedDiscovery.playlists) {
+    if (!playlist?.id || isDjPlaylist(playlist)) continue;
+    const existing = byId.get(playlist.id);
+    byId.set(
+      playlist.id,
+      existing ? mergePlaylistMetadata(existing, playlist) : playlist,
+    );
+  }
+  return [...byId.values()].sort((left, right) => {
+    const leftRank = personalizedPlaylistRank(left) ?? Number.MAX_SAFE_INTEGER;
+    const rightRank = personalizedPlaylistRank(right) ?? Number.MAX_SAFE_INTEGER;
+    if (leftRank !== rightRank) return leftRank - rightRank;
+    return String(left.name ?? "").localeCompare(String(right.name ?? ""));
+  });
+}
+
+/**
+ * Starts the one Home discovery pass for the current account. Calls made
+ * while this pass is running receive the same promise; a successful answer is
+ * retained until the auth epoch changes. A failed pass keeps the rootlist
+ * visible and can only be retried by a later Home visit after the backoff.
+ */
+export function ensurePersonalizedDiscovery(rootlist = library) {
+  if (!isSearchReady()) return Promise.resolve(personalizedDiscovery.playlists);
+  if (personalizedDiscovery.sessionEpoch !== searchSessionEpoch) {
+    resetPersonalizedDiscoveryForSession();
+  }
+  if (personalizedDiscoveryPromise) return personalizedDiscoveryPromise;
+  if (personalizedDiscovery.status === "ready") {
+    return Promise.resolve(personalizedDiscovery.playlists);
+  }
+  if (
+    personalizedDiscovery.status === "error" &&
+    Date.now() < personalizedDiscovery.retryAfter
+  ) {
+    return Promise.resolve(personalizedDiscovery.playlists);
+  }
+
+  const epoch = searchSessionEpoch;
+  const root = Array.isArray(rootlist) ? rootlist : [];
+  const hasDiscoverWeekly = root.some(
+    (playlist) => normalizedPlaylistName(playlist?.name) === "discover weekly",
+  );
+  const queries = hasDiscoverWeekly
+    ? PERSONALIZED_DISCOVERY_QUERIES
+    : [...PERSONALIZED_DISCOVERY_QUERIES, "Discover Weekly"];
+  personalizedDiscovery.sessionEpoch = epoch;
+  personalizedDiscovery.status = "loading";
+  personalizedDiscovery.error = "";
+  personalizedDiscovery.retryAfter = 0;
+
+  const pass = Promise.allSettled(
+    queries.map((query) =>
+      Promise.resolve().then(() => api.search(query, PERSONALIZED_SEARCH_LIMIT)),
+    ),
+  ).then((settled) => {
+    if (epoch !== searchSessionEpoch) return personalizedDiscovery.playlists;
+    const found = [];
+    let failures = 0;
+    for (const result of settled) {
+      if (result.status === "fulfilled") found.push(...extractPersonalizedSearchPlaylists(result.value));
+      else failures += 1;
+    }
+    if (found.length) {
+      personalizedDiscovery.playlists = dedupePlaylists(found);
+    }
+    if (failures) {
+      personalizedDiscovery.status = "error";
+      personalizedDiscovery.error = PERSONALIZED_FAILURE_MESSAGE;
+      personalizedDiscovery.retryAfter = Date.now() + PERSONALIZED_DISCOVERY_BACKOFF_MS;
+    } else {
+      personalizedDiscovery.status = "ready";
+      personalizedDiscovery.error = "";
+      personalizedDiscovery.retryAfter = 0;
+    }
+    return personalizedDiscovery.playlists;
+  }).finally(() => {
+    if (personalizedDiscoveryPromise === pass) personalizedDiscoveryPromise = null;
+  });
+  personalizedDiscoveryPromise = pass;
+  return pass;
 }
 
 function activityNow() {

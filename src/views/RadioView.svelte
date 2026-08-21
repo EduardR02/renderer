@@ -41,13 +41,14 @@
   const fallbackCover = $derived(
     artistRadio ? seedArtist?.cover_url || seed?.cover_url || "" : seed?.cover_url || "",
   );
+  const officialCover = $derived(!artistRadio ? radio?.cover_url || "" : "");
   const coverId = $derived(
     artistRadio ? seedArtist?.id || seed?.id || "" : seed?.album_id || seed?.id || "",
   );
   const coverName = $derived(
     artistRadio ? seedArtist?.name || seed?.name || "" : seed?.album_name || seed?.name || "",
   );
-  const tone = $derived(coverTone(fallbackCover, coverId || "radio"));
+  const tone = $derived(coverTone(officialCover || fallbackCover, coverId || "radio"));
   const artSize = $derived(detailArtSize(ui.paneWidth));
 
   const playingThis = $derived.by(() => {
@@ -168,7 +169,7 @@
   {:else}
     <header class="detail-head">
       <Cover
-        src={radioArtSources.length >= 4 ? "" : fallbackCover}
+        src={officialCover || (radioArtSources.length >= 4 ? "" : fallbackCover)}
         srcs={radioArtSources}
         id={coverId}
         name={coverName}

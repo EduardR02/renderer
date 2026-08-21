@@ -1,11 +1,14 @@
 <script>
+  import { untrack } from "svelte";
   import {
     library,
     libraryState,
+    route,
+    playback,
     navigate,
     ui,
-    personalizedPlaylistRank,
-    isDjPlaylist,
+    ensurePersonalizedDiscovery,
+    mergePersonalizedPlaylists,
   } from "../lib/state.svelte.js";
   import { playPlaylistById, playLikedSongs } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
@@ -53,47 +56,35 @@
 
   const recentShelf = $derived(recentlyPlayed.slice(0, cardsPerRow));
   const recentIds = $derived(new Set(recentShelf.map((playlist) => playlist.id)));
-  /*
-   * There is no confirmed current Home/space persisted query yet. Keep this
-   * fallback entirely rootlist-backed: the classifier only sees playlists
-   * answered by the authenticated library browse, then the stable rank puts
-   * the canonical shelves first without inventing any missing mixes.
-   */
-  const madeForYouCandidates = $derived.by(() => {
-    const ranked = [];
-    const seen = new Set();
-    for (const playlist of uniqueLibrary) {
-      if (
-        !playlist?.id ||
-        seen.has(playlist.id) ||
-        recentIds.has(playlist.id) ||
-        isDjPlaylist(playlist)
-      ) {
-        continue;
-      }
-      const rank = personalizedPlaylistRank(playlist);
-      if (rank === null) continue;
-      seen.add(playlist.id);
-      ranked.push({ playlist, rank });
-    }
-    ranked.sort((left, right) => left.rank - right.rank);
-    return ranked.map(({ playlist }) => playlist);
+
+  /* Search discovery is lazy and session-cached. Waiting for the library
+     answer means the conditional Discover Weekly query never races an empty
+     rootlist snapshot. */
+  $effect(() => {
+    const home = route.name === "library";
+    const ready = playback.ready === true && playback.auth_state === "ready";
+    const answered = libraryState.loaded;
+    if (!home || !ready || !answered) return;
+    untrack(() => ensurePersonalizedDiscovery(library));
   });
-  let madeForYouExpanded = $state(false);
+
+  const madeForYouCandidates = $derived.by(() =>
+    mergePersonalizedPlaylists(uniqueLibrary).filter(
+      (playlist) => !recentIds.has(playlist.id),
+    ),
+  );
   const madeForYouInitialCount = $derived(cardsPerRow * 2);
   const madeForYou = $derived(
-    madeForYouExpanded
-      ? madeForYouCandidates
-      : madeForYouCandidates.slice(0, madeForYouInitialCount),
+    madeForYouCandidates.slice(0, madeForYouInitialCount),
   );
-  const canExpandMadeForYou = $derived(
+  const canSeeAllMadeForYou = $derived(
     madeForYouCandidates.length > madeForYouInitialCount,
   );
   const shownIds = $derived(
     new Set([
       ...recentShelf,
-      // Keep the collapsed shelf's hidden cards out of Your library too:
-      // Show all should reveal them in one canonical place, not duplicate them.
+      // Keep personalized cards out of Your library: See all reveals them in
+      // one canonical place rather than duplicating them below.
       ...madeForYouCandidates,
     ].map((playlist) => playlist.id)),
   );
@@ -224,20 +215,17 @@
     <div class="section home-shelf-section">
       <div class="section-head">
         <h2 class="section-title">Made for you</h2>
-        {#if canExpandMadeForYou}
+        {#if canSeeAllMadeForYou}
           <button
-            class="btn-ghost"
+            class="link-more"
             type="button"
-            aria-controls="made-for-you-grid"
-            aria-expanded={madeForYouExpanded}
-            onclick={() => (madeForYouExpanded = !madeForYouExpanded)}
+            onclick={() => navigate("made-for-you")}
           >
-            {madeForYouExpanded ? "Show less" : "Show all"}
+            See all
           </button>
         {/if}
       </div>
       <div
-        id="made-for-you-grid"
         class="grid home-shelf"
         style={`--shelf-columns:${cardsPerRow}`}
       >
@@ -295,8 +283,8 @@
 <style>
   /*
    * Shelves reuse the exact card object and cover interactions from `.grid`.
-   * The column count follows the pane width, so Made for you starts at two
-   * responsive rows and can reveal the rest without changing card geometry.
+   * The column count follows the pane width, so Made for you always stays
+   * within two responsive rows; See all owns the unbounded view.
    */
   .grid.home-shelf {
     grid-template-columns: repeat(var(--shelf-columns), minmax(0, 1fr));

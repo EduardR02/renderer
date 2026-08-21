@@ -1478,7 +1478,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .p-art { width: 48px; height: 48px; --tile: 48px; flex: none; }
 .p-art-btn { width: 48px; height: 48px; flex: none; border-radius: var(--r1); line-height: 0; }
 .p-meta { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
-.p-title { font-size: var(--t-13); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.p-title { font-size: var(--t-13); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .p-artists {
   font-family: var(--font-small); font-size: var(--t-11); color: var(--fg-2);
   text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

@@ -723,16 +723,18 @@ async fn track_radio_browse(
         .map_err(|error| format!("inspired-by fetch for {seed_uri} failed: {error}"))?;
     let source = parse_inspired_by(&bytes)?;
 
-    let recommendation_uris = match source {
-        InspiredBySource::Tracks(uris) => uris,
+    let (recommendation_uris, cover_url) = match source {
+        InspiredBySource::Tracks(uris) => (uris, None),
         InspiredBySource::Playlist(uri) => {
             let playlist: Playlist = metadata_get(session, &uri, "radio playlist").await?;
-            playlist
+            let cover_url = playlist_attributes_cover(&playlist.attributes);
+            let recommendation_uris = playlist
                 .contents
                 .items
                 .iter()
                 .map(|item| item.id.clone())
-                .collect()
+                .collect();
+            (recommendation_uris, cover_url)
         }
     };
     let seed_id = id_of(&seed_uri);
@@ -758,6 +760,7 @@ async fn track_radio_browse(
         tracks,
         seed_kind: "track".to_owned(),
         seed_artist: None,
+        cover_url,
     })
 }
 
@@ -805,6 +808,7 @@ async fn artist_radio_browse(
         tracks,
         seed_kind: "artist".to_owned(),
         seed_artist: Some(seed_artist),
+        cover_url: None,
     })
 }
 
@@ -1349,6 +1353,13 @@ fn merge_artist_overview(
                 .related_artists
                 .clone_from(&supplied.related_artists);
         }
+        overview
+            .discovered_on
+            .clone_from(&supplied.discovered_on);
+        overview
+            .artist_playlists
+            .clone_from(&supplied.artist_playlists);
+        overview.artist_pick.clone_from(&supplied.artist_pick);
     }
 
     (overview.biography.is_some()
@@ -1358,7 +1369,10 @@ fn merge_artist_overview(
         || overview.world_rank.is_some()
         || !overview.top_cities.is_empty()
         || !overview.popular_releases.is_empty()
-        || !overview.related_artists.is_empty())
+        || !overview.related_artists.is_empty()
+        || !overview.discovered_on.is_empty()
+        || !overview.artist_playlists.is_empty()
+        || overview.artist_pick.is_some())
     .then_some(overview)
 }
 
@@ -1467,6 +1481,52 @@ fn parse_catalogue_release_payload(
 /// page boundary is albums, not arbitrary track counts: opening a release
 /// always resolves that logical unit in full, while scrolling controls how
 /// many releases exist in memory and on screen.
+///
+/// The artist endpoint stores each release type in its own catalogue order.
+/// For a multi-type request, walk those catalogues in round-robin order before
+/// slicing the requested page; otherwise a bounded first page is all albums
+/// and the other types remain invisible until the user has scrolled through
+/// the entire album catalogue. A single-type request keeps its source order.
+fn interleaved_catalogue_uris(
+    groups: &[Vec<SpotifyUri>; 4],
+    selected: &[usize],
+) -> Vec<SpotifyUri> {
+    if selected.len() <= 1 {
+        return selected
+            .first()
+            .map(|&index| {
+                let mut seen = HashSet::new();
+                groups[index]
+                    .iter()
+                    .filter(|uri| seen.insert(uri_of(uri)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    let mut positions = vec![0usize; selected.len()];
+    let mut seen = HashSet::new();
+    let mut releases = Vec::new();
+    loop {
+        let mut added = false;
+        for (slot, &group) in selected.iter().enumerate() {
+            while let Some(uri) = groups[group].get(positions[slot]) {
+                positions[slot] += 1;
+                if seen.insert(uri_of(uri)) {
+                    releases.push(uri.clone());
+                    added = true;
+                    break;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    releases
+}
+
 pub async fn artist_catalogue_browse(
     session: &Session,
     id: &str,
@@ -1479,18 +1539,12 @@ pub async fn artist_catalogue_browse(
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
 
     let selected = if release_types.is_empty() {
-        vec![0, 1]
+        vec![0, 1, 2]
     } else {
         selected_release_group_indices(release_types)?
     };
     let groups = artist_release_groups(&artist);
-    let mut seen_releases = HashSet::new();
-    let releases: Vec<SpotifyUri> = selected
-        .iter()
-        .flat_map(|&index| groups[index].iter())
-        .filter(|uri| seen_releases.insert(uri_of(uri)))
-        .cloned()
-        .collect();
+    let releases = interleaved_catalogue_uris(&groups, &selected);
     let total = releases.len();
     let limit = limit.clamp(1, 6);
     let end = offset.saturating_add(limit).min(total);
@@ -1889,6 +1943,8 @@ struct SearchPlaylistWrapperJson {
 #[derive(Default, Deserialize)]
 #[allow(non_snake_case)] // GraphQL schema field names
 struct SearchPlaylistHitJson {
+    #[serde(default, rename = "__typename")]
+    typename: Option<String>,
     #[serde(default)]
     uri: Option<String>,
     #[serde(default)]
@@ -2279,6 +2335,30 @@ fn playlist_ref_from_hit(hit: &SearchPlaylistHitJson) -> PlaylistRef {
             .and_then(|content| parse_count(content.totalCount.as_ref())),
     }
 }
+fn overview_playlist_ref(item: &SearchPlaylistWrapperJson) -> Option<PlaylistRef> {
+    let hit = item.data.as_ref()?;
+    if hit.typename.as_deref() != Some("Playlist") {
+        return None;
+    }
+    let reference = playlist_ref_from_hit(hit);
+    (!reference.id.is_empty() && !reference.name.is_empty()).then_some(reference)
+}
+
+/// Keeps only server-tagged playlist entries from an artist overview section,
+/// preserving the service's order and dropping duplicate URIs.
+fn overview_playlist_refs(
+    section: Option<&ArtistOverviewPlaylistSectionJson>,
+) -> Vec<PlaylistRef> {
+    let mut seen = HashSet::new();
+    section
+        .and_then(|section| section.items.as_deref())
+        .into_iter()
+        .flatten()
+        .filter_map(overview_playlist_ref)
+        .filter(|reference| seen.insert(reference.uri.clone()))
+        .collect()
+}
+
 
 /// Pathfinder persisted-query hashes for `operationName=searchDesktop`,
 /// newest first. The hashes rotate; when the primary is rejected the
@@ -2435,15 +2515,45 @@ struct ArtistOverviewUnionJson {
 }
 
 #[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
 struct ArtistOverviewProfileJson {
     #[serde(default)]
     biography: Option<ArtistBiographyJson>,
+    #[serde(default)]
+    playlistsV2: Option<ArtistOverviewPlaylistSectionJson>,
+    #[serde(default)]
+    pinnedItem: Option<ArtistOverviewPinnedItemJson>,
 }
 
 #[derive(Default, Deserialize)]
+struct ArtistOverviewPlaylistSectionJson {
+    #[serde(default)]
+    items: Option<Vec<SearchPlaylistWrapperJson>>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct ArtistOverviewPinnedItemJson {
+    #[serde(default)]
+    itemV2: Option<SearchPlaylistWrapperJson>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
 struct ArtistBiographyJson {
     #[serde(default)]
     text: Option<String>,
+}
+
+/// Overview-only playlist shelves. `featuringV2` is intentionally absent:
+/// Spotify loads it through the separate `queryArtistFeaturing` document.
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct ArtistOverviewRelatedContentJson {
+    #[serde(default)]
+    relatedArtists: Option<ArtistRelatedArtistsJson>,
+    #[serde(default)]
+    discoveredOnV2: Option<ArtistOverviewPlaylistSectionJson>,
 }
 
 #[derive(Default, Deserialize)]
@@ -2530,13 +2640,6 @@ struct ArtistPopularReleaseJson {
     date: Option<SearchDateJson>,
     #[serde(default)]
     artists: Option<ArtistOverviewArtistListJson>,
-}
-
-#[derive(Default, Deserialize)]
-#[allow(non_snake_case)]
-struct ArtistOverviewRelatedContentJson {
-    #[serde(default)]
-    relatedArtists: Option<ArtistRelatedArtistsJson>,
 }
 
 #[derive(Default, Deserialize)]
@@ -2717,6 +2820,20 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
             })
         })
         .collect();
+    let discovered_on = overview_playlist_refs(
+        artist
+            .relatedContent
+            .as_ref()
+            .and_then(|content| content.discoveredOnV2.as_ref()),
+    );
+    let artist_playlists = overview_playlist_refs(
+        profile.and_then(|profile| profile.playlistsV2.as_ref()),
+    );
+    let artist_pick = profile
+        .and_then(|profile| profile.pinnedItem.as_ref())
+        .and_then(|item| item.itemV2.as_ref())
+        .and_then(overview_playlist_ref);
+
 
     // These three arrays are independently server ranked. Preserve both their
     // category order and each array's item order; never re-sort by year/name.
@@ -2779,6 +2896,9 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
             top_cities,
             popular_releases,
             related_artists,
+            discovered_on,
+            artist_playlists,
+            artist_pick,
         },
         top_playcounts,
     })
@@ -3224,7 +3344,8 @@ mod tests {
     use librespot_core::FileId;
     use librespot_metadata::album::Discs;
     use librespot_metadata::artist::{Artists, Biography};
-    use librespot_metadata::image::{Image, ImageSize};
+    use librespot_metadata::image::{Image, ImageSize, PictureSize, PictureSizes};
+    use librespot_metadata::playlist::attribute::PlaylistAttributes;
     use librespot_metadata::track::Tracks;
     use librespot_metadata::album::AlbumType;
 
@@ -4745,6 +4866,45 @@ mod tests {
 
         assert!(parse_inspired_by(br#"{"mediaItems":[{"uri":null}]}"#).is_err());
         assert!(parse_inspired_by(b"not json").is_err());
+    }
+
+    #[test]
+    fn playlist_radio_cover_prefers_picture_file_id_over_picture_sizes() {
+        let attributes = |picture, picture_sizes| PlaylistAttributes {
+            name: String::new(),
+            description: String::new(),
+            picture,
+            is_collaborative: false,
+            pl3_version: String::new(),
+            is_deleted_by_owner: false,
+            client_id: String::new(),
+            format: String::new(),
+            format_attributes: Default::default(),
+            picture_sizes,
+        };
+        let sizes = PictureSizes(vec![PictureSize {
+            target_name: "default".to_owned(),
+            url: "https://i.scdn.co/image/from-size".to_owned(),
+        }]);
+
+        assert_eq!(
+            playlist_attributes_cover(&attributes(vec![0xAB, 0xCD], sizes.clone())),
+            Some("https://i.scdn.co/image/abcd".to_owned())
+        );
+        assert_eq!(
+            playlist_attributes_cover(&attributes(Vec::new(), sizes)),
+            Some("https://i.scdn.co/image/from-size".to_owned())
+        );
+        assert_eq!(
+            playlist_attributes_cover(&attributes(
+                Vec::new(),
+                PictureSizes(vec![PictureSize {
+                    target_name: "default".to_owned(),
+                    url: String::new(),
+                }])
+            )),
+            None
+        );
     }
 
     #[test]

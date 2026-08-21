@@ -314,7 +314,8 @@ pub struct PlaylistBrowse {
 /// `seed_kind` is `"track"` for the inspired-by song route and `"artist"` for
 /// the Apollo artist station route. Artist radio has no playable artist seed,
 /// so `seed` is the station's first ranked track and `seed_artist` carries the
-/// label shown by the client.
+/// label shown by the client. Track radio may also carry the official cover of
+/// the inspired-by playlist in `cover_url`.
 ///
 /// Radio responses intentionally carry no follower, like, or listener count.
 /// The inspired-by/Apollo payloads expose aggregate-looking fields whose
@@ -328,6 +329,8 @@ pub struct RadioBrowse {
     pub seed_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed_artist: Option<ArtistRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
 }
 
 /// Optional recommendations displayed below a playlist. This payload is
@@ -468,6 +471,14 @@ pub struct ArtistOverview {
     pub top_cities: Vec<ArtistTopCity>,
     pub popular_releases: Vec<AlbumRef>,
     pub related_artists: Vec<ArtistRef>,
+    /// Server-ranked playlists from `relatedContent.discoveredOnV2`.
+    pub discovered_on: Vec<PlaylistRef>,
+    /// Artist-owned playlists from `profile.playlistsV2`.
+    pub artist_playlists: Vec<PlaylistRef>,
+    /// Artist Pick when its pinned item is a playlist; other item kinds stay
+    /// omitted because this browse contract only carries playlist cards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist_pick: Option<PlaylistRef>,
 }
 
 /// Payload of a successful [`Command::BrowseArtist`] response.
@@ -1145,6 +1156,7 @@ mod tests {
             tracks: vec![seed],
             seed_kind: "track".to_owned(),
             seed_artist: None,
+            cover_url: Some("https://i.scdn.co/image/radio-cover".to_owned()),
         };
         let response = serde_json::to_value(BrowseResponse {
             kind: "browse_radio",
@@ -1158,6 +1170,7 @@ mod tests {
         assert_eq!(response["data"]["seed"]["name"], "Seed");
         assert_eq!(response["data"]["tracks"][0]["name"], "Seed");
         assert_eq!(response["data"]["seed_kind"], "track");
+        assert_eq!(response["data"]["cover_url"], "https://i.scdn.co/image/radio-cover");
         assert!(response["data"].get("seed_artist").is_none());
 
         let artist_payload = RadioBrowse {
@@ -1175,6 +1188,7 @@ mod tests {
                 name: "Artist".to_owned(),
                 portrait_url: None,
             }),
+            cover_url: None,
         };
         let artist_response = serde_json::to_value(BrowseResponse {
             kind: "browse_radio",
@@ -1186,6 +1200,7 @@ mod tests {
         .unwrap();
         assert_eq!(artist_response["data"]["seed_kind"], "artist");
         assert_eq!(artist_response["data"]["seed_artist"]["name"], "Artist");
+        assert!(artist_response["data"].get("cover_url").is_none());
         assert!(artist_response["data"].get("followers").is_none());
         assert!(artist_response["data"].get("likes").is_none());
         assert!(artist_response["data"].get("listeners").is_none());

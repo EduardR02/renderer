@@ -22,12 +22,15 @@
   import CreditsDialog from "./components/CreditsDialog.svelte";
   import NowPlayingPanel from "./components/NowPlayingPanel.svelte";
   import LibraryView from "./views/LibraryView.svelte";
+  import MadeForYouView from "./views/MadeForYouView.svelte";
   import LikedSongsView from "./views/LikedSongsView.svelte";
   import PlaylistView from "./views/PlaylistView.svelte";
   import RadioView from "./views/RadioView.svelte";
   import AlbumView from "./views/AlbumView.svelte";
   import ArtistView from "./views/ArtistView.svelte";
   import DiscographyView from "./views/DiscographyView.svelte";
+  import FansAlsoLikeView from "./views/FansAlsoLikeView.svelte";
+  import AppearsOnView from "./views/AppearsOnView.svelte";
   import SearchView from "./views/SearchView.svelte";
   import SearchSongsView from "./views/SearchSongsView.svelte";
   import QueueView from "./views/QueueView.svelte";
@@ -168,6 +171,8 @@
         <LoginView />
       {:else if route.name === "library"}
         <LibraryView />
+      {:else if route.name === "made-for-you"}
+        <MadeForYouView />
       {:else if route.name === "search"}
         <SearchView />
       {:else if route.name === "search-songs"}
@@ -184,6 +189,10 @@
         <ArtistView />
       {:else if route.name === "discography"}
         <DiscographyView />
+      {:else if route.name === "fans-also-like"}
+        <FansAlsoLikeView />
+      {:else if route.name === "appears-on"}
+        <AppearsOnView />
       {:else if route.name === "queue"}
         <QueueView />
       {:else if route.name === "settings"}

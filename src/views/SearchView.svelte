@@ -208,7 +208,7 @@
       </div>
     </div>
 
-    {#each ["Albums", "Playlists", "Artists"] as heading (heading)}
+    {#each ["Playlists", "Albums", "Artists"] as heading (heading)}
       <div class="section" aria-hidden="true">
         <div class="section-head"><h2 class="section-title">{heading}</h2></div>
         <div class="grid">
@@ -299,45 +299,6 @@
       </p>
     {/if}
 
-    {#if albums.length}
-      <div class="section">
-        <div class="section-head"><h2 class="section-title">Albums</h2></div>
-        <div class="grid">
-          {#each albums as al (al.id)}
-            {@const tone = coverTone(al.cover_url, al.id)}
-            <div class="card" style:--tone-glow={tone.glow}>
-              <div class="card-art">
-                <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />
-                <button
-                  class="card-open"
-                  aria-label={`Open ${al.name}`}
-                  onclick={() => navigate("album", al.id)}
-                ></button>
-                <button
-                  class="card-play"
-                  aria-label={`Play ${al.name}`}
-                  title={`Play ${al.name}`}
-                  disabled={!!busy}
-                  onclick={() => play(al.id, playAlbumById, "Could not play this release.")}
-                >
-                  <Icon name={busy === al.id ? "more" : "play"} size={15} />
-                </button>
-              </div>
-              <button class="card-copy" onclick={() => navigate("album", al.id)}>
-                <span class="card-name">{al.name}</span>
-                <!-- One expression, not two adjacent ones: `{year} · {names}`
-                     across an {#if} loses the space after the middot, which is
-                     why these read as "2019 ·Ceramic Hands". -->
-                <span class="card-sub"
-                  >{[al.year || null, al.artist_names.join(", ")].filter(Boolean).join(" · ")}</span
-                >
-              </button>
-            </div>
-          {/each}
-        </div>
-      </div>
-    {/if}
-
     {#if playlists.length}
       <div class="section">
         <div class="section-head"><h2 class="section-title">Playlists</h2></div>
@@ -378,6 +339,45 @@
                   ]
                     .filter(Boolean)
                     .join(" · ") || "Playlist"}</span
+                >
+              </button>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    {#if albums.length}
+      <div class="section">
+        <div class="section-head"><h2 class="section-title">Albums</h2></div>
+        <div class="grid">
+          {#each albums as al (al.id)}
+            {@const tone = coverTone(al.cover_url, al.id)}
+            <div class="card" style:--tone-glow={tone.glow}>
+              <div class="card-art">
+                <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />
+                <button
+                  class="card-open"
+                  aria-label={`Open ${al.name}`}
+                  onclick={() => navigate("album", al.id)}
+                ></button>
+                <button
+                  class="card-play"
+                  aria-label={`Play ${al.name}`}
+                  title={`Play ${al.name}`}
+                  disabled={!!busy}
+                  onclick={() => play(al.id, playAlbumById, "Could not play this release.")}
+                >
+                  <Icon name={busy === al.id ? "more" : "play"} size={15} />
+                </button>
+              </div>
+              <button class="card-copy" onclick={() => navigate("album", al.id)}>
+                <span class="card-name">{al.name}</span>
+                <!-- One expression, not two adjacent ones: `{year} · {names}`
+                     across an {#if} loses the space after the middot, which is
+                     why these read as "2019 ·Ceramic Hands". -->
+                <span class="card-sub"
+                  >{[al.year || null, al.artist_names.join(", ")].filter(Boolean).join(" · ")}</span
                 >
               </button>
             </div>

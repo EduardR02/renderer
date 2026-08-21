@@ -287,6 +287,7 @@ pub struct RadioDetail {
     pub tracks: Vec<Track>,
     pub seed_kind: String,
     pub seed_artist: Option<Artist>,
+    pub cover_url: Option<String>,
 }
 
 impl From<RadioBrowse> for RadioDetail {
@@ -296,6 +297,7 @@ impl From<RadioBrowse> for RadioDetail {
             tracks: browse.tracks.into_iter().map(Track::from).collect(),
             seed_kind: browse.seed_kind,
             seed_artist: browse.seed_artist.map(Artist::from),
+            cover_url: browse.cover_url,
         }
     }
 }
@@ -521,6 +523,9 @@ pub struct ArtistOverviewDetail {
     pub top_cities: Vec<ArtistTopCityDetail>,
     pub popular_releases: Vec<Album>,
     pub related_artists: Vec<Artist>,
+    pub discovered_on: Vec<Playlist>,
+    pub artist_playlists: Vec<Playlist>,
+    pub artist_pick: Option<Playlist>,
 }
 
 impl From<ArtistOverview> for ArtistOverviewDetail {
@@ -546,6 +551,17 @@ impl From<ArtistOverview> for ArtistOverviewDetail {
                 .into_iter()
                 .map(Artist::from)
                 .collect(),
+            discovered_on: overview
+                .discovered_on
+                .iter()
+                .map(Playlist::from)
+                .collect(),
+            artist_playlists: overview
+                .artist_playlists
+                .iter()
+                .map(Playlist::from)
+                .collect(),
+            artist_pick: overview.artist_pick.as_ref().map(Playlist::from),
         }
     }
 }
@@ -943,6 +959,9 @@ mod tests {
                 name: "Related".into(),
                 portrait_url: Some("portrait".into()),
             }],
+            discovered_on: Vec::new(),
+            artist_playlists: Vec::new(),
+            artist_pick: None,
         };
 
         let frontend = ArtistOverviewDetail::from(overview);

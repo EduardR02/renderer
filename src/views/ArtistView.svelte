@@ -1,6 +1,6 @@
 <script>
   import { detail, api, navigate, ui, retryDetail, loadCataloguePage } from "../lib/state.svelte.js";
-  import { playAlbumById } from "../lib/play.js";
+  import { playAlbumById, playPlaylistById } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
@@ -18,12 +18,13 @@
    *
    * The shelf is ONE row, not four. The pre-redesign page stacked a separate
    * shelf for Albums, Singles, Compilations and Appears-on, each with its own
-   * "Show all", which asked the same question four times. The segmented toggle
-   * asks it once and swaps what is under it. "See all" carries a regular
-   * catalogue selection into the reader; ranked Popular releases open the
-   * reader on "All" because that order only exists in this overview payload.
-   * Every release on the shelf comes out of the artist payload. Regular groups
-   * carry per-type summaries; ranked Popular releases come from the overview.
+   * "Show all". The segmented toggle now covers only the three main catalogue
+   * groups; Appears On lives in its own lazy shelf near the bottom. "See all"
+   * carries a regular catalogue selection into the reader; ranked Popular
+   * releases open the reader on "All" because that order only exists in this
+   * overview payload. Every release on the main shelf comes out of the artist
+   * payload. Regular groups carry per-type summaries; ranked Popular releases
+   * come from the overview.
    */
   const artist = $derived(detail.artist);
   const top = $derived(artist?.top_tracks ?? []);
@@ -32,6 +33,26 @@
   const popularReleases = $derived(overview?.popular_releases ?? []);
   const relatedArtists = $derived(overview?.related_artists ?? []);
   const topCities = $derived(overview?.top_cities ?? []);
+  const discoveredOnPlaylists = $derived(overview?.discovered_on ?? []);
+  const artistPlaylists = $derived(overview?.artist_playlists ?? []);
+  const artistPickPlaylist = $derived(overview?.artist_pick ?? null);
+  const playlistShelves = $derived.by(() => {
+    const seen = new Set();
+    if (artistPickPlaylist?.id) seen.add(artistPickPlaylist.id);
+    const unique = (items) => {
+      const result = [];
+      for (const playlist of items ?? []) {
+        if (!playlist?.id || seen.has(playlist.id)) continue;
+        seen.add(playlist.id);
+        result.push(playlist);
+      }
+      return result;
+    };
+    return {
+      artist: unique(artistPlaylists),
+      discovered: unique(discoveredOnPlaylists),
+    };
+  });
   const NUMBER_FORMAT = new Intl.NumberFormat();
   const aboutStats = $derived.by(() => {
     const facts = [];
@@ -120,6 +141,10 @@
     shelfRetry = 0;
     shelfError = "";
     shelfErrorKey = "";
+    appearsOnReady = false;
+    appearsOnLoading = false;
+    appearsOnError = "";
+    appearsOnRetry = 0;
   });
 
   /* An overview may be refreshed independently of the catalogue payload. Do
@@ -133,18 +158,15 @@
     albums: "Album",
     singles: "Single or EP",
     compilations: "Compilation",
-    appears_on: "Appears on",
   };
 
   /**
    * What the shelf shows for the current segment.
    *
-   * Named catalogue segments show that group in the order the engine returned
-   * it. Ranked Popular releases use the overview's server order. "All" is the
-   * exception and cannot be: a concatenation of four lists would be eleven
-   * albums followed by whatever fits, so it is the most recent releases across
-   * every type instead — which is what a highlight row on an artist page is
-   * for.
+   * Named catalogue segments show the order returned by the engine. Ranked
+   * Popular releases use the overview's server order. "All" is the exception:
+   * it intersperses the most recent releases across the three main types,
+   * which is what a highlight row on an artist page is for.
    */
   const shelf = $derived.by(() => {
     if (group === "popular") {
@@ -179,6 +201,26 @@
   });
   const visibleShelf = $derived(shelf.slice(0, perRow));
   const visibleRelatedArtists = $derived(relatedArtists.slice(0, perRow));
+  const appearsOnCount = $derived(counts.appears_on ?? 0);
+  const appearsOnReleases = $derived.by(() =>
+    mergeShelfReleases(
+      artist?.releases?.appears_on,
+      shelfExtras[`${artist?.id ?? ""}:appears_on`],
+    ),
+  );
+  const visibleAppearsOn = $derived(appearsOnReleases.slice(0, perRow));
+  let appearsOnSentinel = $state(null);
+  let appearsOnReady = $state(false);
+  let appearsOnLoading = $state(false);
+  let appearsOnError = $state("");
+  let appearsOnRetry = $state(0);
+
+  function retryAppearsOn() {
+    if (!appearsOnError) return;
+    appearsOnError = "";
+    appearsOnRetry += 1;
+    appearsOnReady = true;
+  }
 
   /**
    * A named shelf starts with lightweight AlbumRefs. Hydrate one bounded
@@ -225,6 +267,59 @@
         if (artist?.id !== id || group !== selected.id) return;
         shelfErrorKey = viewKey;
         shelfError = String(reason || "Could not load more of this catalogue.");
+      });
+  });
+  /* Appears On is intentionally not part of the main selector. Its first
+     bounded page waits until the lower shelf approaches the viewport. */
+  $effect(() => {
+    const node = appearsOnSentinel;
+    if (!node || !artist?.id || !appearsOnCount) return;
+    const scroller = node.closest(".scroll");
+    if (!scroller) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) appearsOnReady = true;
+      },
+      { root: scroller, rootMargin: "0px 0px 360px 0px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  });
+
+  $effect(() => {
+    const id = artist?.id;
+    if (!id || !appearsOnReady || !appearsOnCount || appearsOnLoading || appearsOnError) return;
+    const target = Math.min(7, appearsOnCount);
+    if (appearsOnReleases.length >= target) return;
+    const requestKey = `${id}:appears_on:${appearsOnRetry}`;
+    if (requestedShelfWidths.has(requestKey)) return;
+    requestedShelfWidths.add(requestKey);
+    appearsOnLoading = true;
+    appearsOnError = "";
+    loadCataloguePage(id, ["appears_on"], 0, 7)
+      .then((page) => {
+        if (artist?.id !== id) return;
+        const key = `${id}:appears_on`;
+        const existing = shelfExtras[key] ?? [];
+        const known = new Set(
+          [...(artist?.releases?.appears_on ?? []), ...existing]
+            .map((release) => release?.id)
+            .filter(Boolean),
+        );
+        const additions = [];
+        for (const release of page?.releases ?? []) {
+          if (!release?.id || known.has(release.id)) continue;
+          known.add(release.id);
+          additions.push(release);
+        }
+        if (additions.length) shelfExtras[key] = [...existing, ...additions];
+      })
+      .catch((reason) => {
+        requestedShelfWidths.delete(requestKey);
+        if (artist?.id === id) appearsOnError = String(reason || "Could not load Appears On.");
+      })
+      .finally(() => {
+        if (artist?.id === id) appearsOnLoading = false;
       });
   });
 
@@ -280,7 +375,46 @@
       busy = "";
     }
   }
+  async function playPlaylist(id) {
+    if (busy) return;
+    busy = id;
+    playError = "";
+    try {
+      await playPlaylistById(id);
+    } catch (reason) {
+      playError = String(reason || "Could not play this playlist.");
+    } finally {
+      busy = "";
+    }
+  }
 </script>
+{#snippet playlistCard(pl)}
+  {@const tone = coverTone(pl.cover_url || pl.cover_urls?.[0] || "", pl.id)}
+  <div class="card" style:--tone-glow={tone.glow}>
+    <div class="card-art">
+      <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} fill lg />
+      <button
+        class="card-open"
+        aria-label={`Open ${pl.name}`}
+        onclick={() => navigate("playlist", pl.id)}
+      ></button>
+      <button
+        class="card-play"
+        aria-label={`Play ${pl.name}`}
+        title={`Play ${pl.name}`}
+        disabled={!!busy}
+        onclick={() => playPlaylist(pl.id)}
+      >
+        <Icon name={busy === pl.id ? "more" : "play"} size={15} />
+      </button>
+    </div>
+    <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
+      <span class="card-name">{pl.name}</span>
+      <span class="card-sub">{pl.tracks_total ? `${pl.tracks_total} songs` : "Playlist"}</span>
+    </button>
+  </div>
+{/snippet}
+
 
 <!-- `bleed`: the banner carries its own negative margins up under the topbar,
      so the page must not pad above it. -->
@@ -418,6 +552,7 @@
           {/each}
         </div>
 
+
         {#if visibleShelf.length}
           <!-- Exactly one row. Same card object as the library and search
                grids, and the same non-negotiable rule: the artwork OPENS the
@@ -473,11 +608,56 @@
         {/if}
       </section>
     {/if}
+    {#if artistPickPlaylist}
+      <section class="section artist-pick" aria-labelledby="pick-title">
+        <div class="section-head">
+          <h2 class="section-title" id="pick-title">Artist Pick</h2>
+        </div>
+        <div class="artist-pick-card">
+          {@render playlistCard(artistPickPlaylist)}
+        </div>
+      </section>
+    {/if}
+
+    {#if playlistShelves.artist.length}
+      <section class="section" aria-labelledby="artist-playlists-title">
+        <div class="section-head">
+          <h2 class="section-title" id="artist-playlists-title">
+            Artist playlists<span class="section-count tnum">{playlistShelves.artist.length}</span>
+          </h2>
+        </div>
+        <div class="shelf playlist-shelf" style:--per-row={perRow}>
+          {#each playlistShelves.artist.slice(0, perRow) as playlist (playlist.id)}
+            {@render playlistCard(playlist)}
+          {/each}
+        </div>
+      </section>
+    {/if}
+
+    {#if playlistShelves.discovered.length}
+      <section class="section" aria-labelledby="discovered-title">
+        <div class="section-head">
+          <h2 class="section-title" id="discovered-title">
+            Discovered on<span class="section-count tnum">{playlistShelves.discovered.length}</span>
+          </h2>
+        </div>
+        <div class="shelf playlist-shelf" style:--per-row={perRow}>
+          {#each playlistShelves.discovered.slice(0, perRow) as playlist (playlist.id)}
+            {@render playlistCard(playlist)}
+          {/each}
+        </div>
+      </section>
+    {/if}
 
     {#if visibleRelatedArtists.length}
       <section class="section" aria-labelledby="related-title">
         <div class="section-head">
           <h2 class="section-title" id="related-title">Fans also like</h2>
+          {#if relatedArtists.length > visibleRelatedArtists.length}
+            <button class="link-more" onclick={() => navigate("fans-also-like", artist.id)}>
+              See all<Icon name="fwd" size={12} />
+            </button>
+          {/if}
         </div>
         <div class="shelf" style:--per-row={perRow}>
           {#each visibleRelatedArtists as related (related.id)}
@@ -503,6 +683,65 @@
             </button>
           {/each}
         </div>
+      </section>
+    {/if}
+
+    {#if appearsOnCount}
+      <section class="section appears" aria-labelledby="appears-title">
+        <div class="section-head">
+          <h2 class="section-title" id="appears-title">
+            Appears On<span class="section-count tnum">{appearsOnCount}</span>
+          </h2>
+          {#if appearsOnCount > perRow}
+            <button class="link-more" onclick={() => navigate("appears-on", artist.id)}>
+              See all<Icon name="fwd" size={12} />
+            </button>
+          {/if}
+        </div>
+        <div class="shelf appears-shelf" style:--per-row={perRow} bind:this={appearsOnSentinel}>
+          {#if visibleAppearsOn.length}
+            {#each visibleAppearsOn as release (release.id)}
+              {@const tone = coverTone(release.cover_url, release.id)}
+              <div class="card" style:--tone-glow={tone.glow}>
+                <div class="card-art">
+                  <Cover src={release.cover_url} id={release.id} name={release.name} fill lg />
+                  <button
+                    class="card-open"
+                    aria-label={`Open ${release.name}`}
+                    onclick={() => navigate("album", release.id)}
+                  ></button>
+                  <button
+                    class="card-play"
+                    aria-label={`Play ${release.name}`}
+                    title={`Play ${release.name}`}
+                    disabled={!!busy}
+                    onclick={() => playRelease(release.id)}
+                  >
+                    <Icon name={busy === release.id ? "more" : "play"} size={15} />
+                  </button>
+                </div>
+                <button class="card-copy" onclick={() => navigate("album", release.id)}>
+                  <span class="card-name">{release.name}</span>
+                  <span class="card-sub">{[release.year || null, "Appears on"].filter(Boolean).join(" · ")}</span>
+                </button>
+              </div>
+            {/each}
+          {:else if appearsOnLoading}
+            {#each Array.from({ length: perRow }) as _, i (i)}
+              <div class="card" aria-hidden="true">
+                <span class="skeleton" style="display:block;aspect-ratio:1;width:100%;border-radius:var(--r3)"></span>
+                <span class="card-copy">
+                  <span class="skeleton line" style="width:72%;height:12px;margin:0"></span>
+                  <span class="skeleton line sm" style="height:10px;margin:6px 0 0"></span>
+                </span>
+              </div>
+            {/each}
+          {:else}
+            <p class="shelf-empty">Spotify lists {appearsOnCount} Appears On releases, but none are available yet.</p>
+          {/if}
+        </div>
+        {#if appearsOnError}<p class="inline-error" role="alert">{appearsOnError}</p>{/if}
+        {#if appearsOnError}<button class="link-more" onclick={retryAppearsOn}>Try again</button>{/if}
       </section>
     {/if}
 
@@ -558,7 +797,7 @@
       </div>
     </section>
 
-    {#if !top.length && !hasReleases && !popularReleases.length && !relatedArtists.length}
+    {#if !top.length && !hasReleases && !appearsOnCount && !popularReleases.length && !relatedArtists.length && !artistPickPlaylist && !playlistShelves.artist.length && !playlistShelves.discovered.length}
       <div class="empty">
         <p class="h">Nothing to show for this artist.</p>
         <p class="sub">The engine returned no popular songs or releases.</p>
@@ -572,6 +811,7 @@
 
   .dx { margin-top: var(--s8); }
   .dx .seg { margin-bottom: var(--s5); }
+  .appears { margin-top: var(--s9); }
 
   /* One row, always. `repeat(auto-fill, …)` was not an option: it decides how
      many cards fit and then wraps the rest, and a shelf that wraps is a grid.
@@ -582,6 +822,8 @@
     display: grid; gap: var(--s5);
     grid-template-columns: repeat(var(--per-row, 5), minmax(0, 1fr));
   }
+  .artist-pick-card { width: min(240px, 100%); }
+  .playlist-shelf { margin-top: var(--s1); }
   /* The overflow, named. It sits under the shelf rather than beside the
      heading because it is about the row you just looked at. */
   .shelf-more {
