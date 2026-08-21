@@ -31,6 +31,7 @@
   import DiscographyView from "./views/DiscographyView.svelte";
   import FansAlsoLikeView from "./views/FansAlsoLikeView.svelte";
   import AppearsOnView from "./views/AppearsOnView.svelte";
+  import ArtistPlaylistCollectionView from "./views/ArtistPlaylistCollectionView.svelte";
   import SearchView from "./views/SearchView.svelte";
   import SearchSongsView from "./views/SearchSongsView.svelte";
   import QueueView from "./views/QueueView.svelte";
@@ -193,6 +194,8 @@
         <FansAlsoLikeView />
       {:else if route.name === "appears-on"}
         <AppearsOnView />
+      {:else if route.name === "artist-playlists" || route.name === "discovered-on"}
+        <ArtistPlaylistCollectionView />
       {:else if route.name === "queue"}
         <QueueView />
       {:else if route.name === "settings"}

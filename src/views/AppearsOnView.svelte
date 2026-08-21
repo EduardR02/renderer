@@ -13,7 +13,7 @@
   const counts = $derived(artist?.release_counts ?? {});
   const appearsOnCount = $derived(counts.appears_on ?? 0);
   const RELEASE_TYPES = ["appears_on"];
-  const PAGE_SIZE = 7;
+  const PAGE_SIZE = 6;
 
   let releases = $state([]);
   let nextOffset = $state(0);
@@ -22,19 +22,26 @@
   let error = $state("");
   let sentinel = $state(null);
   let loadedArtist = "";
-  let armed = false;
+  let loadGeneration = 0;
   let busy = $state("");
   let playError = $state("");
 
-  async function loadNext(key = artist?.id ?? "") {
+  async function loadNext(key = artist?.id ?? "", generation = loadGeneration) {
     const id = artist?.id;
-    if (!id || id !== key || loading || nextOffset == null || !appearsOnCount) return;
+    if (
+      !id ||
+      generation !== loadGeneration ||
+      id !== key ||
+      loading ||
+      nextOffset == null ||
+      !appearsOnCount
+    ) return;
     const offset = nextOffset;
     loading = true;
     error = "";
     try {
       const page = await loadCataloguePage(id, RELEASE_TYPES, offset, PAGE_SIZE);
-      if (artist?.id !== key) return;
+      if (generation !== loadGeneration || artist?.id !== key) return;
       const known = new Set(releases.map((release) => release.id));
       for (const release of page?.releases ?? []) {
         if (!release?.id || known.has(release.id)) continue;
@@ -43,11 +50,12 @@
       }
       total = page?.total ?? appearsOnCount;
       nextOffset = page?.next_offset ?? null;
-      armed = false;
     } catch (reason) {
-      error = String(reason || "Could not load Appears On.");
+      if (generation === loadGeneration) {
+        error = String(reason || "Could not load Appears On.");
+      }
     } finally {
-      if (artist?.id === key) loading = false;
+      if (generation === loadGeneration) loading = false;
     }
   }
 
@@ -55,46 +63,47 @@
     const id = artist?.id ?? "";
     if (!id || id === loadedArtist) return;
     loadedArtist = id;
+    loadGeneration += 1;
+    const generation = loadGeneration;
+    loading = false;
     releases = [];
     nextOffset = 0;
     total = appearsOnCount;
     error = "";
-    armed = false;
-    queueMicrotask(() => loadNext(id));
+    busy = "";
+    playError = "";
+    queueMicrotask(() => loadNext(id, generation));
   });
 
-  /* One bounded page opens the view. Further pages wait for a real scroll so a
-     short viewport never chains through the complete catalogue on mount. */
+  /* One bounded page opens the view. Further pages load only when a real
+     scroll reaches the footer; the button remains the keyboard fallback. */
   $effect(() => {
     const node = sentinel;
     if (!node) return;
     const scroller = node.closest(".scroll");
     if (!scroller) return;
-    const onScroll = () => (armed = true);
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry?.isIntersecting && armed) loadNext();
-      },
-      { root: scroller, rootMargin: "0px 0px 400px 0px" },
-    );
-    scroller.addEventListener("scroll", onScroll, { passive: true });
-    observer.observe(node);
-    return () => {
-      scroller.removeEventListener("scroll", onScroll);
-      observer.disconnect();
+    const onScroll = () => {
+      const remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+      if (remaining <= 400) loadNext();
     };
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    return () => scroller.removeEventListener("scroll", onScroll);
   });
 
   async function playRelease(id) {
     if (busy) return;
+    const generation = loadGeneration;
+    const artistId = artist?.id;
     busy = id;
     playError = "";
     try {
       await playAlbumById(id);
     } catch (reason) {
-      playError = String(reason || "Could not play this release.");
+      if (generation === loadGeneration && artist?.id === artistId) {
+        playError = String(reason || "Could not play this release.");
+      }
     } finally {
-      busy = "";
+      if (generation === loadGeneration && artist?.id === artistId) busy = "";
     }
   }
 </script>
@@ -162,6 +171,8 @@
     <div class="aux-foot" bind:this={sentinel}>
       {#if loading && releases.length}
         <span class="aux-status">Loading releases…</span>
+      {:else if error && nextOffset != null}
+        <button class="btn-ghost" onclick={() => loadNext()}>Try again</button>
       {:else if nextOffset != null && releases.length}
         <button class="btn-ghost" onclick={() => loadNext()}>Load more<Icon name="chevron-down" size={14} /></button>
       {:else if releases.length}

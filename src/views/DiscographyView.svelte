@@ -49,7 +49,18 @@
   /* Seeded from the route so "See all" lands on the segment you were looking
      at, then owned locally: re-pushing history on every toggle would make Back
      mean "undo the last filter click" instead of "leave the discography". */
-  let group = $state(route.param ?? "all");
+  function selectedGroup(value) {
+    return GROUPS.some((candidate) => candidate.id === value) ? value : "all";
+  }
+
+  let group = $state(selectedGroup(route.param));
+  let loadedRoute = `${route.id ?? ""}:${route.param ?? ""}`;
+  $effect(() => {
+    const key = `${route.id ?? ""}:${route.param ?? ""}`;
+    if (key === loadedRoute) return;
+    loadedRoute = key;
+    group = selectedGroup(route.param);
+  });
   const releaseTypes = $derived(GROUPS.find((g) => g.id === group)?.types ?? GROUPS[0].types);
 
   /**
@@ -73,22 +84,26 @@
   let sentinel = $state(null);
   /** Identity of the list currently loaded, so a group or artist change refills. */
   let loadedKey = "";
-  /**
-   * The sentinel can be on screen before the first batch renders, which would
-   * otherwise chain-load the whole catalogue on open. Only a real scroll arms
-   * it.
-   */
-  let armed = false;
+  let loadGeneration = 0;
 
-  async function loadNext(key = `${artist?.id ?? ""}:${group}`) {
+  async function loadNext(
+    key = `${artist?.id ?? ""}:${group}`,
+    generation = loadGeneration,
+  ) {
     const id = artist?.id;
-    if (!id || loading || nextOffset == null) return;
+    if (
+      !id ||
+      generation !== loadGeneration ||
+      `${id}:${group}` !== key ||
+      loading ||
+      nextOffset == null
+    ) return;
     const offset = nextOffset;
     loading = true;
     error = "";
     try {
       const page = await loadCataloguePage(id, releaseTypes, offset, 4);
-      if (`${artist?.id}:${group}` !== key) return;
+      if (generation !== loadGeneration || `${artist?.id}:${group}` !== key) return;
       const known = new Set(releases.map((release) => release.id));
       for (const release of page?.releases ?? []) {
         if (known.has(release.id)) continue;
@@ -97,32 +112,23 @@
       }
       total = page?.total ?? total;
       nextOffset = page?.next_offset ?? null;
-      armed = false;
     } catch (reason) {
-      error = String(reason || "Could not load more of this catalogue.");
+      if (generation === loadGeneration) {
+        error = String(reason || "Could not load more of this catalogue.");
+      }
     } finally {
-      if (`${artist?.id}:${group}` === key) loading = false;
+      if (generation === loadGeneration) loading = false;
     }
   }
 
   /**
-   * Display order is distinct from the playback context. The backend samples
-   * the three main groups in bounded pages; the default All reader then
-   * intersperses whatever has arrived by release year, keeping the server
-   * order for ties. Single-type pages retain their catalogue order.
+   * Display order is distinct from the playback context. Catalogue order is
+   * the backend's stable round-robin walk across selected release types; it
+   * must not reshuffle already-visible releases when another page arrives.
+   * Explicit sort choices order the releases currently loaded.
    */
   const ordered = $derived.by(() => {
     const items = releases.map((release, index) => ({ release, index }));
-    if (sort === "catalogue" && group === "all") {
-      return items.sort((a, b) => {
-        const aYear = a.release.year;
-        const bYear = b.release.year;
-        if (aYear == null && bYear == null) return a.index - b.index;
-        if (aYear == null) return 1;
-        if (bYear == null) return -1;
-        return bYear - aYear || a.index - b.index;
-      });
-    }
     if (sort === "catalogue") return items;
     if (sort === "az") {
       return items.sort((a, b) =>
@@ -156,12 +162,14 @@
     const key = `${artist?.id ?? ""}:${group}`;
     if (!artist?.id || key === loadedKey) return;
     loadedKey = key;
+    loadGeneration += 1;
+    const generation = loadGeneration;
+    loading = false;
     releases = [];
     nextOffset = 0;
     total = 0;
     error = "";
-    armed = false;
-    queueMicrotask(() => loadNext(key));
+    queueMicrotask(() => loadNext(key, generation));
   });
 
   $effect(() => {
@@ -170,20 +178,11 @@
     const scroller = node.closest(".scroll");
     if (!scroller) return;
     const onScroll = () => {
-      armed = true;
+      const remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+      if (remaining <= 400) loadNext();
     };
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry?.isIntersecting && armed) loadNext();
-      },
-      { root: scroller, rootMargin: "0px 0px 400px 0px" },
-    );
     scroller.addEventListener("scroll", onScroll, { passive: true });
-    observer.observe(node);
-    return () => {
-      scroller.removeEventListener("scroll", onScroll);
-      observer.disconnect();
-    };
+    return () => scroller.removeEventListener("scroll", onScroll);
   });
 
   /* The control row is type on the page until releases pass under it. */
@@ -328,9 +327,13 @@
     <div class="dx-foot" bind:this={sentinel}>
       {#if loading && releases.length}
         <span class="dx-status">Loading releases…</span>
+      {:else if error && nextOffset != null}
+        <button class="btn-ghost" onclick={() => loadNext()}>
+          Try again
+        </button>
       {:else if nextOffset != null && releases.length}
-        <!-- The observer does this on approach; the button is the keyboard and
-             failed-observer path, not the primary affordance. -->
+        <!-- Near-footer scrolling does this automatically; the button is the
+             keyboard fallback and explicit retry affordance. -->
         <button class="btn-ghost" onclick={() => loadNext()}>
           Load more<Icon name="chevron-down" size={14} />
         </button>

@@ -27,16 +27,23 @@ export function canGoForward() {
 }
 
 /** The artist routes that read one and the same `detail.artist` payload. */
-const ARTIST_ROUTES = new Set(["artist", "discography", "fans-also-like", "appears-on"]);
+const ARTIST_ROUTES = new Set([
+  "artist",
+  "discography",
+  "fans-also-like",
+  "appears-on",
+  "artist-playlists",
+  "discovered-on",
+]);
 
 /**
  * Clears stale detail so the target view shows its loading state.
  *
- * The exception is the artist page and its discography, which are two
- * presentations of ONE payload: an artist's page and its "see all" both need
- * `detail.artist`, and blanking it on the way between them would make a
- * navigation that adds no new data look like a page load. Called before the
- * route is applied, so `route` still describes where we are coming FROM.
+ * Artist detail and every auxiliary artist route are presentations of one
+ * payload. Moving among them for the same artist must keep `detail.artist`;
+ * blanking it would turn a data-free route change into another page load.
+ * Called before the route is applied, so `route` still describes where we are
+ * coming FROM.
  */
 function clearStaleDetail(entry) {
   if (entry.name === "playlist") detail.playlist = null;
@@ -131,6 +138,7 @@ const lazyQueue = $state({ generation: 0, source: null, cursor: null, loading: f
 const QUEUE_BACKFILL_LOW_WATER = 8;
 let lazyBackfillPromise = null;
 const cataloguePageCache = new Map();
+const CATALOGUE_PAGE_CACHE_MAX = 64;
 const cataloguePagePending = new Map();
 
 function clearLazyQueue() {
@@ -158,11 +166,21 @@ function catalogueTracks(releases) {
 
 export function loadCataloguePage(id, releaseTypes = ["albums", "singles"], offset = 0, limit = 4) {
   const key = `${id}:${releaseTypes.join(",")}:${offset}:${limit}`;
-  if (cataloguePageCache.has(key)) return Promise.resolve(cataloguePageCache.get(key));
+  const cached = cataloguePageCache.get(key);
+  if (cached) {
+    // Pages contain complete track lists, so keep this in-memory cache bounded
+    // while retaining recently visited catalogue and Appears On pages.
+    cataloguePageCache.delete(key);
+    cataloguePageCache.set(key, cached);
+    return Promise.resolve(cached);
+  }
   if (cataloguePagePending.has(key)) return cataloguePagePending.get(key);
   const request = api.browseArtistCatalogue(id, releaseTypes, offset, limit)
     .then((page) => {
       cataloguePageCache.set(key, page);
+      while (cataloguePageCache.size > CATALOGUE_PAGE_CACHE_MAX) {
+        cataloguePageCache.delete(cataloguePageCache.keys().next().value);
+      }
       return page;
     })
     .finally(() => cataloguePagePending.delete(key));
@@ -884,7 +902,7 @@ function normalizedPlaylistName(value) {
 }
 
 function personalizedSearchName(name) {
-  return /^daily mix [1-6]$/.test(name) ||
+  return name.includes("daily") ||
     name === "release radar" ||
     name === "discover weekly";
 }
@@ -907,6 +925,7 @@ function isSpotifyOwner(playlist) {
     ["uri", ownerValue(playlist?.owner_uri)],
     ["display", ownerValue(playlist?.owner)],
   ].filter(([, value]) => value);
+  if (!identities.length) return false;
   for (const [kind, raw] of identities) {
     const value = raw.toLowerCase().replace(/\s+/g, " ").trim();
     if (kind === "uri") {

@@ -6,6 +6,7 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import { GROUPS, RELEASE_KEYS } from "../lib/discography.js";
+  import { artistPlaylistCollections } from "../lib/artist.js";
 
   /**
    * The artist page: who this is, what to play, and one shelf of records.
@@ -33,26 +34,8 @@
   const popularReleases = $derived(overview?.popular_releases ?? []);
   const relatedArtists = $derived(overview?.related_artists ?? []);
   const topCities = $derived(overview?.top_cities ?? []);
-  const discoveredOnPlaylists = $derived(overview?.discovered_on ?? []);
-  const artistPlaylists = $derived(overview?.artist_playlists ?? []);
   const artistPickPlaylist = $derived(overview?.artist_pick ?? null);
-  const playlistShelves = $derived.by(() => {
-    const seen = new Set();
-    if (artistPickPlaylist?.id) seen.add(artistPickPlaylist.id);
-    const unique = (items) => {
-      const result = [];
-      for (const playlist of items ?? []) {
-        if (!playlist?.id || seen.has(playlist.id)) continue;
-        seen.add(playlist.id);
-        result.push(playlist);
-      }
-      return result;
-    };
-    return {
-      artist: unique(artistPlaylists),
-      discovered: unique(discoveredOnPlaylists),
-    };
-  });
+  const playlistShelves = $derived(artistPlaylistCollections(overview));
   const NUMBER_FORMAT = new Intl.NumberFormat();
   const aboutStats = $derived.by(() => {
     const facts = [];
@@ -123,10 +106,13 @@
 
   let group = $state("popular");
 
-  const requestedShelfWidths = new Set();
+  const requestedShelfPages = new Set();
   let shelfRetry = $state(0);
   let shelfError = $state("");
   let shelfErrorKey = $state("");
+  let artistGeneration = 0;
+  let busy = $state("");
+  let playError = $state("");
 
   /* The artist changed under us — a link from a track row, say. Start the new
      artist on its ranked releases when the overview provides them, otherwise
@@ -135,9 +121,10 @@
   $effect(() => {
     if (artist?.id === seenArtist) return;
     seenArtist = artist?.id ?? null;
+    artistGeneration += 1;
     group = popularReleases.length ? "popular" : "all";
     shelfExtras = {};
-    requestedShelfWidths.clear();
+    requestedShelfPages.clear();
     shelfRetry = 0;
     shelfError = "";
     shelfErrorKey = "";
@@ -145,6 +132,8 @@
     appearsOnLoading = false;
     appearsOnError = "";
     appearsOnRetry = 0;
+    busy = "";
+    playError = "";
   });
 
   /* An overview may be refreshed independently of the catalogue payload. Do
@@ -223,28 +212,29 @@
   }
 
   /**
-   * A named shelf starts with lightweight AlbumRefs. Hydrate one bounded
-   * seven-card page per artist/group; narrower panes reuse and slice it rather
-   * than turning every resize into another request.
+   * A named shelf starts with lightweight AlbumRefs. Hydrate one bounded page
+   * per artist/group; narrower panes reuse and slice it rather than turning
+   * every resize into another request.
    */
+  const SHELF_PAGE_SIZE = 6;
 
   $effect(() => {
     const id = artist?.id;
     if (!id || group === "all" || group === "popular") return;
 
     const selected = GROUPS.find((candidate) => candidate.id === group);
-    const target = Math.min(7, counts[group] ?? 0);
+    const target = Math.min(SHELF_PAGE_SIZE, counts[group] ?? 0);
     const loaded = (groupLists[group] ?? []).length;
     if (!selected || target <= 0 || loaded >= target) return;
 
     const requestKey = `${id}:${group}:${shelfRetry}`;
-    if (requestedShelfWidths.has(requestKey)) return;
-    requestedShelfWidths.add(requestKey);
+    if (requestedShelfPages.has(requestKey)) return;
+    requestedShelfPages.add(requestKey);
 
     const viewKey = `${id}:${group}`;
     shelfError = "";
     shelfErrorKey = "";
-    loadCataloguePage(id, selected.types, 0, 7)
+    loadCataloguePage(id, selected.types, 0, SHELF_PAGE_SIZE)
       .then((page) => {
         if (artist?.id !== id) return;
 
@@ -263,7 +253,7 @@
         if (additions.length) shelfExtras[viewKey] = [...existing, ...additions];
       })
       .catch((reason) => {
-        requestedShelfWidths.delete(requestKey);
+        requestedShelfPages.delete(requestKey);
         if (artist?.id !== id || group !== selected.id) return;
         shelfErrorKey = viewKey;
         shelfError = String(reason || "Could not load more of this catalogue.");
@@ -289,14 +279,14 @@
   $effect(() => {
     const id = artist?.id;
     if (!id || !appearsOnReady || !appearsOnCount || appearsOnLoading || appearsOnError) return;
-    const target = Math.min(7, appearsOnCount);
+    const target = Math.min(SHELF_PAGE_SIZE, appearsOnCount);
     if (appearsOnReleases.length >= target) return;
     const requestKey = `${id}:appears_on:${appearsOnRetry}`;
-    if (requestedShelfWidths.has(requestKey)) return;
-    requestedShelfWidths.add(requestKey);
+    if (requestedShelfPages.has(requestKey)) return;
+    requestedShelfPages.add(requestKey);
     appearsOnLoading = true;
     appearsOnError = "";
-    loadCataloguePage(id, ["appears_on"], 0, 7)
+    loadCataloguePage(id, ["appears_on"], 0, SHELF_PAGE_SIZE)
       .then((page) => {
         if (artist?.id !== id) return;
         const key = `${id}:appears_on`;
@@ -315,7 +305,7 @@
         if (additions.length) shelfExtras[key] = [...existing, ...additions];
       })
       .catch((reason) => {
-        requestedShelfWidths.delete(requestKey);
+        requestedShelfPages.delete(requestKey);
         if (artist?.id === id) appearsOnError = String(reason || "Could not load Appears On.");
       })
       .finally(() => {
@@ -361,30 +351,34 @@
 
   /* A shelf card knows an id and nothing else, so playing it costs one browse
      first — the shared rule for every card in the app (see lib/play.js). */
-  let busy = $state("");
-  let playError = $state("");
   async function playRelease(id) {
     if (busy) return;
+    const generation = artistGeneration;
     busy = id;
     playError = "";
     try {
       await playAlbumById(id);
     } catch (reason) {
-      playError = String(reason || "Could not play this release.");
+      if (generation === artistGeneration) {
+        playError = String(reason || "Could not play this release.");
+      }
     } finally {
-      busy = "";
+      if (generation === artistGeneration) busy = "";
     }
   }
   async function playPlaylist(id) {
     if (busy) return;
+    const generation = artistGeneration;
     busy = id;
     playError = "";
     try {
       await playPlaylistById(id);
     } catch (reason) {
-      playError = String(reason || "Could not play this playlist.");
+      if (generation === artistGeneration) {
+        playError = String(reason || "Could not play this playlist.");
+      }
     } finally {
-      busy = "";
+      if (generation === artistGeneration) busy = "";
     }
   }
 </script>
@@ -625,6 +619,11 @@
           <h2 class="section-title" id="artist-playlists-title">
             Artist playlists<span class="section-count tnum">{playlistShelves.artist.length}</span>
           </h2>
+          {#if playlistShelves.artist.length > perRow}
+            <button class="link-more" onclick={() => navigate("artist-playlists", artist.id)}>
+              See all<Icon name="fwd" size={12} />
+            </button>
+          {/if}
         </div>
         <div class="shelf playlist-shelf" style:--per-row={perRow}>
           {#each playlistShelves.artist.slice(0, perRow) as playlist (playlist.id)}
@@ -640,6 +639,11 @@
           <h2 class="section-title" id="discovered-title">
             Discovered on<span class="section-count tnum">{playlistShelves.discovered.length}</span>
           </h2>
+          {#if playlistShelves.discovered.length > perRow}
+            <button class="link-more" onclick={() => navigate("discovered-on", artist.id)}>
+              See all<Icon name="fwd" size={12} />
+            </button>
+          {/if}
         </div>
         <div class="shelf playlist-shelf" style:--per-row={perRow}>
           {#each playlistShelves.discovered.slice(0, perRow) as playlist (playlist.id)}
