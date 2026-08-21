@@ -299,6 +299,7 @@ pub async fn create_playlist(session: &Session, name: &str) -> Result<PlaylistRe
         id,
         uri,
         name: name.to_owned(),
+        description: None,
         owner_id: session.username(),
         owner_name: String::new(),
         cover_url: None,

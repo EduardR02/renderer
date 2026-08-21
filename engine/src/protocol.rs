@@ -283,6 +283,8 @@ pub struct PlaylistRef {
     pub id: String,
     pub uri: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub owner_id: String,
     pub owner_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -962,6 +964,7 @@ mod tests {
             id: "0123456789ABCDEFGHIJKL".to_owned(),
             uri: "spotify:playlist:0123456789ABCDEFGHIJKL".to_owned(),
             name: "Road Trip".to_owned(),
+            description: Some("A road trip playlist.".to_owned()),
             owner_id: "alice".to_owned(),
             owner_name: String::new(),
             cover_url: Some("https://i.scdn.co/image/0123".to_owned()),
@@ -1012,6 +1015,7 @@ mod tests {
                         "id": "0123456789ABCDEFGHIJKL",
                         "uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
                         "name": "Road Trip",
+                        "description": "A road trip playlist.",
                         "owner_id": "alice",
                         "owner_name": "",
                         "cover_url": "https://i.scdn.co/image/0123",
@@ -1066,6 +1070,7 @@ mod tests {
                 "id": "0123456789ABCDEFGHIJKL",
                 "uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
                 "name": "Road Trip",
+                "description": "A road trip playlist.",
                 "owner_id": "alice",
                 "owner_name": "",
                 "cover_url": "https://i.scdn.co/image/0123",

@@ -22,3 +22,14 @@ export function artistPlaylistCollections(overview) {
     discovered: unique(overview?.discovered_on),
   };
 }
+
+export function artistPlaylistSubtitle(playlist) {
+  const description = String(playlist?.description ?? "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (description) return description;
+  if (playlist?.owner) return `By ${playlist.owner}`;
+  if (playlist?.tracks_total) return `${playlist.tracks_total} songs`;
+  return "Playlist";
+}

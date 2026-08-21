@@ -4,7 +4,7 @@
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
-  import { artistPlaylistCollections } from "../lib/artist.js";
+  import { artistPlaylistCollections, artistPlaylistSubtitle } from "../lib/artist.js";
 
   /* Both routes project the artist overview already in memory. Opening a full
      collection must not repeat the artist request. Keep the same cross-shelf
@@ -80,9 +80,7 @@
     </div>
     <button class="card-copy" onclick={() => navigate("playlist", playlist.id)}>
       <span class="card-name">{playlist.name}</span>
-      <span class="card-sub">
-        {playlist.owner ? `By ${playlist.owner}` : playlist.tracks_total ? `${playlist.tracks_total} songs` : "Playlist"}
-      </span>
+      <span class="card-sub">{artistPlaylistSubtitle(playlist)}</span>
     </button>
   </div>
 {/snippet}

@@ -47,7 +47,7 @@
 //!   only as the graceful fallback when every overview hash has rotated.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -984,6 +984,7 @@ fn playlist_ref_from_rootlist(
         name: attributes.and_then(|a| a.name.clone()).unwrap_or_default(),
         owner_id: meta.owner_username.clone().or(user).unwrap_or_default(),
         // The rootlist carries owner usernames but no display names.
+        description: None,
         owner_name: String::new(),
         cover_url: attributes.and_then(rootlist_cover),
         track_count: meta.length.and_then(|length| u32::try_from(length).ok()),
@@ -1195,6 +1196,192 @@ fn artist_portrait(artist: &Artist) -> Option<String> {
     cover_url(&artist.portraits).or_else(|| cover_url(&artist.portrait_group))
 }
 
+#[derive(Clone, Debug, Default)]
+struct ArtistVisualIdentity {
+    square_cover: Option<String>,
+    sixteen_by_nine: Option<String>,
+    square_full_bleed: Option<String>,
+    wide_full_bleed: Option<String>,
+}
+
+impl ArtistVisualIdentity {
+    fn header(&self) -> Option<&str> {
+        self.wide_full_bleed
+            .as_deref()
+            .or(self.sixteen_by_nine.as_deref())
+    }
+
+    fn biography(&self) -> Option<&str> {
+        self.sixteen_by_nine
+            .as_deref()
+            .or(self.square_full_bleed.as_deref())
+            .or(self.square_cover.as_deref())
+    }
+}
+
+struct WireReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> WireReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn varint(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = *self.bytes.get(self.position)?;
+            self.position += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn field(&mut self) -> Option<(u32, u8)> {
+        let tag = self.varint()?;
+        Some((u32::try_from(tag >> 3).ok()?, u8::try_from(tag & 7).ok()?))
+    }
+
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let length = usize::try_from(self.varint()?).ok()?;
+        let end = self.position.checked_add(length)?;
+        let value = self.bytes.get(self.position..end)?;
+        self.position = end;
+        Some(value)
+    }
+
+    fn skip(&mut self, wire_type: u8) -> bool {
+        match wire_type {
+            0 => self.varint().is_some(),
+            1 => {
+                self.position = self.position.saturating_add(8);
+                self.position <= self.bytes.len()
+            }
+            2 => self.bytes().is_some(),
+            5 => {
+                self.position = self.position.saturating_add(4);
+                self.position <= self.bytes.len()
+            }
+            _ => false,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.position >= self.bytes.len()
+    }
+}
+
+fn visual_flat_file_url(payload: &[u8]) -> Option<String> {
+    let mut reader = WireReader::new(payload);
+    while !reader.done() {
+        let (field, wire_type) = reader.field()?;
+        if field == 1 && wire_type == 2 {
+            return std::str::from_utf8(reader.bytes()?)
+                .ok()
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned);
+        }
+        if !reader.skip(wire_type) {
+            return None;
+        }
+    }
+    None
+}
+
+fn visual_instance(payload: &[u8]) -> Option<(u64, String)> {
+    let mut reader = WireReader::new(payload);
+    let mut url = None;
+    let mut size = 0;
+    while !reader.done() {
+        let (field, wire_type) = reader.field()?;
+        match (field, wire_type) {
+            (1, 2) => url = visual_flat_file_url(reader.bytes()?),
+            (2, 0) => size = reader.varint()?,
+            _ if !reader.skip(wire_type) => return None,
+            _ => {}
+        }
+    }
+    Some((size, url?))
+}
+
+fn visual_group_url(payload: &[u8]) -> Option<String> {
+    let mut reader = WireReader::new(payload);
+    let mut best = None;
+    while !reader.done() {
+        let (field, wire_type) = reader.field()?;
+        if field == 1 && wire_type == 2 {
+            if let Some(candidate) = visual_instance(reader.bytes()?) {
+                if best
+                    .as_ref()
+                    .is_none_or(|current: &(u64, String)| candidate.0 >= current.0)
+                {
+                    best = Some(candidate);
+                }
+            }
+        } else if !reader.skip(wire_type) {
+            return None;
+        }
+    }
+    best.map(|(_, url)| url)
+}
+
+fn parse_artist_visual_identity(payload: &[u8]) -> Option<ArtistVisualIdentity> {
+    let mut reader = WireReader::new(payload);
+    let mut visuals = ArtistVisualIdentity::default();
+    while !reader.done() {
+        let (field, wire_type) = reader.field()?;
+        if wire_type == 2 && matches!(field, 1 | 2 | 5 | 6) {
+            let url = visual_group_url(reader.bytes()?);
+            match field {
+                1 => visuals.square_cover = url,
+                2 => visuals.sixteen_by_nine = url,
+                5 => visuals.square_full_bleed = url,
+                6 => visuals.wide_full_bleed = url,
+                _ => unreachable!(),
+            }
+        } else if !reader.skip(wire_type) {
+            return None;
+        }
+    }
+    (visuals.header().is_some() || visuals.biography().is_some()).then_some(visuals)
+}
+
+async fn artist_visual_identity(
+    session: &Session,
+    artist_uri: &SpotifyUri,
+) -> Result<Option<ArtistVisualIdentity>, String> {
+    // The entity service only returns visual identity when identity is part of
+    // the same request. Asking for VISUAL_IDENTITY_TRAIT alone succeeds with
+    // an empty response, which previously hid the dedicated wide header.
+    let mut request = build_batched_request(
+        std::slice::from_ref(artist_uri),
+        ExtensionKind::VISUAL_IDENTITY_TRAIT,
+        &session.country(),
+    );
+    request.entity_request[0].query.insert(
+        0,
+        ExtensionQuery {
+            extension_kind: EnumOrUnknown::new(ExtensionKind::IDENTITY_TRAIT),
+            ..Default::default()
+        },
+    );
+    let response = session
+        .spclient()
+        .get_extended_metadata(request)
+        .await
+        .map_err(|error| format!("artist visual identity request failed: {error}"))?;
+    let payload = collect_extension_payloads(&response, ExtensionKind::VISUAL_IDENTITY_TRAIT)
+        .into_iter()
+        .next()
+        .map(|(_, payload)| payload);
+    Ok(payload.as_deref().and_then(parse_artist_visual_identity))
+}
+
 
 const INITIAL_ARTIST_RELEASES: usize = 12;
 const MAX_ARTIST_RELEASE_PAGE: usize = 40;
@@ -1358,6 +1545,7 @@ fn metadata_artist_overview(artist: &Artist) -> ArtistOverview {
 fn merge_artist_overview(
     artist: &Artist,
     query: Option<&ArtistOverviewQuery>,
+    visuals: Option<&ArtistVisualIdentity>,
 ) -> Option<ArtistOverview> {
     let mut overview = metadata_artist_overview(artist);
     if let Some(query) = query {
@@ -1395,6 +1583,14 @@ fn merge_artist_overview(
             .clone_from(&supplied.artist_playlists);
         overview.artist_pick.clone_from(&supplied.artist_pick);
     }
+    if let Some(visuals) = visuals {
+        if let Some(header) = visuals.header() {
+            overview.header_image_url = Some(header.to_owned());
+        }
+        if overview.biography_image_url.is_none() {
+            overview.biography_image_url = visuals.biography().map(str::to_owned);
+        }
+    }
 
 
     (overview.biography.is_some()
@@ -1430,10 +1626,15 @@ pub async fn artist_browse(
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
     let artist_uri = uri_of(&artist.id);
     let top_track_uris = artist.top_tracks.for_country(&session.country());
-    let (query_overview, top_tracks) = tokio::join!(
+    let (query_overview, visual_identity, top_tracks) = tokio::join!(
         cached_artist_overview(session, id, &artist_uri),
+        artist_visual_identity(session, &uri),
         fetch_tracks(session, top_track_uris.iter()),
     );
+    let visual_identity = visual_identity
+        .inspect_err(|error| eprintln!("{error}"))
+        .ok()
+        .flatten();
     let mut top_tracks = top_tracks?;
     if let Some(query) = query_overview.as_ref() {
         // queryArtistOverview carries the same URI/playcount map as getTrack.
@@ -1453,7 +1654,11 @@ pub async fn artist_browse(
 
     let groups = artist_release_groups(&artist);
     let page = resolve_initial_artist_release_page(session, &groups).await?;
-    let overview = merge_artist_overview(&artist, query_overview.as_ref());
+    let overview = merge_artist_overview(
+        &artist,
+        query_overview.as_ref(),
+        visual_identity.as_ref(),
+    );
 
     Ok(spotify_playback_engine::protocol::ArtistBrowse {
         id: id_of(&artist.id),
@@ -1515,7 +1720,7 @@ fn parse_catalogue_release_payload(
     })
 }
 
-const CATALOGUE_MANIFEST_TTL: Duration = Duration::from_secs(5 * 60);
+const CATALOGUE_MANIFEST_TTL: Duration = Duration::from_secs(30 * 60);
 const CATALOGUE_MANIFEST_CACHE_CAPACITY: usize = 8;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1524,36 +1729,33 @@ struct CatalogueManifestKey {
     country: String,
     selected_groups: Vec<usize>,
 }
-
 #[derive(Clone)]
 struct CatalogueManifestEntry {
     fetched_at: Instant,
-    releases: Vec<CatalogueReleaseSeed>,
+    releases: Arc<[SpotifyUri]>,
 }
 
 #[derive(Default)]
 struct CatalogueManifestCache {
     entries: HashMap<CatalogueManifestKey, CatalogueManifestEntry>,
 }
-
 impl CatalogueManifestCache {
     fn get(
         &mut self,
         key: &CatalogueManifestKey,
         now: Instant,
-    ) -> Option<Vec<CatalogueReleaseSeed>> {
+    ) -> Option<Arc<[SpotifyUri]>> {
         let entry = self.entries.get(key)?;
         if now.duration_since(entry.fetched_at) >= CATALOGUE_MANIFEST_TTL {
             self.entries.remove(key);
             return None;
         }
-        Some(entry.releases.clone())
+        Some(Arc::clone(&entry.releases))
     }
-
     fn insert(
         &mut self,
         key: CatalogueManifestKey,
-        releases: Vec<CatalogueReleaseSeed>,
+        releases: Arc<[SpotifyUri]>,
         now: Instant,
     ) {
         self.entries.retain(|_, entry| {
@@ -1649,12 +1851,260 @@ fn order_catalogue_manifest(
     });
 }
 
+const ARTIST_DISCOGRAPHY_HASH: &str =
+    "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599";
+
+#[derive(Default, Deserialize)]
+struct ArtistDiscographyResponseJson {
+    #[serde(default)]
+    data: Option<ArtistDiscographyDataJson>,
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct ArtistDiscographyDataJson {
+    #[serde(default)]
+    artistUnion: Option<ArtistDiscographyUnionJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistDiscographyUnionJson {
+    #[serde(default)]
+    discography: Option<ArtistDiscographyJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistDiscographyJson {
+    #[serde(default)]
+    albums: Option<ArtistDiscographySectionJson>,
+    #[serde(default)]
+    singles: Option<ArtistDiscographySectionJson>,
+    #[serde(default)]
+    compilations: Option<ArtistDiscographySectionJson>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct ArtistDiscographySectionJson {
+    #[serde(default)]
+    items: Vec<ArtistDiscographyReleaseGroupJson>,
+    #[serde(default)]
+    totalCount: usize,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistDiscographyReleaseGroupJson {
+    #[serde(default)]
+    releases: ArtistDiscographyReleasesJson,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistDiscographyReleasesJson {
+    #[serde(default)]
+    items: Vec<ArtistDiscographyReleaseJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistDiscographyReleaseJson {
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    date: Option<ArtistDiscographyDateJson>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct ArtistDiscographyDateJson {
+    #[serde(default)]
+    isoString: Option<String>,
+    #[serde(default)]
+    year: Option<u32>,
+}
+
+#[derive(Clone)]
+struct OrderedReleaseUri {
+    uri: SpotifyUri,
+    date: String,
+}
+
+fn artist_discography_body(
+    artist_uri: &str,
+    group: usize,
+    offset: usize,
+    limit: usize,
+) -> Result<String, String> {
+    let operation = match group {
+        0 => "queryArtistDiscographyAlbums",
+        1 => "queryArtistDiscographySingles",
+        2 => "queryArtistDiscographyCompilations",
+        _ => return Err("the official discography query has no Appears On group".to_owned()),
+    };
+    Ok(serde_json::json!({
+        "operationName": operation,
+        "variables": {
+            "uri": artist_uri,
+            "offset": offset,
+            "limit": limit.clamp(1, 300),
+            "order": "DATE_DESC",
+        },
+        "extensions": {
+            "persistedQuery": {
+                "version": 1,
+                "sha256Hash": ARTIST_DISCOGRAPHY_HASH,
+            },
+        },
+    })
+    .to_string())
+}
+
+fn parse_artist_discography_page(
+    payload: &[u8],
+    group: usize,
+) -> Result<(Vec<OrderedReleaseUri>, usize, usize), String> {
+    let ArtistDiscographyResponseJson { data, errors } = serde_json::from_slice(payload)
+        .map_err(|error| format!("unparseable artist discography response: {error}"))?;
+    let discography = data
+        .and_then(|data| data.artistUnion)
+        .and_then(|artist| artist.discography)
+        .ok_or_else(|| {
+            if errors.as_deref().unwrap_or_default().is_empty() {
+                "artist discography response contained no catalogue".to_owned()
+            } else {
+                "artist discography document was rejected".to_owned()
+            }
+        })?;
+    let section = match group {
+        0 => discography.albums,
+        1 => discography.singles,
+        2 => discography.compilations,
+        _ => None,
+    }
+    .ok_or_else(|| "artist discography response omitted the requested group".to_owned())?;
+    let consumed = section.items.len();
+    let releases = section
+        .items
+        .into_iter()
+        .filter_map(|group| {
+            // Each row is one release family. Spotify orders variants by
+            // market preference; the first valid URI is the one its client
+            // presents for that row.
+            let release = group
+                .releases
+                .items
+                .into_iter()
+                .find(|release| release.uri.as_deref().is_some_and(|uri| !uri.is_empty()))?;
+            let uri = SpotifyUri::from_uri(release.uri.as_deref()?).ok()?;
+            let date = release
+                .date
+                .and_then(|date| {
+                    date.isoString
+                        .filter(|date| !date.is_empty())
+                        .or_else(|| date.year.map(|year| format!("{year:04}")))
+                })
+                .unwrap_or_default();
+            Some(OrderedReleaseUri { uri, date })
+        })
+        .collect();
+    Ok((releases, consumed, section.totalCount))
+}
+
+async fn official_discography_group(
+    session: &Session,
+    artist_uri: &str,
+    group: usize,
+    expected: usize,
+) -> Result<Vec<OrderedReleaseUri>, String> {
+    if expected == 0 {
+        return Ok(Vec::new());
+    }
+    let mut offset = 0;
+    let mut total = expected;
+    let mut releases = Vec::with_capacity(expected);
+    loop {
+        let limit = total.saturating_sub(offset).clamp(1, 300);
+        let body = artist_discography_body(artist_uri, group, offset, limit)?;
+        let payload = pathfinder_post(session, &body, "artist discography").await?;
+        let (mut page, consumed, reported_total) =
+            parse_artist_discography_page(&payload, group)?;
+        total = reported_total;
+        releases.append(&mut page);
+        if consumed == 0 || offset.saturating_add(consumed) >= total {
+            break;
+        }
+        offset = offset.saturating_add(consumed);
+    }
+    if expected > 0 && releases.is_empty() {
+        return Err("artist discography returned no releases".to_owned());
+    }
+    Ok(releases)
+}
+
+fn merge_official_discography(groups: impl IntoIterator<Item = Vec<OrderedReleaseUri>>) -> Vec<SpotifyUri> {
+    let mut seen = HashSet::new();
+    let mut releases = groups
+        .into_iter()
+        .flatten()
+        .filter(|release| seen.insert(uri_of(&release.uri)))
+        .collect::<Vec<_>>();
+    // Stable sort: exact server dates decide the global mixed order; equal-date
+    // rows retain each section's server order and the selected section order.
+    releases.sort_by(|left, right| right.date.cmp(&left.date));
+    releases.into_iter().map(|release| release.uri).collect()
+}
+
+async fn official_catalogue_manifest(
+    session: &Session,
+    artist_uri: &str,
+    groups: &[Vec<SpotifyUri>; 4],
+    selected: &[usize],
+) -> Result<Vec<SpotifyUri>, String> {
+    match selected {
+        [group @ 0..=2] => Ok(merge_official_discography([official_discography_group(
+            session,
+            artist_uri,
+            *group,
+            groups[*group].len(),
+        )
+        .await?])),
+        [0, 1, 2] => {
+            let (albums, singles, compilations) = tokio::join!(
+                official_discography_group(session, artist_uri, 0, groups[0].len()),
+                official_discography_group(session, artist_uri, 1, groups[1].len()),
+                official_discography_group(session, artist_uri, 2, groups[2].len()),
+            );
+            Ok(merge_official_discography([
+                albums?,
+                singles?,
+                compilations?,
+            ]))
+        }
+        _ => Err("unsupported official discography group combination".to_owned()),
+    }
+}
+
+fn cached_catalogue_manifest(
+    artist_id: &str,
+    country: &str,
+    selected: &[usize],
+) -> Option<Arc<[SpotifyUri]>> {
+    let key = CatalogueManifestKey {
+        artist_id: artist_id.to_owned(),
+        country: country.to_owned(),
+        selected_groups: selected.to_vec(),
+    };
+    CATALOGUE_MANIFEST_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key, Instant::now())
+}
+
 async fn catalogue_manifest(
     session: &Session,
     artist_id: &str,
     groups: &[Vec<SpotifyUri>; 4],
     selected: &[usize],
-) -> Result<Vec<CatalogueReleaseSeed>, String> {
+) -> Result<Arc<[SpotifyUri]>, String> {
     let key = CatalogueManifestKey {
         artist_id: artist_id.to_owned(),
         country: session.country(),
@@ -1668,20 +2118,34 @@ async fn catalogue_manifest(
         return Ok(cached);
     }
 
-    let uris = interleaved_catalogue_uris(groups, selected);
-    let mut releases = fetch_extended(
-        session,
-        uris.iter(),
-        ExtensionKind::ALBUM_V4,
-        parse_catalogue_release_payload,
-    )
-    .await?;
-    order_catalogue_manifest(&mut releases, selected.len());
+    let artist_uri = format!("spotify:artist:{artist_id}");
+    let releases = match official_catalogue_manifest(session, &artist_uri, groups, selected).await {
+        Ok(releases) if !releases.is_empty() => releases,
+        Ok(_) | Err(_) => {
+            // The persisted document can rotate. Retain the metadata4 path as
+            // a correct, slower fallback rather than making the catalogue
+            // unavailable when that optional server ordering disappears.
+            let uris = interleaved_catalogue_uris(groups, selected);
+            let mut seeds = fetch_extended(
+                session,
+                uris.iter(),
+                ExtensionKind::ALBUM_V4,
+                parse_catalogue_release_payload,
+            )
+            .await?;
+            order_catalogue_manifest(&mut seeds, selected.len());
+            seeds
+                .into_iter()
+                .filter_map(|release| SpotifyUri::from_uri(&release.header.uri).ok())
+                .collect()
+        }
+    };
 
+    let releases: Arc<[SpotifyUri]> = releases.into();
     CATALOGUE_MANIFEST_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key, releases.clone(), Instant::now());
+        .insert(key, Arc::clone(&releases), Instant::now());
     Ok(releases)
 }
 
@@ -1692,21 +2156,32 @@ pub async fn artist_catalogue_browse(
     offset: usize,
     limit: usize,
 ) -> Result<spotify_playback_engine::protocol::ArtistCataloguePage, String> {
-    let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
-        .map_err(|error| format!("invalid artist id: {error}"))?;
-    let artist: Artist = metadata_get(session, &uri, "artist").await?;
-
     let selected = if release_types.is_empty() {
         vec![0, 1, 2]
     } else {
         selected_release_group_indices(release_types)?
     };
-    let groups = artist_release_groups(&artist);
-    let manifest = catalogue_manifest(session, id, &groups, &selected).await?;
+    let country = session.country();
+    let manifest = if let Some(cached) = cached_catalogue_manifest(id, &country, &selected) {
+        cached
+    } else {
+        let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
+            .map_err(|error| format!("invalid artist id: {error}"))?;
+        let artist: Artist = metadata_get(session, &uri, "artist").await?;
+        let groups = artist_release_groups(&artist);
+        catalogue_manifest(session, id, &groups, &selected).await?
+    };
     let total = manifest.len();
     let limit = limit.clamp(1, 6);
     let end = offset.saturating_add(limit).min(total);
-    let mut seeds = manifest.get(offset..end).unwrap_or_default().to_vec();
+    let page = manifest.get(offset..end).unwrap_or_default();
+    let mut seeds = fetch_extended(
+        session,
+        page.iter(),
+        ExtensionKind::ALBUM_V4,
+        parse_catalogue_release_payload,
+    )
+    .await?;
     let wanted_tracks: Vec<SpotifyUri> = seeds
         .iter()
         .flat_map(|release| release.track_uris.iter().cloned())
@@ -2101,6 +2576,8 @@ struct SearchPlaylistHitJson {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     ownerV2: Option<SearchPlaylistOwnerV2Json>,
     #[serde(default)]
     images: Option<SearchPlaylistImagesJson>,
@@ -2465,6 +2942,12 @@ fn playlist_ref_from_hit(hit: &SearchPlaylistHitJson) -> PlaylistRef {
         id: hit_id(hit.uri.as_deref()),
         uri: hit.uri.clone().unwrap_or_default(),
         name: hit.name.clone().unwrap_or_default(),
+        description: hit
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(str::to_owned),
         owner_id,
         owner_name: owner
             .and_then(|owner| owner.name.clone())
@@ -4058,6 +4541,7 @@ mod tests {
                             {"data": {
                                 "uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
                                 "name": "Public Mix",
+                                "description": "The essential tracks, all in one playlist.",
                                 "ownerV2": {"data": {
                                     "name": "Alice Example",
                                     "username": "alice",
@@ -4095,6 +4579,10 @@ mod tests {
         assert_eq!(playlists.len(), 2);
         assert_eq!(playlists[0].id, "0123456789ABCDEFGHIJKL");
         assert_eq!(playlists[0].name, "Public Mix");
+        assert_eq!(
+            playlists[0].description.as_deref(),
+            Some("The essential tracks, all in one playlist.")
+        );
         assert_eq!(playlists[0].owner_id, "alice");
         assert_eq!(playlists[0].owner_name, "Alice Example");
         assert_eq!(playlists[0].track_count, Some(42));
@@ -4502,7 +4990,7 @@ mod tests {
         related.portrait_group = Images(vec![image(ImageSize::DEFAULT, 0xef)]);
         artist.related = Artists(vec![related]);
 
-        let overview = merge_artist_overview(&artist, None).unwrap();
+        let overview = merge_artist_overview(&artist, None, None).unwrap();
         assert_eq!(overview.biography.as_deref(), Some("Metadata biography"));
         assert_eq!(overview.popularity, Some(73));
         assert_eq!(overview.related_artists.len(), 1);
@@ -4738,6 +5226,69 @@ mod tests {
     }
 
     #[test]
+    fn official_discography_uses_exact_dates_and_preserves_equal_date_order() {
+        let albums = br#"{
+            "data":{"artistUnion":{"discography":{"albums":{
+                "totalCount":2,
+                "items":[
+                    {"releases":{"items":[
+                        {"uri":"spotify:album:0abcdefghijklmnopqrstu",
+                         "date":{"isoString":"2025-10-03T00:00:00Z","year":2025}},
+                        {"uri":"spotify:album:1abcdefghijklmnopqrstu",
+                         "date":{"isoString":"2025-10-03T00:00:00Z","year":2025}}
+                    ]}},
+                    {"releases":{"items":[
+                        {"uri":"spotify:album:2abcdefghijklmnopqrstu",
+                         "date":{"isoString":"2024-04-19T00:00:00Z","year":2024}}
+                    ]}}
+                ]
+            }}}}
+        }"#;
+        let singles = br#"{
+            "data":{"artistUnion":{"discography":{"singles":{
+                "totalCount":2,
+                "items":[
+                    {"releases":{"items":[
+                        {"uri":"spotify:album:3abcdefghijklmnopqrstu",
+                         "date":{"isoString":"2025-10-03T00:00:00Z","year":2025}}
+                    ]}},
+                    {"releases":{"items":[
+                        {"uri":"spotify:album:4abcdefghijklmnopqrstu",
+                         "date":{"isoString":"2025-09-01T00:00:00Z","year":2025}}
+                    ]}}
+                ]
+            }}}}
+        }"#;
+        let (albums, consumed, total) = parse_artist_discography_page(albums, 0).unwrap();
+        assert_eq!((consumed, total), (2, 2));
+        assert_eq!(id_of(&albums[0].uri), "0abcdefghijklmnopqrstu");
+        let (singles, _, _) = parse_artist_discography_page(singles, 1).unwrap();
+
+        let ordered = merge_official_discography([albums, singles]);
+
+        assert_eq!(
+            ordered.iter().map(id_of).collect::<Vec<_>>(),
+            vec![
+                "0abcdefghijklmnopqrstu",
+                "3abcdefghijklmnopqrstu",
+                "4abcdefghijklmnopqrstu",
+                "2abcdefghijklmnopqrstu",
+            ],
+            "exact dates sort globally; same-day releases retain section/server order",
+        );
+        let body: serde_json::Value = serde_json::from_str(
+            &artist_discography_body("spotify:artist:id", 1, 20, 40).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["operationName"], "queryArtistDiscographySingles");
+        assert_eq!(body["variables"]["order"], "DATE_DESC");
+        assert_eq!(
+            body["extensions"]["persistedQuery"]["sha256Hash"],
+            ARTIST_DISCOGRAPHY_HASH,
+        );
+    }
+
+    #[test]
     fn album_years_drop_the_placeholder_zero() {
         let covers = Images(vec![image(ImageSize::DEFAULT, 0x11)]);
         let mut album = test_album("0abcdefghijklmnopqrstu", "Album", Vec::new(), covers);
@@ -4775,6 +5326,50 @@ mod tests {
             artist_portrait(&artist).as_deref(),
             Some(format!("{COVER_BASE}{}", "cd".repeat(20))).as_deref()
         );
+    }
+
+    #[test]
+    fn visual_identity_prefers_the_largest_dedicated_wide_header() {
+        fn varint(mut value: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                out.push(if value == 0 { byte } else { byte | 0x80 });
+                if value == 0 {
+                    return out;
+                }
+            }
+        }
+        fn message(field: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![(field << 3) | 2];
+            out.extend(varint(payload.len() as u64));
+            out.extend(payload);
+            out
+        }
+        fn instance(url: &str, size: u8) -> Vec<u8> {
+            let mut out = message(1, &message(1, url.as_bytes()));
+            out.extend([2 << 3, size]);
+            out
+        }
+        fn group(images: &[(&str, u8)]) -> Vec<u8> {
+            images
+                .iter()
+                .flat_map(|(url, size)| message(1, &instance(url, *size)))
+                .collect()
+        }
+
+        let mut payload = message(1, &group(&[("avatar", 2)]));
+        payload.extend(message(2, &group(&[("biography", 2)])));
+        payload.extend(message(
+            6,
+            &group(&[("header-small", 0), ("header-wide", 2)]),
+        ));
+        let visuals = parse_artist_visual_identity(&payload).unwrap();
+
+        assert_eq!(visuals.header(), Some("header-wide"));
+        assert_eq!(visuals.biography(), Some("biography"));
+        assert_ne!(visuals.header(), visuals.square_cover.as_deref());
     }
 
     #[test]

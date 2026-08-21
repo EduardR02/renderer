@@ -134,6 +134,7 @@ pub struct Playlist {
     pub id: String,
     pub uri: String,
     pub name: String,
+    pub description: String,
     /// Display name of the owning user (falls back to the username).
     pub owner: String,
     pub owner_id: String,
@@ -175,6 +176,7 @@ impl From<&PlaylistRef> for Playlist {
             id: reference.id.clone(),
             uri: reference.uri.clone(),
             name: reference.name.clone(),
+            description: reference.description.clone().unwrap_or_default(),
             owner: if reference.owner_name.is_empty() {
                 reference.owner_id.clone()
             } else {
@@ -255,6 +257,7 @@ impl From<PlaylistBrowse> for PlaylistDetail {
                 id: browse.id,
                 uri: browse.uri,
                 name: browse.name,
+                description: String::new(),
                 owner: if browse.owner_name.is_empty() {
                     browse.owner_id.clone()
                 } else {
@@ -908,6 +911,7 @@ mod tests {
                 id: "0123456789ABCDEFGHIJKL".into(),
                 uri: "spotify:playlist:0123456789ABCDEFGHIJKL".into(),
                 name: "Public Mix".into(),
+                description: Some("A public playlist.".into()),
                 owner_id: "alice".into(),
                 owner_name: "Alice Example".into(),
                 cover_url: Some("https://i.scdn.co/image/cover".into()),
@@ -921,6 +925,7 @@ mod tests {
                 id: "0123456789ABCDEFGHIJKL".into(),
                 uri: "spotify:playlist:0123456789ABCDEFGHIJKL".into(),
                 name: "Public Mix".into(),
+                description: "A public playlist.".into(),
                 owner: "Alice Example".into(),
                 owner_id: "alice".into(),
                 cover_url: "https://i.scdn.co/image/cover".into(),

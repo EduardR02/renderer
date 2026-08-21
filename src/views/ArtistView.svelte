@@ -6,7 +6,7 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import { GROUPS, RELEASE_KEYS } from "../lib/discography.js";
-  import { artistPlaylistCollections } from "../lib/artist.js";
+  import { artistPlaylistCollections, artistPlaylistSubtitle } from "../lib/artist.js";
 
   /**
    * The artist page: who this is, what to play, and one shelf of records.
@@ -404,7 +404,7 @@
     </div>
     <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
       <span class="card-name">{pl.name}</span>
-      <span class="card-sub">{pl.tracks_total ? `${pl.tracks_total} songs` : "Playlist"}</span>
+      <span class="card-sub">{artistPlaylistSubtitle(pl)}</span>
     </button>
   </div>
 {/snippet}
