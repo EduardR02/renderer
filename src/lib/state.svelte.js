@@ -398,7 +398,12 @@ export function loadDetail(name = route.name, id = route.id) {
   const seq = ++browseSeq;
   detail.error = "";
   const settle = (key) => (payload) => {
-    if (seq === browseSeq) detail[key] = payload ?? null;
+    if (seq !== browseSeq) return;
+    // A cached open starts its engine refresh before this command response is
+    // delivered. If that fresher event won the race, never replace it with the
+    // stale disk snapshot that arrived later.
+    if (key === "playlist" && detail.playlist?.id === id) return;
+    detail[key] = payload ?? null;
   };
   const fail = (reason) => {
     if (seq === browseSeq) detail.error = String(reason || "Nothing came back from the engine.");
@@ -1531,12 +1536,22 @@ export async function initEvents() {
    */
   listen("playlist", (e) => {
     const fresh = e.payload;
-    const id = fresh?.playlist?.id;
+    const id = fresh?.id;
     if (!id || route.name !== "playlist" || route.id !== id) return;
     const open = detail.playlist;
-    if (!open) return;
+    // The refresh may beat the cached browse command response. Publishing it
+    // now gives that response something authoritative to preserve.
+    if (!open) {
+      detail.playlist = fresh;
+      return;
+    }
 
-    open.playlist = fresh.playlist;
+    // `PlaylistDetail` is flattened by serde: metadata and `tracks` are
+    // siblings. Refresh the metadata in place without replacing the detail or
+    // track array that the open list is rendering.
+    for (const key of Object.keys(fresh)) {
+      if (key !== "tracks" && open[key] !== fresh[key]) open[key] = fresh[key];
+    }
 
     const current = open.tracks ?? [];
     const incoming = fresh.tracks ?? [];
