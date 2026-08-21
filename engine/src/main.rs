@@ -591,6 +591,11 @@ async fn run(
                 if engine.tick_session_health(&auth_sender) {
                     engine.emit_state()?;
                 }
+                // A track finishes caching mid-listen, so the download mark has
+                // to be able to appear without reopening the list it is in.
+                if engine.refresh_cached_marks() {
+                    engine.emit_state()?;
+                }
                 if engine.tick_position() {
                     // Scalar playhead sync: O(1) regardless of queue size.
                     // Real changes (track, queue, volume, play/pause, ...)

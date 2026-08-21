@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    align_artist_ids, cover_urls_from_tracks, CacheStats, CacheUsage, PlaybackState, Playlist,
+    align_artist_ids, cover_urls_from_tracks, forget_cached_audio, CacheStats, CacheUsage,
+    PlaybackState, Playlist,
     PlaylistDetail, Track,
 };
 
@@ -289,6 +290,10 @@ pub fn load_tracks_cache(dir: &Path) -> Vec<PlaylistTracksEntry> {
             for entry in &mut cache.playlists {
                 for track in &mut entry.tracks {
                     align_artist_ids(track);
+                    // The download mark is about the AUDIO cache, whose
+                    // contents this file knows nothing about — it may have been
+                    // pruned or cleared since. Only a live browse can answer it.
+                    forget_cached_audio(track);
                 }
             }
             cache.playlists
@@ -991,6 +996,27 @@ mod tests {
         );
         assert!(track.artist_ids.iter().all(|id| id.is_empty()));
         assert_eq!(track.artist_id, "a1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The audio cache can be cleared or pruned between two runs of the app,
+    /// and this file would not know. A download mark read back off disk is a
+    /// claim about a directory this cache does not own, so it is dropped.
+    #[test]
+    fn a_tracks_cache_never_restores_a_download_mark() {
+        let dir = std::env::temp_dir().join(format!("spotify-renderer-cached-{}", now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries = vec![PlaylistTracksEntry {
+            id: "p1".into(),
+            fetched_at: Some(42),
+            revision: "rev".into(),
+            tracks: vec![Track { cached: true, ..track("t") }],
+        }];
+        save_tracks_cache(&dir, &entries);
+        assert!(
+            !load_tracks_cache(&dir)[0].tracks[0].cached,
+            "only a live browse may claim a track is on disk"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

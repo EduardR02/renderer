@@ -8,10 +8,10 @@
 use serde::{Deserialize, Serialize};
 
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistCataloguePage, ArtistOverview, ArtistRef,
-    ArtistReleaseCounts, ArtistReleasePage, ArtistReleases, ArtistTopCity, CreditArtist,
-    CreditRole, LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse,
-    SearchBrowse, TrackCredits, TrackRef,
+    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistCataloguePage, ArtistOverview, ArtistPick,
+    ArtistPickItem, ArtistRef, ArtistReleaseCounts, ArtistReleasePage, ArtistReleases,
+    ArtistTopCity, CreditArtist, CreditRole, LikedSongsPage, PlaylistBrowse,
+    PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, TrackCredits, TrackRef,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -48,6 +48,16 @@ pub struct Track {
     /// never mutate this persisted field.
     pub unavailable: bool,
     pub unavailable_reason: Option<String>,
+    /// Whether this track's audio is already in the app-owned librespot cache,
+    /// as measured by the engine at browse time.
+    ///
+    /// This one field is EPHEMERAL where every other field here is durable, so
+    /// it must not survive `playlist_tracks_cache.json`: an audio cache that
+    /// has been cleared or pruned since the file was written would otherwise
+    /// keep showing download marks for tracks that are no longer on disk. It is
+    /// cleared on the way in, next to `align_artist_ids`, rather than stripped
+    /// on the way out — the same repair-on-load idiom, in the same loop.
+    pub cached: bool,
 }
 
 impl From<TrackRef> for Track {
@@ -67,6 +77,7 @@ impl From<TrackRef> for Track {
             added_at: track.added_at,
             unavailable: track.unavailable,
             unavailable_reason: track.unavailable_reason,
+            cached: track.cached,
         }
     }
 }
@@ -88,6 +99,7 @@ impl From<&TrackRef> for Track {
             added_at: track.added_at,
             unavailable: track.unavailable,
             unavailable_reason: track.unavailable_reason.clone(),
+            cached: track.cached,
         }
     }
 }
@@ -109,6 +121,7 @@ impl From<Track> for TrackRef {
             added_at: track.added_at,
             unavailable: track.unavailable,
             unavailable_reason: track.unavailable_reason,
+            cached: track.cached,
         }
     }
 }
@@ -237,6 +250,15 @@ pub fn align_artist_ids(track: &mut Track) {
     if track.artist_ids.len() != track.artist_names.len() {
         track.artist_ids.resize(track.artist_names.len(), String::new());
     }
+}
+
+/// Forgets a cached-audio mark restored from disk. See [`Track::cached`]: the
+/// audio cache and the playlist-track cache are two different files with two
+/// different lifetimes, and only the engine, measuring the audio cache now,
+/// can answer this. Anything read back off disk is a claim about a past state
+/// of a directory this file does not own.
+pub fn forget_cached_audio(track: &mut Track) {
+    track.cached = false;
 }
 
 /// A playlist opened for browsing: playlist metadata plus its tracks.
@@ -530,7 +552,43 @@ pub struct ArtistOverviewDetail {
     pub related_artists: Vec<Artist>,
     pub discovered_on: Vec<Playlist>,
     pub artist_playlists: Vec<Playlist>,
-    pub artist_pick: Option<Playlist>,
+    pub artist_pick: Option<ArtistPickDetail>,
+}
+
+/// The item pinned to the top of an artist's page, with the artist's note.
+/// Mirrors the engine's `ArtistPick`; see it for why this is a tagged union
+/// and not an optional playlist.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ArtistPickDetail {
+    pub comment: Option<String>,
+    pub item: ArtistPickItemDetail,
+}
+
+/// Reaches the frontend as `{ "kind": "track", "data": { … } }`, so one card
+/// component can branch on `kind` to decide whether clicking it plays or opens.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum ArtistPickItemDetail {
+    Playlist(Playlist),
+    Album(Album),
+    Track(Track),
+}
+
+impl From<&ArtistPick> for ArtistPickDetail {
+    fn from(pick: &ArtistPick) -> Self {
+        Self {
+            comment: pick.comment.clone(),
+            item: match &pick.item {
+                ArtistPickItem::Playlist(playlist) => {
+                    ArtistPickItemDetail::Playlist(Playlist::from(playlist))
+                }
+                ArtistPickItem::Album(album) => {
+                    ArtistPickItemDetail::Album(Album::from(album.clone()))
+                }
+                ArtistPickItem::Track(track) => ArtistPickItemDetail::Track(Track::from(track)),
+            },
+        }
+    }
 }
 
 impl From<ArtistOverview> for ArtistOverviewDetail {
@@ -568,7 +626,7 @@ impl From<ArtistOverview> for ArtistOverviewDetail {
                 .iter()
                 .map(Playlist::from)
                 .collect(),
-            artist_pick: overview.artist_pick.as_ref().map(Playlist::from),
+            artist_pick: overview.artist_pick.as_ref().map(ArtistPickDetail::from),
         }
     }
 }

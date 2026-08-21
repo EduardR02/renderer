@@ -47,14 +47,15 @@
 //!   only as the graceful fallback when every overview hash has rotated.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::Bytes;
 use http::{Method, Request};
+use librespot_core::cache::Cache;
 use librespot_core::error::ErrorKind;
-use librespot_core::{Session, SpotifyId, SpotifyUri};
+use librespot_core::{FileId, Session, SpotifyId, SpotifyUri};
 use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
 use librespot_protocol::extended_metadata::{
     BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
@@ -64,8 +65,8 @@ use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 
 use spotify_playback_engine::protocol::{
-    AlbumRef, ArtistOverview, ArtistRef, ArtistTopCity, CreditArtist, CreditRole,
-    PlaylistRecommendations, PlaylistRef, RadioBrowse, TrackCredits, TrackRef,
+    AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity, CreditArtist,
+    CreditRole, PlaylistRecommendations, PlaylistRef, RadioBrowse, TrackCredits, TrackRef,
 };
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
@@ -266,7 +267,132 @@ pub fn track_ref(track: &Track) -> TrackRef {
         added_at: None,
         unavailable: false,
         unavailable_reason: None,
+        cached: false,
     }
+}
+
+/// Whether this track's audio is already sitting in the app-owned cache.
+///
+/// THE COST, because this runs per track on every browse: `file_path` is pure
+/// string work (librespot hashes the file id into `audio/<xx>/<rest>`), and
+/// `fs::exists` is one `GetFileAttributesW` — not an open, which is what
+/// `Path::exists` would have been. A track exposes a handful of formats and the
+/// scan short-circuits on the first hit, so a fully cached 200-track playlist
+/// costs 200 attribute lookups and an uncached one about four times that. On
+/// the order of a millisecond, once, on a code path that has just finished a
+/// network round trip — against the alternative the brief warned about, which
+/// was 200 IPC calls from the UI.
+///
+/// It is deliberately NOT a directory index with a TTL. An index is faster in
+/// the abstract and wrong in practice: it goes stale the moment playback
+/// caches something, and the staleness window is exactly when someone is
+/// looking at the mark.
+///
+/// One known gap: a region-replaced track plays from an `alternative`, whose
+/// file ids are not on the track itself, so such a track reads as uncached even
+/// when its substitute is on disk. Resolving alternatives here would mean a
+/// metadata fetch per track, which is the cost this whole approach exists to
+/// avoid.
+fn track_is_cached(track: &Track, cache: Option<&Cache>) -> bool {
+    let Some(cache) = cache else {
+        return false;
+    };
+    any_file_on_disk(track.files.values().copied(), cache)
+}
+
+/// `std::fs::exists`, not `Path::exists`: the former is one `GetFileAttributesW`,
+/// the latter opens a handle. At a few hundred rows the difference is the whole
+/// budget.
+fn any_file_on_disk(files: impl IntoIterator<Item = FileId>, cache: &Cache) -> bool {
+    files.into_iter().any(|file_id| {
+        cache
+            .file_path(file_id)
+            .is_some_and(|path| std::fs::exists(path).unwrap_or(false))
+    })
+}
+
+/// What a track's audio is made of, for every track parsed this session.
+///
+/// A download mark is derived from a track's FILE ids, and those exist only on
+/// the metadata payload. They are not on `TrackRef` and not in the on-disk
+/// track cache — both of those persist what the UI needs, not what the audio
+/// layer needs — so once a payload has been parsed the ids are gone, and
+/// answering "is this cached?" anywhere else costs a metadata fetch. That is
+/// the reason the mark could only ever be a snapshot taken while browsing, and
+/// why playing a song did not light it up until the next browse.
+///
+/// Keeping the ids makes every later answer pure filesystem. The map is cheap:
+/// an id string and a handful of 20-byte file ids per track, so ten thousand
+/// tracks sit comfortably under a megabyte. It is memory-only on purpose — a
+/// file id outliving the metadata it came from would send us looking for the
+/// wrong file, and a browse refills it for free.
+static FILE_IDS: LazyLock<RwLock<HashMap<String, TrackFiles>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[derive(Default)]
+struct TrackFiles {
+    files: Vec<FileId>,
+    /// The recordings librespot may substitute for this one. A region-replaced
+    /// track carries no files of its own and plays from one of these, so a
+    /// lookup that stops at `files` calls it uncached forever.
+    alternatives: Vec<String>,
+}
+
+fn remember_track_files(id: &str, track: &Track) {
+    if id.is_empty() {
+        return;
+    }
+    let entry = TrackFiles {
+        files: track.files.values().copied().collect(),
+        alternatives: track.alternatives.0.iter().map(id_of).collect(),
+    };
+    if let Ok(mut index) = FILE_IDS.write() {
+        index.insert(id.to_owned(), entry);
+    }
+}
+
+/// One level of alternative-chasing, and one only: substitutes do not chain in
+/// practice, and an unbounded walk over attacker-shaped data is not worth the
+/// two lines it would save.
+fn resolve_cached(
+    id: &str,
+    index: &HashMap<String, TrackFiles>,
+    cache: &Cache,
+    follow: bool,
+) -> Option<bool> {
+    let entry = index.get(id)?;
+    if any_file_on_disk(entry.files.iter().copied(), cache) {
+        return Some(true);
+    }
+    if follow
+        && entry
+            .alternatives
+            .iter()
+            .any(|alt| resolve_cached(alt, index, cache, false) == Some(true))
+    {
+        return Some(true);
+    }
+    Some(false)
+}
+
+/// The subset of `ids` whose audio is already on disk.
+///
+/// Pure filesystem — one path join and one attribute lookup per file, short
+/// circuiting on the first format that hits — so a screenful of rows costs
+/// microseconds and a whole playlist costs about a millisecond. Ids the engine
+/// has never parsed are simply absent from the result rather than reported as
+/// uncached, because "I do not know" and "no" are different answers.
+pub fn cached_track_ids(ids: &[String], cache: Option<&Cache>) -> Vec<String> {
+    let Some(cache) = cache else {
+        return Vec::new();
+    };
+    let Ok(index) = FILE_IDS.read() else {
+        return Vec::new();
+    };
+    ids.iter()
+        .filter(|id| resolve_cached(id, &index, cache, true) == Some(true))
+        .cloned()
+        .collect()
 }
 
 /// Release year of an album, or `None` when the metadata carries no date.
@@ -519,6 +645,7 @@ fn parse_track_payload(
     entity_uri: &str,
     payload: &[u8],
     policy: &AvailabilityPolicy,
+    cache: Option<&Cache>,
 ) -> Option<TrackRef> {
     let message = librespot_protocol::metadata::Track::parse_from_bytes(payload).ok()?;
     let uri = SpotifyUri::from_uri(entity_uri).ok()?;
@@ -527,6 +654,10 @@ fn parse_track_payload(
     let mut reference = track_ref(&track);
     reference.unavailable = unavailable_reason.is_some();
     reference.unavailable_reason = unavailable_reason;
+    // Here and nowhere else: this is the one point where a track's file ids
+    // exist without a request having been made for them.
+    remember_track_files(&reference.id, &track);
+    reference.cached = track_is_cached(&track, cache);
     Some(reference)
 }
 
@@ -549,8 +680,9 @@ pub async fn fetch_tracks<'a>(
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
 ) -> Result<Vec<TrackRef>, String> {
     let policy = AvailabilityPolicy::for_session(session);
+    let cache = session.cache().cloned();
     fetch_extended(session, uris, ExtensionKind::TRACK_V4, |entity_uri, payload| {
-        parse_track_payload(entity_uri, payload, &policy)
+        parse_track_payload(entity_uri, payload, &policy, cache.as_deref())
     })
     .await
 }
@@ -2879,6 +3011,10 @@ fn track_ref_from_hit(hit: &SearchTrackHitJson) -> TrackRef {
             .and_then(|duration| duration.totalMilliseconds.as_ref())
             .filter(|value| parse_millis(Some(value)) == 0)
             .map(|_| "invalid track duration".to_owned()),
+        // A pathfinder search hit carries no file ids, so cache state is not
+        // knowable here. It is answered only where real track metadata is
+        // parsed; see `track_is_cached`.
+        cached: false,
     }
 }
 
@@ -2970,6 +3106,53 @@ fn overview_playlist_ref(item: &SearchPlaylistWrapperJson) -> Option<PlaylistRef
     }
     let reference = playlist_ref_from_hit(hit);
     (!reference.id.is_empty() && !reference.name.is_empty()).then_some(reference)
+}
+
+/// Maps `profile.pinnedItem` onto the three kinds an Artist Pick can be.
+///
+/// The union is discriminated by the payload's own `__typename`, and each arm
+/// is handed to the same mapper the search results use, so a pinned album and a
+/// searched album become the same `AlbumRef` by the same code. An unknown
+/// `__typename` (Spotify has added kinds before, and will again) yields `None`
+/// rather than a card with no name in it.
+///
+/// A pick with no resolvable id or name is dropped: the card's whole job is to
+/// be clicked, and there is nothing to open without an id.
+fn artist_pick_from_pinned_item(pinned: &ArtistOverviewPinnedItemJson) -> Option<ArtistPick> {
+    let data = pinned.itemV2.as_ref()?.data.as_ref()?;
+    let typename = data.get("__typename").and_then(serde_json::Value::as_str)?;
+    let item = match typename {
+        "Playlist" => {
+            let hit: SearchPlaylistHitJson = serde_json::from_value(data.clone()).ok()?;
+            ArtistPickItem::Playlist(playlist_ref_from_hit(&hit))
+        }
+        "Album" => {
+            let hit: SearchAlbumHitJson = serde_json::from_value(data.clone()).ok()?;
+            ArtistPickItem::Album(album_ref_from_hit(&hit))
+        }
+        "Track" => {
+            let hit: SearchTrackHitJson = serde_json::from_value(data.clone()).ok()?;
+            ArtistPickItem::Track(track_ref_from_hit(&hit))
+        }
+        _ => return None,
+    };
+    let (id, name) = match &item {
+        ArtistPickItem::Playlist(playlist) => (&playlist.id, &playlist.name),
+        ArtistPickItem::Album(album) => (&album.id, &album.name),
+        ArtistPickItem::Track(track) => (&track.id, &track.name),
+    };
+    if id.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(ArtistPick {
+        comment: pinned
+            .comment
+            .as_deref()
+            .map(str::trim)
+            .filter(|comment| !comment.is_empty())
+            .map(str::to_owned),
+        item,
+    })
 }
 
 /// Keeps only server-tagged playlist entries from an artist overview section,
@@ -3163,11 +3346,25 @@ struct ArtistOverviewPlaylistSectionJson {
     items: Option<Vec<SearchPlaylistWrapperJson>>,
 }
 
+/// `profile.pinnedItem` is a wrapper around a UNION, so its payload is kept as
+/// raw JSON and re-read once the `__typename` inside has said which of the
+/// three documented shapes it is. That is deliberately not a superset struct:
+/// the three hit shapes already exist and are already exercised by search, and
+/// one flat struct holding every field of all three would silently accept a
+/// playlist that happened to carry a `date`.
 #[derive(Default, Deserialize)]
 #[allow(non_snake_case)]
 struct ArtistOverviewPinnedItemJson {
     #[serde(default)]
-    itemV2: Option<SearchPlaylistWrapperJson>,
+    comment: Option<String>,
+    #[serde(default)]
+    itemV2: Option<ArtistPinnedItemWrapperJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistPinnedItemWrapperJson {
+    #[serde(default)]
+    data: Option<serde_json::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -3499,8 +3696,7 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
     );
     let artist_pick = profile
         .and_then(|profile| profile.pinnedItem.as_ref())
-        .and_then(|item| item.itemV2.as_ref())
-        .and_then(overview_playlist_ref);
+        .and_then(artist_pick_from_pinned_item);
 
 
     // These three arrays are independently server ranked. Preserve both their
@@ -4059,7 +4255,7 @@ mod tests {
         }
     }
 
-    fn test_album(id: &str, name: &str, artists: Vec<Artist>, covers: Images) -> Album {
+    pub(super) fn test_album(id: &str, name: &str, artists: Vec<Artist>, covers: Images) -> Album {
         Album {
             id: SpotifyUri::from_uri(&format!("spotify:album:{id}")).unwrap(),
             name: name.to_owned(),
@@ -4084,7 +4280,7 @@ mod tests {
         }
     }
 
-    fn test_track(id: &str, name: &str, duration: i32, album: Album, artists: Vec<Artist>) -> Track {
+    pub(super) fn test_track(id: &str, name: &str, duration: i32, album: Album, artists: Vec<Artist>) -> Track {
         Track {
             id: SpotifyUri::from_uri(&format!("spotify:track:{id}")).unwrap(),
             name: name.to_owned(),
@@ -4701,6 +4897,99 @@ mod tests {
         );
         assert_eq!(credit_artist_id("spotify:artist:x"), "");
         assert_eq!(credit_artist_id("spotify:artist:bad/id"), "");
+    }
+
+    /// `pinnedItem.itemV2` is a union, and the parser used to keep only its
+    /// Playlist arm. Each kind has to survive to the browse payload with its
+    /// tag intact, because the card that renders it plays a track and opens
+    /// everything else.
+    #[test]
+    fn artist_pick_maps_every_pinned_item_kind_and_drops_unknown_ones() {
+        let pinned = |comment: &str, item: &str| {
+            let body = format!(
+                r#"{{"data": {{"artistUnion": {{"profile": {{"pinnedItem": {{
+                    "comment": {comment}, "itemV2": {{"data": {item}}}
+                }}}}}}}}}}"#
+            );
+            parse_artist_overview_payload(body.as_bytes())
+                .unwrap()
+                .overview
+                .artist_pick
+        };
+
+        let track = pinned(
+            r#""  On repeat all summer.  ""#,
+            r#"{
+                "__typename": "Track",
+                "uri": "spotify:track:5aAx2yzptFyBCsvcXQqvcc",
+                "name": "Salt Flats",
+                "artists": {"items": [{"uri": "spotify:artist:1a2b3c4d5e6f7g8h9i0jkl", "profile": {"name": "Mora Vex"}}]},
+                "albumOfTrack": {"uri": "spotify:album:0abcdefghijklmnopqrstu", "name": "Salt Flats", "coverArt": {"sources": [{"url": "cover", "width": 640}]}},
+                "duration": {"totalMilliseconds": 214000}
+            }"#,
+        )
+        .expect("a pinned track is an Artist Pick");
+        // Trimmed, and kept: the comment is what makes a pick a pick.
+        assert_eq!(track.comment.as_deref(), Some("On repeat all summer."));
+        match track.item {
+            ArtistPickItem::Track(track) => {
+                assert_eq!(track.name, "Salt Flats");
+                assert_eq!(track.artist_names, vec!["Mora Vex".to_owned()]);
+                assert_eq!(track.duration_ms, 214_000);
+                assert_eq!(track.cover_url, "cover");
+            }
+            other => panic!("expected a track, got {other:?}"),
+        }
+
+        let album = pinned(
+            "null",
+            r#"{
+                "__typename": "Album",
+                "uri": "spotify:album:0abcdefghijklmnopqrstu",
+                "name": "Low Country",
+                "artists": {"items": [{"uri": "spotify:artist:1a2b3c4d5e6f7g8h9i0jkl", "profile": {"name": "Mora Vex"}}]},
+                "coverArt": {"sources": [{"url": "sleeve", "width": 640}]},
+                "date": {"year": 2024}
+            }"#,
+        )
+        .expect("a pinned album is an Artist Pick");
+        assert!(album.comment.is_none(), "an absent comment stays absent");
+        match album.item {
+            ArtistPickItem::Album(album) => {
+                assert_eq!(album.name, "Low Country");
+                assert_eq!(album.year, Some(2024));
+            }
+            other => panic!("expected an album, got {other:?}"),
+        }
+
+        let playlist = pinned(
+            r#""""#,
+            r#"{
+                "__typename": "Playlist",
+                "uri": "spotify:playlist:0abcdefghijklmnopqrstu",
+                "name": "Late Shift",
+                "ownerV2": {"data": {"name": "Mora Vex", "uri": "spotify:user:moravex"}},
+                "images": {"items": [{"sources": [{"url": "tile", "width": 640}]}]},
+                "content": {"totalCount": 46}
+            }"#,
+        )
+        .expect("a pinned playlist is still an Artist Pick");
+        assert!(playlist.comment.is_none(), "an empty comment is not a comment");
+        match playlist.item {
+            ArtistPickItem::Playlist(playlist) => {
+                assert_eq!(playlist.name, "Late Shift");
+                assert_eq!(playlist.track_count, Some(46));
+            }
+            other => panic!("expected a playlist, got {other:?}"),
+        }
+
+        // A kind this build has never heard of is not a card with no name in
+        // it, and neither is a well-formed one with nothing to open.
+        assert!(
+            pinned("null", r#"{"__typename": "PreRelease", "uri": "spotify:prerelease:x"}"#).is_none()
+        );
+        assert!(pinned("null", r#"{"__typename": "Track", "name": "No id here"}"#).is_none());
+        assert!(pinned("null", "null").is_none());
     }
 
     #[test]
@@ -5828,5 +6117,50 @@ mod tests {
         assert_eq!(tracks[2].id, "second");
         assert_eq!(tracks.iter().filter(|track| track.id == "seed").count(), 1);
         assert_eq!(tracks.iter().filter(|track| track.id == "first").count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod file_index_tests {
+    use super::*;
+    use librespot_metadata::track::Tracks;
+
+    /// The index is a process-wide map, so every test in here uses ids of its
+    /// own rather than sharing fixtures.
+    fn uri(id: &str) -> SpotifyUri {
+        SpotifyUri::from_uri(&format!("spotify:track:{id}")).unwrap()
+    }
+
+    #[test]
+    fn a_substitute_recording_is_remembered_so_it_can_be_followed_later() {
+        let mut track = tests::test_track(
+            "1indexAAAAAAAAAAAAAAAA",
+            "Region locked",
+            1000,
+            tests::test_album("1indexBBBBBBBBBBBBBBBB", "Album", Vec::new(), Default::default()),
+            Vec::new(),
+        );
+        // The shape this exists for: no files of its own, so the only way to
+        // answer honestly is through whatever librespot would substitute.
+        track.alternatives = Tracks(vec![uri("1indexCCCCCCCCCCCCCCCC")]);
+
+        remember_track_files("1indexAAAAAAAAAAAAAAAA", &track);
+
+        let index = FILE_IDS.read().unwrap();
+        let entry = index
+            .get("1indexAAAAAAAAAAAAAAAA")
+            .expect("a parsed track is in the index");
+        assert!(entry.files.is_empty(), "this fixture has no files of its own");
+        assert_eq!(
+            entry.alternatives,
+            vec!["1indexCCCCCCCCCCCCCCCC".to_owned()],
+            "the substitute must be recorded, or the track reads as uncached forever"
+        );
+    }
+
+    #[test]
+    fn without_a_cache_nothing_is_reported_as_cached() {
+        let ids = vec!["1indexDDDDDDDDDDDDDDDD".to_owned()];
+        assert!(cached_track_ids(&ids, None).is_empty());
     }
 }

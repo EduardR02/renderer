@@ -881,6 +881,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .art.lg { border-radius: var(--r3); }
 .art.circle { border-radius: var(--rf); }
 .art.raised { box-shadow: var(--ring), 0 14px 34px -10px rgba(0, 0, 0, 0.85); }
+/* The image's own proportions, for a lone photograph rather than a tile in a
+   row of tiles. The square shape-guard is off because width and height are no
+   longer both definite, and the placeholder fill is off because there is no
+   fixed box left for it to fill — that fill is what painted a grey slab under
+   a landscape picture in a taller box. */
+.art.natural { aspect-ratio: auto; height: auto; background: none; }
+.art.natural > img { width: 100%; height: auto; }
 
 /* tier 2 — 2x2 mosaic of the first four distinct album covers */
 .art.mosaic { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
@@ -1174,6 +1181,20 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: color var(--d1) var(--ease);
 }
 .tl-head > .tl-sort-btn:first-child { justify-content: flex-end; }
+/* One cell, two controls — the head for a title cell that now carries the
+   artists on its second line. It shrinks as one track, and `Artist` is what
+   gives way first: it is the secondary of the pair, and "TITLE" alone still
+   names the column correctly. */
+.tl-title-head {
+  display: flex; align-items: center; gap: var(--s2);
+  min-width: 0; height: 100%; overflow: hidden;
+}
+.tl-title-head > .tl-sort-btn { flex: 0 1 auto; }
+.tl-artist-sort { flex-shrink: 1000; }
+.tl-head-sep {
+  flex: none; width: 3px; height: 3px; border-radius: 50%;
+  background: var(--fg-3);
+}
 .tl-sort-btn:hover { color: var(--fg-1); }
 .tl-sort-btn.active { color: var(--fg); }
 .tl-sort-indicator { color: var(--foam); }
@@ -1265,27 +1286,54 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   font-size: var(--t-13); color: var(--fg);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* The second line of every row: an optional status mark, then the artists.
+   A flex row rather than the artists alone, because the mark has to sit
+   BEFORE the names and outside the box that ellipsises — a truncating line
+   that swallowed its own leading icon would be the worst of both. */
+.t-sub { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .t-artists {
+  min-width: 0;
   font-family: var(--font-small);
   font-size: var(--t-11); color: var(--fg-2);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   transition: color var(--d1) var(--ease);
 }
 .tl-row:hover .t-artists { color: var(--fg-1); }
+/* CACHED = the file is on your disk, and "what is yours" is rose in this
+   palette. ROSE-INK rather than rose, for exactly the reason that token
+   exists: a 10px glyph is a MARK, not a field, and pale rose at mark scale is
+   the dirty white the accent block warns about. Deliberately not foam (this is
+   not something you can do) and not gold (that layer owns facts about a
+   RECORD, not about your disk).
+
+   Quieted by MIXING TOWARD GREY, never by opacity. `opacity: 0.72` over
+   near-black is arithmetically the same trap this file documents twice
+   already — alpha collapses chroma toward the ground, and #f99e98 at 72% over
+   #121212 lands near #b3726e, which is the brown. Mixing 72% of the ink with
+   --fg-2 instead keeps the luminance and most of the hue: a soft rose that is
+   still unmistakably rose at ten pixels. Same construction as `--count`.
+
+   It comes up to full strength with the rest of the row on hover, like every
+   other secondary mark here. */
+.t-cached {
+  display: grid; place-items: center; flex: none;
+  color: color-mix(in srgb, var(--rose-ink) 72%, var(--fg-2));
+  transition: color var(--d1) var(--ease);
+}
+.tl-row:hover .t-cached { color: var(--rose-ink); }
+/* Named for a screen reader, invisible to everyone else: the mark is the whole
+   message and it has no text of its own. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
 .c-album {
   min-width: 0; text-align: left; font-size: var(--t-12); color: var(--fg-2);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   transition: color var(--d1) var(--ease);
 }
 .tl-row:hover .c-album { color: var(--fg-1); }
-.c-artist,
-.c-artist > span {
-  display: block; min-width: 0;
-  font-family: var(--font-small); font-size: var(--t-12); color: var(--fg-2);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  transition: color var(--d1) var(--ease);
-}
-/* Same weight as the album and artist columns it sits beside. It was a step
+/* Same weight as the album column it sits beside. It was a step
    brighter than either, which made the least interesting column in the table
    the most visible one — and with the whole grey ramp lifted it would now be
    shouting. Hover still promotes it, like the rest of the row. */
@@ -1295,8 +1343,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   transition: color var(--d1) var(--ease);
 }
-.tl-row:hover .c-artist,
-.tl-row:hover .c-artist > span { color: var(--fg-1); }
 .tl-row:hover .c-added { color: var(--fg); }
 /* Durations and play counts sat at 11px/600 — small enough to need weight to
    be legible, heavy enough to read as little bold stubs beside 400 titles.
@@ -1872,16 +1918,48 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   letter-spacing: -0.005em; line-height: 1.25; color: var(--fg);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.credit-plain { display: block; }
-/* The link affordance is the hover colour and the mark that appears with it —
-   at this density a permanent glyph on every second name is visual static. */
+.credit-plain { display: block; cursor: default; }
+/* =====================================================================
+   WHICH NAMES ARE LINKS
+
+   Previously the only difference between a contributor with a page and one
+   without was the colour it turned under the pointer — so finding out which of
+   ninety names were clickable meant hovering ninety names. That is a puzzle,
+   not an affordance.
+
+   The fix is the oldest one there is: linked names are UNDERLINED at rest.
+   It costs no layout, adds no glyph to a grid that already runs eight columns
+   wide, survives the ellipsis (an underline is drawn per line box, unlike a
+   leading or trailing mark), and is the one convention every reader already
+   knows. The rule is drawn in foam at low strength, so at a glance the sheet
+   shows a column of names with some of them ruled — legible without turning
+   the list into a wall of blue.
+
+   The arrow still arrives on hover. Its job was never to say "this is a link",
+   it was to say "this leaves the app", and that is still worth saying.
+
+   `role="link"` + `tabindex="0"` on a span rather than a <button>, for the
+   same reason ArtistLinks is one: a button is an atomic inline box, so it
+   cannot ellipsise, and a sliced name is worse than no name at all.
+   ===================================================================== */
 .credit-link {
   display: flex; align-items: center; gap: var(--s1); min-width: 0; max-width: 100%;
-  text-align: left; color: var(--fg);
+  text-align: left; color: var(--fg); cursor: pointer;
   transition: color var(--d1) var(--ease);
+}
+.credit-link .credit-name {
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--foam) 46%, transparent);
+  text-decoration-thickness: 1px;
+  /* Clear of the descenders. At 15px an underline at the default offset cuts
+     through every g, y and p in the list. */
+  text-underline-offset: 3px;
+  transition: text-decoration-color var(--d1) var(--ease);
 }
 .credit-link .icon { opacity: 0; color: var(--accent); transition: opacity var(--d1) var(--ease); }
 .credit-link:hover, .credit-link:focus-visible { color: var(--accent); }
+.credit-link:hover .credit-name,
+.credit-link:focus-visible .credit-name { text-decoration-color: var(--accent); }
 .credit-link:hover .icon, .credit-link:focus-visible .icon { opacity: 1; }
 .credit-roles {
   min-width: 0; color: var(--fg-3);
@@ -2199,16 +2277,37 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   overflow-wrap: anywhere;
 }
 
-/* artist banner */
+/* =====================================================================
+   ARTIST BANNER
+
+   The height is 268px PLUS the topbar, and the second term is the whole
+   point. The banner bleeds upward under the sticky bar by exactly
+   `--topbar-h`, so at a flat 260px the top fifth of the official portrait
+   spent its life behind translucent glass — the image was not being
+   obstructed by the blur so much as being drawn into a box that was 52px
+   shorter than it looked. Adding the bar's height back gives the picture the
+   full 268px band BELOW the glass while keeping something real for the bar to
+   blur, which is why the blur is wanted here in the first place.
+   ===================================================================== */
 .banner {
-  position: relative; height: 260px; flex: none;
+  position: relative; flex: none;
+  /* The official header art is about 2.3:1 (Taylor Swift's is 2660x1140), so a
+     FIXED band threw away a quarter of it vertically at every window size —
+     `cover` has to crop whatever the box does not ask for. Deriving the height
+     from the window instead keeps the box much closer to the source's own
+     shape, so far more of the picture survives, and the bounds stop it from
+     becoming a letterbox on a small window or a mural on a large one. */
+  height: calc(clamp(300px, 30vw, 420px) + var(--topbar-h));
   margin: calc(var(--topbar-h) * -1) calc(var(--pane-pad) * -1) 0;
   padding: 0 var(--pane-pad) var(--s6); display: flex; flex-direction: column; justify-content: flex-end;
   overflow: hidden;
 }
 .banner .bg { position: absolute; inset: 0; z-index: 0; }
-/* favour the upper third: artist portraits put the face there */
-.banner .bg img { width: 100%; height: 100%; object-fit: cover; object-position: center 28%; filter: saturate(0.9); }
+/* Favour the upper third — artist portraits put the face there — but not as
+   hard as before. The band's top `--topbar-h` sits behind the glass, so a crop
+   pinned high pushed the subject INTO the blurred strip. Shifting the window
+   down moves it clear while still keeping the frame off the bottom edge. */
+.banner .bg img { width: 100%; height: 100%; object-fit: cover; object-position: center 22%; filter: saturate(0.9); }
 /* The portrait rides in on a <Cover fill>, which normally draws a framed tile;
    in a full-bleed banner the frame and the monogram are both wrong. Height is
    fixed by .banner either way, so a missing portrait leaves the generated
@@ -2217,7 +2316,18 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .banner .bg .art.gen::after { content: none; }
 .banner .bg::after {
   content: ""; position: absolute; inset: 0;
-  background: linear-gradient(180deg, rgba(10,10,12,0.35) 0%, rgba(10,10,12,0.6) 45%, var(--bg-1) 100%);
+  /* The scrim exists for ONE job: keeping the name legible where it sits, at
+     the bottom. It used to reach 0.6 by 45% and then run all the way to the
+     pane colour, which meant more than half the photograph was being washed
+     out to light a strip of type in the last quarter of it. It now stays out
+     of the way through the middle and only closes in under the name. The name
+     carries its own shadow, so the scrim does not have to do that work twice. */
+  background: linear-gradient(180deg,
+    rgba(10, 10, 12, 0.30) 0%,
+    rgba(10, 10, 12, 0.10) 24%,
+    rgba(10, 10, 12, 0.12) 54%,
+    rgba(10, 10, 12, 0.52) 84%,
+    var(--bg-1) 100%);
 }
 .banner > *:not(.bg) { position: relative; z-index: 1; }
 /* The banner is a flex COLUMN, so without this the tag stretches to the full
@@ -2234,6 +2344,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   margin-top: var(--s2); overflow-wrap: anywhere;
   text-shadow: 0 2px 20px rgba(0, 0, 0, 0.55);
 }
+/* Reach, under the name. It sits on a photograph, so it carries the name's
+   shadow rather than relying on the gradient alone, and it stays at --fg-1:
+   a second white line directly under a 64px white one would read as a
+   subtitle competing with the title rather than as a fact about it. */
+.banner-listeners {
+  margin-top: var(--s3); color: var(--fg-1); font-size: var(--t-13);
+  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.6);
+}
+.banner-listeners .tnum { color: var(--fg); font-weight: var(--w-med); }
 /* the banner already bleeds up under the topbar; the page must not pad above it */
 .page.bleed { padding-top: 0; }
 

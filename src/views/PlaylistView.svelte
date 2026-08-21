@@ -687,7 +687,6 @@
           tracks={sortedTracks}
           {playFrom}
           playlistId={editable ? pl.id : null}
-          showArtist
           showAdded
           sortKey={sortState.key}
           sortDirection={sortState.direction}
@@ -738,7 +737,6 @@
             <TrackList
               tracks={recommendations}
               playFrom={playRecommendation}
-              showArtist
               showHead={false}
               allowAddToPlaylist={false}
               disableWindowing

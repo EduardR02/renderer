@@ -41,4 +41,13 @@
 <symbol id="i-chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></symbol>
 <symbol id="i-logout" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
 <symbol id="i-login" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/></symbol>
+<!-- The cached mark, and it is a SOLID DISC with the arrow punched out of it
+     rather than an outlined circle with an arrow inside. It is drawn at 11px
+     next to an artist name: at that size a 1.8px stroke describing two nested
+     shapes is mush, while filled area still reads as a shape and as a colour.
+     Same argument the palette block in app.css makes about small warm marks.
+     `evenodd` is what cuts the arrow out, so the row's own background shows
+     through and the glyph stays correct on hover and on the playing row. -->
+<symbol id="i-cached" viewBox="0 0 24 24"><path fill="currentColor" fill-rule="evenodd" d="M12 2.6a9.4 9.4 0 1 0 0 18.8 9.4 9.4 0 0 0 0-18.8Zm1.3 4.6h-2.6v4.5H8.4L12 16.6l3.6-4.9h-2.3V7.2Z"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M10.2 13.8a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7l-1.7 1.7"/><path d="M13.8 10.2a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.7-1.7"/></symbol>
 </defs></svg>

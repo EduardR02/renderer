@@ -786,10 +786,23 @@ fn spawn_refresh_playlist(app: AppHandle, id: String) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
-        if let Err(error) = fetch_playlist(&state, &client, &id).await {
-            log::error(&format!(
+        match fetch_playlist(&state, &client, &id).await {
+            /* Tell the window, do not just warm the cache.
+               This refresh used to update the caches and stop there, so the
+               fresh payload was only ever seen the NEXT time the playlist was
+               opened. Download marks made that obvious: `cached` is stripped
+               when the track cache is loaded from disk, deliberately, since a
+               pruned audio cache must not leave phantom marks behind — so a
+               cache-served open showed none, the refresh quietly learned the
+               real ones, and they appeared on the second open. Anything else
+               that changed server-side had the same one-open lag; the marks
+               were just the visible case. */
+            Ok(detail) => {
+                let _ = app.emit("playlist", &detail);
+            }
+            Err(error) => log::error(&format!(
                 "background refresh of playlist {id} failed: {error}"
-            ));
+            )),
         }
     });
 }

@@ -5,6 +5,7 @@
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
+  import Biography from "../components/Biography.svelte";
   import { GROUPS, RELEASE_KEYS } from "../lib/discography.js";
   import { artistPlaylistCollections, artistPlaylistSubtitle } from "../lib/artist.js";
 
@@ -34,25 +35,55 @@
   const popularReleases = $derived(overview?.popular_releases ?? []);
   const relatedArtists = $derived(overview?.related_artists ?? []);
   const topCities = $derived(overview?.top_cities ?? []);
-  const artistPickPlaylist = $derived(overview?.artist_pick ?? null);
+  const artistPick = $derived(overview?.artist_pick ?? null);
   const playlistShelves = $derived(artistPlaylistCollections(overview));
   const NUMBER_FORMAT = new Intl.NumberFormat();
+
+  /* ---------------------------------------------------------------- about
+     Every field on the overview is nullable and they fail independently, so
+     each block below decides for itself whether it exists. Nothing here draws
+     a labelled placeholder for a fact that did not arrive: an empty stat is
+     worse than a shorter card.
+
+     The release counts that used to sit in this list are gone. They said
+     nothing you could not read off the Discography section forty pixels
+     above, and four display numbers in a row turned the quietest part of the
+     page into its loudest. */
+  const rank = $derived(overview?.world_rank || null);
+  const popularity = $derived(
+    Number.isFinite(overview?.popularity) && overview.popularity > 0 ? overview.popularity : null,
+  );
+  const aboutFigure = $derived(overview?.biography_image_url || overview?.header_image_url || "");
+  /* The supporting pair. Monthly listeners also lead the header now, and that
+     is deliberate rather than an oversight: up there the figure is the first
+     thing you read about an artist, down here it is the number the follower
+     count and the rank are being compared against. What it must not do is
+     appear at display size in both places, so this pair is set small and the
+     rank keeps the one big number on the card. */
   const aboutStats = $derived.by(() => {
     const facts = [];
     if (overview?.monthly_listeners) {
-      facts.push({ value: NUMBER_FORMAT.format(overview.monthly_listeners), label: "Monthly listeners" });
+      facts.push({
+        value: NUMBER_FORMAT.format(overview.monthly_listeners),
+        label: "Monthly listeners",
+      });
     }
     if (overview?.followers) {
       facts.push({ value: NUMBER_FORMAT.format(overview.followers), label: "Followers" });
     }
-    if (overview?.world_rank) {
-      facts.push({ value: `#${NUMBER_FORMAT.format(overview.world_rank)}`, label: "Worldwide" });
-    }
-    if (overview?.popularity) {
-      facts.push({ value: `${overview.popularity}/100`, label: "Popularity" });
-    }
     return facts;
   });
+  /* A city's share of the top city's audience, which is what turns a list into
+     something with a shape. Cities whose listener count is missing get no bar
+     rather than a zero-width one — an absent number is not a small number. */
+  const cityLeader = $derived(Math.max(0, ...topCities.map((city) => city.listeners ?? 0)));
+  /* Three columns need roughly 300 + 240 + 300 plus two gaps. Below that the
+     figures and the cities stack into one column beside the picture rather
+     than being squeezed into thirds that fit none of them. */
+  const aboutWide = $derived((ui.paneWidth || 1200) >= 940);
+  const hasAbout = $derived(
+    !!(overview?.biography || aboutFigure || rank || popularity || aboutStats.length || topCities.length),
+  );
   let shelfExtras = $state({});
 
   function mergeShelfReleases(primary, extras) {
@@ -366,6 +397,74 @@
       if (generation === artistGeneration) busy = "";
     }
   }
+  /* -------------------------------------------------------- artist pick
+     One shape, three kinds. The pinned item arrives tagged (see the engine's
+     `ArtistPickItem`) precisely so the card can branch here rather than
+     guessing from which fields happen to be populated.
+
+     `subtitle` is the line that tells you WHAT you are being offered without
+     repeating the kind pill above it. */
+  const pick = $derived.by(() => {
+    const raw = artistPick?.item;
+    if (!raw?.data) return null;
+    const data = raw.data;
+    const kind = raw.kind;
+    const common = {
+      comment: artistPick.comment || "",
+      id: data.id,
+      name: data.name,
+      cover: data.cover_url || "",
+      covers: data.cover_urls ?? [],
+    };
+    if (kind === "track") {
+      return {
+        ...common,
+        kind,
+        label: "Song",
+        subtitle: (data.artist_names ?? []).join(", "),
+        track: data,
+      };
+    }
+    if (kind === "album") {
+      return {
+        ...common,
+        kind,
+        /* Spotify calls a one-to-three-track release a single, and the pinned
+           item is very often exactly that — but the pinned payload carries no
+           album type, so this says the honest thing rather than guessing. */
+        label: "Release",
+        subtitle: [(data.artist_names ?? []).join(", "), data.year || null]
+          .filter(Boolean)
+          .join(" · "),
+      };
+    }
+    return {
+      ...common,
+      kind: "playlist",
+      label: "Playlist",
+      subtitle: artistPlaylistSubtitle(data),
+    };
+  });
+
+  function openPick() {
+    if (!pick) return;
+    if (pick.kind === "album") navigate("album", pick.id);
+    else if (pick.kind === "playlist") navigate("playlist", pick.id);
+  }
+
+  async function playPick() {
+    if (!pick) return;
+    /* A pinned TRACK is the one kind with nothing to open, so the frame itself
+       plays it and there is no second control. Everything else keeps the rule
+       the rest of the app is built on: the card opens, the button plays. */
+    if (pick.kind === "track") {
+      api.playQueue([pick.track], 0).catch(() => {});
+      return;
+    }
+    if (pick.kind === "album") await playRelease(pick.id);
+    else await playPlaylist(pick.id);
+  }
+
   async function playPlaylist(id) {
     if (busy) return;
     const generation = artistGeneration;
@@ -409,6 +508,76 @@
   </div>
 {/snippet}
 
+<!--
+  THE PICK CARD — one card, three kinds, and the affordance is the difference.
+
+  This section used to render the square shelf card, which was only ever
+  reachable for a pinned playlist because the browse contract dropped every
+  other kind. A pin is not a shelf item: there is exactly one of it, it is the
+  artist SAYING something, and it can carry their words. So it is a wide frame
+  with the artwork at a fixed 76px and the copy given the room instead — which
+  is also the shape that lets a pinned song sit beside a pinned album without
+  either looking like a mistake.
+-->
+{#snippet pickCard(item)}
+  {@const tone = coverTone(item.cover || item.covers?.[0] || "", item.id)}
+  <div
+    class="pick"
+    class:playable={item.kind === "track"}
+    style:--tone-wash={tone.wash}
+    style:--tone-glow={tone.glow}
+  >
+    <div class="pick-art">
+      <Cover
+        src={item.cover}
+        srcs={item.covers}
+        id={item.id}
+        name={item.name}
+        fill
+        lg
+      />
+    </div>
+    <div class="pick-copy">
+      <span class="kind">{item.label}</span>
+      <span class="pick-name">{item.name}</span>
+      {#if item.subtitle}<span class="pick-sub">{item.subtitle}</span>{/if}
+      {#if item.comment}
+        <!-- The artist's own words. Set as a quote, because that is what it
+             is, and it is the only thing on this page written by the person
+             the page is about. -->
+        <p class="pick-note">{item.comment}</p>
+      {/if}
+    </div>
+
+    {#if item.kind === "track"}
+      <!-- Nothing to open, so the whole frame is the play control and there is
+           no floating button to duplicate it. -->
+      <button
+        class="pick-hit"
+        aria-label={`Play ${item.name}`}
+        title={`Play ${item.name}`}
+        onclick={playPick}
+      ></button>
+      <span class="pick-play" aria-hidden="true"><Icon name="play" size={16} /></span>
+    {:else}
+      <button
+        class="pick-hit"
+        aria-label={`Open ${item.name}`}
+        onclick={openPick}
+      ></button>
+      <button
+        class="pick-play as-button"
+        aria-label={`Play ${item.name}`}
+        title={`Play ${item.name}`}
+        disabled={!!busy}
+        onclick={playPick}
+      >
+        <Icon name={busy === item.id ? "more" : "play"} size={16} />
+      </button>
+    {/if}
+  </div>
+{/snippet}
+
 
 <!-- `bleed`: the banner carries its own negative margins up under the topbar,
      so the page must not pad above it. -->
@@ -435,6 +604,15 @@
     <span class="tag">Artist</span>
     {#if artist}
       <h1 class="name">{artist.name}</h1>
+      <!-- Under the name, the way the official client does it: reach is the
+           one fact about an artist you want before you have decided whether to
+           press play. A fixed slot is not worth it here — the line either
+           exists for this artist for the whole visit or it never does. -->
+      {#if overview?.monthly_listeners}
+        <p class="banner-listeners">
+          <span class="tnum">{NUMBER_FORMAT.format(overview.monthly_listeners)}</span> monthly listeners
+        </p>
+      {/if}
     {:else}
       <span class="skeleton line lg" style="margin-top:var(--s3);height:52px;width:min(420px,62%)"></span>
     {/if}
@@ -454,10 +632,7 @@
          the block that replaces it, so nothing on this page moves when the
          payload lands — which is the whole point of drawing it at all. -->
     <div aria-hidden="true">
-      <p class="detail-meta" style="margin-top:var(--s5)">
-        <span class="skeleton line sm" style="margin:0"></span>
-      </p>
-      <div class="actions">
+      <div class="actions" style="margin-top:var(--s6)">
         <span class="skeleton" style="width:48px;height:48px;border-radius:var(--rf)"></span>
         <span class="skeleton" style="width:104px;height:32px;border-radius:var(--r2)"></span>
       </div>
@@ -491,14 +666,10 @@
       </div>
     </div>
   {:else}
-    <p class="detail-meta" style="margin-top:var(--s5)">
-      <span class="num">{top.length} popular {top.length === 1 ? "song" : "songs"}</span>
-      {#if hasReleases}
-        <span class="sep">/</span><span class="num">{releaseTotal} releases</span>
-      {/if}
-    </p>
-
-    <div class="actions">
+    <!-- No meta line here. "10 popular songs / 31 releases" counted the two
+         sections immediately below it, both of which already carry their own
+         count beside their own heading. -->
+    <div class="actions" style="margin-top:var(--s6)">
       <button class="play-lg" title="Play popular songs" onclick={() => playTop(0)} disabled={!top.length}>
         <Icon name="play" size={19} />
       </button>
@@ -607,14 +778,12 @@
         {/if}
       </section>
     {/if}
-    {#if artistPickPlaylist}
+    {#if pick}
       <section class="section artist-pick" aria-labelledby="pick-title">
         <div class="section-head">
           <h2 class="section-title" id="pick-title">Artist Pick</h2>
         </div>
-        <div class="artist-pick-card">
-          {@render playlistCard(artistPickPlaylist)}
-        </div>
+        {@render pickCard(pick)}
       </section>
     {/if}
 
@@ -654,6 +823,133 @@
           {#each playlistShelves.discovered.slice(0, perRow) as playlist (playlist.id)}
             {@render playlistCard(playlist)}
           {/each}
+        </div>
+      </section>
+    {/if}
+
+    <!--
+      ABOUT — the liner-note layer of this page, and it is set as one.
+
+      Gold is the hue this design system reserves for facts ABOUT a record or
+      the people who made it, as opposed to things you can do to them; the
+      credits sheet already owns it. This card is the same kind of object, so
+      it takes the same lead: a gold-led rule opens it, the popularity meter
+      fills in gold, and each city row is washed in gold in proportion to its
+      share. No panel and no border — grouping in this app is space and a
+      hairline, and a boxed card here would be the only one in the interface.
+    -->
+    {#if hasAbout}
+      <section class="section about" aria-labelledby="about-title">
+        <!-- "About", not "About {name}". This is a section label in the same
+             family as the Settings group headings, and it is one screen below
+             a 64px display setting of the same name — so repeating it here
+             bought nothing and cost the heading its rule as soon as the name
+             wrapped the label to two lines. -->
+        <h2 class="about-head" id="about-title">About</h2>
+        <div class="about-body" class:no-figure={!aboutFigure} class:wide={aboutWide}>
+          {#if aboutFigure}
+            <!-- The official editorial photograph, whole and at its own
+                 proportions. It was once drawn into the same 148px tile the
+                 search results use, then into a fixed portrait box that cropped
+                 the sides off a landscape source; it is now simply itself. -->
+            <figure class="about-figure">
+              <Cover src={aboutFigure} id={artist.id} name={artist.name} natural lg raised />
+            </figure>
+          {/if}
+
+          <!-- picture | figures | cities across the top, prose full width under.
+               `.about-side` exists ONLY for the narrow case, where there is not
+               room for three columns and the figures and the cities stack into
+               one. When there IS room it is dissolved with `display: contents`
+               so its two children become grid items in their own right — which
+               is how the same markup serves both shapes without duplicating it
+               or doing row arithmetic that breaks the moment an artist has no
+               cities. Either way both sit beside the photograph, never under
+               it. -->
+          <div class="about-side">
+          <div class="about-lede">
+            {#if rank}
+              <!-- ONE display number, not four. The worldwide rank is the fact
+                   here you cannot get anywhere else in the app. -->
+              <p class="rank">
+                <span class="rank-n tnum">#{NUMBER_FORMAT.format(rank)}</span>
+                <span class="caps">Worldwide</span>
+              </p>
+            {/if}
+
+            {#if aboutStats.length}
+              <dl class="about-stats">
+                {#each aboutStats as fact (fact.label)}
+                  <div>
+                    <dt class="tnum">{fact.value}</dt>
+                    <dd class="caps">{fact.label}</dd>
+                  </div>
+                {/each}
+              </dl>
+            {/if}
+
+            {#if popularity !== null}
+              <!-- Popularity kept, and framed as the oddity it is: it is a
+                   real 0-100 figure the official client never puts on screen.
+                   A meter rather than "72/100" — a fraction reads as a mark
+                   out of a test, a filled rail reads as an instrument, and the
+                   app already uses this exact shape for its cache gauge. -->
+              <div class="pop">
+                <div class="pop-line">
+                  <span class="caps">Popularity</span>
+                  <span class="pop-n tnum">{popularity}</span>
+                </div>
+                <div
+                  class="pop-rail"
+                  role="meter"
+                  aria-valuenow={popularity}
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-label="Spotify popularity"
+                >
+                  <span class="pop-fill" style:--p={popularity / 100}></span>
+                </div>
+              </div>
+            {/if}
+          </div>
+
+            {#if topCities.length}
+              <div class="cities">
+                <h3 class="caps">Top cities</h3>
+                <ol>
+                  {#each topCities.slice(0, 5) as city, i (`${city.city}:${city.region}:${city.country}`)}
+                    {@const place = [city.region, city.country].filter(Boolean).join(", ")}
+                    {@const share = cityLeader && city.listeners ? city.listeners / cityLeader : 0}
+                    <!-- The bar IS the row: a left-anchored wash sized to the
+                         city's share of the leader, which is the same device
+                         the playing track row uses. A separate bar element
+                         beside a list would be a chart, and this is a list
+                         that happens to have a shape. -->
+                    <li style:--share={share}>
+                      <span class="city-rank tnum">{i + 1}</span>
+                      <span class="city-name">{city.city}</span>
+                      {#if place}<span class="city-place">{place}</span>{/if}
+                      {#if city.listeners}
+                        <span class="city-n tnum">{NUMBER_FORMAT.format(city.listeners)}</span>
+                      {/if}
+                    </li>
+                  {/each}
+                </ol>
+              </div>
+            {/if}
+          </div>
+
+          <!-- Prose runs the full width under everything, and only exists when
+               there is prose: an empty grid item still costs a row gap. -->
+          {#if overview?.biography}
+            <div class="about-rest">
+              <!-- The ONLY thing on this page that expands. See lib/bio.js for
+                   what the string turns out to contain. -->
+              <div class="about-bio">
+                <Biography source={overview.biography} lines={5} />
+              </div>
+            </div>
+          {/if}
         </div>
       </section>
     {/if}
@@ -755,65 +1051,8 @@
     {/if}
 
 
-    <section class="section about" aria-labelledby="about-title">
-      <h2 class="section-title" id="about-title">About {artist.name}</h2>
-      <div class="about-body">
-        <div class="about-portrait">
-          <Cover
-            src={overview?.biography_image_url || overview?.header_image_url || artist.cover_url}
-            id={artist.id}
-            name={artist.name}
-            size={148}
-            lg
-            raised
-          />
-        </div>
-        <div class="about-copy">
-          {#if aboutStats.length || hasReleases}
-            <dl class="about-stats">
-              {#each aboutStats as fact (fact.label)}
-                <div>
-                  <dt class="tnum">{fact.value}</dt>
-                  <dd class="caps">{fact.label}</dd>
-                </div>
-              {/each}
-              {#each GROUPS.slice(1) as g (g.id)}
-                {#if (counts[g.id] ?? 0) > 0}
-                  <div>
-                    <dt class="tnum">{NUMBER_FORMAT.format(counts[g.id])}</dt>
-                    <dd class="caps">{g.label}</dd>
-                  </div>
-                {/if}
-              {/each}
-            </dl>
-          {/if}
-          {#if overview?.biography}
-            <p class="biography">{overview.biography}</p>
-          {/if}
-          {#if topCities.length}
-            <div class="top-cities">
-              <h3 class="caps">Top listening cities</h3>
-              <ol>
-                {#each topCities as city (`${city.city}:${city.region}:${city.country}`)}
-                  {@const place = [city.region, city.country].filter(Boolean).join(", ")}
-                  <li>
-                    <span>
-                      <strong>{city.city}</strong>
-                      {#if place}<small>{place}</small>{/if}
-                    </span>
-                    {#if city.listeners}
-                      <span class="city-listeners tnum">{NUMBER_FORMAT.format(city.listeners)}</span>
-                    {/if}
-                  </li>
-                {/each}
-              </ol>
-            </div>
-          {/if}
-        </div>
-      </div>
-    </section>
 
-    {#if !top.length && !hasReleases && !appearsOnCount && !popularReleases.length && !relatedArtists.length && !artistPickPlaylist && !playlistShelves.artist.length && !playlistShelves.discovered.length}
+    {#if !top.length && !hasReleases && !appearsOnCount && !popularReleases.length && !relatedArtists.length && !pick && !playlistShelves.artist.length && !playlistShelves.discovered.length}
       <div class="empty">
         <p class="h">Nothing to show for this artist.</p>
         <p class="sub">The engine returned no popular songs or releases.</p>
@@ -838,7 +1077,6 @@
     display: grid; gap: var(--s5);
     grid-template-columns: repeat(var(--per-row, 5), minmax(0, 1fr));
   }
-  .artist-pick-card { width: min(240px, 100%); }
   .playlist-shelf { margin-top: var(--s1); }
   /* The overflow, named. It sits under the shelf rather than beside the
      heading because it is about the row you just looked at. */
@@ -850,45 +1088,240 @@
   .shelf-more:hover { color: var(--accent); }
   .shelf-empty { max-width: 56ch; color: var(--fg-2); font-size: var(--t-12); }
 
-  /* ---------------------------------------------------------------- about */
-  .about { margin-top: var(--s9); }
-  .about-body {
-    display: grid; grid-template-columns: 148px minmax(0, 1fr);
-    gap: var(--s6); align-items: start; margin-top: var(--s4);
+  /* ------------------------------------------------------------ the pick */
+  /* A PANEL, unlike every other card on this page, and it is the same panel
+     the search Top Result uses: one singled-out item, tinted with its own
+     artwork's colour so it reads as a thing that was chosen rather than as the
+     first cell of a shelf that is not there. The shelf card it used to borrow
+     was a 240px square that looked like a stray album with a caption. */
+  .pick {
+    position: relative; isolation: isolate;
+    display: grid; grid-template-columns: 88px minmax(0, 1fr) auto;
+    align-items: center; gap: var(--s4);
+    width: min(560px, 100%); padding: var(--s4);
+    border-radius: var(--r3);
+    background:
+      linear-gradient(150deg,
+        color-mix(in srgb, var(--tone-wash, var(--bg-2)) 78%, var(--bg-2)),
+        var(--bg-2) 82%);
+    transition: filter var(--d1) var(--ease);
   }
-  /* Fixed track and a fixed tile: a portrait that never arrives costs the
-     image and nothing else, and the copy beside it does not move. */
-  .about-portrait { width: 148px; height: 148px; --tile: 148px; }
-  .about-copy { min-width: 0; }
-  .about-stats {
-    display: flex; flex-wrap: wrap; gap: var(--s5) var(--s7); margin: 0 0 var(--s5);
+  .pick:hover { filter: brightness(1.22); }
+  .pick-art { position: relative; width: 88px; height: 88px; --tile: 88px; }
+  /* The sleeve throws its own colour under itself, as it does in the inspector
+     and the credits sheet — what stops a tile reading as a stamp on a panel. */
+  .pick-art :global(.art) {
+    box-shadow: var(--ring), 0 10px 24px -10px color-mix(in srgb, var(--tone-glow) 78%, transparent);
   }
-  .about-stats dt {
-    font-family: var(--font-display); font-size: var(--t-32); font-weight: var(--w-bold);
-    letter-spacing: -0.02em; line-height: 1; color: var(--fg);
+  /* `padding-right`, because the column that follows is the play button and an
+     ellipsis that stops flush against it reads as text still running rather
+     than text that has ended. */
+  .pick-copy {
+    display: flex; flex-direction: column; align-items: flex-start;
+    gap: 3px; min-width: 0; padding-right: var(--s2);
   }
-  .about-stats dd { margin: var(--s2) 0 0; }
-  .biography {
-    max-width: 72ch; margin: 0; padding-top: var(--s4); border-top: 1px solid var(--line);
-    color: var(--fg-1); font-size: var(--t-13); line-height: 1.65; white-space: pre-line;
+  .pick-copy > .kind { margin-bottom: 2px; }
+  .pick-name {
+    max-width: 100%;
+    font-family: var(--font-display); font-size: var(--t-15); font-weight: var(--w-semi);
+    letter-spacing: -0.01em; color: var(--fg);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .top-cities { max-width: 620px; margin-top: var(--s5); }
-  .top-cities h3 { margin: 0 0 var(--s2); color: var(--fg-2); }
-  .top-cities ol {
-    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0 var(--s6); margin: 0; padding: 0; list-style: none;
+  .pick-sub {
+    max-width: 100%; color: var(--fg-2);
+    font-family: var(--font-small); font-size: var(--t-12);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .top-cities li {
-    display: flex; align-items: baseline; justify-content: space-between; gap: var(--s3);
-    min-width: 0; padding: var(--s2) 0; border-bottom: 1px solid var(--line);
-    color: var(--fg-1); font-size: var(--t-12);
+  /* The artist's note, marked as a quotation by a rule rather than by quote
+     marks: a curly quote around a sentence that may already contain one is a
+     typographic gamble the rest of this app does not take. */
+  /* `padding-right` is not spacing, it is headroom for the italic.
+     An italic glyph inks past the advance width its line box is measured from,
+     and `overflow: hidden` clips at the padding edge — so with no padding the
+     last character of a note lost its right-hand stroke ("Toy Story 5" ended
+     mid-5). The clamp still has to be there for long notes, so the fix is to
+     move the clip edge, not remove it. */
+  .pick-note {
+    max-width: 46ch; margin-top: var(--s2);
+    padding-left: var(--s3); padding-right: 0.25em;
+    border-left: 2px solid color-mix(in srgb, var(--gold) 52%, transparent);
+    color: var(--fg-1); font-size: var(--t-12); font-style: italic; line-height: 1.5;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
   }
-  .top-cities strong { font-weight: var(--w-medium); }
-  .top-cities small { margin-left: var(--s2); color: var(--fg-3); font-size: var(--t-11); }
-  .city-listeners { flex: none; color: var(--fg-2); font-size: var(--t-11); }
+  /* Transparent, full-bleed, and BELOW the play control — the same two-real-
+     controls arrangement `.card` uses, for the same reason: a button may not
+     contain a button. */
+  .pick-hit {
+    position: absolute; inset: 0; z-index: 1;
+    border-radius: var(--r3); background: none;
+  }
+  .pick-play {
+    position: relative; z-index: 2; justify-self: end;
+    display: grid; place-items: center; width: 40px; height: 40px;
+    border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
+    box-shadow: 0 8px 20px -8px color-mix(in srgb, var(--foam) 55%, transparent);
+    transition: background-color var(--d1) var(--ease), transform var(--d1) var(--ease);
+  }
+  .pick-play.as-button:hover:not(:disabled) { background: var(--accent-hi); }
+  .pick-play.as-button:active:not(:disabled) { transform: scale(0.94); }
+  /* A pinned song has no separate control, so the glyph is decoration for a
+     frame that is itself the button — and it has to react to the frame. */
+  .pick.playable:hover .pick-play { background: var(--accent-hi); }
 
-  @media (max-width: 720px) {
-    .about-body { grid-template-columns: minmax(0, 1fr); }
-    .top-cities ol { grid-template-columns: minmax(0, 1fr); }
+  /* ---------------------------------------------------------------- about */
+  /* A CONTAINER, so the two-column split below reacts to the width this
+     section actually has rather than to the width of the window. Those are
+     different numbers by up to 576px here: the rail and the now-playing
+     inspector are both fixed, so a 1400px window with the inspector open gives
+     the pane less room than a 940px one without it. A `@media` query cannot
+     see that, which is the same class of mistake the track grid's `--cols`
+     comment above describes. Contained on the inline axis only, so the
+     section's height still comes from its content. */
+  .about { margin-top: var(--s9); container-type: inline-size; }
+  /* Same object as a settings group heading: the label and its separator are
+     one mark, and the lead-in names the layer. Gold here rather than foam —
+     this is the liner-note section, not structure. */
+  .about-head {
+    display: flex; align-items: center; gap: var(--s3);
+    font-family: var(--font-small);
+    font-size: var(--t-caps); font-weight: var(--w-semi); letter-spacing: var(--track-caps);
+    text-transform: uppercase; color: var(--label-hi);
+    padding-bottom: var(--s5);
+  }
+  .about-head::after {
+    content: ""; flex: 1; height: 1px;
+    background: linear-gradient(90deg,
+      color-mix(in srgb, var(--gold) 58%, transparent), var(--line) 28%, var(--line));
+  }
+  /* Narrow: picture | (figures over cities).  Wide: picture | figures | cities.
+     Prose spans the full width underneath in both. */
+  /* The picture's track is ELASTIC, not a 300px cap. A fixed maximum meant the
+     photograph stayed 300px wide while the card had room to spare beside it,
+     and — because the track could still shrink — it was free to end up SMALLER
+     than that when space got tight. Worst of both. A fractional track with a
+     floor grows into whatever the card has and never collapses; the ceiling
+     lives on the figure so an enormous window does not turn an editorial photo
+     into a poster. */
+  .about-body {
+    display: grid; grid-template-columns: minmax(200px, 0.85fr) minmax(0, 1.15fr);
+    gap: var(--s6) var(--s7); align-items: start;
+  }
+  .about-side { display: flex; flex-direction: column; gap: var(--s6); min-width: 0; }
+  .about-lede, .cities { min-width: 0; }
+  .about-rest { grid-column: 1 / -1; min-width: 0; }
+  /* Three columns once there is room for them, which is where `display:
+     contents` earns its keep: the wrapper stops generating a box and its two
+     children place themselves as grid items. */
+  .about-body.wide {
+    grid-template-columns: minmax(220px, 1fr) minmax(0, 1fr) minmax(0, 1.2fr);
+  }
+  .about-body.wide .about-side { display: contents; }
+  /* No image, no column. An empty tile beside the copy would be a hole that
+     reads as a failed load; the copy simply takes the width instead. */
+  .about-body.no-figure { grid-template-columns: minmax(0, 1fr); }
+  .about-body.no-figure.wide { grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); }
+  /* The picture is shown WHOLE, at its own proportions.
+     Stretching it to the height of the copy beside it sounded tidy and was
+     wrong: these editorial images are usually landscape (a common one is
+     640x429), and a 300px-wide column stretched to 320-460px tall is a
+     portrait box, so `cover` cut the sides off a wide photograph to fill a
+     tall hole. Letting the height follow the width means no crop at all and
+     no letterbox either — the frame is whatever the image's frame is. */
+  /* The shape is the picture's own — see the `natural` mode on Cover, which is
+     where width/height/aspect are settled. Nothing to override here. */
+  .about-figure {
+    margin: 0; width: 100%; max-width: 440px; align-self: start; --tile: 300px;
+  }
+  /* Measure belongs to the prose, not to the block that holds it: the cities
+     want the width, a paragraph does not. */
+  .about-bio :global(*) { max-width: 78ch; }
+
+  .rank { display: flex; align-items: baseline; gap: var(--s3); }
+  .rank-n {
+    font-family: var(--font-display); font-size: var(--t-32); font-weight: var(--w-bold);
+    letter-spacing: -0.03em; line-height: 1; color: var(--fg);
+  }
+  .about-stats { display: flex; flex-wrap: wrap; gap: var(--s3) var(--s7); margin: var(--s5) 0 0; }
+  /* A step and a half below the rank, deliberately: these are supporting
+     figures, and at display size they competed with the one number that is
+     genuinely hard to find anywhere else. */
+  .about-stats dt {
+    font-family: var(--font-number); font-size: var(--t-15); font-weight: var(--w-med);
+    line-height: 1.2; color: var(--fg);
+  }
+  .about-stats dd { margin: 2px 0 0; }
+
+  .pop { margin-top: var(--s6); max-width: 340px; }
+  .pop-line { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s3); }
+  .pop-n {
+    font-family: var(--font-number); font-size: var(--t-13); font-weight: var(--w-med);
+    color: color-mix(in srgb, var(--gold) 70%, var(--fg));
+  }
+  .pop-rail {
+    position: relative; height: 4px; margin-top: var(--s2); overflow: hidden;
+    border-radius: var(--rf); background: rgba(255, 255, 255, 0.07);
+  }
+  /* scaleX on a pre-painted gradient, like every other rail in the app. Gold
+     rather than the foam-to-rose signature: the signature says "this is the
+     app", and this is a fact about the artist. */
+  .pop-fill {
+    position: absolute; inset: 0; transform-origin: left; transform: scaleX(var(--p, 0));
+    background: linear-gradient(90deg,
+      color-mix(in srgb, var(--gold) 45%, transparent), var(--gold));
+  }
+  .about-bio {
+    margin-top: var(--s6); padding-top: var(--s5); border-top: 1px solid var(--line);
+  }
+
+  /* The rule separates the cities from the figures ABOVE them, so it only
+     belongs when something is actually above them. In the three-column layout
+     the cities are their own column starting at the top of the card, and the
+     rule was a hairline hanging over nothing. */
+  .cities { margin-top: var(--s6); padding-top: var(--s5); border-top: 1px solid var(--line); }
+  .about-body.wide .cities { margin-top: 0; padding-top: 0; border-top: none; }
+  .cities h3 { margin: 0 0 var(--s3); }
+  .cities ol { margin: 0; padding: 0; list-style: none; }
+  /* [rank] [city] [region, country] [listeners] — one grid so four columns of
+     five rows line up, instead of four independently-wrapping flex rows. */
+  .cities li {
+    position: relative;
+    display: grid; grid-template-columns: 16px auto minmax(0, 1fr) auto;
+    align-items: baseline; gap: var(--s3);
+    padding: var(--s2) 0 9px; font-size: var(--t-12); color: var(--fg-1);
+  }
+  /* The comparison is a 2px RULE under each row, not a wash behind it.
+     A washed row was the first thing tried and it was the mistake the palette
+     block in app.css already documents: gold at 15% over near-black resolves
+     to about #2a2318, so five rows of it read as five dim brown blocks rather
+     than as one colour at five widths. Alpha destroys chroma; the fix is to
+     spend LESS AREA at MORE strength. Two pixels of near-solid gold is
+     unmistakably gold, and the width still carries the whole comparison. */
+  .cities li::before {
+    content: ""; position: absolute; inset: auto 0 0 0; height: 2px;
+    border-radius: 1px; background: var(--line);
+  }
+  .cities li::after {
+    content: ""; position: absolute; inset: auto auto 0 0; height: 2px;
+    width: calc(var(--share, 0) * 100%);
+    border-radius: 1px; background: var(--gold); opacity: 0.82;
+  }
+  .city-rank { color: var(--fg-3); font-size: var(--t-11); text-align: right; }
+  .city-name { color: var(--fg); font-weight: var(--w-med); }
+  .city-place {
+    min-width: 0; color: var(--fg-3); font-family: var(--font-small); font-size: var(--t-11);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .city-n { flex: none; color: var(--fg-2); font-family: var(--font-number); font-size: var(--t-11); }
+
+  /* Below this the copy column is narrower than the picture beside it, which
+     is the point at which the picture has stopped being an illustration and
+     started being an obstruction. It goes above the copy instead, at a size
+     that still reads as a photograph. */
+  @container (max-width: 680px) {
+    .about-body { grid-template-columns: minmax(0, 1fr); gap: var(--s5); }
+    .about-side { display: flex; }
+    /* Width only. Forcing a ratio here would put the old portrait box back and
+       reserve space the picture does not occupy. */
+    .about-figure { width: min(260px, 62%); }
   }
 </style>

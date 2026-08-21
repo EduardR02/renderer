@@ -290,6 +290,43 @@ impl Engine {
         true
     }
 
+    /// Re-checks the download mark on the only tracks that can have changed.
+    ///
+    /// A track's audio reaches the cache because librespot streamed it, so the
+    /// set that can newly become cached while you are looking at a list is the
+    /// one playing and the one queued behind it — not the other two hundred
+    /// rows. That is what makes this affordable on a heartbeat: two lookups,
+    /// each a path join and one file-attribute call, rather than a walk of the
+    /// queue or a directory scan.
+    ///
+    /// Returns whether anything changed, so a quiet tick still emits nothing.
+    pub fn refresh_cached_marks(&mut self) -> bool {
+        let Some(current) = self.state.current_index else {
+            return false;
+        };
+        let ids: Vec<String> = [current, current + 1]
+            .into_iter()
+            .filter_map(|index| self.state.queue.get(index))
+            .filter(|track| !track.cached)
+            .map(|track| track.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return false;
+        }
+        let now_cached = crate::browse::cached_track_ids(&ids, Some(&self.cache));
+        if now_cached.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for track in &mut self.state.queue {
+            if !track.cached && now_cached.contains(&track.id) {
+                track.cached = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Notices a session librespot has invalidated underneath us and rebuilds
     /// it, with backoff. Driven from the same heartbeat that advances the
     /// playhead, so no extra timer is needed; the check is one `RwLock` read.

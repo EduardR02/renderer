@@ -211,7 +211,7 @@
 
     {#if tracks.length}
       <div style="margin-top:var(--s6)">
-        <TrackList {tracks} {playFrom} showArtist />
+        <TrackList {tracks} {playFrom} />
       </div>
     {:else}
       <div class="empty">

@@ -29,6 +29,20 @@
      * monogram scale.
      */
     fill = false,
+    /**
+     * Show the source at its OWN proportions: width leads, height follows.
+     *
+     * Every other mode puts the image in a box of a known shape and crops to
+     * it, which is right for a tile in a row of tiles. It is wrong for a lone
+     * editorial photograph, where the frame the photographer chose is part of
+     * the picture. `fill` cannot do this: it writes `height: 100%` inline, so
+     * the tile keeps a height the image no longer fills and `.art`'s own
+     * `background` paints the difference as a grey slab under the picture.
+     *
+     * Only meaningful for a real image; the generated monogram tile stays
+     * square, because a letter has no proportions to respect.
+     */
+    natural = false,
     lg = false,
     circle = false,
     raised = false,
@@ -69,8 +83,9 @@
     class:circle
     class:raised
     class:mosaic={tier === "mosaic"}
-    style:width={fill ? "100%" : `${size}px`}
-    style:height={fill ? "100%" : `${size}px`}
+    class:natural
+    style:width={fill || natural ? "100%" : `${size}px`}
+    style:height={natural ? null : fill ? "100%" : `${size}px`}
   >
     <!-- width/height attributes as well as the CSS above: a load that fails
          still reserves the identical box, so nothing reflows around it. -->

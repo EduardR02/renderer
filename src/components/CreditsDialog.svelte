@@ -227,14 +227,24 @@
                 {@const roles = roleLine(contributor)}
                 <li>
                   {#if contributor.url}
-                    <button
+                    <!-- A span with role="link", not a <button>: a button is an
+                         atomic inline box and cannot ellipsise, which sliced
+                         long names mid-glyph. Same pattern as ArtistLinks. -->
+                    <span
                       class="credit-link"
+                      role="link"
+                      tabindex="0"
                       aria-label={`Open ${contributor.name} in your browser`}
                       onclick={() => openContributor(contributor.url)}
+                      onkeydown={(event) => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        openContributor(contributor.url);
+                      }}
                     >
                       <span class="credit-name">{contributor.name}</span>
                       <Icon name="fwd" size={11} />
-                    </button>
+                    </span>
                   {:else}
                     <span class="credit-name credit-plain">{contributor.name}</span>
                   {/if}

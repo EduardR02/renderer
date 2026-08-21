@@ -295,7 +295,37 @@ export function applyPlayback(payload) {
   }
   if ("position_ms" in payload) anchorPlayhead(payload.position_ms);
   if (playback.playing !== wasPlaying) syncPlayheadTicker(playback.playing);
+  if ("queue" in payload) propagateCachedMarks(payload.queue);
   maybeStartDeferredSearch();
+}
+
+/**
+ * Carries download marks from the queue into whatever list is on screen.
+ *
+ * The engine re-checks the playing track as it finishes caching (see
+ * `refresh_cached_marks`) and that reaches us on the queue. But a playlist view
+ * renders `detail.playlist.tracks`, a different array holding different objects
+ * for the same songs, so without this the mark would appear in the queue and
+ * nowhere the reader is looking.
+ *
+ * One-way and set-only: a track that has become cached stays marked for as long
+ * as the list is open. Un-marking would mean re-deriving the whole list from a
+ * payload that only speaks about two tracks, and inferring "not cached" from
+ * "not mentioned" is exactly the wrong reading.
+ */
+function propagateCachedMarks(queue) {
+  const cachedIds = new Set(
+    (queue ?? []).filter((track) => track?.cached && track.id).map((track) => track.id),
+  );
+  if (!cachedIds.size) return;
+  for (const view of [detail.playlist, detail.album, detail.artist, detail.radio]) {
+    for (const track of view?.tracks ?? []) {
+      if (!track.cached && cachedIds.has(track.id)) track.cached = true;
+    }
+    for (const track of view?.top_tracks ?? []) {
+      if (!track.cached && cachedIds.has(track.id)) track.cached = true;
+    }
+  }
 }
 
 export function applySession(payload) {
@@ -1485,6 +1515,53 @@ export async function initEvents() {
   listen("position", (e) => {
     playback.position_ms = e.payload ?? 0;
     anchorPlayhead(playback.position_ms);
+  }).catch(() => {});
+  /**
+   * A playlist opened from cache is served instantly and refreshed behind it.
+   * This is that refresh landing.
+   *
+   * It is applied only if the playlist is still the one on screen, because the
+   * fetch outlives the navigation that started it — and it is MERGED rather
+   * than assigned. `TrackList` treats a new array as a new list and resets the
+   * shared pane scroller to the top, so swapping `tracks` wholesale would yank
+   * the reader back to row one a second after they opened the page and started
+   * scrolling. Same rows in the same order means patch the fields in place;
+   * only a genuinely different list earns a replacement, where starting at the
+   * top is the honest thing to do anyway.
+   */
+  listen("playlist", (e) => {
+    const fresh = e.payload;
+    const id = fresh?.playlist?.id;
+    if (!id || route.name !== "playlist" || route.id !== id) return;
+    const open = detail.playlist;
+    if (!open) return;
+
+    open.playlist = fresh.playlist;
+
+    const current = open.tracks ?? [];
+    const incoming = fresh.tracks ?? [];
+    const sameRows =
+      current.length === incoming.length &&
+      current.every((track, i) => track.id === incoming[i]?.id);
+
+    if (!sameRows) {
+      open.tracks = incoming;
+      return;
+    }
+    /* The fields a refresh can legitimately move. Assigning only on a real
+       difference keeps this from waking every row's subscribers each time a
+       background refresh finds nothing new. */
+    for (let i = 0; i < current.length; i++) {
+      const from = incoming[i];
+      const into = current[i];
+      if (into.cached !== from.cached) into.cached = from.cached;
+      if (into.play_count !== from.play_count) into.play_count = from.play_count;
+      if (into.unavailable !== from.unavailable) into.unavailable = from.unavailable;
+      if (into.unavailable_reason !== from.unavailable_reason) {
+        into.unavailable_reason = from.unavailable_reason;
+      }
+      if (into.added_at !== from.added_at) into.added_at = from.added_at;
+    }
   }).catch(() => {});
   listen("session", (e) => applySession(e.payload)).catch(() => {});
   listen("library", (e) => setLibrary(e.payload)).catch(() => {});

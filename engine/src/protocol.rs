@@ -42,6 +42,16 @@ pub struct TrackRef {
     pub unavailable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+    /// Whether this track's audio is already on disk in the app-owned
+    /// librespot cache, so playing it costs no download.
+    ///
+    /// Answered where the track's metadata is parsed, because that is the one
+    /// place the file ids are already in hand: knowing this anywhere else would
+    /// mean a second metadata fetch per track. It is a snapshot taken at browse
+    /// time, not a subscription — a track that finishes caching while a list is
+    /// on screen is marked on the next browse of that list.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cached: bool,
 }
 impl Default for TrackRef {
     fn default() -> Self {
@@ -60,6 +70,7 @@ impl Default for TrackRef {
             added_at: None,
             unavailable: false,
             unavailable_reason: None,
+            cached: false,
         }
     }
 }
@@ -483,10 +494,38 @@ pub struct ArtistOverview {
     pub discovered_on: Vec<PlaylistRef>,
     /// Artist-owned playlists from `profile.playlistsV2`.
     pub artist_playlists: Vec<PlaylistRef>,
-    /// Artist Pick when its pinned item is a playlist; other item kinds stay
-    /// omitted because this browse contract only carries playlist cards.
+    /// Whatever the artist pinned to the top of their page — see [`ArtistPick`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub artist_pick: Option<PlaylistRef>,
+    pub artist_pick: Option<ArtistPick>,
+}
+
+/// The item an artist pinned to the top of their page, and the note they
+/// wrote alongside it.
+///
+/// This used to be an `Option<PlaylistRef>` and the doc comment said so
+/// outright: "other item kinds stay omitted because this browse contract only
+/// carries playlist cards". `profile.pinnedItem.itemV2` is a union, and a
+/// pinned SINGLE is at least as common as a pinned playlist, so the contract
+/// was dropping the ordinary case and keeping the rarer one.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ArtistPick {
+    /// The artist's own words about the pick. Frequently absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    pub item: ArtistPickItem,
+}
+
+/// The three kinds `pinnedItem.itemV2` can resolve to, tagged rather than
+/// modelled as three optional fields: exactly one is present, always, and a
+/// shape that cannot express "two at once" is the one that matches the source.
+/// The tag survives to the UI because the card's affordance depends on it — a
+/// pinned track plays, a pinned album or playlist opens.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum ArtistPickItem {
+    Playlist(PlaylistRef),
+    Album(AlbumRef),
+    Track(TrackRef),
 }
 
 /// Payload of a successful [`Command::BrowseArtist`] response.
