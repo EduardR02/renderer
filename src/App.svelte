@@ -1,5 +1,5 @@
 <script>
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import {
     initEvents,
     route,
@@ -60,6 +60,20 @@
     observer.observe(node);
     ui.paneWidth = Math.round(node.getBoundingClientRect().width);
     return () => observer.disconnect();
+  });
+
+  /* Every route reuses this one scroll container. Without an explicit reset,
+     the incoming view inherits the outgoing view's pixel offset; shorter pages
+     are then clamped to their bottom. Reset after Svelte commits the new view
+     for forward, back, and history navigation alike. */
+  let scrollEl = $state(null);
+  $effect(() => {
+    route.name;
+    route.id;
+    route.param;
+    const node = scrollEl;
+    if (!node) return;
+    tick().then(() => node.scrollTo({ top: 0, behavior: "instant" }));
   });
 
   // Dynamic album/catalogue queues stay small. The next bounded page is
@@ -156,7 +170,7 @@
   <Sidebar />
 
   <main class="pane" bind:this={paneEl}>
-    <div class="scroll">
+    <div class="scroll" bind:this={scrollEl}>
       <TopBar />
 
       {#if playback.error}

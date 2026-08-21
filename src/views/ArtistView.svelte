@@ -419,7 +419,12 @@
   <header class="banner">
     <div class="bg">
       {#if artist}
-        <Cover src={artist.cover_url} id={artist.id} name={artist.name} fill />
+        <Cover
+          src={overview?.header_image_url || artist.cover_url}
+          id={artist.id}
+          name={artist.name}
+          fill
+        />
       {:else}
         <!-- Something has to be behind the banner's darkening gradient while
              the portrait is on its way, or 260px of the page is pure black and
@@ -754,7 +759,14 @@
       <h2 class="section-title" id="about-title">About {artist.name}</h2>
       <div class="about-body">
         <div class="about-portrait">
-          <Cover src={artist.cover_url} id={artist.id} name={artist.name} size={148} lg raised />
+          <Cover
+            src={overview?.biography_image_url || overview?.header_image_url || artist.cover_url}
+            id={artist.id}
+            name={artist.name}
+            size={148}
+            lg
+            raised
+          />
         </div>
         <div class="about-copy">
           {#if aboutStats.length || hasReleases}

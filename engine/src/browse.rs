@@ -119,6 +119,18 @@ pub fn cover_url(images: &Images) -> Option<String> {
         .map(|hex| format!("{COVER_BASE}{hex}"))
 }
 
+fn largest_cover_url<'a>(
+    images: impl IntoIterator<Item = &'a librespot_metadata::image::Image>,
+) -> Option<String> {
+    images
+        .into_iter()
+        .max_by_key(|image| {
+            i64::from(image.width.max(0)).saturating_mul(i64::from(image.height.max(0)))
+        })
+        .and_then(|image| image.id.to_base16().ok())
+        .map(|hex| format!("{COVER_BASE}{hex}"))
+}
+
 fn id_of(uri: &SpotifyUri) -> String {
     uri.to_id().unwrap_or_default()
 }
@@ -1183,6 +1195,7 @@ fn artist_portrait(artist: &Artist) -> Option<String> {
     cover_url(&artist.portraits).or_else(|| cover_url(&artist.portrait_group))
 }
 
+
 const INITIAL_ARTIST_RELEASES: usize = 12;
 const MAX_ARTIST_RELEASE_PAGE: usize = 40;
 
@@ -1306,13 +1319,24 @@ async fn resolve_initial_artist_release_page(
 }
 
 fn metadata_artist_overview(artist: &Artist) -> ArtistOverview {
+    let biography = artist
+        .biographies
+        .iter()
+        .find(|biography| !biography.text.trim().is_empty());
+    let biography_images = biography
+        .into_iter()
+        .flat_map(|biography| {
+            biography
+                .portraits
+                .iter()
+                .chain(biography.portrait_group.iter().flat_map(|group| group.iter()))
+        });
     ArtistOverview {
-        biography: artist
-            .biographies
-            .iter()
-            .map(|biography| biography.text.trim())
-            .find(|text| !text.is_empty())
-            .map(str::to_owned),
+        biography: biography.map(|biography| biography.text.trim().to_owned()),
+        header_image_url: largest_cover_url(
+            artist.portraits.iter().chain(artist.portrait_group.iter()),
+        ),
+        biography_image_url: largest_cover_url(biography_images),
         popularity: u32::try_from(artist.popularity)
             .ok()
             .filter(|popularity| *popularity > 0),
@@ -1341,6 +1365,16 @@ fn merge_artist_overview(
         if supplied.biography.is_some() {
             overview.biography.clone_from(&supplied.biography);
         }
+        if supplied.header_image_url.is_some() {
+            overview
+                .header_image_url
+                .clone_from(&supplied.header_image_url);
+        }
+        if supplied.biography_image_url.is_some() {
+            overview
+                .biography_image_url
+                .clone_from(&supplied.biography_image_url);
+        }
         overview.followers = supplied.followers;
         overview.monthly_listeners = supplied.monthly_listeners;
         overview.world_rank = supplied.world_rank;
@@ -1362,7 +1396,10 @@ fn merge_artist_overview(
         overview.artist_pick.clone_from(&supplied.artist_pick);
     }
 
+
     (overview.biography.is_some()
+        || overview.header_image_url.is_some()
+        || overview.biography_image_url.is_some()
         || overview.popularity.is_some()
         || overview.followers.is_some()
         || overview.monthly_listeners.is_some()
@@ -1450,6 +1487,7 @@ pub async fn artist_releases_browse(
     resolve_artist_release_page(session, &groups, release_types, offset, limit).await
 }
 
+#[derive(Clone)]
 struct CatalogueReleaseSeed {
     header: spotify_playback_engine::protocol::AlbumBrowse,
     track_uris: Vec<SpotifyUri>,
@@ -1477,16 +1515,79 @@ fn parse_catalogue_release_payload(
     })
 }
 
-/// A lazy page of complete releases for the expanded artist catalogue. The
-/// page boundary is albums, not arbitrary track counts: opening a release
-/// always resolves that logical unit in full, while scrolling controls how
-/// many releases exist in memory and on screen.
-///
-/// The artist endpoint stores each release type in its own catalogue order.
-/// For a multi-type request, walk those catalogues in round-robin order before
-/// slicing the requested page; otherwise a bounded first page is all albums
-/// and the other types remain invisible until the user has scrolled through
-/// the entire album catalogue. A single-type request keeps its source order.
+const CATALOGUE_MANIFEST_TTL: Duration = Duration::from_secs(5 * 60);
+const CATALOGUE_MANIFEST_CACHE_CAPACITY: usize = 8;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CatalogueManifestKey {
+    artist_id: String,
+    country: String,
+    selected_groups: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct CatalogueManifestEntry {
+    fetched_at: Instant,
+    releases: Vec<CatalogueReleaseSeed>,
+}
+
+#[derive(Default)]
+struct CatalogueManifestCache {
+    entries: HashMap<CatalogueManifestKey, CatalogueManifestEntry>,
+}
+
+impl CatalogueManifestCache {
+    fn get(
+        &mut self,
+        key: &CatalogueManifestKey,
+        now: Instant,
+    ) -> Option<Vec<CatalogueReleaseSeed>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.fetched_at) >= CATALOGUE_MANIFEST_TTL {
+            self.entries.remove(key);
+            return None;
+        }
+        Some(entry.releases.clone())
+    }
+
+    fn insert(
+        &mut self,
+        key: CatalogueManifestKey,
+        releases: Vec<CatalogueReleaseSeed>,
+        now: Instant,
+    ) {
+        self.entries.retain(|_, entry| {
+            now.duration_since(entry.fetched_at) < CATALOGUE_MANIFEST_TTL
+        });
+        if !self.entries.contains_key(&key)
+            && self.entries.len() >= CATALOGUE_MANIFEST_CACHE_CAPACITY
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            key,
+            CatalogueManifestEntry {
+                fetched_at: now,
+                releases,
+            },
+        );
+    }
+}
+
+static CATALOGUE_MANIFEST_CACHE: LazyLock<Mutex<CatalogueManifestCache>> =
+    LazyLock::new(|| Mutex::new(CatalogueManifestCache::default()));
+
+/// Deduplicates the selected release groups in a deterministic order before
+/// their metadata is resolved. Multi-group manifests are sorted globally by
+/// year afterwards; this round-robin order is only the stable tie-breaker.
+/// Single-group manifests retain the artist endpoint's source order.
 fn interleaved_catalogue_uris(
     groups: &[Vec<SpotifyUri>; 4],
     selected: &[usize],
@@ -1527,6 +1628,63 @@ fn interleaved_catalogue_uris(
     releases
 }
 
+fn order_catalogue_manifest(
+    releases: &mut [CatalogueReleaseSeed],
+    selected_group_count: usize,
+) {
+    if selected_group_count <= 1 {
+        return;
+    }
+    // The artist metadata keeps each release type in a separate sequence.
+    // Round-robin pagination therefore places an old album ahead of a recent
+    // single that has not been loaded yet. Sort the complete mixed manifest
+    // before choosing any page boundary. Stable sort preserves source order
+    // for same-year and undated releases.
+    releases.sort_by(|left, right| {
+        right
+            .header
+            .year
+            .unwrap_or(0)
+            .cmp(&left.header.year.unwrap_or(0))
+    });
+}
+
+async fn catalogue_manifest(
+    session: &Session,
+    artist_id: &str,
+    groups: &[Vec<SpotifyUri>; 4],
+    selected: &[usize],
+) -> Result<Vec<CatalogueReleaseSeed>, String> {
+    let key = CatalogueManifestKey {
+        artist_id: artist_id.to_owned(),
+        country: session.country(),
+        selected_groups: selected.to_vec(),
+    };
+    if let Some(cached) = CATALOGUE_MANIFEST_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key, Instant::now())
+    {
+        return Ok(cached);
+    }
+
+    let uris = interleaved_catalogue_uris(groups, selected);
+    let mut releases = fetch_extended(
+        session,
+        uris.iter(),
+        ExtensionKind::ALBUM_V4,
+        parse_catalogue_release_payload,
+    )
+    .await?;
+    order_catalogue_manifest(&mut releases, selected.len());
+
+    CATALOGUE_MANIFEST_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, releases.clone(), Instant::now());
+    Ok(releases)
+}
+
 pub async fn artist_catalogue_browse(
     session: &Session,
     id: &str,
@@ -1544,18 +1702,11 @@ pub async fn artist_catalogue_browse(
         selected_release_group_indices(release_types)?
     };
     let groups = artist_release_groups(&artist);
-    let releases = interleaved_catalogue_uris(&groups, &selected);
-    let total = releases.len();
+    let manifest = catalogue_manifest(session, id, &groups, &selected).await?;
+    let total = manifest.len();
     let limit = limit.clamp(1, 6);
     let end = offset.saturating_add(limit).min(total);
-    let page = releases.get(offset..end).unwrap_or_default();
-    let mut seeds = fetch_extended(
-        session,
-        page.iter(),
-        ExtensionKind::ALBUM_V4,
-        parse_catalogue_release_payload,
-    )
-    .await?;
+    let mut seeds = manifest.get(offset..end).unwrap_or_default().to_vec();
     let wanted_tracks: Vec<SpotifyUri> = seeds
         .iter()
         .flat_map(|release| release.track_uris.iter().cloned())
@@ -2267,13 +2418,7 @@ fn album_ref_from_hit(hit: &SearchAlbumHitJson) -> AlbumRef {
             .map(|artist| hit_id(artist.uri.as_deref()))
             .collect(),
         cover_url: hit_image(hit.coverArt.as_ref()),
-        // Free: the year travels in the same search response. A year of 0
-        // would be a placeholder, not a release date.
-        year: hit
-            .date
-            .as_ref()
-            .and_then(|date| date.year)
-            .filter(|year| *year > 0),
+        year: hit.date.as_ref().and_then(|date| date.year).filter(|year| *year > 0),
     }
 }
 
@@ -2380,6 +2525,12 @@ const ARTIST_OVERVIEW_CACHE_CAPACITY: usize = 64;
 /// document keeps the exact variable shape it was captured with; GraphQL
 /// gateways are not required to ignore undeclared variables.
 const ARTIST_OVERVIEW_SCHEMAS: &[ArtistOverviewSchema] = &[
+    // Current desktop client document (Spotify 1.2.97): includes the richer
+    // artist visuals. A successful historical schema can omit those fields.
+    ArtistOverviewSchema {
+        hash: "1ac33ddab5d39a3a9c27802774e6d78b9405cc188c6f75aed007df2a32737c72",
+        variables: ArtistOverviewVariables::Locale,
+    },
     ArtistOverviewSchema {
         hash: "ae0e2958a4ab645b35ca19ac04d0495ae12d9c5d7b7286217674801a9aab281a",
         variables: ArtistOverviewVariables::LocaleAndPreRelease,
@@ -2387,10 +2538,6 @@ const ARTIST_OVERVIEW_SCHEMAS: &[ArtistOverviewSchema] = &[
     ArtistOverviewSchema {
         hash: "5b9e64f43843fa3a9b6a98543600299b0a2cbbbccfdcdcef2402eb9c1017ca4c",
         variables: ArtistOverviewVariables::PreRelease,
-    },
-    ArtistOverviewSchema {
-        hash: "1ac33ddab5d39a3a9c27802774e6d78b9405cc188c6f75aed007df2a32737c72",
-        variables: ArtistOverviewVariables::Locale,
     },
     ArtistOverviewSchema {
         hash: "d66221ea13998b2f81883c5187d174c8646e4041d67f5b1e103bc262d447e3a0",
@@ -2506,6 +2653,8 @@ struct ArtistOverviewDataJson {
 struct ArtistOverviewUnionJson {
     #[serde(default)]
     profile: Option<ArtistOverviewProfileJson>,
+    #[serde(default)]
+    visuals: Option<ArtistOverviewVisualsJson>,
     #[serde(default)]
     stats: Option<ArtistOverviewStatsJson>,
     #[serde(default)]
@@ -2655,6 +2804,21 @@ struct ArtistOverviewImageJson {
 }
 
 #[derive(Default, Deserialize)]
+#[allow(non_snake_case)]
+struct ArtistOverviewVisualsJson {
+    #[serde(default)]
+    avatarImage: Option<ArtistOverviewImageJson>,
+    #[serde(default)]
+    gallery: Option<ArtistOverviewGalleryJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct ArtistOverviewGalleryJson {
+    #[serde(default)]
+    items: Option<Vec<ArtistOverviewImageJson>>,
+}
+
+#[derive(Default, Deserialize)]
 struct ArtistOverviewArtistListJson {
     #[serde(default)]
     items: Option<Vec<SearchArtistJson>>,
@@ -2726,6 +2890,17 @@ fn overview_image(image: Option<&ArtistOverviewImageJson>) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
+fn overview_largest_image(image: Option<&ArtistOverviewImageJson>) -> Option<String> {
+    image?
+        .sources
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|source| source.url.as_deref().is_some_and(|url| !url.is_empty()))
+        .max_by_key(|source| source.width.unwrap_or(0))
+        .and_then(|source| source.url.clone())
+}
+
 fn overview_related_artist_ref(artist: &ArtistOverviewRelatedArtistJson) -> ArtistRef {
     ArtistRef {
         id: hit_id(artist.uri.as_deref()),
@@ -2793,6 +2968,16 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
     let profile = artist.profile.as_ref();
     let stats = artist.stats.as_ref();
     let discography = artist.discography.as_ref();
+    let visuals = artist.visuals.as_ref();
+    let header_image_url = overview_largest_image(
+        visuals.and_then(|visuals| visuals.avatarImage.as_ref()),
+    );
+    let biography_image_url = visuals
+        .and_then(|visuals| visuals.gallery.as_ref())
+        .and_then(|gallery| gallery.items.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .find_map(|image| overview_largest_image(Some(image)));
     let biography = profile
         .and_then(|profile| profile.biography.as_ref())
         .and_then(|biography| biography.text.as_deref())
@@ -2889,6 +3074,8 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
     Ok(ArtistOverviewQuery {
         overview: ArtistOverview {
             biography,
+            header_image_url,
+            biography_image_url,
             popularity: None,
             followers,
             monthly_listeners,
@@ -4079,6 +4266,19 @@ mod tests {
         let body = br#"{
             "data": {"artistUnion": {
                 "profile": {"biography": {"text": "  A real biography.\nSecond paragraph.  "}},
+                "visuals": {
+                    "avatarImage": {"sources": [
+                        {"url": "header-small", "width": 320},
+                        {"url": "header-large", "width": 1200}
+                    ]},
+                    "gallery": {"items": [
+                        {"sources": [
+                            {"url": "bio-small", "width": 400},
+                            {"url": "bio-large", "width": 1600}
+                        ]},
+                        {"sources": [{"url": "bio-second", "width": 1800}]}
+                    ]}
+                },
                 "stats": {
                     "followers": 1200,
                     "monthlyListeners": "3400",
@@ -4122,6 +4322,14 @@ mod tests {
         assert_eq!(
             parsed.overview.biography.as_deref(),
             Some("A real biography.\nSecond paragraph.")
+        );
+        assert_eq!(
+            parsed.overview.header_image_url.as_deref(),
+            Some("header-large")
+        );
+        assert_eq!(
+            parsed.overview.biography_image_url.as_deref(),
+            Some("bio-large")
         );
         assert_eq!(parsed.overview.followers, Some(1200));
         assert_eq!(parsed.overview.monthly_listeners, Some(3400));
@@ -4179,7 +4387,7 @@ mod tests {
     fn artist_overview_hashes_keep_their_verified_variable_shapes() {
         assert_eq!(
             ARTIST_OVERVIEW_SCHEMAS[0].hash,
-            "ae0e2958a4ab645b35ca19ac04d0495ae12d9c5d7b7286217674801a9aab281a"
+            "1ac33ddab5d39a3a9c27802774e6d78b9405cc188c6f75aed007df2a32737c72"
         );
         let bodies: Vec<serde_json::Value> = ARTIST_OVERVIEW_SCHEMAS
             .iter()
@@ -4196,11 +4404,11 @@ mod tests {
             assert_eq!(body["variables"]["uri"], "spotify:artist:id");
         }
         assert_eq!(bodies[0]["variables"]["locale"], "");
-        assert_eq!(bodies[0]["variables"]["preReleaseV2"], false);
-        assert!(bodies[1]["variables"].get("locale").is_none());
+        assert!(bodies[0]["variables"].get("preReleaseV2").is_none());
+        assert_eq!(bodies[1]["variables"]["locale"], "");
         assert_eq!(bodies[1]["variables"]["preReleaseV2"], false);
-        assert_eq!(bodies[2]["variables"]["locale"], "");
-        assert!(bodies[2]["variables"].get("preReleaseV2").is_none());
+        assert!(bodies[2]["variables"].get("locale").is_none());
+        assert_eq!(bodies[2]["variables"]["preReleaseV2"], false);
         assert_eq!(
             bodies[3]["variables"].as_object().unwrap().len(),
             1,
@@ -4278,9 +4486,16 @@ mod tests {
     fn metadata4_keeps_the_artist_page_useful_when_every_overview_hash_fails() {
         let mut artist = test_artist("0123456789ABCDEFGHIJKL", "Artist");
         artist.popularity = 73;
+        artist.portrait_group = Images(vec![
+            image(ImageSize::SMALL, 0xa1),
+            image(ImageSize::LARGE, 0xa2),
+        ]);
         artist.biographies.0.push(Biography {
             text: "Metadata biography".to_owned(),
-            portraits: Images::default(),
+            portraits: Images(vec![
+                image(ImageSize::SMALL, 0xb1),
+                image(ImageSize::LARGE, 0xb2),
+            ]),
             portrait_group: Vec::new(),
         });
         let mut related = test_artist("1123456789ABCDEFGHIJKL", "Related");
@@ -4291,9 +4506,18 @@ mod tests {
         assert_eq!(overview.biography.as_deref(), Some("Metadata biography"));
         assert_eq!(overview.popularity, Some(73));
         assert_eq!(overview.related_artists.len(), 1);
+        assert_eq!(
+            overview.header_image_url.as_deref(),
+            Some(format!("{COVER_BASE}{}", "a2".repeat(20))).as_deref()
+        );
+        assert_eq!(
+            overview.biography_image_url.as_deref(),
+            Some(format!("{COVER_BASE}{}", "b2".repeat(20))).as_deref()
+        );
         assert!(overview.followers.is_none());
         assert!(overview.popular_releases.is_empty());
     }
+
 
     #[test]
     fn get_track_supplies_the_artist_popular_counts_in_one_response() {
@@ -4460,6 +4684,56 @@ mod tests {
                 "2abcdefghijklmnopqrstu",
                 "1abcdefghijklmnopqrstu",
             ],
+        );
+    }
+
+    #[test]
+    fn mixed_catalogue_is_sorted_before_pagination_with_stable_year_ties() {
+        let seed = |name: &str, year| CatalogueReleaseSeed {
+            header: spotify_playback_engine::protocol::AlbumBrowse {
+                name: name.to_owned(),
+                year,
+                ..Default::default()
+            },
+            track_uris: Vec::new(),
+        };
+        let mut releases = vec![
+            seed("old album", Some(2010)),
+            seed("new single", Some(2024)),
+            seed("recent album", Some(2023)),
+            seed("new album", Some(2024)),
+            seed("undated", None),
+        ];
+
+        order_catalogue_manifest(&mut releases, 3);
+
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.header.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "new single",
+                "new album",
+                "recent album",
+                "old album",
+                "undated",
+            ],
+        );
+
+        let mut single_group = releases.clone();
+        single_group.reverse();
+        let source_order = single_group
+            .iter()
+            .map(|release| release.header.name.clone())
+            .collect::<Vec<_>>();
+        order_catalogue_manifest(&mut single_group, 1);
+        assert_eq!(
+            single_group
+                .iter()
+                .map(|release| release.header.name.clone())
+                .collect::<Vec<_>>(),
+            source_order,
         );
     }
 

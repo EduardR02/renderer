@@ -460,6 +460,12 @@ pub struct ArtistTopCity {
 pub struct ArtistOverview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub biography: Option<String>,
+    /// Largest artist-page avatar supplied by `visuals.avatarImage`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_image_url: Option<String>,
+    /// First editorial gallery image supplied for the artist biography.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub biography_image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub popularity: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
