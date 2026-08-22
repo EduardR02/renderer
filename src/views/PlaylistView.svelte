@@ -753,6 +753,10 @@
   {/if}
 </section>
 {#if deleteOpen && editable}
+  <ConfirmDialog
+    open={deleteOpen}
+    title="Delete this playlist?"
+    message={`"${pl?.name ?? "This playlist"}" and its ${tracks.length} songs are removed from your library.`}
     confirmLabel="Delete playlist"
     busyLabel="Deleting…"
     busy={deleting}

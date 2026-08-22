@@ -242,8 +242,8 @@ async fn run(
                                 engine.shutdown();
                                 break;
                             }
-                            Command::GetHistory { offset, limit } => {
-                                let result = engine.history_page(offset, limit);
+                            Command::GetHistory { offset, limit, query, sort } => {
+                                let result = engine.history_page(offset, limit, &query, sort);
                                 engine.send_browse_response(&request_id, "history", &result)?;
                             }
                             Command::ClearHistory => {
@@ -482,8 +482,14 @@ async fn run(
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
                                         let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = waveform::extract(&session, &track_id, points).await;
+                                        // Blocking pool, not a runtime worker:
+                                        // extraction decodes a whole track with
+                                        // network-backed reads and no await
+                                        // points, which would otherwise occupy
+                                        // one worker thread for seconds.
+                                        let handle = tokio::runtime::Handle::current();
+                                        tokio::task::spawn_blocking(move || {
+                                            let result = handle.block_on(waveform::extract(&session, &track_id, points));
                                             let _ = sender.send(BrowseOutcome::Waveform { request_id, result });
                                         });
                                     }

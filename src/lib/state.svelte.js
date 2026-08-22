@@ -108,7 +108,15 @@ export function goForward() {
  * the pane a containing block for `position: fixed` and reposition every row
  * menu. One observed number, read on resize and never on scroll.
  */
-export const ui = $state({ searchFocusTick: 0, nowPlayingOpen: false, paneWidth: 0 });
+export const ui = $state({
+  searchFocusTick: 0,
+  nowPlayingOpen: false,
+  paneWidth: 0,
+  /* Whether the app window has focus. Owned by App.svelte, published here
+     because two unrelated surfaces gate decorative work on it: the VU meter's
+     `anim-paused` class and the Canvas video's decoder. */
+  windowFocused: true,
+});
 
 /** Live preference bits used by mounted surfaces without polling Settings. */
 export const appSettings = $state({ animated_canvas: false });
@@ -1402,7 +1410,8 @@ export const api = {
     clearLazyQueue();
     return invoke("move_queue", { from, to });
   },
-  getHistory: (offset = 0, limit = 40) => invoke("get_history", { offset, limit }),
+  getHistory: (offset = 0, limit = 40, query = "", sort = "recent") =>
+    invoke("get_history", { offset, limit, query, sort }),
   clearHistory: () => invoke("clear_history"),
   getTrackEdit: (trackId, playlistId = null) =>
     invoke("get_track_edit", { trackId, playlistId }),

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -35,6 +35,14 @@ const BROWSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Engine respawn backoff bounds.
 const RESPAWN_BACKOFF_START: Duration = Duration::from_secs(2);
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Playback state is persisted while the app runs, not only on a clean exit,
+/// because a crash or a hard kill would otherwise lose the queue entirely.
+/// These bounds keep that cheap: at most one small write every
+/// [`PERSIST_MIN_INTERVAL`], and a moving playhead alone never triggers one
+/// until it has drifted [`PERSIST_POSITION_DRIFT_MS`] from what is on disk.
+const PERSIST_MIN_INTERVAL: Duration = Duration::from_secs(5);
+const PERSIST_POSITION_DRIFT_MS: u32 = 15_000;
 
 /// Roll the engine log once past this size, keeping one previous generation.
 const ENGINE_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -170,6 +178,25 @@ impl RestoreSnapshot {
     }
 }
 
+/// What the last write put on disk, so the rate limit can skip a write that
+/// would change nothing.
+#[derive(Debug)]
+struct PersistedSnapshot {
+    written_at: Instant,
+    snapshot: PlaybackSnapshot,
+}
+
+impl PersistedSnapshot {
+    /// Position alone is exempt until it has drifted far enough to be worth a
+    /// write: it moves on every heartbeat, nothing else does.
+    fn superseded_by(&self, next: &PlaybackSnapshot) -> bool {
+        let mut rebased = next.clone();
+        rebased.position_ms = self.snapshot.position_ms;
+        rebased != self.snapshot
+            || next.position_ms.abs_diff(self.snapshot.position_ms) >= PERSIST_POSITION_DRIFT_MS
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RestorePlan {
     snapshot: RestoreSnapshot,
@@ -185,6 +212,7 @@ pub struct EngineClient {
     exit_tx: watch::Sender<bool>,
     last_state: Mutex<Option<PlaybackState>>,
     restore_pending: Mutex<Option<RestorePlan>>,
+    last_persisted: Mutex<Option<PersistedSnapshot>>,
     next_request_id: AtomicU64,
     shutting_down: AtomicBool,
 }
@@ -208,6 +236,7 @@ impl EngineClient {
             exit_tx,
             last_state: Mutex::new(None),
             restore_pending: Mutex::new(restore_pending),
+            last_persisted: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         });
@@ -577,9 +606,14 @@ impl EngineClient {
         &self,
         offset: usize,
         limit: usize,
+        query: &str,
+        sort: &str,
     ) -> Result<spotify_playback_engine::protocol::HistoryPage, String> {
         let reply = self
-            .request("get_history", json!({"offset": offset, "limit": limit}))
+            .request(
+                "get_history",
+                json!({"offset": offset, "limit": limit, "query": query, "sort": sort}),
+            )
             .await?;
         parse_data(reply, "get_history")
     }
@@ -848,8 +882,10 @@ impl EngineClient {
         Ok(())
     }
 
-    /// Persists one heartbeat-freshened snapshot, then gracefully stops the
-    /// engine. No playback mutation performs recurring full-queue disk writes.
+    /// Persists one heartbeat-freshened snapshot unconditionally, then
+    /// gracefully stops the engine. [`EngineClient::maybe_persist`] has
+    /// usually written the same thing already; this is the exit path's
+    /// guarantee that the final position is not lost.
     pub fn shutdown_engine(&self) {
         log::info("engine shutdown requested");
         if let Err(error) = self.persist_playback_state() {
@@ -864,6 +900,46 @@ impl EngineClient {
             let _ = child.wait();
         }
         *self.stdin.lock() = None;
+    }
+
+    /// Rate-limited persistence from the reader thread, so an unclean exit
+    /// (crash, hard kill, machine shutdown) still leaves a usable queue on
+    /// disk. Restoring one is the whole point of the snapshot, and writing it
+    /// only from the exit path meant any exit that skipped that path silently
+    /// dropped what was playing. Skipped while a restore is in flight, where
+    /// `last_state` is deliberately stale.
+    fn maybe_persist(&self) {
+        let Some(state) = self
+            .last_state
+            .lock()
+            .as_ref()
+            .filter(|state| state.auth_state == "ready")
+            .cloned()
+        else {
+            return;
+        };
+        if self.restore_pending.lock().is_some() {
+            return;
+        }
+        let snapshot = PlaybackSnapshot::from_playback(&state);
+        let mut guard = self.last_persisted.lock();
+        if let Some(previous) = guard.as_ref() {
+            if previous.written_at.elapsed() < PERSIST_MIN_INTERVAL
+                || !previous.superseded_by(&snapshot)
+            {
+                return;
+            }
+        }
+        let written_at = Instant::now();
+        if let Err(error) = save_playback_snapshot(&snapshot) {
+            log::warn(&format!("could not persist playback state: {error}"));
+        }
+        // Recorded even on failure: a snapshot the validator rejects must not
+        // retry, and log, on every heartbeat.
+        *guard = Some(PersistedSnapshot {
+            written_at,
+            snapshot,
+        });
     }
 
     fn persist_playback_state(&self) -> Result<(), String> {
@@ -901,6 +977,7 @@ impl EngineClient {
         drop(pending);
         if !suppress_snapshot {
             *self.last_state.lock() = Some(state.clone());
+            self.maybe_persist();
         }
         let _ = self.state_tx.send(StateLine::State(state.clone()));
     }
@@ -911,6 +988,7 @@ impl EngineClient {
             last.position_ms = heartbeat.position_ms;
             last.duration_ms = heartbeat.duration_ms;
         }
+        self.maybe_persist();
         let _ = self.state_tx.send(StateLine::Position(heartbeat));
     }
 
@@ -1153,9 +1231,57 @@ mod tests {
             exit_tx,
             last_state: Mutex::new(Some(state)),
             restore_pending: Mutex::new(None),
+            last_persisted: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         })
+    }
+
+    fn persisted(snapshot: PlaybackSnapshot) -> PersistedSnapshot {
+        PersistedSnapshot {
+            written_at: Instant::now(),
+            snapshot,
+        }
+    }
+
+    /// The heartbeat calls `maybe_persist` several times a second. Rewriting
+    /// the queue each time would be pure churn, so only a real change — or a
+    /// playhead that has moved far enough to be worth restoring to — counts.
+    #[test]
+    fn only_a_real_change_or_a_drifted_playhead_supersedes_the_written_snapshot() {
+        let mut state = PlaybackState::default();
+        state.queue = vec![Track {
+            uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        state.current_index = Some(0);
+        state.position_ms = 30_000;
+        let written = persisted(PlaybackSnapshot::from_playback(&state));
+
+        assert!(
+            !written.superseded_by(&PlaybackSnapshot::from_playback(&state)),
+            "an identical snapshot is not worth a write"
+        );
+
+        let mut nudged = state.clone();
+        nudged.position_ms = 30_000 + PERSIST_POSITION_DRIFT_MS - 1;
+        assert!(
+            !written.superseded_by(&PlaybackSnapshot::from_playback(&nudged)),
+            "the playhead alone is exempt until it has drifted far enough"
+        );
+
+        let mut drifted = state.clone();
+        drifted.position_ms = 30_000 + PERSIST_POSITION_DRIFT_MS;
+        assert!(written.superseded_by(&PlaybackSnapshot::from_playback(&drifted)));
+
+        let mut paused_elsewhere = state.clone();
+        paused_elsewhere.position_ms = 30_100;
+        paused_elsewhere.volume = 41;
+        assert!(
+            written.superseded_by(&PlaybackSnapshot::from_playback(&paused_elsewhere)),
+            "anything but the playhead is worth a write immediately"
+        );
     }
 
     #[test]

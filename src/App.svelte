@@ -91,11 +91,10 @@
      client burns CPU at idle — so gate it on focus as well as on playback.
      A class beats a JS ticker: the compositor stops on its own and nothing
      re-enters the main thread. */
-  let focused = $state(true);
   $effect(() => {
-    focused = document.hasFocus();
-    const on = () => (focused = true);
-    const off = () => (focused = false);
+    ui.windowFocused = document.hasFocus();
+    const on = () => (ui.windowFocused = true);
+    const off = () => (ui.windowFocused = false);
     window.addEventListener("focus", on);
     window.addEventListener("blur", off);
     return () => {
@@ -168,7 +167,7 @@
 
 <IconSprite />
 
-<div class="app" class:anim-paused={!playback.playing || !focused} class:has-inspector={ui.nowPlayingOpen}>
+<div class="app" class:anim-paused={!playback.playing || !ui.windowFocused} class:has-inspector={ui.nowPlayingOpen}>
   <Sidebar />
 
   <main class="pane" bind:this={paneEl}>

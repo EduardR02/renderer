@@ -133,9 +133,25 @@ pub async fn get_history(
     client: State<'_, Arc<EngineClient>>,
     offset: Option<usize>,
     limit: Option<usize>,
+    query: Option<String>,
+    sort: Option<String>,
 ) -> Result<HistoryPage, String> {
+    // An order the engine does not know is the default order, not an error:
+    // the view's dropdown is the only thing that sends this, and a stale
+    // value from it should still return the history.
+    let sort = match sort.as_deref() {
+        Some("oldest") => "oldest",
+        Some("title") => "title",
+        Some("artist") => "artist",
+        _ => "recent",
+    };
     Ok(client
-        .get_history(offset.unwrap_or(0), limit.unwrap_or(40).clamp(1, 100))
+        .get_history(
+            offset.unwrap_or(0),
+            limit.unwrap_or(40).clamp(1, 100),
+            query.as_deref().unwrap_or_default(),
+            sort,
+        )
         .await?
         .into())
 }

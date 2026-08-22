@@ -114,14 +114,14 @@
 </script>
 
 <aside class="sidebar">
-  <div class="brand">
-    <span class="mark"><Icon name="note" size={13} /></span>
-    <span class="name">Renderer</span>
-  </div>
-
   <nav class="nav">
     <button class="nav-item" class:active={route.name === "library"} onclick={() => navigate("library")}>
-      <Icon name="home" size={17} /><span>Home</span>
+      <!-- The renderer's mark, where the outline house used to be. It came off
+           an inert branding block above this nav; the rail is short enough that
+           48px of it was worth a whole library row, and Home is the one
+           destination that is also "the app", so the mark still says what it
+           said before without costing a line. -->
+      <span class="nav-mark"><Icon name="note" size={12} /></span><span>Home</span>
     </button>
     <button class="nav-item" class:active={route.name === "queue"} onclick={() => navigate("queue")}>
       <Icon name="queue" size={17} /><span>Queue</span>

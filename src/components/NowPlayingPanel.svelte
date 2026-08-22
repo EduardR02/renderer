@@ -28,6 +28,7 @@
   let canvasTrack = $state("");
   let canvasUrl = $state("");
   let canvasReady = $state(false);
+  let canvasEl = $state(null);
   let pageVisible = $state(!document.hidden);
   let reducedMotion = $state(false);
 
@@ -75,12 +76,35 @@
       });
   });
 
-  function handleCanvasReady(event) {
-    if (event.currentTarget?.getAttribute("src") === canvasUrl) canvasReady = true;
+  /**
+   * Whether the Canvas video may run its decoder right now.
+   *
+   * A 720x1280 loop decoding forever is exactly the cost this app exists to
+   * avoid, and the element being off screen is not enough to stop it: a
+   * `<video autoplay>` in a window that merely lost focus keeps decoding every
+   * frame. So playback is driven from here rather than from the `autoplay`
+   * attribute, and it stops on all three of the things that mean nobody is
+   * watching — the panel closed (this component unmounts), the window
+   * backgrounded or minimised, and the music paused. The last one is not only
+   * about cost: a Canvas is the record's motion, and it standing still while
+   * the record does is what the official client shows too.
+   */
+  const canvasPlaying = $derived(
+    Boolean(canvasUrl) && pageVisible && ui.windowFocused && playback.playing,
+  );
+
+  $effect(() => {
+    const video = canvasEl;
+    if (!video) return;
+    if (canvasPlaying) video.play().catch(() => {});
+    else video.pause();
+  });
+
+  function handleCanvasReady() {
+    canvasReady = true;
   }
 
-  function handleCanvasError(event) {
-    if (event.currentTarget?.getAttribute("src") !== canvasUrl) return;
+  function handleCanvasError() {
     canvasUrl = "";
     canvasReady = false;
   }
@@ -153,11 +177,12 @@
           <video
             class="np-canvas"
             class:canvasReady={canvasReady}
+            bind:this={canvasEl}
             src={canvasUrl}
             muted
             loop
             playsinline
-            autoplay
+            preload="auto"
             aria-label={`Canvas animation for ${current.name}`}
             oncanplay={handleCanvasReady}
             onerror={handleCanvasError}

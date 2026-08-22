@@ -221,13 +221,22 @@ pub enum Command {
         track_id: String,
         points: u16,
     },
-    /// Bounded newest-first local listening history page. This command is
+    /// One bounded page of the local listening history. This command is
     /// deliberately available before Spotify authentication is ready.
+    ///
+    /// The filter and the order are applied HERE, over the whole journal,
+    /// because they have to be: a client that filters the pages it happens to
+    /// have loaded is searching a window, not a history.
     GetHistory {
         #[serde(default)]
         offset: usize,
         #[serde(default = "default_history_page_size")]
         limit: usize,
+        /// Case-insensitive substring over track title and artist names.
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        sort: HistorySort,
     },
     /// Removes all finalized and in-progress local listening history rows.
     ClearHistory,
@@ -381,11 +390,27 @@ pub struct HistoryItem {
     pub track: Option<TrackRef>,
 }
 
+/// How a listening-history page is ordered. Recency is the log's own order;
+/// the other two exist because a long log gets searched rather than read, and
+/// a search wants its hits gathered by name.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySort {
+    #[default]
+    Recent,
+    Oldest,
+    Title,
+    Artist,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HistoryPage {
     pub entries: Vec<HistoryItem>,
     pub next_offset: Option<usize>,
+    /// Rows matching the query, across the whole journal. The client sizes its
+    /// virtual list from this, so it is the count AFTER filtering.
+    pub total: usize,
 }
 fn default_browse_page_size() -> usize {
     20

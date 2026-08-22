@@ -154,6 +154,7 @@ pub struct HistoryEntry {
 pub struct HistoryPage {
     pub entries: Vec<HistoryEntry>,
     pub next_offset: Option<usize>,
+    pub total: usize,
 }
 
 impl From<EngineHistoryPage> for HistoryPage {
@@ -172,6 +173,7 @@ impl From<EngineHistoryPage> for HistoryPage {
                 })
                 .collect(),
             next_offset: page.next_offset,
+            total: page.total,
         }
     }
 }

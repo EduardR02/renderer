@@ -17,6 +17,7 @@
   import ArtistLinks from "./ArtistLinks.svelte";
   import { formatTime } from "../lib/time.js";
   import { observeStuck } from "../lib/sticky.js";
+  import { rowWindow } from "../lib/virtual.js";
 
   let {
     tracks = [],
@@ -164,6 +165,37 @@
     return `Sort by ${label}, currently ${sortDirection === "asc" ? "ascending" : "descending"}`;
   }
 
+  /**
+   * Puts a popover in the browser's TOP LAYER, and it is the whole fix for the
+   * row menu disappearing behind the page.
+   *
+   * These menus are `position: fixed`, but fixed positioning does not take an
+   * element out of its ancestors' PAINT order, and this one is rendered inside
+   * the page: a detail page wraps its content in `.wash`, which gives every
+   * child `z-index: 1` and the header `z-index: 2`, so the menu was competing
+   * inside a local stacking context it could never win. Opening upward near the
+   * top of a list put it under the header; opening downward near the bottom put
+   * it under the "Recommended" section, which is simply a LATER child of the
+   * same wash at the same z-index. No number fixes that — `z-index: 200` was
+   * already there and lost to a `z-index: 1` sibling, because the comparison
+   * that decides it happens one level up.
+   *
+   * The top layer is outside every stacking context and every clip on the page,
+   * so there is nothing left to lose to. `manual` rather than `auto` because
+   * the menu and its submenus have to coexist (an `auto` popover light-dismisses
+   * its siblings) and because dismissal is already handled below.
+   */
+  function topLayer(node) {
+    node.showPopover();
+    return { destroy: () => node.isConnected && node.hidePopover() };
+  }
+
+  function closeMenus() {
+    menu.open = false;
+    picker.open = false;
+    artistPicker.open = false;
+  }
+
   /* One shared menu instance for the whole table rather than one per row.
      `maxH` is part of the position, not decoration: see openRowMenu. */
   const menu = $state({
@@ -284,6 +316,15 @@
 
   function openRowMenu(e, track, i) {
     e.stopPropagation();
+    /* The trigger is a TOGGLE. The dismiss handler below deliberately ignores
+       pointer-downs on the kebab — otherwise it would close the menu a moment
+       before this click reopened it, and the button would look dead — which
+       leaves closing on a second press to this line. Pressing a different row's
+       kebab still just moves the menu to that row. */
+    if (menu.open && menu.index === i) {
+      closeMenus();
+      return;
+    }
     const r = e.currentTarget.getBoundingClientRect();
     const placed = placePopover(r, MENU_MAX_H);
     menu.open = true;
@@ -471,6 +512,7 @@
      misses the frame. Keep the updates small and frequent. */
   const OVERSCAN = 6;
 
+  let rootEl = $state(null);
   let bodyEl = $state(null);
   let firstRow = $state(0);
   let lastRow = $state(0);
@@ -489,18 +531,10 @@
 
   function measure(scroller) {
     if (!bodyEl || !scroller) return;
-    const len = tracks.length;
-    // Layout is clean during scroll, so these reads are cheap and — unlike a
-    // cached offset — stay correct when the header above the list changes size.
-    const above = scroller.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
-    /* Keep both ends inside the fixed-height body and never let `f` pass `l`.
-       This also keeps the translated window valid if the shared scroller can
-       continue below the list because another section follows it. */
-    const f = Math.min(Math.max(0, Math.floor(above / ROW_H) - OVERSCAN), len);
-    const l = Math.min(
-      len,
-      Math.max(f, Math.ceil((above + scroller.clientHeight) / ROW_H) + OVERSCAN),
-    );
+    /* The window arithmetic is shared with the history list; the clamping it
+       does also keeps this window valid when the shared scroller continues
+       below the table because another section follows it. */
+    const { first: f, last: l } = rowWindow(bodyEl, scroller, ROW_H, OVERSCAN, tracks.length);
     if (f === curFirst && l === curLast) return;
     curFirst = f;
     curLast = l;
@@ -602,23 +636,28 @@
     if (!menu.open && !picker.open && !artistPicker.open) return;
     const onDown = (e) => {
       const el = e.target;
+      /* The kebab is exempt so that its own click can toggle; see openRowMenu. */
       if (el?.closest?.(".menu, .c-more")) return;
-      menu.open = false;
-      picker.open = false;
-      artistPicker.open = false;
+      closeMenus();
     };
     const onKey = (e) => {
-      if (e.key === "Escape") {
-        menu.open = false;
-        picker.open = false;
-        artistPicker.open = false;
-      }
+      if (e.key === "Escape") closeMenus();
     };
+    /* A menu is placed against a row, from that row's rect, once. Scrolling or
+       resizing moves the row and not the menu, so the anchoring is stale the
+       moment either happens — and a menu that follows a scrolling row is a
+       per-frame layout read on the scroller, which this app does not do
+       anywhere. Dismissing is both cheaper and what the pointer is asking for. */
+    const scroller = rootEl?.closest(".scroll");
     window.addEventListener("pointerdown", onDown, true);
     window.addEventListener("keydown", onKey);
+    window.addEventListener("resize", closeMenus);
+    scroller?.addEventListener("scroll", closeMenus, { passive: true });
     return () => {
       window.removeEventListener("pointerdown", onDown, true);
       window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", closeMenus);
+      scroller?.removeEventListener("scroll", closeMenus);
     };
   });
 </script>
@@ -739,6 +778,7 @@
 <div
   class="tl"
   class:dense
+  bind:this={rootEl}
   style="overflow-anchor: none"
   style:--cols={cols}
 >
@@ -831,6 +871,8 @@
 {#if menu.open}
   <div
     class="menu"
+    popover="manual"
+    use:topLayer
     style:left="{menu.x}px"
     style:top={menu.top === null ? null : menu.top + "px"}
     style:bottom={menu.bottom === null ? null : menu.bottom + "px"}
@@ -912,6 +954,8 @@
 {#if picker.open}
   <div
     class="menu"
+    popover="manual"
+    use:topLayer
     style:left="{picker.x}px"
     style:top={picker.top === null ? null : picker.top + "px"}
     style:bottom={picker.bottom === null ? null : picker.bottom + "px"}
@@ -926,6 +970,8 @@
 {#if artistPicker.open}
   <div
     class="menu"
+    popover="manual"
+    use:topLayer
     style:left="{artistPicker.x}px"
     style:top={artistPicker.top === null ? null : artistPicker.top + "px"}
     style:bottom={artistPicker.bottom === null ? null : artistPicker.bottom + "px"}
@@ -950,9 +996,14 @@
      number that knows nothing about where the menu was put, so a menu that
      flipped upward near the top of the list was clamped to the window and slid
      under the topbar's glass with its first items unreachable. */
+  /* `inset` and `margin` are overrides of the UA's own `[popover]` rule, which
+     sets `inset: 0; margin: auto` to centre a popover in the viewport. The
+     three declarations that follow it are the position; the UA's `right: 0`
+     would otherwise stretch every menu to the right edge of the window. */
   .menu {
     position: fixed;
-    z-index: 200;
+    inset: auto;
+    margin: 0;
     overflow-y: auto;
   }
   .menu-item.done { color: var(--accent); }

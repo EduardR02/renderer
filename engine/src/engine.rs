@@ -18,7 +18,7 @@ use crate::customization::{TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
 use crate::io::ProtocolWriter;
 use spotify_playback_engine::protocol::{
-    AuthState, BrowseResponse, Command, HistoryPage, PositionEvent, RepeatMode, Response,
+    AuthState, BrowseResponse, Command, HistoryPage, HistorySort, PositionEvent, RepeatMode, Response,
     StateEvent, TimeRange, TrackEditDefinition, TrackEditStatus, TrackRef,
 };
 use serde::Serialize;
@@ -235,8 +235,14 @@ impl Engine {
     }
 
 
-    pub fn history_page(&self, offset: usize, limit: usize) -> Result<HistoryPage, String> {
-        self.listening_history.page(offset, limit)
+    pub fn history_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        query: &str,
+        sort: HistorySort,
+    ) -> Result<HistoryPage, String> {
+        self.listening_history.page(offset, limit, query, sort)
     }
 
     pub fn clear_history(&mut self) -> Result<bool, String> {
@@ -957,8 +963,13 @@ impl Engine {
 
     pub fn on_audio_signal(&mut self, signal: AudioSignal) -> bool {
         match signal {
+            // Deliberately not gated on `playing`: the boundary was reached,
+            // and the seek is what re-arms the pipeline to emit the next one.
+            // Dropping it because a pause raced the signal would leave the
+            // loop silently dead for the rest of the track, and `seek`
+            // preserves the paused intent anyway.
             AudioSignal::LoopBoundary { position_ms }
-                if self.state.playing && self.current_loop_start() == Some(position_ms) =>
+                if self.current_loop_start() == Some(position_ms) =>
             {
                 if let Err(error) = self.seek(position_ms) {
                     self.state.playing = false;
@@ -1123,6 +1134,11 @@ impl Engine {
     ) -> Result<bool, String> {
         Self::validate_queue(&queue, index)?;
         fill_queue_context(&mut queue, &context);
+        // The snapshot carries whatever edits were resolved when it was
+        // written, which may since have been deleted or disabled. Every other
+        // queue install re-resolves against the store; this one must too, or a
+        // restart replays an edit the store no longer holds.
+        self.resolve_queue_edits(&mut queue);
         self.finalize_listening(false);
         if let Some(player) = &self.player {
             player.stop();

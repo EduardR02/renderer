@@ -237,7 +237,12 @@
       <div class="set-row">
         <div>
           <div class="k">Animated Canvas</div>
-          <div class="d">Show Spotify's official looping Canvas video in the Now playing panel when available.</div>
+          <div class="d">
+            Show Spotify's official looping Canvas video in the Now playing panel when available.
+            Spotify also gates Canvas per account, server-side, and its backend returns nothing for
+            every client while that is off — so this switch can only turn Canvas off, never on.
+            Enable video in Spotify's own settings first.
+          </div>
         </div>
         <div class="set-ctl">
           <input

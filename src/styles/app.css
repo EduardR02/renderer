@@ -312,24 +312,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   background: var(--bg-nav);
   border-radius: var(--r-panel);
 }
-.brand {
-  display: flex; align-items: center; gap: var(--s3);
-  height: 40px; padding: 0 var(--s2); margin-bottom: var(--s2);
-  cursor: pointer;
-}
-.brand .mark {
-  width: 22px; height: 22px; flex: none; border-radius: var(--r1);
-  background: linear-gradient(140deg, var(--foam) 0%, var(--rose) 100%);
-  display: grid; place-items: center; color: var(--accent-ink);
-}
-.brand .name {
-  font-family: var(--font-display);
-  font-size: var(--t-13); font-weight: var(--w-semi); letter-spacing: 0.02em;
-  text-transform: uppercase; color: var(--fg-1);
-  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-
 .nav { display: flex; flex-direction: column; gap: 1px; padding-right: var(--s1); }
+/* The app's mark, carried by the Home row. It is a filled tile among outline
+   glyphs, so it is drawn one pixel narrower than the 17px icons around it —
+   area reads heavier than stroke, and at 20px it was the loudest thing in the
+   rail. */
+.nav-mark {
+  width: 19px; height: 19px; flex: none; border-radius: var(--r1);
+  background: linear-gradient(140deg, var(--foam) 0%, var(--rose) 100%);
+  display: grid; place-items: center;
+}
 .nav-item {
   display: flex; align-items: center; gap: var(--s3);
   height: 34px; padding: 0 var(--s2); border-radius: var(--r2);
@@ -347,6 +339,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   box-shadow: inset 2px 0 var(--accent);
 }
 .nav-item.active svg { opacity: 1; color: var(--accent); }
+/* The nav dims and re-tints its icons for hover and for the selected row; the
+   glyph punched out of the mark is neither — it belongs to the tile. */
+.nav-item .nav-mark svg { opacity: 1; color: var(--accent-ink); }
 /* the label ellipses; the shortcut chip is never pushed out of the rail */
 .nav-item > span:not(.kbd) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav-item .kbd { margin-left: auto; flex: none; }

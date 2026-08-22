@@ -182,7 +182,17 @@ pub fn configure_customization(edit: Option<TrackEdit>, speed: f32, position_ms:
         .lock()
         .expect("audio customization should not be poisoned") = active.then_some(config);
     CUSTOMIZATION_REVISION.fetch_add(1, Ordering::Release);
-    CUSTOMIZATION_ACTIVE.store(active, Ordering::Release);
+    let was_active = CUSTOMIZATION_ACTIVE.swap(active, Ordering::AcqRel);
+    // Clearing the ring discards audio that is decoded, resampled and queued
+    // but not yet played. That is required when the pipeline changes what the
+    // samples are, and destructive otherwise: every track load reconfigures,
+    // and gapless playback (`gapless: true`) never stops the sink between
+    // tracks, so clearing unconditionally cut the last WRITE_AHEAD_MS off the
+    // end of every track. Seek and speed changes reach `RodioSink::stop`,
+    // which clears on its own.
+    if !active && !was_active {
+        return;
+    }
     if let Some(ring) = LIVE_RING
         .lock()
         .expect("live sample ring should not be poisoned")
@@ -466,7 +476,11 @@ impl Iterator for LiveSource {
             }
         }
 
-        if self.pos == self.packet.samples.len() {
+        // A packet can carry a loop marker and no samples, when the loop end
+        // fell on a packet boundary. Draining rather than popping once keeps
+        // the marker on the exact frame it belongs to, and stops an empty
+        // packet from indexing past the end below.
+        while self.pos == self.packet.samples.len() {
             if let Some(position_ms) = self.packet.loop_to_ms.take() {
                 if let Some(sender) = AUDIO_SIGNAL_SENDER
                     .lock()
@@ -789,14 +803,18 @@ impl Sink for RodioSink {
 
         let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
         self.synchronize_pipeline(revision);
-        let (processed, loop_to_ms) = if CUSTOMIZATION_ACTIVE.load(Ordering::Acquire) {
+        // Branching on the pipeline rather than on CUSTOMIZATION_ACTIVE keeps
+        // this to one observation: the flag is published after the revision, so
+        // a configure landing between the two reads could claim an active
+        // customization while the pipeline was still absent.
+        let (processed, loop_to_ms) = if let Some(pipeline) = self.pipeline.as_mut() {
             let mut processed = Vec::new();
-            let loop_to_ms = self
-                .pipeline
-                .as_mut()
-                .expect("active customization must have a sample pipeline")
-                .process(&samples_f32, &mut processed);
-            if processed.is_empty() {
+            let loop_to_ms = pipeline.process(&samples_f32, &mut processed);
+            // An empty result still has to reach the ring when it carries a
+            // loop marker: dropping the packet would strand the marker, and
+            // the pipeline only emits one per loop, so playback would stall
+            // silently and forever.
+            if processed.is_empty() && loop_to_ms.is_none() {
                 return Ok(());
             }
             (processed, loop_to_ms)
@@ -814,7 +832,7 @@ impl Sink for RodioSink {
             Some(resampler) => {
                 let mut resampled = Vec::new();
                 resampler.process(&processed, &mut resampled);
-                if resampled.is_empty() {
+                if resampled.is_empty() && loop_to_ms.is_none() {
                     return Ok(());
                 }
                 resampled
@@ -1202,6 +1220,106 @@ mod tests {
             mixer_out.next();
         }
         assert_eq!(ring.queued_samples(), 0, "resume must poll the existing source");
+    }
+
+    /// `configure_customization` owns process-wide statics, so the tests that
+    /// drive it take turns rather than racing each other's flag and ring.
+    static CUSTOMIZATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn customization_guard() -> std::sync::MutexGuard<'static, ()> {
+        CUSTOMIZATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The load-bearing bypass gate: at the ordinary transport setting
+    /// `RodioSink::write` must hand the converter's own `Vec` straight to the
+    /// resampler, and it takes that branch whenever no pipeline was built. So
+    /// the property that keeps the -116 dB path untouched is precisely "no
+    /// speed and no edit an unedited 1x listener can produce arms one".
+    /// `speed != 1.0` is a float comparison, which is only safe because every
+    /// value the UI offers is a binary fraction — pin that here rather than
+    /// trusting it.
+    #[test]
+    fn nothing_arms_the_sample_pipeline_at_1x_without_an_edit() {
+        let _guard = customization_guard();
+        // Mirrors SPEEDS in src/components/PlayerBar.svelte.
+        for speed in [0.5f32, 0.75, 1.0, 1.25, 1.5, 2.0] {
+            configure_customization(None, speed, 0);
+            assert_eq!(
+                CUSTOMIZATION_ACTIVE.load(Ordering::Acquire),
+                speed != 1.0,
+                "speed {speed} (bits {:08x}) armed the pipeline wrongly",
+                speed.to_bits()
+            );
+        }
+        configure_customization(Some(TrackEdit::default()), 1.0, 0);
+        assert!(
+            !CUSTOMIZATION_ACTIVE.load(Ordering::Acquire),
+            "an edit record with no cuts and no loop must stay bypassed"
+        );
+        configure_customization(None, 1.0, 0);
+    }
+
+    /// Every track load reconfigures, and gapless playback never stops the
+    /// sink in between, so a reconfigure that clears the ring unconditionally
+    /// throws away the decoded tail of the outgoing track — WRITE_AHEAD_MS of
+    /// it, on every single track. Only a reconfigure that changes what the
+    /// samples are has earned the discontinuity.
+    #[test]
+    fn reconfiguring_an_unarmed_pipeline_keeps_the_queued_tail() {
+        let _guard = customization_guard();
+        let ring = test_ring();
+        *LIVE_RING
+            .lock()
+            .expect("live sample ring should not be poisoned") = Arc::downgrade(&ring);
+
+        ring.push(packet(1024), Duration::from_millis(50)).unwrap();
+        configure_customization(None, 1.0, 0);
+        assert_eq!(
+            ring.queued_samples(),
+            1024,
+            "an ordinary track change must not drop the previous track's tail"
+        );
+
+        configure_customization(None, 1.25, 0);
+        assert_eq!(
+            ring.queued_samples(),
+            0,
+            "arming the pipeline changes the samples, so the queue is stale"
+        );
+
+        ring.push(packet(1024), Duration::from_millis(50)).unwrap();
+        configure_customization(None, 1.0, 0);
+        assert_eq!(
+            ring.queued_samples(),
+            0,
+            "disarming it is equally a discontinuity"
+        );
+    }
+
+    /// A loop end that lands on a packet boundary produces a marker with no
+    /// samples. `LiveSource` must still deliver it — and must not index past
+    /// the end of the empty packet on the way.
+    #[test]
+    fn a_marker_without_samples_is_delivered_and_does_not_panic() {
+        let ring = test_ring();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        install_signal_sender(sender);
+        ring.push_marked(Vec::new(), Some(4_200), Duration::from_millis(50))
+            .unwrap();
+        ring.push_marked(packet(2), None, Duration::from_millis(50))
+            .unwrap();
+
+        let mut source = LiveSource::new(Arc::clone(&ring), OUT_RATE);
+        for _ in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
+            source.next();
+        }
+        assert_eq!(source.next(), Some(1.0), "the audio behind the marker plays");
+        match receiver.try_recv() {
+            Ok(AudioSignal::LoopBoundary { position_ms }) => assert_eq!(position_ms, 4_200),
+            other => panic!("expected the loop boundary, got {other:?}"),
+        }
     }
 
     /// The rodio gain curve must mirror librespot's default SoftMixer
