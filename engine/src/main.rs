@@ -1,10 +1,14 @@
 mod audio;
 mod auth;
 mod browse;
+mod customization;
 mod edits;
 mod engine;
+mod history;
 mod io;
 mod resample;
+mod time_stretch;
+mod waveform;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -16,9 +20,9 @@ use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistReleasePage, Command, LikedSongsPage,
-    PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, Response, SearchBrowse,
-    TrackCredits,
+    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistReleasePage, Canvas, Command,
+    LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, Response,
+    SearchBrowse, TrackCredits, TrackWaveform,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -69,6 +73,14 @@ enum BrowseOutcome {
     TrackCredits {
         request_id: String,
         result: Result<TrackCredits, String>,
+    },
+    Canvas {
+        request_id: String,
+        result: Result<Option<Canvas>, String>,
+    },
+    Waveform {
+        request_id: String,
+        result: Result<TrackWaveform, String>,
     },
     Search {
         request_id: String,
@@ -175,6 +187,7 @@ fn main() -> ExitCode {
         cache,
         temporary_directory,
         credentials_file,
+        state_directory,
     ));
     runtime.shutdown_timeout(Duration::from_secs(1));
     match result {
@@ -191,20 +204,24 @@ async fn run(
     cache: Cache,
     temporary_directory: PathBuf,
     credentials_file: PathBuf,
+    state_directory: PathBuf,
 ) -> Result<(), String> {
     let (input_sender, mut input_receiver) = mpsc::unbounded_channel();
     let (auth_sender, mut auth_receiver) = mpsc::unbounded_channel::<AuthSignal>();
     let (player_sender, mut player_receiver) = mpsc::unbounded_channel::<PlayerSignal>();
     let (browse_sender, mut browse_receiver) = mpsc::unbounded_channel::<BrowseOutcome>();
+    let (audio_sender, mut audio_receiver) = mpsc::unbounded_channel();
     io::spawn_input_reader(input_sender);
 
     configure_audio_fetch();
+    audio::install_signal_sender(audio_sender);
 
     let mut engine = Engine::new(
         writer,
         cache,
         temporary_directory,
         credentials_file,
+        state_directory,
     );
     engine.start_authentication(auth_sender.clone());
     engine.emit_state()?;
@@ -224,6 +241,49 @@ async fn run(
                                 engine.send_response(&request_id, &success)?;
                                 engine.shutdown();
                                 break;
+                            }
+                            Command::GetHistory { offset, limit } => {
+                                let result = engine.history_page(offset, limit);
+                                engine.send_browse_response(&request_id, "history", &result)?;
+                            }
+                            Command::ClearHistory => {
+                                let result = engine.clear_history();
+                                engine.send_response(&request_id, &result)?;
+                            }
+                            Command::GetTrackEdit { track_id, playlist_id } => {
+                                let result: Result<_, String> =
+                                    Ok(engine.track_edit_status(&track_id, playlist_id.as_deref()));
+                                engine.send_browse_response(&request_id, "get_track_edit", &result)?;
+                            }
+                            Command::SaveTrackEdit {
+                                track_id,
+                                duration_ms,
+                                cuts,
+                                loop_range,
+                            } => {
+                                let result =
+                                    engine.save_track_edit(track_id, duration_ms, cuts, loop_range);
+                                engine.send_browse_response(&request_id, "save_track_edit", &result)?;
+                            }
+                            Command::DeleteTrackEdit { track_id } => {
+                                let result = engine
+                                    .delete_track_edit(&track_id)
+                                    .map(|()| true);
+                                engine.send_response(&request_id, &result)?;
+                            }
+                            Command::SetPlaylistTrackEditEnabled {
+                                playlist_id,
+                                track_id,
+                                enabled,
+                            } => {
+                                let result = engine
+                                    .set_playlist_track_edit_enabled(
+                                        &playlist_id,
+                                        &track_id,
+                                        enabled,
+                                    )
+                                    .map(|()| true);
+                                engine.send_response(&request_id, &result)?;
                             }
                             // Browse and edit commands run their network work
                             // off the loop: the session clone is handed to a
@@ -401,6 +461,40 @@ async fn run(
                                     }
                                 }
                             }
+                            Command::BrowseCanvas { id } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::canvas_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::Canvas { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Canvas {
+                                            request_id,
+                                            result: Err(error),
+                                        });
+                                    }
+                                }
+                            }
+                            Command::ExtractTrackWaveform { track_id, points } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = waveform::extract(&session, &track_id, points).await;
+                                            let _ = sender.send(BrowseOutcome::Waveform { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Waveform {
+                                            request_id,
+                                            result: Err(error),
+                                        });
+                                    }
+                                }
+                            }
                             Command::BrowseSearch { query, limit } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -536,6 +630,13 @@ async fn run(
                     }
                 }
             }
+            signal = audio_receiver.recv() => {
+                if let Some(signal) = signal {
+                    if engine.on_audio_signal(signal) {
+                        engine.emit_state()?;
+                    }
+                }
+            }
             outcome = browse_receiver.recv() => {
                 if let Some(outcome) = outcome {
                     match outcome {
@@ -572,6 +673,12 @@ async fn run(
                         }
                         BrowseOutcome::TrackCredits { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_track_credits", &result)?;
+                        }
+                        BrowseOutcome::Canvas { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_canvas", &result)?;
+                        }
+                        BrowseOutcome::Waveform { request_id, result } => {
+                            engine.send_browse_response(&request_id, "extract_track_waveform", &result)?;
                         }
                         BrowseOutcome::Search { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_search", &result)?;

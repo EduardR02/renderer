@@ -295,6 +295,7 @@
             showHead={false}
             showPlays
             disableWindowing
+            queueContext={`artist:${route.id ?? ""}`}
           />
         </div>
       </article>

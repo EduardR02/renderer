@@ -24,13 +24,12 @@
   const tone = $derived(coverTone(album?.cover_url ?? "", album?.id ?? ""));
 
   function playFrom(i) {
-    if (tracks.length) api.playQueue(tracks, i).catch(() => {});
+    if (tracks.length) api.playQueue(tracks, i, `album:${album?.id ?? ""}`).catch(() => {});
   }
 
   function shufflePlay() {
     if (!tracks.length) return;
-    api.setShuffle(true).catch(() => {});
-    api.playQueue(tracks, 0).catch(() => {});
+    api.playQueue(tracks, 0, `album:${album?.id ?? ""}`).catch(() => {});
   }
 </script>
 
@@ -122,7 +121,7 @@
       <!-- No album column and no per-row thumbnail: the art is already the
            largest thing on the page, and every row would repeat it. -->
       <div style="margin-top:var(--s6)">
-        <TrackList {tracks} {playFrom} showAlbum={false} showArt={false} showPlays />
+        <TrackList {tracks} {playFrom} showAlbum={false} showArt={false} showPlays queueContext={`album:${album?.id ?? ""}`} />
       </div>
     {:else}
       <div class="empty">

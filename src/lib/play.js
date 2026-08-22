@@ -17,7 +17,7 @@ export async function playAlbumById(id) {
   const album = await api.browseAlbum(id);
   const tracks = album?.tracks ?? [];
   if (!tracks.length) throw new Error("No playable tracks were returned for this release.");
-  await api.playQueue(tracks, 0);
+  await api.playQueue(tracks, 0, `album:${id}`);
 }
 
 /**
@@ -32,7 +32,7 @@ export async function playLikedSongs() {
   const page = await api.browseLikedSongs(null);
   const tracks = page?.tracks ?? [];
   if (!tracks.length) throw new Error("No liked songs came back.");
-  await api.playQueue(tracks, 0);
+  await api.playQueue(tracks, 0, "liked");
 }
 
 export async function playPlaylistById(id) {
@@ -42,7 +42,7 @@ export async function playPlaylistById(id) {
   // Queue first: a failed play must not create either a Home listening-history
   // stamp or a library-activity promotion. A card is as much a play source as
   // the playlist page's big button.
-  await api.playQueue(tracks, 0);
+  await api.playQueue(tracks, 0, `playlist:${id}`);
   promotePlaylist(id, { played: true });
   api.touchPlaylist(id).catch(() => {});
 }

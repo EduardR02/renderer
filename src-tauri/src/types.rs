@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use spotify_playback_engine::protocol::{
     AlbumBrowse, AlbumRef, ArtistBrowse, ArtistCataloguePage, ArtistOverview, ArtistPick,
     ArtistPickItem, ArtistRef, ArtistReleaseCounts, ArtistReleasePage, ArtistReleases,
-    ArtistTopCity, CreditArtist, CreditRole, LikedSongsPage, PlaylistBrowse,
-    PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, TrackCredits, TrackRef,
+    ArtistTopCity, CreditArtist, CreditRole, HistoryPage as EngineHistoryPage, LikedSongsPage,
+    PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse,
+    TrackCredits, TrackEdit, TrackRef,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -58,6 +59,11 @@ pub struct Track {
     /// cleared on the way in, next to `align_artist_ids`, rather than stripped
     /// on the way out — the same repair-on-load idiom, in the same loop.
     pub cached: bool,
+    /// Compact queue source context used when a play becomes a local history
+    /// row. It is intentionally ephemeral metadata, not part of the row.
+    pub context: String,
+    /// Frozen queue-only edit snapshot. Browse/cache tracks leave it absent.
+    pub effective_edit: Option<TrackEdit>,
 }
 
 impl From<TrackRef> for Track {
@@ -77,7 +83,9 @@ impl From<TrackRef> for Track {
             added_at: track.added_at,
             unavailable: track.unavailable,
             unavailable_reason: track.unavailable_reason,
+            context: track.context,
             cached: track.cached,
+            effective_edit: track.effective_edit,
         }
     }
 }
@@ -99,7 +107,9 @@ impl From<&TrackRef> for Track {
             added_at: track.added_at,
             unavailable: track.unavailable,
             unavailable_reason: track.unavailable_reason.clone(),
+            context: track.context.clone(),
             cached: track.cached,
+            effective_edit: track.effective_edit.clone(),
         }
     }
 }
@@ -121,7 +131,47 @@ impl From<Track> for TrackRef {
             added_at: track.added_at,
             unavailable: track.unavailable,
             unavailable_reason: track.unavailable_reason,
+            context: track.context,
             cached: track.cached,
+            effective_edit: track.effective_edit,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryEntry {
+    pub track_id: String,
+    pub started_at: i64,
+    pub ms_played: u64,
+    pub completed: bool,
+    pub context: String,
+    pub track: Option<Track>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryPage {
+    pub entries: Vec<HistoryEntry>,
+    pub next_offset: Option<usize>,
+}
+
+impl From<EngineHistoryPage> for HistoryPage {
+    fn from(page: EngineHistoryPage) -> Self {
+        Self {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|entry| HistoryEntry {
+                    track_id: entry.row.track_id,
+                    started_at: entry.row.started_at,
+                    ms_played: entry.row.ms_played,
+                    completed: entry.row.completed,
+                    context: entry.row.context,
+                    track: entry.track.map(Track::from),
+                })
+                .collect(),
+            next_offset: page.next_offset,
         }
     }
 }
@@ -257,8 +307,13 @@ pub fn align_artist_ids(track: &mut Track) {
 /// different lifetimes, and only the engine, measuring the audio cache now,
 /// can answer this. Anything read back off disk is a claim about a past state
 /// of a directory this file does not own.
+///
+/// Queue edit snapshots are equally ephemeral here: only the engine may
+/// resolve one from a playlist context when constructing a future queue.
 pub fn forget_cached_audio(track: &mut Track) {
     track.cached = false;
+    track.effective_edit = None;
+    track.context.clear();
 }
 
 /// A playlist opened for browsing: playlist metadata plus its tracks.
@@ -786,6 +841,7 @@ pub struct PlaybackState {
     pub shuffle: bool,
     /// One of `off`, `context`, `track`.
     pub repeat: String,
+    pub playback_speed: f32,
     pub current_index: Option<usize>,
     #[serde(deserialize_with = "string_or_default")]
     pub current_uri: String,
@@ -809,6 +865,7 @@ impl Default for PlaybackState {
             volume: 50,
             shuffle: false,
             repeat: "off".to_owned(),
+            playback_speed: 1.0,
             current_index: None,
             current_uri: String::new(),
             queue: Vec::new(),

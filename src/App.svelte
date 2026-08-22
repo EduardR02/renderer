@@ -36,6 +36,8 @@
   import SearchSongsView from "./views/SearchSongsView.svelte";
   import QueueView from "./views/QueueView.svelte";
   import SettingsView from "./views/SettingsView.svelte";
+  import HistoryView from "./views/HistoryView.svelte";
+  import TrackEditorView from "./views/TrackEditorView.svelte";
   import LoginView from "./views/LoginView.svelte";
 
   $effect(() => {
@@ -212,6 +214,10 @@
         <ArtistPlaylistCollectionView />
       {:else if route.name === "queue"}
         <QueueView />
+      {:else if route.name === "history"}
+        <HistoryView />
+      {:else if route.name === "track-editor"}
+        <TrackEditorView />
       {:else if route.name === "settings"}
         <SettingsView />
       {/if}

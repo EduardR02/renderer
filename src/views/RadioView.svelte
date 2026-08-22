@@ -76,7 +76,7 @@
 
   function playFrom(index) {
     if (!tracks[index]) return;
-    api.playQueue(tracks, index).catch(() => {});
+    api.playQueue(tracks, index, `radio:${route.id ?? ""}`).catch(() => {});
   }
 
   function playOrToggle() {
@@ -84,13 +84,13 @@
       togglePlay();
       return;
     }
-    if (tracks.length) api.playQueue(tracks, 0).catch(() => {});
+    if (tracks.length) api.playQueue(tracks, 0, `radio:${route.id ?? ""}`).catch(() => {});
   }
 
   function shufflePlay() {
     if (!tracks.length) return;
     api.setShuffle(true).catch(() => {});
-    api.playQueue(tracks, 0).catch(() => {});
+    api.playQueue(tracks, 0, `radio:${route.id ?? ""}`).catch(() => {});
   }
 
   async function saveAsPlaylist() {
@@ -211,7 +211,7 @@
 
     {#if tracks.length}
       <div style="margin-top:var(--s6)">
-        <TrackList {tracks} {playFrom} />
+        <TrackList {tracks} {playFrom} queueContext={`radio:${route.id ?? ""}`} />
       </div>
     {:else}
       <div class="empty">

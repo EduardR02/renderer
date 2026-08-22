@@ -4,6 +4,52 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TimeRange {
+    pub start_ms: u32,
+    pub end_ms: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TrackEdit {
+    pub cuts: Vec<TimeRange>,
+    pub loop_range: Option<TimeRange>,
+}
+
+impl TrackEdit {
+    pub fn is_empty(&self) -> bool {
+        self.cuts.is_empty() && self.loop_range.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TrackEditDefinition {
+    pub track_id: String,
+    pub duration_ms: u32,
+    #[serde(flatten)]
+    pub edit: TrackEdit,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TrackEditStatus {
+    pub definition: Option<TrackEditDefinition>,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WaveformPeak {
+    pub min: f32,
+    pub max: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TrackWaveform {
+    pub track_id: String,
+    pub duration_ms: u32,
+    pub peaks: Vec<WaveformPeak>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TrackRef {
@@ -52,6 +98,15 @@ pub struct TrackRef {
     /// on screen is marked on the next browse of that list.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cached: bool,
+    /// Compact source context carried with a queue item into listening history
+    /// (for example `playlist:<id>` or `liked`). Empty means the caller did
+    /// not know the source; queue commands may provide a fallback.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context: String,
+    /// Immutable playback edit resolved when this item enters a queue. Browse
+    /// results leave it absent; queue restore retains it verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_edit: Option<TrackEdit>,
 }
 impl Default for TrackRef {
     fn default() -> Self {
@@ -71,6 +126,8 @@ impl Default for TrackRef {
             unavailable: false,
             unavailable_reason: None,
             cached: false,
+            context: String::new(),
+            effective_edit: None,
         }
     }
 }
@@ -90,13 +147,16 @@ pub enum Command {
         queue: Vec<TrackRef>,
         index: usize,
         position_ms: u32,
+        #[serde(default)]
+        context: String,
     },
     /// Installs a paused queue/playhead without asking librespot to load audio.
-    /// The current item is loaded only when a later `play` arrives.
     RestoreQueue {
         queue: Vec<TrackRef>,
         index: usize,
         position_ms: u32,
+        #[serde(default)]
+        context: String,
     },
     PlayQueueIndex {
         index: usize,
@@ -117,11 +177,18 @@ pub enum Command {
     SetRepeat {
         mode: RepeatMode,
     },
+    SetPlaybackSpeed {
+        speed: f32,
+    },
     AddQueue {
         track: TrackRef,
+        #[serde(default)]
+        context: String,
     },
     AddQueueBatch {
         tracks: Vec<TrackRef>,
+        #[serde(default)]
+        context: String,
     },
     RemoveQueue {
         index: usize,
@@ -130,6 +197,40 @@ pub enum Command {
         from: usize,
         to: usize,
     },
+    GetTrackEdit {
+        track_id: String,
+        #[serde(default)]
+        playlist_id: Option<String>,
+    },
+    SaveTrackEdit {
+        track_id: String,
+        duration_ms: u32,
+        cuts: Vec<TimeRange>,
+        #[serde(default)]
+        loop_range: Option<TimeRange>,
+    },
+    DeleteTrackEdit {
+        track_id: String,
+    },
+    SetPlaylistTrackEditEnabled {
+        playlist_id: String,
+        track_id: String,
+        enabled: bool,
+    },
+    ExtractTrackWaveform {
+        track_id: String,
+        points: u16,
+    },
+    /// Bounded newest-first local listening history page. This command is
+    /// deliberately available before Spotify authentication is ready.
+    GetHistory {
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_history_page_size")]
+        limit: usize,
+    },
+    /// Removes all finalized and in-progress local listening history rows.
+    ClearHistory,
     Shutdown,
     /// User playlist library via the spclient rootlist (first `length`
     /// entries). Responded to with a `browse_playlists` message.
@@ -200,6 +301,12 @@ pub enum Command {
     BrowseTrackCredits {
         id: String,
     },
+    /// One authenticated, on-demand Canvas lookup for a track URI/id.
+    /// Responded to with a `browse_canvas` message. No browse path invokes
+    /// this implicitly: the panel asks only while animated Canvas is enabled.
+    BrowseCanvas {
+        id: String,
+    },
     /// Creates a playlist via the spclient playlist4 create endpoint and adds
     /// it to the user's rootlist. Responded to with an `edit_create_playlist`
     /// message carrying the new playlist's [`PlaylistRef`].
@@ -247,6 +354,39 @@ pub enum Command {
     Login,
 }
 
+fn default_history_page_size() -> usize {
+    40
+}
+
+/// One logical local listening-history row. The persisted format contains
+/// exactly these durable facts; track metadata lives in a bounded sidecar.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HistoryRow {
+    pub track_id: String,
+    /// Unix epoch milliseconds at the first actual Playing event.
+    pub started_at: i64,
+    pub ms_played: u64,
+    pub completed: bool,
+    pub context: String,
+}
+
+/// A history row plus separately retained track metadata for rendering and
+/// replay. Older rows may have no metadata when their sidecar entry expired.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HistoryItem {
+    #[serde(flatten)]
+    pub row: HistoryRow,
+    pub track: Option<TrackRef>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HistoryPage {
+    pub entries: Vec<HistoryItem>,
+    pub next_offset: Option<usize>,
+}
 fn default_browse_page_size() -> usize {
     20
 }
@@ -597,6 +737,19 @@ pub struct TrackCredits {
     pub source: String,
 }
 
+/// The official Spotify Canvas video attached to one track.
+///
+/// The endpoint can also return image/GIF records; the engine deliberately
+/// drops those and exposes only the HTTPS `canvaz.scdn.co` video URL plus the
+/// source enum, so callers cannot accidentally render an invented fallback.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Canvas {
+    pub url: String,
+    #[serde(rename = "type")]
+    pub canvas_type: String,
+}
+
 /// Payload of a successful [`Command::BrowseSearch`] response.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -644,6 +797,7 @@ pub struct StateEvent<'a> {
     pub volume: u8,
     pub shuffle: bool,
     pub repeat: RepeatMode,
+    pub playback_speed: f32,
     pub current_index: Option<usize>,
     pub current_uri: Option<&'a str>,
     pub queue: &'a [TrackRef],
@@ -800,6 +954,7 @@ mod tests {
             volume: 42,
             shuffle: false,
             repeat: RepeatMode::Context,
+            playback_speed: 1.0,
             current_index: Some(0),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
             queue: &queue,
@@ -833,6 +988,7 @@ mod tests {
             volume: 50,
             shuffle: false,
             repeat: RepeatMode::Off,
+            playback_speed: 1.0,
             current_index: None,
             current_uri: None,
             queue: &[],
@@ -910,6 +1066,7 @@ mod tests {
             queue,
             index,
             position_ms,
+            ..
         } = restore.command
         else {
             panic!("restore_queue must parse as its dedicated command");
@@ -1132,6 +1289,7 @@ mod tests {
             volume: 50,
             shuffle: false,
             repeat: RepeatMode::Off,
+            playback_speed: 1.0,
             current_index: None,
             current_uri: None,
             queue: &[],
@@ -1151,6 +1309,7 @@ mod tests {
             volume: 50,
             shuffle: false,
             repeat: RepeatMode::Off,
+            playback_speed: 1.0,
             current_index: None,
             current_uri: None,
             queue: &[],

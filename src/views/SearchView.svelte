@@ -34,11 +34,11 @@
     if (!top) return;
     if (top.kind === "Artist") navigate("artist", top.id);
     else if (top.kind === "Album") navigate("album", top.id);
-    else api.playQueue(tracks, 0).catch(() => {});
+    else api.playQueue(tracks, 0, "search").catch(() => {});
   }
 
   function playTrack(i) {
-    if (tracks.length) api.playQueue(tracks, i).catch(() => {});
+    if (tracks.length) api.playQueue(tracks, i, "search").catch(() => {});
   }
 
   let busy = $state("");
@@ -286,8 +286,8 @@
             tracks={visibleTracks}
             playFrom={playTrack}
             showAlbum={false}
-            showHead={false}
             disableWindowing
+            queueContext="search"
           />
         </div>
       {/if}

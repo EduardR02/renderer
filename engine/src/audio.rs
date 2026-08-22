@@ -129,7 +129,7 @@
 //! between `mem::replace(self, Invalid)` and the reassignment.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -139,8 +139,11 @@ use librespot_playback::config::AudioFormat;
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
+use spotify_playback_engine::protocol::TrackEdit;
+use tokio::sync::mpsc;
 
 use crate::resample::Resampler;
+use crate::time_stretch::{AudioPipeline, PipelineConfig};
 
 /// The live rodio sink, registered on first playback so [`set_sink_volume`]
 /// can apply transport volume changes at the output mixer — instantly audible,
@@ -151,6 +154,43 @@ static LIVE_SINK: Mutex<Weak<rodio::Sink>> = Mutex::new(Weak::new());
 /// cached transport volume while the librespot sink is still logically Closed.
 static SINK_VOLUME: AtomicU16 = AtomicU16::new(u16::MAX);
 const LIVE_SINK_POISON_MSG: &str = "live rodio sink registry should not be poisoned";
+static LIVE_RING: Mutex<Weak<SampleRing>> = Mutex::new(Weak::new());
+static CUSTOMIZATION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CUSTOMIZATION_REVISION: AtomicU64 = AtomicU64::new(0);
+static CUSTOMIZATION: Mutex<Option<PipelineConfig>> = Mutex::new(None);
+static AUDIO_SIGNAL_SENDER: Mutex<Option<mpsc::UnboundedSender<AudioSignal>>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug)]
+pub enum AudioSignal {
+    LoopBoundary { position_ms: u32 },
+}
+
+pub fn install_signal_sender(sender: mpsc::UnboundedSender<AudioSignal>) {
+    *AUDIO_SIGNAL_SENDER
+        .lock()
+        .expect("audio signal sender should not be poisoned") = Some(sender);
+}
+
+pub fn configure_customization(edit: Option<TrackEdit>, speed: f32, position_ms: u32) {
+    let config = PipelineConfig {
+        edit,
+        speed,
+        position_ms,
+    };
+    let active = config.active();
+    *CUSTOMIZATION
+        .lock()
+        .expect("audio customization should not be poisoned") = active.then_some(config);
+    CUSTOMIZATION_REVISION.fetch_add(1, Ordering::Release);
+    CUSTOMIZATION_ACTIVE.store(active, Ordering::Release);
+    if let Some(ring) = LIVE_RING
+        .lock()
+        .expect("live sample ring should not be poisoned")
+        .upgrade()
+    {
+        ring.clear();
+    }
+}
 
 #[derive(Debug)]
 pub enum RodioError {
@@ -275,8 +315,14 @@ struct SampleRing {
     generation: AtomicU64,
 }
 
+#[derive(Default)]
+struct RingPacket {
+    samples: Vec<f32>,
+    loop_to_ms: Option<u32>,
+}
+
 struct RingState {
-    packets: VecDeque<Vec<f32>>,
+    packets: VecDeque<RingPacket>,
     /// Kept alongside `packets` so the producer's fullness check is a field
     /// read rather than a walk of the deque.
     queued_samples: usize,
@@ -309,11 +355,18 @@ impl SampleRing {
         self.lock().queued_samples
     }
 
-    /// Appends a packet, waiting up to `timeout` for the consumer to make
-    /// room. Returns `Err` if the ring never drained, which the caller
-    /// surfaces as a sink error rather than blocking the player thread
-    /// forever.
+    #[cfg(test)]
     fn push(&self, packet: Vec<f32>, timeout: Duration) -> Result<(), ()> {
+        self.push_marked(packet, None, timeout)
+    }
+
+
+    fn push_marked(
+        &self,
+        samples: Vec<f32>,
+        loop_to_ms: Option<u32>,
+        timeout: Duration,
+    ) -> Result<(), ()> {
         let deadline = Instant::now() + timeout;
         let mut state = self.lock();
         while state.queued_samples >= self.capacity {
@@ -328,16 +381,19 @@ impl SampleRing {
                 .unwrap_or_else(PoisonError::into_inner);
             state = guard;
         }
-        state.queued_samples += packet.len();
-        state.packets.push_back(packet);
+        state.queued_samples += samples.len();
+        state.packets.push_back(RingPacket {
+            samples,
+            loop_to_ms,
+        });
         Ok(())
     }
 
     /// Takes the next packet, or `None` when the producer has fallen behind.
-    fn pop(&self) -> Option<Vec<f32>> {
+    fn pop(&self) -> Option<RingPacket> {
         let mut state = self.lock();
         let packet = state.packets.pop_front()?;
-        state.queued_samples -= packet.len();
+        state.queued_samples -= packet.samples.len();
         drop(state);
         self.space_freed.notify_one();
         Some(packet)
@@ -364,7 +420,7 @@ struct LiveSource {
     ring: Arc<SampleRing>,
     /// The generation this source is playing; a mismatch means `stop()` ran.
     generation: u64,
-    packet: Vec<f32>,
+    packet: RingPacket,
     pos: usize,
     /// Samples of silence still owed. Silence is always emitted in whole
     /// frames so an underrun (or the start-up priming) can never shift the
@@ -381,7 +437,7 @@ impl LiveSource {
         LiveSource {
             ring,
             generation,
-            packet: Vec::new(),
+            packet: RingPacket::default(),
             pos: 0,
             silence_remaining: RODIO_BOOTSTRAP_SPAN_SAMPLES,
             rate,
@@ -405,12 +461,21 @@ impl Iterator for LiveSource {
             let generation = self.ring.generation.load(Ordering::Acquire);
             if generation != self.generation {
                 self.generation = generation;
-                self.packet.clear();
+                self.packet = RingPacket::default();
                 self.pos = 0;
             }
         }
 
-        if self.pos == self.packet.len() {
+        if self.pos == self.packet.samples.len() {
+            if let Some(position_ms) = self.packet.loop_to_ms.take() {
+                if let Some(sender) = AUDIO_SIGNAL_SENDER
+                    .lock()
+                    .expect("audio signal sender should not be poisoned")
+                    .as_ref()
+                {
+                    let _ = sender.send(AudioSignal::LoopBoundary { position_ms });
+                }
+            }
             match self.ring.pop() {
                 Some(packet) => {
                     self.packet = packet;
@@ -425,7 +490,7 @@ impl Iterator for LiveSource {
             }
         }
 
-        let sample = self.packet[self.pos];
+        let sample = self.packet.samples[self.pos];
         self.pos += 1;
         Some(sample)
     }
@@ -474,7 +539,26 @@ pub struct RodioSink {
     /// `None` when the device already runs at librespot's rate and the samples
     /// need no conversion.
     resampler: Option<Resampler>,
+    pipeline_revision: u64,
+    pipeline: Option<AudioPipeline>,
     _stream: rodio::OutputStream,
+}
+
+impl RodioSink {
+    fn synchronize_pipeline(&mut self, revision: u64) {
+        if self.pipeline_revision == revision {
+            return;
+        }
+        let config = CUSTOMIZATION
+            .lock()
+            .expect("audio customization should not be poisoned")
+            .clone();
+        self.pipeline = config.as_ref().map(AudioPipeline::new);
+        self.pipeline_revision = revision;
+        if let Some(resampler) = &mut self.resampler {
+            resampler.reset();
+        }
+    }
 }
 
 /// Maps a u16 volume (librespot's 0..=65535 scale) to rodio gain using the
@@ -599,6 +683,10 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
     let stream = create_stream(&host, format).expect("rodio stream could not open");
     let output_rate = stream.config().sample_rate();
     let resampler = Resampler::new(SAMPLE_RATE, output_rate, NUM_CHANNELS as u16);
+    let ring = SampleRing::new(write_ahead_samples(output_rate));
+    *LIVE_RING
+        .lock()
+        .expect("live sample ring should not be poisoned") = Arc::downgrade(&ring);
 
     // The one fact that decides output fidelity, and the one that is otherwise
     // invisible: which rate the device actually opened at, and therefore
@@ -626,9 +714,11 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
 
     RodioSink {
         rodio_sink: None,
-        ring: SampleRing::new(write_ahead_samples(output_rate)),
+        ring,
         output_rate,
         resampler,
+        pipeline_revision: CUSTOMIZATION_REVISION.load(Ordering::Acquire).wrapping_sub(1),
+        pipeline: None,
         _stream: stream,
     }
 }
@@ -673,6 +763,9 @@ impl Sink for RodioSink {
         if let Some(resampler) = &mut self.resampler {
             resampler.reset();
         }
+        if let Some(pipeline) = &mut self.pipeline {
+            pipeline.reset_buffers();
+        }
         if let Some(sink) = &self.rodio_sink {
             sink.pause();
         }
@@ -694,26 +787,39 @@ impl Sink for RodioSink {
             )));
         }
 
+        let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
+        self.synchronize_pipeline(revision);
+        let (processed, loop_to_ms) = if CUSTOMIZATION_ACTIVE.load(Ordering::Acquire) {
+            let mut processed = Vec::new();
+            let loop_to_ms = self
+                .pipeline
+                .as_mut()
+                .expect("active customization must have a sample pipeline")
+                .process(&samples_f32, &mut processed);
+            if processed.is_empty() {
+                return Ok(());
+            }
+            (processed, loop_to_ms)
+        } else {
+            // Load-bearing bypass: the ordinary 1.0/no-edit path hands the
+            // converter output directly to the existing resampler/ring flow.
+            (samples_f32, None)
+        };
+
         // Resample to the device's rate here, on the player thread, rather than
         // letting rodio do it with linear interpolation on the audio thread.
         // See "Playback rate and fidelity" in the module docs. The ring
         // therefore holds device-rate audio from this point on.
         let queued = match &mut self.resampler {
             Some(resampler) => {
-                // One allocation per packet, sized up-front by `process`. The
-                // decoder path already allocates one per packet in
-                // `f64_to_f32`, so this adds no new order of cost.
                 let mut resampled = Vec::new();
-                resampler.process(&samples_f32, &mut resampled);
-                // A packet shorter than the filter's look-ahead completes no
-                // output frames. Nothing to queue yet: those samples stay in
-                // the resampler and come out with the next packet.
+                resampler.process(&processed, &mut resampled);
                 if resampled.is_empty() {
                     return Ok(());
                 }
                 resampled
             }
-            None => samples_f32,
+            None => processed,
         };
 
         // Backpressure: the ring holds about WRITE_AHEAD_MS of audio, small
@@ -723,9 +829,11 @@ impl Sink for RodioSink {
         // WRITE_DRAIN_TIMEOUT the write fails with a normal sink error and
         // librespot pauses playback (its `handle_packet` error path), which
         // stops further writes and leaves the engine alive and recoverable.
-        self.ring.push(queued, WRITE_DRAIN_TIMEOUT).map_err(|()| {
-            SinkError::OnWrite("rodio sink stalled: audio output is not draining".to_owned())
-        })
+        self.ring
+            .push_marked(queued, loop_to_ms, WRITE_DRAIN_TIMEOUT)
+            .map_err(|()| {
+                SinkError::OnWrite("rodio sink stalled: audio output is not draining".to_owned())
+            })
     }
 }
 
@@ -815,7 +923,7 @@ mod tests {
             ring.push(packet(512), Duration::from_millis(50)).unwrap();
         }
         let popped = ring.pop().expect("a packet is queued");
-        assert_eq!(popped.len(), 512);
+        assert_eq!(popped.samples.len(), 512);
         ring.push(packet(512), Duration::from_millis(50))
             .expect("popping made room");
     }

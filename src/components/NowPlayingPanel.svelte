@@ -7,6 +7,8 @@
     openCredits,
     trackCredits,
     loadTrackCredits,
+    api,
+    appSettings,
   } from "../lib/state.svelte.js";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
@@ -21,6 +23,67 @@
     playback.current_index >= 0 ? (playback.queue[playback.current_index + 1] ?? null) : null,
   );
   const playCountFormatter = new Intl.NumberFormat();
+
+  const canvasTrackKey = $derived(current?.id || current?.uri || "");
+  let canvasTrack = $state("");
+  let canvasUrl = $state("");
+  let canvasReady = $state(false);
+  let pageVisible = $state(!document.hidden);
+  let reducedMotion = $state(false);
+
+  /* Canvas is an opt-in media decoder: do not even ask the engine while the
+     panel is hidden, the document is backgrounded, or the user asks for
+     reduced motion. The effect's generation also makes an older Tauri reply
+     harmless when the queue advances before it arrives. */
+  $effect(() => {
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const updateMotion = () => (reducedMotion = media.matches);
+    const updateVisibility = () => (pageVisible = !document.hidden);
+    updateMotion();
+    updateVisibility();
+    media.addEventListener?.("change", updateMotion);
+    document.addEventListener("visibilitychange", updateVisibility);
+    return () => {
+      media.removeEventListener?.("change", updateMotion);
+      document.removeEventListener("visibilitychange", updateVisibility);
+    };
+  });
+
+  /* Settings is loaded on panel mount, not polled. `api` mirrors the result
+     into the shared preference bit so a Settings toggle closes an existing
+     Canvas immediately as well. */
+  $effect(() => {
+    api.getAppSettings().catch(() => {});
+  });
+
+  let canvasGeneration = 0;
+  $effect(() => {
+    const key = canvasTrackKey;
+    const shouldFetch = Boolean(key && appSettings.animated_canvas && pageVisible && !reducedMotion);
+    const generation = ++canvasGeneration;
+    canvasTrack = key;
+    canvasUrl = "";
+    canvasReady = false;
+    if (!shouldFetch) return;
+    api.browseCanvas(key)
+      .then((canvas) => {
+        if (generation !== canvasGeneration || !canvas?.url) return;
+        canvasUrl = canvas.url;
+      })
+      .catch(() => {
+        if (generation === canvasGeneration) canvasUrl = "";
+      });
+  });
+
+  function handleCanvasReady(event) {
+    if (event.currentTarget?.getAttribute("src") === canvasUrl) canvasReady = true;
+  }
+
+  function handleCanvasError(event) {
+    if (event.currentTarget?.getAttribute("src") !== canvasUrl) return;
+    canvasUrl = "";
+    canvasReady = false;
+  }
 
   /* Credits are content in this panel, not a destination, so they load with
      the track. Only ever while the panel is mounted — it is opt-in — and the
@@ -86,9 +149,22 @@
           lg
           raised
         />
+        {#if canvasUrl && canvasTrack === canvasTrackKey}
+          <video
+            class="np-canvas"
+            class:canvasReady={canvasReady}
+            src={canvasUrl}
+            muted
+            loop
+            playsinline
+            autoplay
+            aria-label={`Canvas animation for ${current.name}`}
+            oncanplay={handleCanvasReady}
+            onerror={handleCanvasError}
+          ></video>
+        {/if}
       </div>
-    </div>
-
+      </div>
     <div class="np-block np-identity">
       <h2>{current.name}</h2>
       <ArtistLinks

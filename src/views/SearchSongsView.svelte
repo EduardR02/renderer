@@ -33,7 +33,7 @@
   });
 
   function playFrom(index) {
-    if (tracks.length) api.playQueue(tracks, index).catch(() => {});
+    if (tracks.length) api.playQueue(tracks, index, "search").catch(() => {});
   }
 </script>
 
@@ -58,7 +58,7 @@
   </header>
 
   {#if tracks.length}
-    <TrackList {tracks} {playFrom} />
+    <TrackList {tracks} {playFrom} queueContext="search" />
     {#if loading}<p class="inline-status" aria-live="polite">Loading more songs…</p>{/if}
     {#if error}<p class="inline-error results-error" role="alert">{error}</p>{/if}
   {:else if loading}

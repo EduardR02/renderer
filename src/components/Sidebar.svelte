@@ -127,6 +127,9 @@
       <Icon name="queue" size={17} /><span>Queue</span>
       {#if playback.queue.length}<span class="nav-count">{playback.queue.length}</span>{/if}
     </button>
+    <button class="nav-item" class:active={route.name === "history"} onclick={() => navigate("history")}>
+      <Icon name="clock" size={17} /><span>History</span>
+    </button>
   </nav>
 
   <div class="lib">

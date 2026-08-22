@@ -90,6 +90,7 @@ pub struct RestoreSnapshot {
     pub volume: u8,
     pub shuffle: bool,
     pub repeat: String,
+    pub playback_speed: f32,
     pub resume_playing: bool,
 }
 
@@ -102,6 +103,7 @@ impl RestoreSnapshot {
             volume: state.volume,
             shuffle: state.shuffle,
             repeat: state.repeat.clone(),
+            playback_speed: state.playback_speed,
             resume_playing,
         }
         .normalized()
@@ -115,6 +117,7 @@ impl RestoreSnapshot {
             volume: snapshot.volume,
             shuffle: snapshot.shuffle,
             repeat: snapshot.repeat,
+            playback_speed: snapshot.playback_speed,
             resume_playing: false,
         }
         .normalized()
@@ -149,6 +152,7 @@ impl RestoreSnapshot {
             && state.volume == self.volume
             && state.shuffle == self.shuffle
             && state.repeat == self.repeat
+            && state.playback_speed == self.playback_speed
             && state.playing == self.resume_playing
             && position_matches
     }
@@ -161,6 +165,7 @@ impl RestoreSnapshot {
         state.volume = self.volume;
         state.shuffle = self.shuffle;
         state.repeat = self.repeat.clone();
+        state.playback_speed = self.playback_speed;
         PlaybackSnapshot::from_playback(&state)
     }
 }
@@ -392,7 +397,10 @@ impl EngineClient {
             pending.remove(&request_id);
             return Err(error);
         }
-        let timeout = if kind.starts_with("browse_") || kind.starts_with("edit_") {
+        let timeout = if kind.starts_with("browse_")
+            || kind.starts_with("edit_")
+            || kind == "extract_track_waveform"
+        {
             BROWSE_TIMEOUT
         } else {
             COMMAND_TIMEOUT
@@ -478,15 +486,30 @@ impl EngineClient {
             .map(|_| ())
     }
 
+    pub async fn set_playback_speed(&self, speed: f32) -> Result<(), String> {
+        if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
+            return Err("playback speed must be between 0.5 and 2.0".to_owned());
+        }
+        self.request("set_playback_speed", json!({"speed": speed}))
+            .await
+            .map(|_| ())
+    }
+
     pub async fn play_queue(
         &self,
         queue: &[Track],
         index: usize,
         position_ms: u32,
+        context: &str,
     ) -> Result<(), String> {
         self.request(
             "play_queue",
-            json!({"queue": queue, "index": index, "position_ms": position_ms}),
+            json!({
+                "queue": queue,
+                "index": index,
+                "position_ms": position_ms,
+                "context": context,
+            }),
         )
         .await
         .map(|_| ())
@@ -497,10 +520,16 @@ impl EngineClient {
         queue: &[Track],
         index: usize,
         position_ms: u32,
+        context: &str,
     ) -> Result<(), String> {
         self.request(
             "restore_queue",
-            json!({"queue": queue, "index": index, "position_ms": position_ms}),
+            json!({
+                "queue": queue,
+                "index": index,
+                "position_ms": position_ms,
+                "context": context,
+            }),
         )
         .await
         .map(|_| ())
@@ -512,16 +541,23 @@ impl EngineClient {
             .map(|_| ())
     }
 
-    pub async fn add_queue(&self, track: &Track) -> Result<(), String> {
-        self.request("add_queue", json!({"track": track}))
+    pub async fn add_queue(&self, track: &Track, context: &str) -> Result<(), String> {
+        self.request("add_queue", json!({"track": track, "context": context}))
             .await
             .map(|_| ())
     }
 
-    pub async fn add_queue_batch(&self, tracks: &[Track]) -> Result<(), String> {
-        self.request("add_queue_batch", json!({"tracks": tracks}))
-            .await
-            .map(|_| ())
+    pub async fn add_queue_batch(
+        &self,
+        tracks: &[Track],
+        context: &str,
+    ) -> Result<(), String> {
+        self.request(
+            "add_queue_batch",
+            json!({"tracks": tracks, "context": context}),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn remove_queue(&self, index: usize) -> Result<(), String> {
@@ -536,6 +572,21 @@ impl EngineClient {
             .map(|_| ())
     }
 
+
+    pub async fn get_history(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<spotify_playback_engine::protocol::HistoryPage, String> {
+        let reply = self
+            .request("get_history", json!({"offset": offset, "limit": limit}))
+            .await?;
+        parse_data(reply, "get_history")
+    }
+
+    pub async fn clear_history(&self) -> Result<(), String> {
+        self.request("clear_history", Value::Null).await.map(|_| ())
+    }
     pub async fn login(&self) -> Result<(), String> {
         self.request("login", Value::Null).await.map(|_| ())
     }
@@ -652,6 +703,87 @@ impl EngineClient {
             .request("browse_track_credits", json!({"id": id}))
             .await?;
         parse_data(reply, "browse_track_credits")
+    }
+
+    pub async fn browse_canvas(
+        &self,
+        id: &str,
+    ) -> Result<Option<spotify_playback_engine::protocol::Canvas>, String> {
+        let reply = self.request("browse_canvas", json!({"id": id})).await?;
+        parse_data(reply, "browse_canvas")
+    }
+
+    pub async fn track_edit_status(
+        &self,
+        track_id: &str,
+        playlist_id: Option<&str>,
+    ) -> Result<spotify_playback_engine::protocol::TrackEditStatus, String> {
+        let reply = self
+            .request(
+                "get_track_edit",
+                json!({"track_id": track_id, "playlist_id": playlist_id}),
+            )
+            .await?;
+        parse_data(reply, "get_track_edit")
+    }
+
+    pub async fn save_track_edit(
+        &self,
+        track_id: &str,
+        duration_ms: u32,
+        cuts: &[spotify_playback_engine::protocol::TimeRange],
+        loop_range: Option<spotify_playback_engine::protocol::TimeRange>,
+    ) -> Result<spotify_playback_engine::protocol::TrackEditDefinition, String> {
+        let reply = self
+            .request(
+                "save_track_edit",
+                json!({
+                    "track_id": track_id,
+                    "duration_ms": duration_ms,
+                    "cuts": cuts,
+                    "loop_range": loop_range,
+                }),
+            )
+            .await?;
+        parse_data(reply, "save_track_edit")
+    }
+
+    pub async fn delete_track_edit(&self, track_id: &str) -> Result<(), String> {
+        self.request("delete_track_edit", json!({"track_id": track_id}))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn set_playlist_track_edit_enabled(
+        &self,
+        playlist_id: &str,
+        track_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.request(
+            "set_playlist_track_edit_enabled",
+            json!({
+                "playlist_id": playlist_id,
+                "track_id": track_id,
+                "enabled": enabled,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn extract_track_waveform(
+        &self,
+        track_id: &str,
+        points: u16,
+    ) -> Result<spotify_playback_engine::protocol::TrackWaveform, String> {
+        let reply = self
+            .request(
+                "extract_track_waveform",
+                json!({"track_id": track_id, "points": points}),
+            )
+            .await?;
+        parse_data(reply, "extract_track_waveform")
     }
 
     pub async fn browse_search(

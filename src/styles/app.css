@@ -515,6 +515,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .np-glow .art.gen::after { content: none; }
 @media (prefers-reduced-transparency: reduce) { .np-glow { display: none; } }
 .np-art { position: relative; z-index: 1; width: 100%; aspect-ratio: 1; --tile: 288px; }
+.np-canvas {
+  position: absolute; z-index: 2; inset: 0;
+  display: block; width: 100%; height: 100%;
+  object-fit: cover; object-position: center;
+  border-radius: var(--r4);
+  opacity: 0; pointer-events: none;
+  transform: translateZ(0);
+  contain: paint;
+}
+.np-canvas.canvasReady { opacity: 1; }
 /* The sleeve casts its own colour rather than a neutral black. Two shadows:
    one dark for the lift, one tinted and wider for the light. */
 .np-art .art.raised {

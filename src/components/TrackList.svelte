@@ -10,6 +10,7 @@
     promotePlaylist,
     openCredits,
     ui,
+    openTrackEditor,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
@@ -25,6 +26,8 @@
     /** Off for short embedded lists (search), where column heads are noise. */
     showHead = true,
     playlistId = null,
+    /** Compact source context copied onto tracks added to the queue. */
+    queueContext = null,
     /** Playlist tables may give the added date its own column. */
     showAdded = false,
     /** Official desktop surfaces expose lifetime plays on albums/Popular. */
@@ -44,6 +47,10 @@
     /** Optional per-row guard for an always-visible trailing action. */
     rowActionDisabled = null,
   } = $props();
+
+  const queueSource = $derived(
+    String(queueContext || (playlistId ? `playlist:${playlistId}` : "")).trim(),
+  );
 
   /* =====================================================================
      COLUMNS — one source of truth, in the component that renders the cells.
@@ -162,6 +169,7 @@
   const menu = $state({
     open: false, x: 0, top: null, bottom: null, maxH: 0,
     track: null, index: -1, copied: false,
+    editDefined: false, editEnabled: false, editLoading: false,
   });
   const picker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, track: null });
   /* Same shape and same placement rules as the playlist picker — a second
@@ -288,6 +296,33 @@
     menu.copied = false;
     picker.open = false;
     artistPicker.open = false;
+    menu.editDefined = false;
+    menu.editEnabled = false;
+    menu.editLoading = !!playlistId;
+    if (playlistId && track?.id) {
+      api.getTrackEdit(track.id, playlistId)
+        .then((status) => {
+          if (!menu.open || menu.track?.id !== track.id) return;
+          menu.editDefined = !!status?.definition;
+          menu.editEnabled = !!status?.enabled;
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (menu.open && menu.track?.id === track.id) menu.editLoading = false;
+        });
+    }
+  }
+
+  async function toggleEditedVersion() {
+    if (!playlistId || !menu.track?.id || !menu.editDefined || menu.editLoading) return;
+    const enabled = !menu.editEnabled;
+    menu.editLoading = true;
+    try {
+      await api.setPlaylistTrackEditEnabled(playlistId, menu.track.id, enabled);
+      menu.editEnabled = enabled;
+    } finally {
+      menu.editLoading = false;
+    }
   }
 
   function openPicker(e) {
@@ -801,7 +836,7 @@
     style:bottom={menu.bottom === null ? null : menu.bottom + "px"}
     style:max-height="{menu.maxH}px"
   >
-    <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track).catch(() => {}); }}>
+    <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track, queueSource).catch(() => {}); }}>
       Add to queue
     </button>
     {#if allowAddToPlaylist}
@@ -823,6 +858,26 @@
     {#if menu.track?.id}
       <button class="menu-item" onclick={() => { menu.open = false; openCredits(menu.track); }}>
         View credits
+      </button>
+    {/if}
+    {#if menu.track?.id}
+      <button
+        class="menu-item"
+        onclick={() => {
+          menu.open = false;
+          openTrackEditor(menu.track, playlistId);
+        }}
+      >
+        Edit playback…
+      </button>
+    {/if}
+    {#if playlistId && menu.editDefined}
+      <button
+        class="menu-item"
+        disabled={menu.editLoading}
+        onclick={toggleEditedVersion}
+      >
+        {menu.editEnabled ? "✓ Use edited version" : "Use edited version"}
       </button>
     {/if}
     {#if menu.track?.id}

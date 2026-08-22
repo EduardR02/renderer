@@ -27,6 +27,7 @@
   let appSettings = $state(null);
   let settingsBusy = $state(false);
   let settingsError = $state("");
+  let startupError = $state("");
 
   const CACHE_LIMITS = [
     { value: 1024, label: "1 GiB" },
@@ -99,6 +100,40 @@
     }
   }
 
+  async function updateStartupSetting(update, fallbackMessage) {
+    if (!appSettings || settingsBusy) return;
+    settingsBusy = true;
+    startupError = "";
+    try {
+      appSettings = await update();
+    } catch (error) {
+      startupError = String(error || fallbackMessage);
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
+  function updateLaunchAtLogin(enabled) {
+    return updateStartupSetting(
+      () => api.setLaunchAtLogin(enabled),
+      "Could not update launch at login.",
+    );
+  }
+
+  function updateStartMinimized(enabled) {
+    return updateStartupSetting(
+      () => api.setStartMinimized(enabled),
+      "Could not update start minimized.",
+    );
+  }
+
+  function updateAnimatedCanvas(enabled) {
+    return updateStartupSetting(
+      () => api.setAnimatedCanvas(enabled),
+      "Could not update animated Canvas.",
+    );
+  }
+
   const pingLabel = $derived(
     ping === "ok" ? "Reachable" : ping === "failed" ? "No answer" : ping === "checking" ? "Checking…" : "Not checked"
   );
@@ -162,6 +197,59 @@
           <div class="set-ctl"><span class="dot warn"></span></div>
         </div>
       {/if}
+    </div>
+
+    <div class="set-group">
+      <h2>Playback &amp; startup</h2>
+      <div class="set-row">
+        <div>
+          <div class="k">Launch at login</div>
+          <div class="d">Starts Spotify Renderer when you sign in to Windows.</div>
+          {#if startupError}<div class="inline-error">{startupError}</div>{/if}
+        </div>
+        <div class="set-ctl">
+          <input
+            class="set-check"
+            type="checkbox"
+            aria-label="Launch at login"
+            checked={appSettings?.launch_at_login ?? false}
+            disabled={!appSettings || settingsBusy}
+            onchange={(event) => updateLaunchAtLogin(event.currentTarget.checked)}
+          />
+        </div>
+      </div>
+      <div class="set-row">
+        <div>
+          <div class="k">Start minimized</div>
+          <div class="d">Opens the normal window minimized to the taskbar; closing it still exits the app.</div>
+        </div>
+        <div class="set-ctl">
+          <input
+            class="set-check"
+            type="checkbox"
+            aria-label="Start minimized"
+            checked={appSettings?.start_minimized ?? false}
+            disabled={!appSettings || settingsBusy}
+            onchange={(event) => updateStartMinimized(event.currentTarget.checked)}
+          />
+        </div>
+      </div>
+      <div class="set-row">
+        <div>
+          <div class="k">Animated Canvas</div>
+          <div class="d">Show Spotify's official looping Canvas video in the Now playing panel when available.</div>
+        </div>
+        <div class="set-ctl">
+          <input
+            class="set-check"
+            type="checkbox"
+            aria-label="Animated Canvas"
+            checked={appSettings?.animated_canvas ?? false}
+            disabled={!appSettings || settingsBusy}
+            onchange={(event) => updateAnimatedCanvas(event.currentTarget.checked)}
+          />
+        </div>
+      </div>
     </div>
 
 
@@ -291,3 +379,17 @@
     }}
   />
 {/if}
+
+<style>
+  .set-check {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+
+  .set-check:disabled {
+    cursor: default;
+  }
+</style>

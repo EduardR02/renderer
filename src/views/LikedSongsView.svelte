@@ -55,7 +55,7 @@
   });
 
   function playFrom(index) {
-    if (tracks.length) api.playQueue(tracks, index).catch(() => {});
+    if (tracks.length) api.playQueue(tracks, index, "liked").catch(() => {});
   }
 </script>
 
@@ -97,7 +97,7 @@
 
   {#if tracks.length}
     <div class="section liked-tracks">
-      <TrackList {tracks} {playFrom} showLike={false} />
+      <TrackList {tracks} {playFrom} showLike={false} queueContext="liked" />
     </div>
   {:else if loading}
     <div class="tl liked-loading" style="--cols:28px 36px minmax(0,1fr) 52px" aria-hidden="true">

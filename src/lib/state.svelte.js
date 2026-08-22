@@ -110,6 +110,24 @@ export function goForward() {
  */
 export const ui = $state({ searchFocusTick: 0, nowPlayingOpen: false, paneWidth: 0 });
 
+/** Live preference bits used by mounted surfaces without polling Settings. */
+export const appSettings = $state({ animated_canvas: false });
+
+export const trackEditor = $state({ track: null, playlistId: null });
+
+export function openTrackEditor(track, playlistId = null) {
+  if (!track?.id) return;
+  trackEditor.track = { ...track };
+  trackEditor.playlistId = playlistId || null;
+  navigate("track-editor", track.id, playlistId || null);
+}
+
+function applyAppSettings(value) {
+  if (value && typeof value === "object" && "animated_canvas" in value) {
+    appSettings.animated_canvas = !!value.animated_canvas;
+  }
+}
+
 export function focusSearch() {
   if (route.name !== "search") navigate("search");
   ui.searchFocusTick += 1;
@@ -128,6 +146,7 @@ export const playback = $state({
   volume: 100,
   shuffle: false,
   repeat: "off",
+  playback_speed: 1,
   current_index: -1,
   current_uri: null,
   queue: [],
@@ -150,15 +169,38 @@ function clearLazyQueue() {
   lazyBackfillPromise = null;
 }
 
+function contextTrack(track, context) {
+  const source = String(context ?? "").trim();
+  if (!source || !track) return track;
+  return track.context === source ? track : { ...track, context: source };
+}
+
+function contextTracks(tracks, context) {
+  const source = String(context ?? "").trim();
+  if (!source) return tracks;
+  return (tracks ?? []).map((track) => contextTrack(track, source));
+}
+
+function contextForQueueSource(source) {
+  if (source?.kind === "catalogue" && source.id) return `artist:${source.id}`;
+  return "";
+}
+
 async function startLazyQueue(tracks, source, cursor, index = 0) {
   if (!tracks?.length) throw new Error("No playable tracks were returned.");
   clearLazyQueue();
   const generation = lazyQueue.generation;
-  await invoke("play_queue", { queue: tracks, index });
+  const context = contextForQueueSource(source);
+  await invoke("play_queue", {
+    queue: contextTracks(tracks, context),
+    index,
+    context,
+  });
   if (generation !== lazyQueue.generation) return;
   lazyQueue.source = cursor == null ? null : source;
   lazyQueue.cursor = cursor;
 }
+
 
 function catalogueTracks(releases) {
   return (releases ?? []).flatMap((release) => release?.tracks ?? []);
@@ -189,7 +231,6 @@ export function loadCataloguePage(id, releaseTypes = ["albums", "singles"], offs
 }
 
 export async function playCatalogueContext(releases, id, releaseTypes, nextOffset, index) {
-  // A catalogue is progressively discovered in release order. Global shuffle
   // would require enumerating the very catalogue this path intentionally does
   // not fetch, so this context is explicitly sequential.
   if (playback.shuffle) await invoke("set_shuffle", { enabled: false });
@@ -214,7 +255,13 @@ async function backfillLazyQueue(force = false) {
       const page = await loadCataloguePage(source.id, source.releaseTypes, cursor);
       if (generation !== lazyQueue.generation) return;
       const tracks = catalogueTracks(page?.releases);
-      if (tracks.length) await invoke("add_queue_batch", { tracks });
+      if (tracks.length) {
+        const context = contextForQueueSource(source);
+        await invoke("add_queue_batch", {
+          tracks: contextTracks(tracks, context),
+          context,
+        });
+      }
       if (generation !== lazyQueue.generation) return;
       lazyQueue.retryAfter = 0;
       lazyQueue.cursor = page?.next_offset ?? null;
@@ -1325,13 +1372,28 @@ export const api = {
   },
   setShuffle: (enabled) => invoke("set_shuffle", { enabled: !!enabled }),
   setRepeat: (mode) => invoke("set_repeat", { mode }),
-  playQueue: (queue, index) => {
+  setPlaybackSpeed: (speed) => invoke("set_playback_speed", { speed: Number(speed) }),
+  playQueue: (queue, index, context = "") => {
     clearLazyQueue();
-    return invoke("play_queue", { queue, index });
+    const source = String(context ?? "").trim();
+    return invoke("play_queue", {
+      queue: contextTracks(queue, source),
+      index,
+      context: source,
+    });
   },
   playQueueIndex: (index) => invoke("play_queue_index", { index }),
-  addQueue: (track) => invoke("add_queue", { track }),
-  addQueueBatch: (tracks) => invoke("add_queue_batch", { tracks }),
+  addQueue: (track, context = "") => {
+    const source = String(context ?? "").trim();
+    return invoke("add_queue", { track: contextTrack(track, source), context: source });
+  },
+  addQueueBatch: (tracks, context = "") => {
+    const source = String(context ?? "").trim();
+    return invoke("add_queue_batch", {
+      tracks: contextTracks(tracks, source),
+      context: source,
+    });
+  },
   removeQueue: (index) => {
     clearLazyQueue();
     return invoke("remove_queue", { index });
@@ -1340,6 +1402,21 @@ export const api = {
     clearLazyQueue();
     return invoke("move_queue", { from, to });
   },
+  getHistory: (offset = 0, limit = 40) => invoke("get_history", { offset, limit }),
+  clearHistory: () => invoke("clear_history"),
+  getTrackEdit: (trackId, playlistId = null) =>
+    invoke("get_track_edit", { trackId, playlistId }),
+  saveTrackEdit: (trackId, durationMs, cuts, loopRange = null) =>
+    invoke("save_track_edit", { trackId, durationMs, cuts, loopRange }),
+  deleteTrackEdit: (trackId) => invoke("delete_track_edit", { trackId }),
+  setPlaylistTrackEditEnabled: (playlistId, trackId, enabled) =>
+    invoke("set_playlist_track_edit_enabled", {
+      playlistId,
+      trackId,
+      enabled: !!enabled,
+    }),
+  extractTrackWaveform: (trackId, points = 768) =>
+    invoke("extract_track_waveform", { trackId, points }),
   /**
    * `limit` applies to every section the server returns, not just the three we
    * parse, and it dominates search latency: measured medians are 743ms at 10
@@ -1353,10 +1430,21 @@ export const api = {
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
   touchPlaylistActivity: (id) => invoke("touch_playlist_activity", { id }),
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
+  browseCanvas: (id) => invoke("browse_canvas", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
-  clearCache: (kind) => invoke("clear_cache", { kind }),
-  getAppSettings: () => invoke("get_app_settings"),
+  getAppSettings: () =>
+    invoke("get_app_settings").then((value) => {
+      applyAppSettings(value);
+      return value;
+    }),
   setAudioCacheLimit: (mb) => invoke("set_audio_cache_limit", { mb }),
+  setLaunchAtLogin: (enabled) => invoke("set_launch_at_login", { enabled: !!enabled }),
+  setStartMinimized: (enabled) => invoke("set_start_minimized", { enabled: !!enabled }),
+  setAnimatedCanvas: (enabled) =>
+    invoke("set_animated_canvas", { enabled: !!enabled }).then((value) => {
+      applyAppSettings(value);
+      return value;
+    }),
   browsePlaylists: () => invoke("browse_playlists"),
   browseLikedSongs: (cursor = null) => invoke("browse_liked_songs", { cursor }),
   browsePlaylist: (id) => invoke("browse_playlist", { id }),

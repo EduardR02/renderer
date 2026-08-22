@@ -367,13 +367,13 @@
   const visibleTop = $derived(popularExpanded ? top : top.slice(0, POPULAR_PREVIEW));
 
   function playTop(i) {
-    if (top.length) api.playQueue(top, i).catch(() => {});
+    if (top.length) api.playQueue(top, i, `artist:${artist?.id ?? ""}`).catch(() => {});
   }
 
   function shuffleTop() {
     if (!top.length) return;
     api.setShuffle(true).catch(() => {});
-    api.playQueue(top, 0).catch(() => {});
+    api.playQueue(top, 0, `artist:${artist?.id ?? ""}`).catch(() => {});
   }
 
   function openArtistRadio() {
@@ -458,7 +458,7 @@
        plays it and there is no second control. Everything else keeps the rule
        the rest of the app is built on: the card opens, the button plays. */
     if (pick.kind === "track") {
-      api.playQueue([pick.track], 0).catch(() => {});
+      api.playQueue([pick.track], 0, `artist:${artist?.id ?? ""}`).catch(() => {});
       return;
     }
     if (pick.kind === "album") await playRelease(pick.id);
@@ -693,7 +693,7 @@
         </div>
         <!-- Popular is a bounded section of a longer page, so it renders all
              rows and owns no shared-pane scroll/resize pipeline. -->
-        <TrackList tracks={visibleTop} playFrom={playTop} showAlbum={false} showPlays disableWindowing />
+        <TrackList tracks={visibleTop} playFrom={playTop} showAlbum={false} showPlays disableWindowing queueContext={`artist:${artist?.id ?? ""}`} />
       </div>
     {/if}
 

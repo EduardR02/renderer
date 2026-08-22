@@ -7,7 +7,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
-
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use crate::app::{
     AppSettings, AppState, PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS,
     LIBRARY_LENGTH,
@@ -22,7 +22,7 @@ use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, Sta
 use crate::log;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
-    ArtistReleasePageDetail, CacheStats, LikedSongsDetail, Playlist, PlaylistDetail,
+    ArtistReleasePageDetail, CacheStats, HistoryPage, LikedSongsDetail, Playlist, PlaylistDetail,
     PlaylistRecommendationsDetail, RadioDetail, SearchResult, Track, TrackCreditsDetail,
 };
 
@@ -71,12 +71,21 @@ pub async fn set_repeat(client: State<'_, Arc<EngineClient>>, mode: String) -> R
 }
 
 #[tauri::command]
+pub async fn set_playback_speed(
+    client: State<'_, Arc<EngineClient>>,
+    speed: f32,
+) -> Result<(), String> {
+    client.set_playback_speed(speed).await
+}
+
+#[tauri::command]
 pub async fn play_queue(
     client: State<'_, Arc<EngineClient>>,
     queue: Vec<Track>,
     index: usize,
+    context: String,
 ) -> Result<(), String> {
-    client.play_queue(&queue, index, 0).await
+    client.play_queue(&queue, index, 0, &context).await
 }
 
 #[tauri::command]
@@ -88,16 +97,21 @@ pub async fn play_queue_index(
 }
 
 #[tauri::command]
-pub async fn add_queue(client: State<'_, Arc<EngineClient>>, track: Track) -> Result<(), String> {
-    client.add_queue(&track).await
+pub async fn add_queue(
+    client: State<'_, Arc<EngineClient>>,
+    track: Track,
+    context: String,
+) -> Result<(), String> {
+    client.add_queue(&track, &context).await
 }
 
 #[tauri::command]
 pub async fn add_queue_batch(
     client: State<'_, Arc<EngineClient>>,
     tracks: Vec<Track>,
+    context: String,
 ) -> Result<(), String> {
-    client.add_queue_batch(&tracks).await
+    client.add_queue_batch(&tracks, &context).await
 }
 
 #[tauri::command]
@@ -112,6 +126,78 @@ pub async fn move_queue(
     to: usize,
 ) -> Result<(), String> {
     client.move_queue(from, to).await
+}
+
+#[tauri::command]
+pub async fn get_history(
+    client: State<'_, Arc<EngineClient>>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<HistoryPage, String> {
+    Ok(client
+        .get_history(offset.unwrap_or(0), limit.unwrap_or(40).clamp(1, 100))
+        .await?
+        .into())
+}
+
+#[tauri::command]
+pub async fn clear_history(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
+    client.clear_history().await
+}
+
+#[tauri::command]
+pub async fn get_track_edit(
+    client: State<'_, Arc<EngineClient>>,
+    track_id: String,
+    playlist_id: Option<String>,
+) -> Result<spotify_playback_engine::protocol::TrackEditStatus, String> {
+    client
+        .track_edit_status(&track_id, playlist_id.as_deref())
+        .await
+}
+
+#[tauri::command]
+pub async fn save_track_edit(
+    client: State<'_, Arc<EngineClient>>,
+    track_id: String,
+    duration_ms: u32,
+    cuts: Vec<spotify_playback_engine::protocol::TimeRange>,
+    loop_range: Option<spotify_playback_engine::protocol::TimeRange>,
+) -> Result<spotify_playback_engine::protocol::TrackEditDefinition, String> {
+    client
+        .save_track_edit(&track_id, duration_ms, &cuts, loop_range)
+        .await
+}
+
+#[tauri::command]
+pub async fn delete_track_edit(
+    client: State<'_, Arc<EngineClient>>,
+    track_id: String,
+) -> Result<(), String> {
+    client.delete_track_edit(&track_id).await
+}
+
+#[tauri::command]
+pub async fn set_playlist_track_edit_enabled(
+    client: State<'_, Arc<EngineClient>>,
+    playlist_id: String,
+    track_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    client
+        .set_playlist_track_edit_enabled(&playlist_id, &track_id, enabled)
+        .await
+}
+
+#[tauri::command]
+pub async fn extract_track_waveform(
+    client: State<'_, Arc<EngineClient>>,
+    track_id: String,
+    points: Option<u16>,
+) -> Result<spotify_playback_engine::protocol::TrackWaveform, String> {
+    client
+        .extract_track_waveform(&track_id, points.unwrap_or(768).clamp(64, 4096))
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +356,17 @@ pub async fn browse_track_credits(
     Ok(TrackCreditsDetail::from(
         client.browse_track_credits(&id).await?,
     ))
+}
+
+/// Resolves one official Spotify Canvas video for the currently playing track.
+/// The engine caches positive/negative answers in memory; errors stay errors so
+/// a later panel open can retry without inventing a fallback URL.
+#[tauri::command]
+pub async fn browse_canvas(
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+) -> Result<Option<spotify_playback_engine::protocol::Canvas>, String> {
+    client.browse_canvas(&id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +557,42 @@ pub fn get_app_settings() -> AppSettings {
     load_app_settings()
 }
 
+/// Ensures the OS registration reflects `enabled`, returning the prior
+/// registration state so a later disk-write failure can be rolled back.
+fn set_autostart_registration(app: &AppHandle, enabled: bool) -> Result<bool, String> {
+    let manager = app.autolaunch();
+    let was_enabled = manager
+        .is_enabled()
+        .map_err(|error| format!("could not read launch-at-login registration: {error}"))?;
+    if was_enabled == enabled {
+        return Ok(was_enabled);
+    }
+
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|error| {
+        let action = if enabled { "enable" } else { "disable" };
+        format!("could not {action} launch at login: {error}")
+    })?;
+    Ok(was_enabled)
+}
+
+fn restore_autostart_registration(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|error| {
+        let action = if enabled { "restore enabled" } else { "restore disabled" };
+        format!("could not {action} launch-at-login registration: {error}")
+    })
+}
+
 #[tauri::command]
 pub fn set_audio_cache_limit(mb: u64) -> Result<AppSettings, String> {
     if !matches!(mb, 0 | 1024 | 2048 | 4096 | 8192) {
@@ -467,6 +600,46 @@ pub fn set_audio_cache_limit(mb: u64) -> Result<AppSettings, String> {
     }
     let mut settings = load_app_settings();
     settings.audio_cache_limit_mb = mb;
+    save_app_settings(&settings)?;
+    Ok(settings)
+}
+
+/// Updates the OS registration before persisting the preference. If writing
+/// the preference fails, restore the registration to its previous state.
+#[tauri::command]
+pub fn set_launch_at_login(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<AppSettings, String> {
+    let mut settings = load_app_settings();
+    let was_enabled = set_autostart_registration(&app, enabled)?;
+    settings.launch_at_login = enabled;
+
+    if let Err(error) = save_app_settings(&settings) {
+        if was_enabled != enabled {
+            if let Err(rollback_error) = restore_autostart_registration(&app, was_enabled) {
+                return Err(format!(
+                    "{error}; could not roll back launch-at-login registration: {rollback_error}"
+                ));
+            }
+        }
+        return Err(error);
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
+pub fn set_start_minimized(enabled: bool) -> Result<AppSettings, String> {
+    let mut settings = load_app_settings();
+    settings.start_minimized = enabled;
+    save_app_settings(&settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+pub fn set_animated_canvas(enabled: bool) -> Result<AppSettings, String> {
+    let mut settings = load_app_settings();
+    settings.animated_canvas = enabled;
     save_app_settings(&settings)?;
     Ok(settings)
 }
@@ -511,7 +684,7 @@ pub async fn clear_cache(
         "audio" => {
             // A logged-out/not-yet-ready engine has no active audio handles;
             // failure to empty that already-empty queue is harmless.
-            let _ = client.play_queue(&[], 0, 0).await;
+            let _ = client.play_queue(&[], 0, 0, "").await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             (engine_state_dir().join("audio"), &["cache-version"])
         }
@@ -676,9 +849,10 @@ async fn restore_playback(
     client.set_volume(snapshot.volume).await?;
     client.set_shuffle(snapshot.shuffle).await?;
     client.set_repeat(&snapshot.repeat).await?;
+    client.set_playback_speed(snapshot.playback_speed).await?;
     let index = snapshot.current_index.unwrap_or(0);
     client
-        .restore_queue(&snapshot.queue, index, snapshot.position_ms)
+        .restore_queue(&snapshot.queue, index, snapshot.position_ms, "")
         .await?;
     if snapshot.resume_playing && snapshot.current_index.is_some() {
         client.play().await?;

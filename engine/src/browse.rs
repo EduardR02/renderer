@@ -52,11 +52,13 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::Bytes;
+use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use http::{Method, Request};
 use librespot_core::cache::Cache;
 use librespot_core::error::ErrorKind;
 use librespot_core::{FileId, Session, SpotifyId, SpotifyUri};
 use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
+use librespot_protocol::canvaz;
 use librespot_protocol::extended_metadata::{
     BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
 };
@@ -65,9 +67,11 @@ use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 
 use spotify_playback_engine::protocol::{
-    AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity, CreditArtist,
+    AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity, Canvas,
+    CreditArtist,
     CreditRole, PlaylistRecommendations, PlaylistRef, RadioBrowse, TrackCredits, TrackRef,
 };
+
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
 const COVER_BASE: &str = "https://i.scdn.co/image/";
@@ -268,6 +272,8 @@ pub fn track_ref(track: &Track) -> TrackRef {
         unavailable: false,
         unavailable_reason: None,
         cached: false,
+        context: String::new(),
+        effective_edit: None,
     }
 }
 
@@ -328,6 +334,61 @@ fn any_file_on_disk(files: impl IntoIterator<Item = FileId>, cache: &Cache) -> b
 /// wrong file, and a browse refills it for free.
 static FILE_IDS: LazyLock<RwLock<HashMap<String, TrackFiles>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Canvas answers are intentionally process-memory only. A panel opening can
+/// revisit one track several times, but Canvas is not part of ordinary browse
+/// payloads and must never become a background scan or disk cache.
+const CANVAS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const CANVAS_CACHE_MAX: usize = 256;
+
+#[derive(Clone)]
+struct CanvasCacheEntry {
+    fetched_at: Instant,
+    value: Option<Canvas>,
+}
+
+static CANVAS_CACHE: LazyLock<Mutex<HashMap<String, CanvasCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cached_canvas(uri: &str) -> Option<Option<Canvas>> {
+    let mut cache = CANVAS_CACHE.lock().ok()?;
+    let entry = cache.get(uri)?;
+    if entry.fetched_at.elapsed() > CANVAS_CACHE_TTL {
+        cache.remove(uri);
+        return None;
+    }
+    Some(entry.value.clone())
+}
+
+fn remember_canvas(uri: &str, value: Option<Canvas>) {
+    let Ok(mut cache) = CANVAS_CACHE.lock() else {
+        return;
+    };
+    cache.insert(
+        uri.to_owned(),
+        CanvasCacheEntry {
+            fetched_at: Instant::now(),
+            value,
+        },
+    );
+    while cache.len() > CANVAS_CACHE_MAX {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.fetched_at)
+            .map(|(uri, _)| uri.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
+
+/// Explicit logout/session reset hook. Canvas is not persisted across users.
+pub fn clear_canvas_cache() {
+    if let Ok(mut cache) = CANVAS_CACHE.lock() {
+        cache.clear();
+    }
+}
 
 #[derive(Default)]
 struct TrackFiles {
@@ -1495,6 +1556,7 @@ async fn artist_visual_identity(
         ExtensionKind::VISUAL_IDENTITY_TRAIT,
         &session.country(),
     );
+
     request.entity_request[0].query.insert(
         0,
         ExtensionQuery {
@@ -1512,6 +1574,146 @@ async fn artist_visual_identity(
         .next()
         .map(|(_, payload)| payload);
     Ok(payload.as_deref().and_then(parse_artist_visual_identity))
+}
+/// The narrow Canvas request schema from Spotify's official protobuf:
+///
+/// ```text
+/// message EntityCanvazRequest {
+///   message Entity { string entityUri = 1; string etag = 2; }
+///   repeated Entity entities = 1;
+/// }
+/// ```
+///
+/// librespot-protocol 0.8 includes only the nested response record, so the
+/// request is encoded here with the same bounded wire reader/writer style as
+/// the artist visual-identity parser below.
+fn canvas_request(uri: &str) -> Vec<u8> {
+    fn varint_len(mut value: usize) -> usize {
+        let mut length = 1;
+        while value >= 0x80 {
+            value >>= 7;
+            length += 1;
+        }
+        length
+    }
+
+    fn push_varint(output: &mut Vec<u8>, mut value: usize) {
+        while value >= 0x80 {
+            output.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        output.push(value as u8);
+    }
+
+    let entity_len = 1 + varint_len(uri.len()) + uri.len();
+    let mut entity = Vec::with_capacity(1 + varint_len(uri.len()) + uri.len());
+    entity.push(0x0a);
+    push_varint(&mut entity, uri.len());
+    entity.extend_from_slice(uri.as_bytes());
+
+    let mut request = Vec::with_capacity(1 + varint_len(entity_len) + entity_len);
+    request.push(0x0a);
+    push_varint(&mut request, entity_len);
+    request.extend_from_slice(&entity);
+    request
+}
+
+fn normalize_canvas_track_uri(id: &str) -> Result<String, String> {
+    let id = id.trim();
+    let suffix = id
+        .strip_prefix("spotify:track:")
+        .or_else(|| (!id.is_empty() && !id.contains(':')).then_some(id))
+        .filter(|suffix| !suffix.is_empty() && !suffix.contains(':'))
+        .ok_or_else(|| "Canvas lookup requires a Spotify track id".to_owned())?;
+    Ok(format!("spotify:track:{suffix}"))
+}
+
+fn canvas_type_name(kind: canvaz::Type) -> Option<&'static str> {
+    match kind {
+        canvaz::Type::VIDEO => Some("video"),
+        canvaz::Type::VIDEO_LOOPING => Some("video_looping"),
+        canvaz::Type::VIDEO_LOOPING_RANDOM => Some("video_looping_random"),
+        canvaz::Type::IMAGE | canvaz::Type::GIF => None,
+    }
+}
+
+/// Parses the stale outer response with the generated 0.8 nested message.
+///
+/// The generated `EntityCanvazResponse` is empty because its checked-in
+/// extraction predates the repeated `canvases = 1` field. Its nested `Canvaz`
+/// record is still authoritative for the URL/type field numbers, so only the
+/// one missing outer repeated-message layer is hand-decoded.
+fn parse_canvas_response(payload: &[u8], track_uri: &str) -> Result<Option<Canvas>, String> {
+    let mut reader = WireReader::new(payload);
+    while !reader.done() {
+        let (field, wire_type) = reader
+            .field()
+            .ok_or_else(|| "invalid Canvas response field".to_owned())?;
+        if field == 1 && wire_type == 2 {
+            let record = canvaz::entity_canvaz_response::Canvaz::parse_from_bytes(
+                reader
+                    .bytes()
+                    .ok_or_else(|| "invalid Canvas response record".to_owned())?,
+            )
+            .map_err(|error| format!("invalid Canvas response record: {error}"))?;
+            if !record.entity_uri.is_empty() && record.entity_uri != track_uri {
+                continue;
+            }
+            let Some(canvas_type) = canvas_type_name(
+                record
+                    .type_
+                    .enum_value_or(canvaz::Type::IMAGE),
+            ) else {
+                continue;
+            };
+            let url = record.url.trim();
+            if url.starts_with("https://canvaz.scdn.co/")
+                && url.ends_with(".mp4")
+                && !url.contains(char::is_whitespace)
+            {
+                return Ok(Some(Canvas {
+                    url: url.to_owned(),
+                    canvas_type: canvas_type.to_owned(),
+                }));
+            }
+        } else if !reader.skip(wire_type) {
+            return Err("invalid Canvas response wire type".to_owned());
+        }
+    }
+    Ok(None)
+}
+
+/// Authenticated, on-demand Canvas lookup for one current track.
+///
+/// Spotify's official client posts the protobuf request to the spclient
+/// `/canvaz-cache/v0/canvases` endpoint. Only positive/negative answers are
+/// cached; transport/parse failures remain errors so a later panel open may
+/// retry them.
+pub async fn canvas_browse(session: &Session, id: &str) -> Result<Option<Canvas>, String> {
+    let track_uri = normalize_canvas_track_uri(id)?;
+    if let Some(value) = cached_canvas(&track_uri) {
+        return Ok(value);
+    }
+
+    let request_body = canvas_request(&track_uri);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-protobuf"),
+    );
+    let payload = session
+        .spclient()
+        .request(
+            &Method::POST,
+            "/canvaz-cache/v0/canvases",
+            Some(headers),
+            Some(&request_body),
+        )
+        .await
+        .map_err(|error| format!("Canvas request failed: {error}"))?;
+    let result = parse_canvas_response(&payload, &track_uri)?;
+    remember_canvas(&track_uri, result.clone());
+    Ok(result)
 }
 
 
@@ -3015,6 +3217,8 @@ fn track_ref_from_hit(hit: &SearchTrackHitJson) -> TrackRef {
         // knowable here. It is answered only where real track metadata is
         // parsed; see `track_is_cached`.
         cached: false,
+        context: String::new(),
+        effective_edit: None,
     }
 }
 
@@ -4218,6 +4422,28 @@ mod tests {
     use super::*;
 
     use librespot_core::date::Date;
+
+    #[test]
+    fn canvas_response_keeps_only_official_video_records_for_the_track() {
+        let track_uri = "spotify:track:0123456789ABCDEFGHIJKL";
+        let mut record = canvaz::entity_canvaz_response::Canvaz::new();
+        record.url = "https://canvaz.scdn.co/upload/artist/video.mp4".to_owned();
+        record.entity_uri = track_uri.to_owned();
+        record.type_ = EnumOrUnknown::new(canvaz::Type::VIDEO_LOOPING);
+        let encoded = record.write_to_bytes().unwrap();
+        assert!(encoded.len() < 128, "test fixture keeps a one-byte length");
+        let mut response = vec![0x0a, encoded.len() as u8];
+        response.extend_from_slice(&encoded);
+
+        let canvas = parse_canvas_response(&response, track_uri)
+            .unwrap()
+            .expect("video canvas");
+        assert_eq!(canvas.url, record.url);
+        assert_eq!(canvas.canvas_type, "video_looping");
+        assert!(parse_canvas_response(&response, "spotify:track:other")
+            .unwrap()
+            .is_none());
+    }
 
     fn file_id(byte: u8) -> FileId {
         FileId::from_raw(&[byte; 20])

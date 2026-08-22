@@ -39,6 +39,12 @@
         ? "Repeat all"
         : "Repeat off"
   );
+
+  const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
+  function setSpeed(event) {
+    api.setPlaybackSpeed(Number(event.currentTarget.value)).catch(() => {});
+  }
 </script>
 
 <footer class="player">
@@ -143,6 +149,14 @@
   </div>
 
   <div class="p-right">
+    <label class="p-speed" title="Pitch-preserving playback speed">
+      <span class="sr-only">Playback speed</span>
+      <select value={playback.playback_speed} onchange={setSpeed}>
+        {#each SPEEDS as speed}
+          <option value={speed}>{speed}×</option>
+        {/each}
+      </select>
+    </label>
     <button
       class="btn-icon"
       class:on={ui.nowPlayingOpen}
@@ -173,3 +187,18 @@
     />
   </div>
 </footer>
+
+<style>
+  .p-speed select {
+    width: 52px;
+    height: 28px;
+    border: 1px solid var(--line-2);
+    border-radius: var(--r1);
+    background: var(--bg-2);
+    color: var(--fg-1);
+    font: inherit;
+    font-size: var(--t-12);
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+  }
+</style>

@@ -320,7 +320,7 @@
 
   function playRecommendation(index) {
     if (!recommendations[index]) return;
-    api.playQueue(recommendations, index).catch(() => {});
+    api.playQueue(recommendations, index, `playlist:${pl?.id ?? ""}`).catch(() => {});
   }
 
   function recommendationAddKey(id, uri) {
@@ -371,7 +371,7 @@
   function playQueue(queue, index) {
     // Do not promote or persist a failed play. This keeps `last_played`
     // exclusive to actual playback, rather than an attempted command.
-    return api.playQueue(queue, index).then(() => {
+    return api.playQueue(queue, index, `playlist:${pl?.id ?? ""}`).then(() => {
       markPlayed();
     });
   }
@@ -687,6 +687,7 @@
           tracks={sortedTracks}
           {playFrom}
           playlistId={editable ? pl.id : null}
+          queueContext={`playlist:${pl?.id ?? ""}`}
           showAdded
           sortKey={sortState.key}
           sortDirection={sortState.direction}
@@ -738,6 +739,7 @@
               tracks={recommendations}
               playFrom={playRecommendation}
               showHead={false}
+              queueContext={`playlist:${pl?.id ?? ""}`}
               allowAddToPlaylist={false}
               disableWindowing
               rowActionLabel={editable ? "Add" : null}

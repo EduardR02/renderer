@@ -9,15 +9,48 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tauri::Manager;
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
-use app::{AppState, data_dir, load_tracks_cache};
+use app::{AppState, data_dir, load_app_settings, load_tracks_cache};
 use engine_client::EngineClient;
+
+fn sync_autostart(app: &tauri::AppHandle, enabled: bool) {
+    let manager = app.autolaunch();
+    let actual = match manager.is_enabled() {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn(&format!(
+                "could not read launch-at-login registration at startup: {error}"
+            ));
+            return;
+        }
+    };
+    if actual == enabled {
+        return;
+    }
+
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    if let Err(error) = result {
+        let action = if enabled { "enable" } else { "disable" };
+        log::warn(&format!(
+            "could not {action} launch-at-login registration at startup: {error}"
+        ));
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     log::init(app::logs_dir());
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::play,
             commands::pause,
@@ -27,12 +60,20 @@ pub fn run() {
             commands::set_volume,
             commands::set_shuffle,
             commands::set_repeat,
+            commands::set_playback_speed,
             commands::play_queue,
             commands::play_queue_index,
             commands::add_queue,
             commands::add_queue_batch,
             commands::remove_queue,
             commands::move_queue,
+            commands::get_history,
+            commands::clear_history,
+            commands::get_track_edit,
+            commands::save_track_edit,
+            commands::delete_track_edit,
+            commands::set_playlist_track_edit_enabled,
+            commands::extract_track_waveform,
             commands::search,
             commands::browse_playlists,
             commands::browse_playlist,
@@ -44,6 +85,7 @@ pub fn run() {
             commands::browse_artist_catalogue,
             commands::browse_liked_songs,
             commands::browse_track_credits,
+            commands::browse_canvas,
             commands::create_playlist,
             commands::rename_playlist,
             commands::delete_playlist,
@@ -59,10 +101,31 @@ pub fn run() {
             commands::clear_cache,
             commands::get_app_settings,
             commands::set_audio_cache_limit,
+            commands::set_launch_at_login,
+            commands::set_start_minimized,
+            commands::set_animated_canvas,
             commands::touch_playlist,
             commands::touch_playlist_activity,
         ])
         .setup(|app| {
+            let startup_settings = load_app_settings();
+            let startup_handle = app.handle().clone();
+            sync_autostart(&startup_handle, startup_settings.launch_at_login);
+            if startup_settings.start_minimized {
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Err(error) = window.show() {
+                        log::warn(&format!("could not show the main window at startup: {error}"));
+                    }
+                    if let Err(error) = window.minimize() {
+                        log::warn(&format!(
+                            "could not minimize the main window at startup: {error}"
+                        ));
+                    }
+                } else {
+                    log::warn("could not find the main window to start minimized");
+                }
+            }
+
             let state = Mutex::new(AppState::new(data_dir()));
             let dir = state.lock().data_dir.clone();
             state.lock().tracks_cache = load_tracks_cache(&dir);

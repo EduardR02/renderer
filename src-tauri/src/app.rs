@@ -32,17 +32,23 @@ pub const DEFAULT_AUDIO_CACHE_LIMIT_MB: u64 = 1024;
 #[serde(default)]
 pub struct AppSettings {
     pub audio_cache_limit_mb: u64,
+    pub launch_at_login: bool,
+    pub start_minimized: bool,
+    pub animated_canvas: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             audio_cache_limit_mb: DEFAULT_AUDIO_CACHE_LIMIT_MB,
+            launch_at_login: false,
+            start_minimized: false,
+            animated_canvas: false,
         }
     }
 }
 
-pub const PLAYBACK_STATE_VERSION: u32 = 1;
+pub const PLAYBACK_STATE_VERSION: u32 = 2;
 
 /// App-owned durable playback state. Deliberately excludes `playing`: every
 /// normal process start restores paused, while crash-only resume intent stays
@@ -56,6 +62,7 @@ pub struct PlaybackSnapshot {
     pub volume: u8,
     pub shuffle: bool,
     pub repeat: String,
+    pub playback_speed: f32,
 }
 
 impl PlaybackSnapshot {
@@ -68,6 +75,7 @@ impl PlaybackSnapshot {
             volume: state.volume,
             shuffle: state.shuffle,
             repeat: state.repeat.clone(),
+            playback_speed: state.playback_speed,
         }
     }
 
@@ -75,6 +83,8 @@ impl PlaybackSnapshot {
         self.version == PLAYBACK_STATE_VERSION
             && self.volume <= 100
             && matches!(self.repeat.as_str(), "off" | "context" | "track")
+            && self.playback_speed.is_finite()
+            && (0.5..=2.0).contains(&self.playback_speed)
             && self.current_index.is_none_or(|index| index < self.queue.len())
             && (!self.queue.is_empty() || self.current_index.is_none())
             && self.queue.iter().all(|track| {
@@ -607,6 +617,23 @@ fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result
 mod tests {
     use super::*;
 
+    #[test]
+    fn app_settings_missing_startup_fields_use_safe_defaults() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"audio_cache_limit_mb":2048}"#).unwrap();
+        assert_eq!(settings.audio_cache_limit_mb, 2048);
+        assert!(!settings.launch_at_login);
+        assert!(!settings.start_minimized);
+
+        let mut saved = AppSettings::default();
+        saved.launch_at_login = true;
+        saved.start_minimized = true;
+        let round_trip: AppSettings =
+            serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
+        assert!(round_trip.launch_at_login);
+        assert!(round_trip.start_minimized);
+    }
+
     fn track(id: &str) -> Track {
         Track {
             id: id.to_owned(),
@@ -635,6 +662,7 @@ mod tests {
             volume: 37,
             shuffle: true,
             repeat: "context".to_owned(),
+            playback_speed: 1.25,
         };
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
         assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
