@@ -354,7 +354,10 @@ impl EngineClient {
         let engine_log = logs_dir.join("playback_engine.log");
         rotate_if_large(&engine_log);
         let mut command = Command::new(&exe);
-        let audio_cache_limit_mb = load_app_settings().audio_cache_limit_mb;
+        // Read fresh on every spawn (including supervisor respawns) so a
+        // saved preference is picked up without restarting the whole app.
+        let settings = load_app_settings();
+        let audio_cache_limit_mb = settings.audio_cache_limit_mb;
         command
             .arg("--state-dir")
             .arg(&self.state_dir)
@@ -362,6 +365,8 @@ impl EngineClient {
             .arg(&engine_log)
             .arg("--audio-cache-limit-mb")
             .arg(audio_cache_limit_mb.to_string())
+            .arg("--normalisation")
+            .arg(settings.normalisation.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(match OpenOptions::new().create(true).append(true).open(&engine_log) {
@@ -623,6 +628,15 @@ impl EngineClient {
     }
     pub async fn login(&self) -> Result<(), String> {
         self.request("login", Value::Null).await.map(|_| ())
+    }
+
+    /// Applies the volume-normalisation preference to the live engine. The
+    /// engine rebuilds its player from cached credentials, so a moment of
+    /// reconnection is expected while a session is up.
+    pub async fn set_normalisation(&self, enabled: bool) -> Result<(), String> {
+        self.request("set_normalisation", json!({ "enabled": enabled }))
+            .await
+            .map(|_| ())
     }
 
     pub async fn logout(&self) -> Result<(), String> {

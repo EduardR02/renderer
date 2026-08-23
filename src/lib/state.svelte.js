@@ -1447,6 +1447,11 @@ export const api = {
       return value;
     }),
   setAudioCacheLimit: (mb) => invoke("set_audio_cache_limit", { mb }),
+  setNormalisation: (enabled) =>
+    invoke("set_normalisation", { enabled: !!enabled }).then((value) => {
+      applyAppSettings(value);
+      return value;
+    }),
   setLaunchAtLogin: (enabled) => invoke("set_launch_at_login", { enabled: !!enabled }),
   setStartMinimized: (enabled) => invoke("set_start_minimized", { enabled: !!enabled }),
   setAnimatedCanvas: (enabled) =>

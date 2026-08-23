@@ -95,6 +95,7 @@ pub fn run() {
             commands::status,
             commands::login,
             commands::logout,
+            commands::set_normalisation,
             commands::get_state,
             commands::get_cover,
             commands::get_cache_stats,

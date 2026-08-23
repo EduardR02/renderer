@@ -131,6 +131,15 @@ pub struct Engine {
     /// Whether the seek that set `seek_in_flight` was issued while playing.
     seek_should_play: bool,
     auth_running: bool,
+    /// Track-gain volume normalisation (attenuation-only, see
+    /// `auth::player_config`). Fixed for the lifetime of one player; changing
+    /// it rebuilds the player.
+    normalisation: bool,
+    /// A normalisation change that arrived while an authentication attempt was
+    /// in flight. The attempt captured the old value, so once it lands the
+    /// health tick rebuilds the player with the new one. See
+    /// [`Engine::set_normalisation`] and [`Engine::tick_session_health`].
+    rebuild_after_auth: bool,
     /// The prepared OAuth attempt whose authorize URL is published in
     /// `needs_login` state; `login` consumes it so the UI opens exactly the
     /// URL the flow listens for. Regenerated per attempt.
@@ -180,6 +189,7 @@ impl Engine {
         temporary_directory: std::path::PathBuf,
         credentials_file: std::path::PathBuf,
         state_directory: std::path::PathBuf,
+        normalisation: bool,
     ) -> Self {
         let history_root = state_directory.clone();
         let track_edits = TrackEditStore::load_or_empty(&state_directory);
@@ -230,6 +240,8 @@ impl Engine {
             seek_in_flight: false,
             seek_should_play: false,
             auth_running: false,
+            normalisation,
+            rebuild_after_auth: false,
             pending_auth: None,
         }
     }
@@ -412,6 +424,14 @@ impl Engine {
         if self.auth_running {
             return false;
         }
+        // A normalisation change that was parked behind an in-flight
+        // authentication attempt applies now that the attempt has landed.
+        if self.rebuild_after_auth {
+            self.rebuild_after_auth = false;
+            self.resume_after_reconnect = self.state.playing;
+            self.start_authentication(sender.clone());
+            return true;
+        }
         let dead = self
             .session
             .as_ref()
@@ -449,6 +469,37 @@ impl Engine {
         true
     }
 
+    /// Enables or disables track-gain volume normalisation.
+    ///
+    /// The setting is baked into the player at construction, so a change on a
+    /// live session rebuilds the player from cached credentials — the same
+    /// deliberate reconnect `tick_session_health` performs, queue and play
+    /// intent preserved. While an authentication attempt is in flight the
+    /// attempt has already captured the old value; the change is parked in
+    /// `rebuild_after_auth` and applied by the health tick once it lands.
+    /// With no session at all (`needs_login`) the flag simply waits for the
+    /// next successful login. Returns whether state should be emitted.
+    pub fn set_normalisation(
+        &mut self,
+        enabled: bool,
+        sender: &mpsc::UnboundedSender<AuthSignal>,
+    ) -> bool {
+        if self.normalisation == enabled {
+            return false;
+        }
+        self.normalisation = enabled;
+        if self.auth_running {
+            self.rebuild_after_auth = true;
+            return true;
+        }
+        if self.state.auth_state == AuthState::NeedsLogin {
+            return true;
+        }
+        self.resume_after_reconnect = self.state.playing;
+        self.start_authentication(sender.clone());
+        true
+    }
+
     pub fn start_authentication(&mut self, sender: mpsc::UnboundedSender<AuthSignal>) {
         if self.auth_running {
             return;
@@ -471,8 +522,9 @@ impl Engine {
         }
         let cache = self.cache.clone();
         let temporary_directory = self.temporary_directory.clone();
+        let normalisation = self.normalisation;
         tokio::spawn(async move {
-            let result = connect_cached(cache, temporary_directory).await;
+            let result = connect_cached(cache, temporary_directory, normalisation).await;
             let _ = sender.send(AuthSignal::Complete { generation, result });
         });
     }
@@ -522,8 +574,9 @@ impl Engine {
         let auth_sender = auth_sender.clone();
         let cache = self.cache.clone();
         let temporary_directory = self.temporary_directory.clone();
+        let normalisation = self.normalisation;
         tokio::spawn(async move {
-            let result = complete_oauth(cache, temporary_directory, pending).await;
+            let result = complete_oauth(cache, temporary_directory, pending, normalisation).await;
             let _ = auth_sender.send(AuthSignal::Complete { generation, result });
         });
         Ok(true)
@@ -750,6 +803,9 @@ impl Engine {
         if matches!(&command, Command::Logout) {
             return self.logout();
         }
+        if let Command::SetNormalisation { enabled } = command {
+            return Ok(self.set_normalisation(enabled, auth_sender));
+        }
         self.ensure_ready()?;
         // Pace command-driven track changes so rapid next/prev spam cannot
         // burst audio-key requests (each load of an uncached track fetches
@@ -772,6 +828,7 @@ impl Engine {
             | Command::Shutdown
             | Command::Login
             | Command::Logout
+            | Command::SetNormalisation { .. }
             | Command::BrowsePlaylists { .. }
             | Command::BrowsePlaylist { .. }
             | Command::BrowseRadio { .. }
@@ -1969,7 +2026,14 @@ mod tests {
         )
         .expect("cache with no paths");
         (
-            Engine::new(writer, cache, PathBuf::new(), PathBuf::new(), PathBuf::new()),
+            Engine::new(
+                writer,
+                cache,
+                PathBuf::new(),
+                PathBuf::new(),
+                PathBuf::new(),
+                false,
+            ),
             buffer,
         )
     }
@@ -2611,6 +2675,7 @@ mod tests {
                     PathBuf::new(),
                     fixture.credentials_file(),
                     fixture.directory.clone(),
+                    false,
                 ),
                 buffer,
             )
@@ -2658,6 +2723,7 @@ mod tests {
                 PathBuf::new(),
                 fixture.credentials_file(),
                 fixture.directory.clone(),
+                false,
             );
         assert!(engine.logout().expect("first logout"));
         assert!(!fixture.credentials_exist());
@@ -2709,6 +2775,71 @@ mod tests {
             engine.state.auth_url.as_deref(),
             Some("https://accounts.spotify.com/authorize?running"),
             "an in-flight attempt keeps its URL"
+        );
+    }
+
+    #[test]
+    fn set_normalisation_stores_the_flag_and_parks_the_rebuild_behind_a_live_attempt() {
+        let mut engine = test_engine().0;
+        assert!(!engine.normalisation, "engines start with normalisation off");
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+
+        // Same value: nothing changes and nothing is scheduled.
+        assert!(!engine.set_normalisation(false, &sender));
+
+        // A change while an attempt is in flight must not tear that attempt
+        // down; the rebuild is parked for the health tick instead.
+        engine.auth_running = true;
+        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
+        assert!(engine.set_normalisation(true, &sender));
+        assert!(engine.normalisation);
+        assert!(engine.rebuild_after_auth, "the in-flight attempt has the old value");
+        assert!(!engine.resume_after_reconnect, "no resume intent is set yet");
+    }
+
+    #[test]
+    fn set_normalisation_without_a_session_waits_for_the_next_login() {
+        let mut engine = test_engine().0;
+        engine.enter_needs_login();
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        assert!(engine.set_normalisation(true, &sender));
+        assert!(engine.normalisation);
+        assert!(
+            !engine.rebuild_after_auth,
+            "with no session there is nothing to rebuild"
+        );
+        assert_eq!(
+            engine.state.auth_state,
+            spotify_playback_engine::protocol::AuthState::NeedsLogin,
+            "the login flow itself must not be disturbed"
+        );
+    }
+
+    #[test]
+    fn the_health_tick_applies_a_parked_normalisation_rebuild_once_the_attempt_lands() {
+        let mut engine = test_engine().0;
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        engine.auth_running = true;
+        assert!(engine.set_normalisation(true, &sender));
+        assert!(engine.rebuild_after_auth);
+
+        // The attempt is still running: the tick must leave everything alone.
+        assert!(!engine.tick_session_health(&sender));
+        assert!(engine.rebuild_after_auth);
+
+        // The attempt lands; the next tick performs the parked rebuild.
+        // test_engine holds no cached credentials, so the rebuild itself ends
+        // in needs_login — with real credentials it would reconnect and
+        // resume; here the observable contract is that the parked change is
+        // consumed exactly once and start_authentication ran.
+        engine.auth_running = false;
+        engine.state.playing = true;
+        assert!(engine.tick_session_health(&sender));
+        assert!(!engine.rebuild_after_auth, "the parked change is consumed");
+        assert_eq!(
+            engine.state.auth_state,
+            spotify_playback_engine::protocol::AuthState::NeedsLogin,
+            "the rebuild ran (to needs_login without credentials)"
         );
     }
 

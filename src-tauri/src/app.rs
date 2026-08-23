@@ -35,6 +35,10 @@ pub struct AppSettings {
     pub launch_at_login: bool,
     pub start_minimized: bool,
     pub animated_canvas: bool,
+    /// Track-gain volume normalisation in the engine. Also handed to the live
+    /// engine over the protocol on change, so only the *initial* value comes
+    /// from here.
+    pub normalisation: bool,
 }
 
 impl Default for AppSettings {
@@ -44,6 +48,7 @@ impl Default for AppSettings {
             launch_at_login: false,
             start_minimized: false,
             animated_canvas: false,
+            normalisation: false,
         }
     }
 }
@@ -624,14 +629,17 @@ mod tests {
         assert_eq!(settings.audio_cache_limit_mb, 2048);
         assert!(!settings.launch_at_login);
         assert!(!settings.start_minimized);
+        assert!(!settings.normalisation, "normalisation defaults to off");
 
         let mut saved = AppSettings::default();
         saved.launch_at_login = true;
         saved.start_minimized = true;
+        saved.normalisation = true;
         let round_trip: AppSettings =
             serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
         assert!(round_trip.launch_at_login);
         assert!(round_trip.start_minimized);
+        assert!(round_trip.normalisation);
     }
 
     fn track(id: &str) -> Track {

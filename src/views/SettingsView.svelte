@@ -134,6 +134,23 @@
     );
   }
 
+  let normalisationError = $state("");
+
+  /* Not a startup setting: the engine applies it live by rebuilding its
+     player, so it gets its own error slot and handler. */
+  async function updateNormalisation(enabled) {
+    if (!appSettings || settingsBusy) return;
+    settingsBusy = true;
+    normalisationError = "";
+    try {
+      appSettings = await api.setNormalisation(enabled);
+    } catch (error) {
+      normalisationError = String(error || "Could not update volume normalization.");
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
   const pingLabel = $derived(
     ping === "ok" ? "Reachable" : ping === "failed" ? "No answer" : ping === "checking" ? "Checking…" : "Not checked"
   );
@@ -201,6 +218,27 @@
 
     <div class="set-group">
       <h2>Playback &amp; startup</h2>
+      <div class="set-row">
+        <div>
+          <div class="k">Volume normalization</div>
+          <div class="d">
+            Levels tracks using Spotify's loudness tags, so quiet and loud masters play at a
+            similar volume. Constant per-track gain only — it can turn tracks down but never
+            compresses or limits dynamics. Switching briefly reconnects playback.
+          </div>
+          {#if normalisationError}<div class="inline-error">{normalisationError}</div>{/if}
+        </div>
+        <div class="set-ctl">
+          <input
+            class="set-check"
+            type="checkbox"
+            aria-label="Volume normalization"
+            checked={appSettings?.normalisation ?? false}
+            disabled={!appSettings || settingsBusy}
+            onchange={(event) => updateNormalisation(event.currentTarget.checked)}
+          />
+        </div>
+      </div>
       <div class="set-row">
         <div>
           <div class="k">Launch at login</div>

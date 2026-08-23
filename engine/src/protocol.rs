@@ -361,6 +361,11 @@ pub enum Command {
     /// published in its `needs_login` state. No-op while a session is live or
     /// a flow is already running.
     Login,
+    /// Enables or disables track-gain volume normalisation (attenuation-only,
+    /// ReplayGain-style constant gain from Spotify's embedded loudness tags).
+    /// The engine rebuilds its player so a live session picks the change up
+    /// immediately; without a session it applies at the next successful login.
+    SetNormalisation { enabled: bool },
 }
 
 fn default_history_page_size() -> usize {
@@ -1061,6 +1066,31 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(logout.command, Command::Logout));
+    }
+
+    #[test]
+    fn set_normalisation_command_deserializes_from_the_line_protocol() {
+        let request: Request = serde_json::from_value(json!({
+            "request_id": "request-norm",
+            "type": "set_normalisation",
+            "enabled": true,
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.command,
+            Command::SetNormalisation { enabled: true }
+        ));
+
+        let request: Request = serde_json::from_value(json!({
+            "request_id": "request-norm-off",
+            "type": "set_normalisation",
+            "enabled": false,
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.command,
+            Command::SetNormalisation { enabled: false }
+        ));
     }
 
     #[test]

@@ -8,7 +8,9 @@ use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
 use librespot_core::Session;
-use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
+use librespot_playback::config::{
+    AudioFormat, Bitrate, NormalisationMethod, NormalisationType, PlayerConfig,
+};
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume};
 use librespot_playback::player::{Player, PlayerEventChannel};
@@ -78,6 +80,7 @@ pub fn prepare_oauth() -> Result<PendingAuth, String> {
 pub async fn connect_cached(
     cache: Cache,
     temporary_directory: PathBuf,
+    normalisation: bool,
 ) -> Result<PlaybackHandles, String> {
     let credentials = cache
         .credentials()
@@ -86,7 +89,7 @@ pub async fn connect_cached(
     session_config.tmp_dir = temporary_directory;
     let session = Session::new(session_config, Some(cache.clone()));
     match session.connect(credentials, false).await {
-        Ok(()) => create_playback(session, cache).await,
+        Ok(()) => create_playback(session, cache, normalisation).await,
         Err(error) => {
             eprintln!("cached Spotify credentials were rejected: {error}");
             session.shutdown();
@@ -102,6 +105,7 @@ pub async fn complete_oauth(
     cache: Cache,
     temporary_directory: PathBuf,
     pending: PendingAuth,
+    normalisation: bool,
 ) -> Result<PlaybackHandles, String> {
     eprintln!("Browse to: {}", pending.auth_url);
     let access_token = tokio::task::spawn_blocking(move || run_oauth_flow(pending))
@@ -118,7 +122,7 @@ pub async fn complete_oauth(
         session.shutdown();
         return Err(format!("Spotify authentication failed: {error}"));
     }
-    create_playback(session, cache).await
+    create_playback(session, cache, normalisation).await
 }
 
 /// Blocking OAuth half of [`complete_oauth`]: loopback listener + token
@@ -229,11 +233,21 @@ fn basic_client(
 /// UI projects position locally between engine events, and the engine emits a
 /// single position heartbeat every two seconds while playing. librespot must
 /// not stream 250 ms `PositionChanged` events.
-fn player_config() -> PlayerConfig {
+///
+/// Normalisation, when enabled, is deliberately the *basic* kind: one constant
+/// per-track gain from Spotify's embedded ReplayGain-style tags, clamped so it
+/// can never push a sample past full scale. That makes it pure attenuation —
+/// mathematically transparent in this float pipeline — and it never constructs
+/// librespot's dynamic limiter, which would shave transients on boosted quiet
+/// material. `Track` type keeps every track at the same perceived level.
+fn player_config(normalisation: bool) -> PlayerConfig {
     PlayerConfig {
         bitrate: Bitrate::Bitrate320,
         gapless: true,
-        normalisation: false,
+        normalisation,
+        normalisation_type: NormalisationType::Track,
+        normalisation_method: NormalisationMethod::Basic,
+        normalisation_pregain_db: 0.0,
         // librespot defaults this to a triangular ditherer, which only ever
         // runs in its fixed-point conversions (`f64_to_s16` and friends). The
         // sink takes the float path, where `Converter::f64_to_f32` is a plain
@@ -245,7 +259,11 @@ fn player_config() -> PlayerConfig {
     }
 }
 
-async fn create_playback(session: Session, cache: Cache) -> Result<PlaybackHandles, String> {
+async fn create_playback(
+    session: Session,
+    cache: Cache,
+    normalisation: bool,
+) -> Result<PlaybackHandles, String> {
     let mixer = Arc::new(
         SoftMixer::open(MixerConfig::default())
             .map_err(|error| format!("could not initialize software volume: {error}"))?,
@@ -254,7 +272,7 @@ async fn create_playback(session: Session, cache: Cache) -> Result<PlaybackHandl
     mixer.set_volume(cached_volume);
 
     let (audio_ready_tx, audio_ready_rx) = std_mpsc::sync_channel(1);
-    let config = player_config();
+    let config = player_config(normalisation);
     // Volume is applied by the rodio sink (see audio::set_sink_volume), not
     // per decoded packet, so a transport volume change is audible on the
     // next output callback instead of after the write-ahead buffer plays
@@ -319,7 +337,34 @@ mod tests {
         // Event cadence: the engine emits state on transitions plus a 2 s
         // position heartbeat while playing. librespot must not be configured
         // to stream a 250 ms PositionChanged event for the UI to poll.
-        assert!(player_config().position_update_interval.is_none());
+        assert!(player_config(false).position_update_interval.is_none());
+    }
+
+    #[test]
+    fn normalisation_is_attenuation_only_when_enabled_and_absent_when_disabled() {
+        let enabled = player_config(true);
+        assert!(enabled.normalisation, "the flag must reach the player");
+        assert_eq!(
+            enabled.normalisation_method,
+            librespot_playback::config::NormalisationMethod::Basic,
+            "basic mode is constant gain only; the dynamic limiter must never run"
+        );
+        assert_eq!(
+            enabled.normalisation_type,
+            librespot_playback::config::NormalisationType::Track,
+            "track gain keeps every track at the same perceived level"
+        );
+        assert_eq!(
+            enabled.normalisation_pregain_db, 0.0,
+            "no pregain: quiet tracks stay at their natural level"
+        );
+
+        let disabled = player_config(false);
+        assert!(!disabled.normalisation, "off stays fully off");
+        assert!(
+            disabled.gapless,
+            "enabling normalisation must not disturb the other player settings"
+        );
     }
 
     #[test]

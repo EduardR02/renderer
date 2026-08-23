@@ -481,6 +481,24 @@ pub async fn login(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.login().await
 }
 
+/// Persists the volume-normalisation preference and applies it to the live
+/// engine. The preference is saved first: if the engine request fails (engine
+/// momentarily down), the supervisor respawns it with the saved flag, so the
+/// setting converges either way — but the UI still hears about the failure.
+#[tauri::command]
+pub async fn set_normalisation(
+    client: State<'_, Arc<EngineClient>>,
+    enabled: bool,
+) -> Result<AppSettings, String> {
+    let mut settings = load_app_settings();
+    if settings.normalisation != enabled {
+        settings.normalisation = enabled;
+        save_app_settings(&settings)?;
+    }
+    client.set_normalisation(enabled).await?;
+    Ok(settings)
+}
+
 #[tauri::command]
 pub async fn logout(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.logout().await

@@ -144,7 +144,7 @@ fn configure_audio_fetch() {
 }
 
 fn main() -> ExitCode {
-    let (state_directory, log_file, audio_cache_limit_bytes) =
+    let (state_directory, log_file, audio_cache_limit_bytes, normalisation) =
         match parse_arguments(std::env::args_os().skip(1).collect()) {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -188,6 +188,7 @@ fn main() -> ExitCode {
         temporary_directory,
         credentials_file,
         state_directory,
+        normalisation,
     ));
     runtime.shutdown_timeout(Duration::from_secs(1));
     match result {
@@ -205,6 +206,7 @@ async fn run(
     temporary_directory: PathBuf,
     credentials_file: PathBuf,
     state_directory: PathBuf,
+    normalisation: bool,
 ) -> Result<(), String> {
     let (input_sender, mut input_receiver) = mpsc::unbounded_channel();
     let (auth_sender, mut auth_receiver) = mpsc::unbounded_channel::<AuthSignal>();
@@ -222,6 +224,7 @@ async fn run(
         temporary_directory,
         credentials_file,
         state_directory,
+        normalisation,
     );
     engine.start_authentication(auth_sender.clone());
     engine.emit_state()?;
@@ -721,17 +724,20 @@ async fn run(
     Ok(())
 }
 
-/// Parses `--state-dir <path>` (required) and `--log-file <path>` (optional,
+/// Parses `--state-dir <path>` (required), `--log-file <path>` (optional,
 /// the diagnostic log the parent redirects stderr to; the panic hook appends
-/// there too). Accepts the arguments in any order and tolerates extra
-/// pairs, so older launchers that only pass `--state-dir` keep working.
+/// there too), `--audio-cache-limit-mb <n>` (optional) and
+/// `--normalisation <true|false>` (optional, default off). Accepts the
+/// arguments in any order and tolerates extra pairs, so older launchers that
+/// only pass `--state-dir` keep working.
 fn parse_arguments(
     arguments: Vec<OsString>,
-) -> Result<(PathBuf, Option<PathBuf>, Option<u64>), String> {
+) -> Result<(PathBuf, Option<PathBuf>, Option<u64>, bool), String> {
     let mut state_directory: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut audio_cache_limit_bytes = Some(AUDIO_CACHE_LIMIT_BYTES);
     let mut audio_cache_limit_seen = false;
+    let mut normalisation = false;
     let mut index = 0usize;
     while index < arguments.len() {
         let name = arguments[index].to_string_lossy().into_owned();
@@ -770,13 +776,24 @@ fn parse_arguments(
                     )
                 };
             }
+            "--normalisation" => {
+                normalisation = match value.to_string_lossy().as_ref() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!(
+                            "--normalisation must be \"true\" or \"false\", got {other}"
+                        ))
+                    }
+                };
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
         index += 2;
     }
     let state_directory = state_directory
         .ok_or_else(|| "usage: SpotifyPlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned())?;
-    Ok((state_directory, log_file, audio_cache_limit_bytes))
+    Ok((state_directory, log_file, audio_cache_limit_bytes, normalisation))
 }
 
 /// One panic report: thread, payload, location, and a captured backtrace.
@@ -1053,13 +1070,14 @@ mod tests {
 
     #[test]
     fn parse_arguments_requires_state_dir_and_accepts_an_optional_log_file() {
-        let (state, log, cache_limit) = parse_arguments(os(&["--state-dir", "C:\\sr\\engine"]))
-            .expect("state dir alone");
+        let (state, log, cache_limit, normalisation) =
+            parse_arguments(os(&["--state-dir", "C:\\sr\\engine"])).expect("state dir alone");
         assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
         assert!(log.is_none(), "log file is optional");
         assert_eq!(cache_limit, Some(AUDIO_CACHE_LIMIT_BYTES));
+        assert!(!normalisation, "normalisation defaults to off");
 
-        let (state, log, cache_limit) = parse_arguments(os(&[
+        let (state, log, cache_limit, _) = parse_arguments(os(&[
             "--state-dir",
             "C:\\sr\\engine",
             "--log-file",
@@ -1076,7 +1094,7 @@ mod tests {
         assert_eq!(cache_limit, Some(4096 * 1024 * 1024));
 
         // Flag order must not matter.
-        let (state, log, cache_limit) = parse_arguments(os(&[
+        let (state, log, cache_limit, _) = parse_arguments(os(&[
             "--audio-cache-limit-mb",
             "0",
             "--log-file",
@@ -1088,6 +1106,38 @@ mod tests {
         assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
         assert!(log.is_some());
         assert_eq!(cache_limit, None, "zero selects an unlimited cache");
+    }
+
+    #[test]
+    fn parse_arguments_reads_the_normalisation_flag() {
+        let (_, _, _, normalisation) = parse_arguments(os(&[
+            "--state-dir",
+            "C:\\sr\\engine",
+            "--normalisation",
+            "true",
+        ]))
+        .expect("normalisation on");
+        assert!(normalisation);
+
+        let (_, _, _, normalisation) = parse_arguments(os(&[
+            "--state-dir",
+            "C:\\sr\\engine",
+            "--normalisation",
+            "false",
+        ]))
+        .expect("explicit off");
+        assert!(!normalisation);
+
+        assert!(
+            parse_arguments(os(&[
+                "--state-dir",
+                "C:\\sr\\engine",
+                "--normalisation",
+                "maybe",
+            ]))
+            .is_err(),
+            "a non-boolean value is rejected rather than silently ignored"
+        );
     }
 
     #[test]
