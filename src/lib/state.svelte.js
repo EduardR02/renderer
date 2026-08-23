@@ -1380,7 +1380,20 @@ export const api = {
   },
   setShuffle: (enabled) => invoke("set_shuffle", { enabled: !!enabled }),
   setRepeat: (mode) => invoke("set_repeat", { mode }),
-  setPlaybackSpeed: (speed) => invoke("set_playback_speed", { speed: Number(speed) }),
+  setPlaybackSpeed: (speed) => {
+    const target = Number(speed);
+    const previous = playback.playback_speed;
+    // Optimistic for the same reason as `seek` and `setVolume`: the speed
+    // control drops its local draft when the command *reply* lands, but the
+    // state event carrying the new speed travels a different IPC path and can
+    // arrive later — without this, the control falls back to the old value
+    // for a few frames in between and flickers forward again.
+    playback.playback_speed = target;
+    return invoke("set_playback_speed", { speed: target }).catch((error) => {
+      playback.playback_speed = previous;
+      throw error;
+    });
+  },
   playQueue: (queue, index, context = "") => {
     clearLazyQueue();
     const source = String(context ?? "").trim();

@@ -39,9 +39,13 @@ pub fn error(message: &str) {
 }
 
 fn append(level: &str, message: &str) {
-    let path = match LOG_FILE.lock().expect("app log lock").clone() {
-        Some(path) => path,
-        None => return,
+    // The lock is held across the whole write, not just the path read: two
+    // threads appending concurrently (engine supervisor vs. anything else)
+    // would otherwise interleave mid-line, because `writeln!` on an unbuffered
+    // `File` issues several separate write syscalls per line.
+    let _guard = LOG_FILE.lock().expect("app log lock");
+    let Some(path) = _guard.as_ref() else {
+        return;
     };
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
