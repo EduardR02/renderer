@@ -5,7 +5,7 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { sanitizePlaylistDescription } from "./artist.js";
+import { normalizeCanonicalPlaylistDescription } from "./artist.js";
 
 /* ---------------- Navigation ---------------- */
 
@@ -1091,7 +1091,7 @@ function normalizeSearchPlaylist(value) {
     id,
     uri: ownerValue(value.uri) || `spotify:playlist:${id}`,
     name,
-    description: sanitizePlaylistDescription(value.description),
+    description: normalizeCanonicalPlaylistDescription(value.description),
     owner,
     owner_id: ownerId,
     cover_url: coverUrl,
@@ -1119,14 +1119,22 @@ function dedupePlaylists(playlists) {
 }
 
 function mergePlaylistMetadata(primary, supplement) {
-  const primaryDescription = sanitizePlaylistDescription(primary?.description);
-  const supplementDescription = sanitizePlaylistDescription(supplement?.description);
+  const primaryDescription = normalizeCanonicalPlaylistDescription(primary?.description);
+  const supplementDescription = normalizeCanonicalPlaylistDescription(supplement?.description);
+  const primaryOwner = ownerValue(primary?.owner);
+  const primaryOwnerId = ownerValue(primary?.owner_id);
+  const supplementOwner = ownerValue(supplement?.owner) || ownerValue(supplement?.owner_name);
+  const primaryOwnerSparse = !primaryOwner ||
+    (primaryOwnerId && primaryOwner.toLowerCase() === primaryOwnerId.toLowerCase());
+  const owner = primaryOwnerSparse
+    ? supplementOwner || ownerValue(primary?.owner_name) || primaryOwner
+    : primaryOwner;
   return {
     ...supplement,
     ...primary,
     uri: primary.uri || supplement.uri,
     description: primaryDescription || supplementDescription,
-    owner: primary.owner || supplement.owner,
+    owner,
     owner_id: primary.owner_id || supplement.owner_id,
     cover_url: primary.cover_url || supplement.cover_url,
     cover_urls: primary.cover_urls?.length ? primary.cover_urls : supplement.cover_urls ?? [],
@@ -1775,7 +1783,8 @@ export async function initEvents() {
 
   // Pull initial state. The engine may not be ready yet, so the cached
   // library snapshot (hydrated by the Rust side at startup) is applied here
-  // too for an instant paint; the command response replaces it when fresh.
+  // for an instant paint. Once ready, the coalesced library event supplies
+  // fresh rootlist data without issuing a duplicate browse request.
   api
     .getState()
     .then((payload) => {
@@ -1783,11 +1792,5 @@ export async function initEvents() {
       if (payload && Array.isArray(payload.playlists)) setLibrary(payload.playlists);
     })
     .catch(() => {});
-  api
-    .browsePlaylists()
-    .then((playlists) => setLibrary(playlists))
-    // A failed fetch is still an answer: leaving the rail in its loading frame
-    // forever is worse than saying there is nothing there.
-    .catch(() => (libraryState.loaded = true));
 
 }

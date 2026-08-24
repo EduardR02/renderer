@@ -33,6 +33,7 @@
   let lastRow = $state(0);
   let curFirst = 0;
   let curLast = 0;
+  let resetFrame = 0;
 
   const dateFormatter = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short" });
   const yearFormatter = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" });
@@ -130,7 +131,6 @@
     firstRow = first;
     lastRow = last;
   }
-
   function resetWindow() {
     curFirst = 0;
     curLast = 0;
@@ -139,13 +139,21 @@
     const scroller = bodyEl?.closest(".scroll");
     if (!scroller) return;
     scroller.scrollTop = 0;
-    requestAnimationFrame(() => measure(scroller));
+    if (resetFrame) cancelAnimationFrame(resetFrame);
+    resetFrame = requestAnimationFrame(() => {
+      resetFrame = 0;
+      measure(scroller);
+    });
   }
 
   $effect(() => {
     query;
     sort;
     untrack(resetWindow);
+    return () => {
+      if (resetFrame) cancelAnimationFrame(resetFrame);
+      resetFrame = 0;
+    };
   });
 
   $effect(() => {
@@ -153,25 +161,24 @@
     if (!bodyEl) return;
     const scroller = bodyEl.closest(".scroll");
     if (!scroller) return;
-    let queued = false;
+    let scrollFrame = 0;
     const onScroll = () => {
-      if (queued) return;
-      queued = true;
-      requestAnimationFrame(() => {
-        queued = false;
+      if (scrollFrame) return;
+      scrollFrame = requestAnimationFrame(() => {
+        scrollFrame = 0;
         measure(scroller);
       });
     };
     scroller.addEventListener("scroll", onScroll, { passive: true });
     const observer = new ResizeObserver(() => measure(scroller));
     observer.observe(scroller);
-    measure(scroller);
+    untrack(() => measure(scroller));
     return () => {
       scroller.removeEventListener("scroll", onScroll);
       observer.disconnect();
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
     };
   });
-
   let toolsSentinel = $state(null);
   let toolsStuck = $state(false);
   $effect(() => observeStuck(toolsSentinel, (stuck) => (toolsStuck = stuck)));

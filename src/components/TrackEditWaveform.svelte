@@ -38,7 +38,8 @@
   let viewEnd = $state(1);
   let viewportDuration = 0;
   let drag = $state(null);
-  let drawFrame = 0;
+  let mainDrawFrame = 0;
+  let overviewDrawFrame = 0;
   let pointerFrame = 0;
   let hoverFrame = 0;
   let previewFrame = 0;
@@ -654,14 +655,34 @@
     context.globalAlpha = 1;
   }
 
-  function draw() {
-    drawFrame = 0;
+  function drawMain() {
+    mainDrawFrame = 0;
     drawWaveform(mainCanvas, mainSize, viewStart, viewEnd);
+  }
+
+  function drawOverview() {
+    overviewDrawFrame = 0;
     drawWaveform(overviewCanvas, overviewSize, 0, duration, true);
   }
 
+  function scheduleMainDraw() {
+    if (!mainDrawFrame) mainDrawFrame = requestAnimationFrame(drawMain);
+  }
+
+  function scheduleOverviewDraw() {
+    if (!overviewDrawFrame) overviewDrawFrame = requestAnimationFrame(drawOverview);
+  }
+
   function scheduleDraw() {
-    if (!drawFrame) drawFrame = requestAnimationFrame(draw);
+    scheduleMainDraw();
+    scheduleOverviewDraw();
+  }
+
+  function cancelDraws() {
+    if (mainDrawFrame) cancelAnimationFrame(mainDrawFrame);
+    if (overviewDrawFrame) cancelAnimationFrame(overviewDrawFrame);
+    mainDrawFrame = 0;
+    overviewDrawFrame = 0;
   }
 
   $effect(() => {
@@ -673,12 +694,27 @@
     else setViewport(viewStart, viewStart + Math.min(viewSpan, nextDuration));
   });
 
-  $effect(() => {
-    waveform; viewStart; viewEnd; duration;
+  function drawWaveformsForData() {
+    waveform;
+    duration;
     scheduleDraw();
+  }
+
+  function drawMainForViewport() {
+    viewStart;
+    viewEnd;
+    scheduleMainDraw();
+  }
+
+  function updateMarkers() {
+    cursorMs;
     updateCursorDom(cursorMs, true);
     updatePreviewFallback();
-  });
+  }
+
+  $effect(() => drawWaveformsForData());
+  $effect(() => drawMainForViewport());
+  $effect(() => updateMarkers());
 
   $effect(() => {
     const running = previewAnimationRunning();
@@ -706,10 +742,14 @@
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const size = { width: Math.round(entry.contentRect.width), height: Math.round(entry.contentRect.height) };
-        if (entry.target === main) mainSize = size;
-        else overviewSize = size;
+        if (entry.target === main) {
+          mainSize = size;
+          scheduleMainDraw();
+        } else {
+          overviewSize = size;
+          scheduleOverviewDraw();
+        }
       }
-      scheduleDraw();
     });
     observer.observe(main);
     observer.observe(overview);
@@ -722,7 +762,7 @@
     return () => {
       observer.disconnect();
       window.removeEventListener("keydown", onGlobalKey);
-      if (drawFrame) cancelAnimationFrame(drawFrame);
+      cancelDraws();
       if (pointerFrame) cancelAnimationFrame(pointerFrame);
       if (hoverFrame) cancelAnimationFrame(hoverFrame);
       stopPreviewAnimation();

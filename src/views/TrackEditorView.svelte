@@ -19,6 +19,7 @@
   let retryGeneration = $state(0), waveform = $state(null), waveformState = $state("idle"), waveformError = $state("");
   let definitionGeneration = 0, waveformGeneration = 0, previewGeneration = 0, keySequence = 0;
   let previewRequest = $state(null), previewQueueAwaiting = $state(null), previewQueueIdentity = $state("");
+  let previewCutsSource = null, previewCutsSignature = "", previewCuts = [];
 
   function keyed(range, prefix) {
     return {
@@ -202,31 +203,32 @@
   }
   async function save() {
     if (!dirty || !ready || !track || saving || validation.firstError || (!cuts.length && !loopRange)) return;
-    const id = track.id, sourcePlaylist = playlistId, nextCuts = canonicalCuts(), nextLoop = canonicalLoop();
+    const id = track.id, sourcePlaylist = playlistId, generation = definitionGeneration;
+    const nextCuts = canonicalCuts(), nextLoop = canonicalLoop();
     saving = true;
     actionError = "";
     try {
       const definition = await api.saveTrackEdit(id, duration, nextCuts, nextLoop);
-      if (!active(id, sourcePlaylist)) return;
+      if (!active(id, sourcePlaylist, generation)) return;
       loopRange = hydrateLoop(definition?.loop_range);
       baseline = snapshot();
       definitionExists = true;
       selected = null;
       markPreviewStale();
     } catch (reason) {
-      if (active(id, sourcePlaylist)) actionError = String(reason || "Could not save this edit.");
+      if (active(id, sourcePlaylist, generation)) actionError = String(reason || "Could not save this edit.");
     } finally {
-      if (active(id, sourcePlaylist)) saving = false;
+      if (active(id, sourcePlaylist, generation)) saving = false;
     }
   }
   async function removeDefinition() {
     if (!ready || !track || saving || !definitionExists) return;
-    const id = track.id, sourcePlaylist = playlistId;
+    const id = track.id, sourcePlaylist = playlistId, generation = definitionGeneration;
     saving = true;
     actionError = "";
     try {
       await api.deleteTrackEdit(id);
-      if (!active(id, sourcePlaylist)) return;
+      if (!active(id, sourcePlaylist, generation)) return;
       cuts = [];
       loopRange = null;
       selected = null;
@@ -235,23 +237,23 @@
       enabled = false;
       markPreviewStale();
     } catch (reason) {
-      if (active(id, sourcePlaylist)) actionError = String(reason || "Could not remove this edit.");
+      if (active(id, sourcePlaylist, generation)) actionError = String(reason || "Could not remove this edit.");
     } finally {
-      if (active(id, sourcePlaylist)) saving = false;
+      if (active(id, sourcePlaylist, generation)) saving = false;
     }
   }
   async function setEnabled(value) {
     if (!ready || !playlistId || !track || saving) return;
-    const id = track.id, sourcePlaylist = playlistId;
+    const id = track.id, sourcePlaylist = playlistId, generation = definitionGeneration;
     saving = true;
     actionError = "";
     try {
       await api.setPlaylistTrackEditEnabled(sourcePlaylist, id, value);
-      if (active(id, sourcePlaylist)) enabled = value;
+      if (active(id, sourcePlaylist, generation)) enabled = value;
     } catch (reason) {
-      if (active(id, sourcePlaylist)) actionError = String(reason || "Could not update this playlist.");
+      if (active(id, sourcePlaylist, generation)) actionError = String(reason || "Could not update this playlist.");
     } finally {
-      if (active(id, sourcePlaylist)) saving = false;
+      if (active(id, sourcePlaylist, generation)) saving = false;
     }
   }
   const currentQueueTrack = $derived(
@@ -443,7 +445,7 @@
       : Math.max(0, duration - editCuts.reduce((total, cut) => total + (cut.end_ms - cut.start_ms), 0));
     const compiled = Math.max(0, Math.min(transportDuration, Math.round(Number(position) || 0)));
     let removed = 0;
-    for (const cut of canonicalCuts(editCuts)) {
+    for (const cut of editCuts) {
       const seam = cut.start_ms - removed;
       if (compiled < seam) break;
       removed += cut.end_ms - cut.start_ms;
@@ -469,10 +471,13 @@
 
   function readPreviewPosition() {
     if (!previewIsCurrent || !editorTrackCurrent || !currentQueueTrack?.effective_edit) return null;
-    return compiledToSource(
-      projectedPlaybackPositionMs(),
-      currentQueueTrack.effective_edit.cuts ?? [],
-    );
+    const editCuts = currentQueueTrack.effective_edit.cuts;
+    if (previewCutsSource !== editCuts || previewCutsSignature !== queueEditSignature) {
+      previewCutsSource = editCuts;
+      previewCutsSignature = queueEditSignature;
+      previewCuts = canonicalCuts(editCuts ?? []);
+    }
+    return compiledToSource(projectedPlaybackPositionMs(), previewCuts);
   }
 
   const previewPositionMs = $derived.by(() => readPreviewPosition());
@@ -533,6 +538,7 @@
   $effect(() => {
     const id = track?.id, sourcePlaylist = playlistId;
     retryGeneration;
+    saving = false;
     const generation = ++definitionGeneration;
     loading = !!id;
     loadError = actionError = "";
