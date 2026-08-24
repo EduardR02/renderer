@@ -20,6 +20,7 @@ use crate::app::{
 use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
+use crate::media_keys;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
     ArtistReleasePageDetail, CacheStats, HistoryPage, LikedSongsDetail, Playlist, PlaylistDetail,
@@ -795,6 +796,7 @@ pub async fn consume_states(app: AppHandle) {
                 apply_position_heartbeat(&mut guard, heartbeat);
                 drop(guard);
                 let _ = app.emit("position", heartbeat.position_ms);
+                media_keys::update_position(heartbeat.position_ms);
                 continue;
             }
             // The engine out-ran this consumer; the next line re-syncs
@@ -855,6 +857,7 @@ pub async fn consume_states(app: AppHandle) {
         // Full states are reserved for real changes; heartbeats were already
         // forwarded as scalar `position` events above.
         let _ = app.emit("state", &state);
+        media_keys::update_state(&state);
         if session_changed {
             let _ = app.emit(
                 "session",

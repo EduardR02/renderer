@@ -30,4 +30,5 @@ parking_lot = "0.12"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "system-proxy"] }
 sha1 = "0.10"
+souvlaki = "0.8"
 spotify-playback-engine = { path = "../engine" }

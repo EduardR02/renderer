@@ -3,6 +3,7 @@ mod commands;
 mod covers;
 mod engine_client;
 mod log;
+mod media_keys;
 mod types;
 
 use std::sync::Arc;
@@ -137,6 +138,19 @@ pub fn run() {
             app.manage(client.clone());
             let supervisor = client.clone();
             tauri::async_runtime::spawn(async move { supervisor.supervise().await });
+
+            // Register the window with Windows' media transport controls so
+            // hardware play/pause/next/previous keys work while unfocused.
+            if let Some(window) = app.get_webview_window("main") {
+                match window.hwnd() {
+                    Ok(hwnd) => media_keys::init(client.clone(), hwnd.0),
+                    Err(error) => log::warn(&format!(
+                        "could not get the main window handle for media keys: {error}"
+                    )),
+                }
+            } else {
+                log::warn("could not find the main window for media keys");
+            }
             // Re-request status shortly after startup so a state line always
             // lands after the event consumer has subscribed, even if the
             // engine's very first line beat it.
