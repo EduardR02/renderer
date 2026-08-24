@@ -135,6 +135,10 @@ pub struct Engine {
     seek_in_flight: bool,
     /// Whether the seek that set `seek_in_flight` was issued while playing.
     seek_should_play: bool,
+    /// The customization revision expected by loop-boundary signals. Markers
+    /// can remain queued in the audio callback after a track/config change, so
+    /// delivery must be tied to the pipeline that produced them.
+    audio_revision: u64,
     /// The decoder reached physical EOF while a loop boundary was still
     /// draining through the output queue. `Player::seek` is invalid in
     /// librespot's EndOfTrack state, so the audible marker reloads the same
@@ -260,6 +264,10 @@ impl Engine {
             generation: 0,
             seek_in_flight: false,
             seek_should_play: false,
+            // No marker produced before this engine was constructed belongs
+            // to its first queue, even when the process-wide audio revision
+            // was already advanced by an earlier player instance.
+            audio_revision: crate::audio::customization_revision().wrapping_add(1),
             loop_decoder_eof: false,
             loop_jump_pending: false,
             loop_pass: 1,
@@ -1101,6 +1109,7 @@ impl Engine {
                     self.recent_unavailable.clear();
                     self.player = None;
                     self.mixer = None;
+                    self.invalidate_audio_signals();
                     if let Some(session) = self.session.take() {
                         session.shutdown();
                     }
@@ -1109,7 +1118,7 @@ impl Engine {
                     false
                 }
             }
-            _ => false,
+            PlayerSignal::Event { .. } | PlayerSignal::Closed { .. } => false,
         }
     }
 
@@ -1117,7 +1126,13 @@ impl Engine {
         match signal {
             // Deliberately not gated on `playing`: the boundary was reached,
             // and the jump is what re-arms the pipeline to emit the next one.
-            AudioSignal::LoopBoundary { position_ms } => {
+            AudioSignal::LoopBoundary {
+                position_ms,
+                revision,
+            } => {
+                if revision != self.audio_revision {
+                    return false;
+                }
                 let Some(loop_range) = self.current_loop() else {
                     return false;
                 };
@@ -1157,13 +1172,13 @@ impl Engine {
         }
     }
 
-    fn configure_current_audio_at_loop_pass(&self, position_ms: u32, loop_pass: u32) {
+    fn configure_current_audio_at_loop_pass(&mut self, position_ms: u32, loop_pass: u32) {
         let edit = self
             .state
             .current_index
             .and_then(|index| self.state.queue.get(index))
             .and_then(|track| track.effective_edit.clone());
-        crate::audio::configure_customization_at_loop_pass(
+        self.audio_revision = crate::audio::configure_customization_at_loop_pass(
             edit,
             self.state.playback_speed,
             position_ms,
@@ -1171,13 +1186,13 @@ impl Engine {
         );
     }
 
-    fn configure_current_audio_after_natural_boundary(&self, position_ms: u32) {
+    fn configure_current_audio_after_natural_boundary(&mut self, position_ms: u32) {
         let edit = self
             .state
             .current_index
             .and_then(|index| self.state.queue.get(index))
             .and_then(|track| track.effective_edit.clone());
-        crate::audio::configure_customization_after_natural_boundary(
+        self.audio_revision = crate::audio::configure_customization_after_natural_boundary(
             edit,
             self.state.playback_speed,
             position_ms,
@@ -1189,6 +1204,10 @@ impl Engine {
             .and_then(|index| self.state.queue.get(index))
             .and_then(|track| track.effective_edit.as_ref())
             .and_then(|edit| edit.loop_range)
+    }
+
+    fn invalidate_audio_signals(&mut self) {
+        self.audio_revision = self.audio_revision.wrapping_add(1);
     }
 
     fn loop_pass_for_position(&self, position_ms: u32) -> u32 {
@@ -1297,6 +1316,7 @@ impl Engine {
     fn install_empty_or_unavailable_queue(&mut self, queue: Vec<TrackRef>) -> Result<bool, String> {
         self.finalize_listening(false);
         self.player()?.stop();
+        self.invalidate_audio_signals();
         self.state.queue = queue;
         self.state.current_index = None;
         self.state.position_ms = 0;
@@ -1411,6 +1431,7 @@ impl Engine {
         if let Some(player) = &self.player {
             player.stop();
         }
+        self.invalidate_audio_signals();
         let playable_index = if queue.is_empty() {
             None
         } else {
@@ -1486,7 +1507,8 @@ impl Engine {
         if self.seek_in_flight {
             self.seek_should_play = true;
         }
-        if self.current_needs_load
+        if self.loop_decoder_eof
+            || self.current_needs_load
             || self.loading_failed
             || (self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms)
         {
@@ -1511,10 +1533,11 @@ impl Engine {
         // Paused event must be delivered, not suppressed.
         self.seek_in_flight = false;
         self.seek_should_play = false;
-        // `Unavailable` stops the player below, so a later pause must not send
-        // `pause` to librespot's terminal Loading/Stopped state. Play will
-        // issue a fresh load when requested.
-        if !self.loading_failed && !self.current_needs_load {
+        // `Unavailable` and a decoder EOF stop the current loader below, so
+        // a later pause must not send `pause` to librespot's terminal
+        // Loading/EndOfTrack state. Play will issue a fresh load when
+        // requested.
+        if !self.loading_failed && !self.current_needs_load && !self.loop_decoder_eof {
             self.player()?.pause();
         }
         self.state.playing = false;
@@ -1680,6 +1703,7 @@ impl Engine {
                 // device drains it; explicit queue exhaustion still stops.
                 if !at_end {
                     self.player()?.stop();
+                    self.invalidate_audio_signals();
                 }
                 self.state.playing = false;
                 self.update_position(self.state.duration_ms);
@@ -1706,7 +1730,7 @@ impl Engine {
                 self.seek_source_at_loop_pass(position)?;
             }
         } else {
-            crate::audio::configure_customization(None, speed, 0);
+            self.audio_revision = crate::audio::configure_customization(None, speed, 0);
         }
         Ok(true)
     }
@@ -1799,6 +1823,7 @@ impl Engine {
             None => {}
             Some(_) if self.state.queue.is_empty() => {
                 self.player()?.stop();
+                self.invalidate_audio_signals();
                 self.state.current_index = None;
                 self.state.duration_ms = 0;
                 self.state.playing = false;
@@ -1818,6 +1843,7 @@ impl Engine {
                 } else {
                     self.player()?.stop();
                     self.state.playing = false;
+                    self.invalidate_audio_signals();
                     self.play_request_id = None;
                     self.current_needs_load = false;
                 }
@@ -2140,6 +2166,7 @@ impl Engine {
                 if let Some(player) = &self.player {
                     player.stop();
                 }
+                self.invalidate_audio_signals();
 
                 // An isolated failure can be a corrupt/truncated cache entry;
                 // librespot's decoder retry handles one cached format and
@@ -2180,6 +2207,7 @@ impl Engine {
         if let Some(player) = self.player.take() {
             player.stop();
         }
+        self.invalidate_audio_signals();
         self.play_request_id = None;
         self.loading_failed = false;
         self.current_needs_load = self.state.current_index.is_some();
@@ -2785,7 +2813,10 @@ mod tests {
         }));
         assert!(engine.loop_decoder_eof);
 
-        assert!(engine.on_audio_signal(AudioSignal::LoopBoundary { position_ms: 1_500 }));
+        assert!(engine.on_audio_signal(AudioSignal::LoopBoundary {
+            position_ms: 1_500,
+            revision: engine.audio_revision,
+        }));
         assert_eq!(engine.state.position_ms, 1_500);
         assert!(
             !engine.loop_decoder_eof,
@@ -2912,6 +2943,7 @@ mod tests {
             for pass in 2..=play_count {
                 assert!(engine.on_audio_signal(AudioSignal::LoopBoundary {
                     position_ms: 20_000,
+                    revision: engine.audio_revision,
                 }));
                 assert_eq!(engine.loop_pass, pass);
                 markers += 1;
@@ -2919,9 +2951,27 @@ mod tests {
             assert_eq!(markers, play_count - 1);
             assert!(!engine.on_audio_signal(AudioSignal::LoopBoundary {
                 position_ms: 20_000,
+                revision: engine.audio_revision,
             }));
             assert_eq!(engine.loop_pass, play_count);
         }
+    }
+
+    #[test]
+    fn stale_loop_marker_from_replaced_audio_is_ignored() {
+        let mut engine = playing_engine();
+        engine.state.queue[0].effective_edit = Some(spotify_playback_engine::protocol::TrackEdit {
+            cuts: Vec::new(),
+            loop_range: Some(loop_range(20_000, 40_000, 2)),
+        });
+        let stale_revision = engine.audio_revision;
+        engine.invalidate_audio_signals();
+
+        assert!(!engine.on_audio_signal(AudioSignal::LoopBoundary {
+            position_ms: 20_000,
+            revision: stale_revision,
+        }));
+        assert_eq!(engine.loop_pass, 1);
     }
 
     #[test]
@@ -2937,6 +2987,7 @@ mod tests {
         assert_eq!(engine.loop_pass, 2);
 
         engine.state.position_ms = 40_000;
+
         assert_eq!(engine.set_playback_speed(2.0), Ok(true));
         assert_eq!(engine.loop_pass, 3);
 
@@ -2948,6 +2999,22 @@ mod tests {
         loaded_engine.loop_decoder_eof = true;
         assert!(loaded_engine.set_playback_speed(1.5).is_err());
         assert_eq!(loaded_engine.loop_pass, 2);
+    }
+
+    #[test]
+    fn play_reloads_after_decoder_eof_before_a_loop_marker() {
+        let (mut engine, _) = test_engine();
+        engine.state =
+            edited_playback_state(100_000, Vec::new(), Some(loop_range(20_000, 40_000, 2)));
+        engine.state.position_ms = 25_000;
+        engine.loop_pass = 1;
+        engine.loop_decoder_eof = true;
+
+        assert!(engine.play().is_err(), "the capture engine has no player");
+        assert!(
+            !engine.loop_decoder_eof,
+            "play must re-arm a loader instead of calling play on EndOfTrack"
+        );
     }
 
     #[test]
@@ -3326,9 +3393,11 @@ mod tests {
         loop_engine.current_needs_load = true;
         assert!(loop_engine.on_audio_signal(AudioSignal::LoopBoundary {
             position_ms: 70_000,
+            revision: loop_engine.audio_revision,
         }));
         assert!(loop_engine.on_audio_signal(AudioSignal::LoopBoundary {
             position_ms: 70_000,
+            revision: loop_engine.audio_revision,
         }));
         assert_eq!(loop_engine.loop_pass, 3);
         assert_eq!(loop_engine.state.position_ms, 70_000);

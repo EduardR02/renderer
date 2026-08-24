@@ -166,7 +166,7 @@ static AUDIO_SIGNAL_SENDER: Mutex<Option<mpsc::UnboundedSender<AudioSignal>>> = 
 
 #[derive(Clone, Copy, Debug)]
 pub enum AudioSignal {
-    LoopBoundary { position_ms: u32 },
+    LoopBoundary { position_ms: u32, revision: u64 },
 }
 
 struct Customization {
@@ -183,8 +183,8 @@ pub fn install_signal_sender(sender: mpsc::UnboundedSender<AudioSignal>) {
         .expect("audio signal sender should not be poisoned") = Some(sender);
 }
 
-pub fn configure_customization(edit: Option<TrackEdit>, speed: f32, position_ms: u32) {
-    configure_customization_at_loop_pass(edit, speed, position_ms, 1);
+pub fn configure_customization(edit: Option<TrackEdit>, speed: f32, position_ms: u32) -> u64 {
+    configure_customization_at_loop_pass(edit, speed, position_ms, 1)
 }
 
 /// Installs a discontinuous customization at a known finite-loop pass. The
@@ -195,8 +195,8 @@ pub fn configure_customization_at_loop_pass(
     speed: f32,
     position_ms: u32,
     loop_pass: u32,
-) {
-    set_customization(edit, speed, position_ms, true, loop_pass);
+) -> u64 {
+    set_customization(edit, speed, position_ms, true, loop_pass)
 }
 
 /// Installs the next gapless track without discarding audio already queued from
@@ -206,8 +206,8 @@ pub fn configure_customization_after_natural_boundary(
     edit: Option<TrackEdit>,
     speed: f32,
     position_ms: u32,
-) {
-    set_customization(edit, speed, position_ms, false, 1);
+) -> u64 {
+    set_customization(edit, speed, position_ms, false, 1)
 }
 
 fn set_customization(
@@ -216,7 +216,7 @@ fn set_customization(
     position_ms: u32,
     discontinuous: bool,
     loop_pass: u32,
-) {
+) -> u64 {
     let config = PipelineConfig {
         edit,
         speed,
@@ -230,7 +230,9 @@ fn set_customization(
     customization.config = active.then_some(config);
     customization.discontinuous |= discontinuous;
     CUSTOMIZATION_ACTIVE.store(active, Ordering::Release);
-    CUSTOMIZATION_REVISION.fetch_add(1, Ordering::Release);
+    let revision = CUSTOMIZATION_REVISION
+        .fetch_add(1, Ordering::Release)
+        .wrapping_add(1);
     drop(customization);
 
     if discontinuous {
@@ -242,6 +244,12 @@ fn set_customization(
             ring.clear();
         }
     }
+
+    revision
+}
+
+pub fn customization_revision() -> u64 {
+    CUSTOMIZATION_REVISION.load(Ordering::Acquire)
 }
 
 /// Flushes the delayed WSOLA overlap region at decoder EOF without resetting
@@ -279,7 +287,7 @@ pub fn finish_natural_boundary() -> Result<(), String> {
     if queued.is_empty() {
         return Ok(());
     }
-    ring.push_marked(queued, None, WRITE_DRAIN_TIMEOUT)
+    ring.push_marked(queued, None, 0, WRITE_DRAIN_TIMEOUT)
         .map_err(|()| "rodio sink stalled while flushing the natural EOF tail".to_owned())
 }
 
@@ -411,6 +419,10 @@ struct SampleRing {
 struct RingPacket {
     samples: Vec<f32>,
     loop_to_ms: Option<u32>,
+    /// The customization revision that produced the marker. A packet can
+    /// outlive a seek/track change, so reading the current global revision at
+    /// delivery time would incorrectly retag stale audio as current.
+    loop_revision: u64,
     boundary_id: u64,
 }
 
@@ -454,18 +466,33 @@ impl SampleRing {
 
     #[cfg(test)]
     fn push(&self, packet: Vec<f32>, timeout: Duration) -> Result<(), ()> {
-        self.push_marked(packet, None, timeout)
+        self.push_marked(packet, None, 0, timeout)
     }
 
     fn push_marked(
         &self,
         samples: Vec<f32>,
         loop_to_ms: Option<u32>,
+        loop_revision: u64,
         timeout: Duration,
     ) -> Result<(), ()> {
         let generation = self.generation.load(Ordering::Acquire);
+        self.push_marked_at_generation(generation, samples, loop_to_ms, loop_revision, timeout)
+    }
+
+    fn push_marked_at_generation(
+        &self,
+        generation: u64,
+        samples: Vec<f32>,
+        loop_to_ms: Option<u32>,
+        loop_revision: u64,
+        timeout: Duration,
+    ) -> Result<(), ()> {
         let deadline = Instant::now() + timeout;
         let mut state = self.lock();
+        if self.generation.load(Ordering::Acquire) != generation {
+            return Ok(());
+        }
         while state.queued_samples >= self.capacity {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(());
@@ -475,6 +502,9 @@ impl SampleRing {
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(PoisonError::into_inner);
             state = guard;
+            if self.generation.load(Ordering::Acquire) != generation {
+                return Ok(());
+            }
         }
         let boundary_id = if loop_to_ms.is_some() {
             state.next_boundary_id = state.next_boundary_id.wrapping_add(1);
@@ -486,6 +516,7 @@ impl SampleRing {
         state.packets.push_back(RingPacket {
             samples,
             loop_to_ms,
+            loop_revision,
             boundary_id,
         });
 
@@ -597,18 +628,18 @@ impl Iterator for LiveSource {
             }
         }
 
-        // A packet can carry a loop marker and no samples, when the loop end
-        // fell on a packet boundary. Draining rather than popping once keeps
-        // the marker on the exact frame it belongs to, and stops an empty
-        // packet from indexing past the end below.
         while self.pos == self.packet.samples.len() {
             if let Some(position_ms) = self.packet.loop_to_ms.take() {
+                let revision = self.packet.loop_revision;
                 if let Some(sender) = AUDIO_SIGNAL_SENDER
                     .lock()
                     .expect("audio signal sender should not be poisoned")
                     .as_ref()
                 {
-                    let _ = sender.send(AudioSignal::LoopBoundary { position_ms });
+                    let _ = sender.send(AudioSignal::LoopBoundary {
+                        position_ms,
+                        revision,
+                    });
                 }
                 let boundary_id = std::mem::take(&mut self.packet.boundary_id);
                 self.ring.acknowledge_boundary(boundary_id);
@@ -930,6 +961,7 @@ impl Sink for RodioSink {
     }
 
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        let ring_generation = self.ring.generation.load(Ordering::Acquire);
         let samples = packet
             .samples()
             .map_err(|error| SinkError::OnWrite(error.to_string()))?;
@@ -988,7 +1020,13 @@ impl Sink for RodioSink {
         // librespot pauses playback (its `handle_packet` error path), which
         // stops further writes and leaves the engine alive and recoverable.
         self.ring
-            .push_marked(queued, loop_to_ms, WRITE_DRAIN_TIMEOUT)
+            .push_marked_at_generation(
+                ring_generation,
+                queued,
+                loop_to_ms,
+                loop_to_ms.map_or(0, |_| revision),
+                WRITE_DRAIN_TIMEOUT,
+            )
             .map_err(|()| {
                 SinkError::OnWrite("rodio sink stalled: audio output is not draining".to_owned())
             })
@@ -1109,6 +1147,17 @@ mod tests {
             tail[1..].iter().all(|s| *s == 0.0),
             "audio already handed to the source must stop within one frame: {tail:?}"
         );
+    }
+
+    #[test]
+    fn a_packet_processed_before_stop_is_not_requeued_after_stop() {
+        let ring = test_ring();
+        let generation = ring.generation.load(Ordering::Acquire);
+        ring.clear();
+
+        ring.push_marked_at_generation(generation, packet(8), None, 0, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(ring.queued_samples(), 0);
     }
 
     /// Underrun silence must be a whole number of frames. A single stray
@@ -1494,7 +1543,7 @@ mod tests {
         let producer_ring = Arc::clone(&ring);
         let producer = std::thread::spawn(move || {
             producer_ring
-                .push_marked(Vec::new(), Some(4_200), Duration::from_secs(1))
+                .push_marked(Vec::new(), Some(4_200), 0, Duration::from_secs(1))
                 .unwrap();
         });
         while ring.lock().next_boundary_id == 0 {
@@ -1510,7 +1559,10 @@ mod tests {
         assert_eq!(source.next(), Some(0.0));
         producer.join().unwrap();
         match receiver.try_recv() {
-            Ok(AudioSignal::LoopBoundary { position_ms }) => assert_eq!(position_ms, 4_200),
+            Ok(AudioSignal::LoopBoundary {
+                position_ms,
+                revision: 0,
+            }) => assert_eq!(position_ms, 4_200),
             other => panic!("expected the loop boundary, got {other:?}"),
         }
     }
@@ -1522,7 +1574,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
             producer_ring
-                .push_marked(Vec::new(), Some(900), Duration::from_secs(1))
+                .push_marked(Vec::new(), Some(900), 0, Duration::from_secs(1))
                 .unwrap();
             done_tx.send(()).unwrap();
         });

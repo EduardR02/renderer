@@ -95,6 +95,7 @@ impl AudioPipeline {
 
     pub fn reset_buffers(&mut self) {
         self.filtered.clear();
+        self.loop_sent = false;
         if let Some(stretcher) = &mut self.stretcher {
             stretcher.reset();
         }
@@ -915,6 +916,35 @@ mod tests {
                 "speed {speed} must flush exactly through the original-time loop end"
             );
         }
+    }
+
+    #[test]
+    fn reset_buffers_rearms_a_loop_marker_for_the_resumed_pass() {
+        let edit = TrackEdit {
+            cuts: Vec::new(),
+            loop_range: Some(LoopRange {
+                start_ms: 20,
+                end_ms: 40,
+                play_count: 2,
+            }),
+        };
+        let mut pipeline = AudioPipeline::new(&PipelineConfig {
+            edit: Some(edit),
+            speed: 1.0,
+            position_ms: 0,
+            loop_pass: 1,
+        });
+        let mut output = Vec::new();
+        let first = source_ramp(0, ms_to_frame(80) as usize);
+        assert_eq!(pipeline.process(&first, &mut output), Some(20));
+
+        pipeline.reset_buffers();
+        output.clear();
+        let resumed = source_ramp(
+            ms_to_frame(40) as usize,
+            (ms_to_frame(80) - ms_to_frame(40)) as usize,
+        );
+        assert_eq!(pipeline.process(&resumed, &mut output), Some(20));
     }
 
     #[test]

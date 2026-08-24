@@ -419,7 +419,8 @@ impl Envelope {
             if self.is_full() {
                 break;
             }
-            let bin = self.bin_index.min(self.peaks.len().saturating_sub(1));
+            debug_assert!(self.bin_index < self.peaks.len());
+            let bin = self.bin_index;
             let low = quantize(frame[0].min(frame[1]));
             let high = quantize(frame[0].max(frame[1]));
             let peak = &mut self.peaks[bin];
@@ -435,7 +436,7 @@ impl Envelope {
             self.bin_phase += self.bin_phase_step;
             if self.bin_phase >= SAMPLE_RATE {
                 self.bin_phase -= SAMPLE_RATE;
-                self.bin_index = self.bin_index.saturating_add(1);
+                self.bin_index += 1;
             }
         }
         Ok(())
@@ -511,9 +512,13 @@ fn read_or_invalidate_artifact(
     match read_artifact(path, expected_duration_ms) {
         Ok(result) => Ok(result),
         Err(error) => {
-            fs::remove_file(path).map_err(|remove_error| {
-                format!("malformed waveform cache could not be removed ({error}): {remove_error}")
-            })?;
+            if let Err(remove_error) = fs::remove_file(path) {
+                if remove_error.kind() != io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "malformed waveform cache could not be removed ({error}): {remove_error}"
+                    ));
+                }
+            }
             eprintln!(
                 "regenerating malformed waveform cache {}: {error}",
                 path.display()
@@ -612,7 +617,7 @@ fn write_artifact_atomic(path: &Path, duration_ms: u32, payload: &[u8]) -> Resul
             .and_then(|_| file.write_all(payload))
             .and_then(|_| file.sync_all())
             .map_err(|error| format!("could not write waveform cache artifact: {error}"))?;
-        fs::rename(&temp, path)
+        replace_file_atomically(&temp, path)
             .map_err(|error| format!("could not commit waveform cache artifact: {error}"))?;
         Ok(())
     })();
@@ -620,6 +625,45 @@ fn write_artifact_atomic(path: &Path, duration_ms: u32, payload: &[u8]) -> Resul
         let _ = fs::remove_file(&temp);
     }
     write_result
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_payload(duration_ms: u32, payload: &[u8]) -> Result<(), String> {
@@ -877,6 +921,8 @@ mod tests {
         let payload = envelope.finish();
         write_artifact_atomic(&path, 20, &payload).unwrap();
         assert_eq!(read_artifact(&path, 20).unwrap().unwrap(), payload);
+        write_artifact_atomic(&path, 20, &payload)
+            .expect("atomic cache writes replace an existing artifact");
         let mut coarse = fs::read(&path).unwrap();
         coarse[4..6].copy_from_slice(&1u16.to_le_bytes());
         coarse[12..14].copy_from_slice(&10u16.to_le_bytes());
