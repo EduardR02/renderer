@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::app::{
-    carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
-    load_app_settings, load_playlist_list, now_secs, order_by_last_activity,
+    AppSettings, AppState, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH, PlaylistListCache,
+    PlaylistTracksEntry, carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir,
+    engine_state_dir, load_app_settings, load_playlist_list, now_secs, order_by_last_activity,
     playlist_detail_from_cache, save_app_settings, save_playlist_list, save_tracks_cache,
     touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, upsert_playlist,
-    upsert_tracks_cache, AppSettings, AppState, PlaylistListCache, PlaylistTracksEntry,
-    CACHE_STATS_TTL_SECS, LIBRARY_LENGTH,
+    upsert_tracks_cache,
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
@@ -97,7 +97,7 @@ pub async fn preview_track_edit(
     client: State<'_, Arc<EngineClient>>,
     track: Track,
     cuts: Vec<spotify_playback_engine::protocol::TimeRange>,
-    loop_range: Option<spotify_playback_engine::protocol::TimeRange>,
+    loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
     position_ms: u32,
 ) -> Result<(), String> {
     client
@@ -201,7 +201,7 @@ pub async fn save_track_edit(
     track_id: String,
     duration_ms: u32,
     cuts: Vec<spotify_playback_engine::protocol::TimeRange>,
-    loop_range: Option<spotify_playback_engine::protocol::TimeRange>,
+    loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
 ) -> Result<spotify_playback_engine::protocol::TrackEditDefinition, String> {
     client
         .save_track_edit(&track_id, duration_ms, &cuts, loop_range)

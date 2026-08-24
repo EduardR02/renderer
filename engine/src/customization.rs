@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use spotify_playback_engine::protocol::{
-    TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
+    LoopRange, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
 };
 
 const STORE_VERSION: u32 = 1;
@@ -22,7 +22,7 @@ struct StoredEdits {
 struct StoredDefinition {
     duration_ms: u32,
     cuts: Vec<TimeRange>,
-    loop_range: Option<TimeRange>,
+    loop_range: Option<LoopRange>,
 }
 
 impl StoredDefinition {
@@ -125,7 +125,7 @@ impl TrackEditStore {
         track_id: String,
         duration_ms: u32,
         cuts: Vec<TimeRange>,
-        loop_range: Option<TimeRange>,
+        loop_range: Option<LoopRange>,
     ) -> Result<TrackEditDefinition, String> {
         self.ensure_writable()?;
         validate_definition(&track_id, duration_ms, &cuts, loop_range)?;
@@ -361,7 +361,7 @@ pub fn validate_definition(
     track_id: &str,
     duration_ms: u32,
     cuts: &[TimeRange],
-    loop_range: Option<TimeRange>,
+    loop_range: Option<LoopRange>,
 ) -> Result<(), String> {
     validate_identifier("track id", track_id)?;
     if duration_ms == 0 {
@@ -388,8 +388,15 @@ pub fn validate_definition(
     }
 
     if let Some(loop_range) = loop_range {
-        validate_range("loop", loop_range, duration_ms)?;
-        if cuts.iter().any(|cut| ranges_overlap(*cut, loop_range)) {
+        let loop_time = TimeRange {
+            start_ms: loop_range.start_ms,
+            end_ms: loop_range.end_ms,
+        };
+        validate_range("loop", loop_time, duration_ms)?;
+        if !(2..=32).contains(&loop_range.play_count) {
+            return Err("loop play count must be between 2 and 32".to_owned());
+        }
+        if cuts.iter().any(|cut| ranges_overlap(*cut, loop_time)) {
             return Err("the loop range cannot overlap a cut range".to_owned());
         }
     }
@@ -417,13 +424,20 @@ fn validate_range(label: &str, range: TimeRange, duration_ms: u32) -> Result<(),
 fn ranges_overlap(left: TimeRange, right: TimeRange) -> bool {
     left.start_ms < right.end_ms && right.start_ms < left.end_ms
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn range(start_ms: u32, end_ms: u32) -> TimeRange {
         TimeRange { start_ms, end_ms }
+    }
+
+    fn loop_range(start_ms: u32, end_ms: u32, play_count: u32) -> LoopRange {
+        LoopRange {
+            start_ms,
+            end_ms,
+            play_count,
+        }
     }
 
     #[test]
@@ -447,15 +461,38 @@ mod tests {
             .is_err()
         );
         assert!(validate_definition("track", 10_000, &[range(2_000, 11_000)], None).is_err());
-        assert!(validate_definition("track", 10_000, &[], Some(range(5_000, 5_000))).is_err());
+        assert!(
+            validate_definition("track", 10_000, &[], Some(loop_range(5_000, 5_000, 2))).is_err()
+        );
         assert!(
             validate_definition(
                 "track",
                 10_000,
                 &[range(2_000, 4_000)],
-                Some(range(3_000, 6_000))
+                Some(loop_range(3_000, 6_000, 2))
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_loop_play_counts() {
+        for play_count in [0, 1, 33, u32::MAX] {
+            assert!(
+                validate_definition(
+                    "track",
+                    10_000,
+                    &[],
+                    Some(loop_range(2_000, 4_000, play_count)),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_definition("track", 10_000, &[], Some(loop_range(2_000, 4_000, 2))).is_ok()
+        );
+        assert!(
+            validate_definition("track", 10_000, &[], Some(loop_range(2_000, 4_000, 32))).is_ok()
         );
     }
 

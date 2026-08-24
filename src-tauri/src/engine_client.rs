@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::{oneshot, watch};
 
 use crate::app::{
-    clear_playback_snapshot, engine_state_dir, load_app_settings, load_playback_snapshot,
-    save_playback_snapshot, PlaybackSnapshot,
+    PlaybackSnapshot, clear_playback_snapshot, engine_state_dir, load_app_settings,
+    load_playback_snapshot, save_playback_snapshot,
 };
 use crate::log;
 use crate::types::{PlaybackState, Track};
@@ -677,7 +677,7 @@ impl EngineClient {
         &self,
         track: &Track,
         cuts: &[spotify_playback_engine::protocol::TimeRange],
-        loop_range: Option<spotify_playback_engine::protocol::TimeRange>,
+        loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
         position_ms: u32,
     ) -> Result<(), String> {
         self.request(
@@ -940,7 +940,7 @@ impl EngineClient {
         track_id: &str,
         duration_ms: u32,
         cuts: &[spotify_playback_engine::protocol::TimeRange],
-        loop_range: Option<spotify_playback_engine::protocol::TimeRange>,
+        loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
     ) -> Result<spotify_playback_engine::protocol::TrackEditDefinition, String> {
         let reply = self
             .request(
@@ -1520,11 +1520,13 @@ mod tests {
             .as_deref(),
             Some("0123456789ABCDEFGHIJKL"),
         );
-        assert!(waveform_timeout_cancellation(
-            "cancel_track_waveform",
-            &json!({"track_id": "0123456789ABCDEFGHIJKL"}),
-        )
-        .is_none());
+        assert!(
+            waveform_timeout_cancellation(
+                "cancel_track_waveform",
+                &json!({"track_id": "0123456789ABCDEFGHIJKL"}),
+            )
+            .is_none()
+        );
 
         let line = build_line(
             "waveform-1",
@@ -1552,9 +1554,10 @@ mod tests {
             start_ms: 1_000,
             end_ms: 2_500,
         }];
-        let loop_range = Some(spotify_playback_engine::protocol::TimeRange {
+        let loop_range = Some(spotify_playback_engine::protocol::LoopRange {
             start_ms: 5_000,
             end_ms: 9_000,
+            play_count: 2,
         });
         let line = build_line(
             "preview-1",
@@ -1592,7 +1595,7 @@ mod tests {
                 data: Some(json!({
                     "track_id": "0123456789ABCDEFGHIJKL",
                     "duration_ms": 25,
-                    "interval_ms": 10,
+                    "interval_ms": 1,
                     "bin_count": 3,
                     "peaks_base64": "AAAAAAAAAAAAAAAA",
                 })),
@@ -1601,7 +1604,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(waveform.bin_count, 3);
-        assert_eq!(waveform.interval_ms, 10);
+        assert_eq!(waveform.interval_ms, 1);
     }
 
     /// Heartbeats notify the writer several times a second. Rewriting the

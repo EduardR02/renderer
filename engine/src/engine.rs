@@ -20,8 +20,8 @@ use crate::history::ListeningHistory;
 use crate::io::ProtocolWriter;
 use serde::Serialize;
 use spotify_playback_engine::protocol::{
-    AuthState, BrowseResponse, Command, HistoryItem, PositionEvent, RepeatMode, Response,
-    StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus, TrackRef,
+    AuthState, BrowseResponse, Command, HistoryItem, LoopRange, PositionEvent, RepeatMode,
+    Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus, TrackRef,
 };
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
@@ -140,6 +140,11 @@ pub struct Engine {
     /// confirmed the new load/position. If EOF wins that race, reload instead
     /// of waiting for a marker that was already consumed.
     loop_jump_pending: bool,
+    /// One-based audible pass through the current finite loop. Fresh loads
+    /// and user seeks derive it from their source position: pass one before
+    /// the loop end, and the final pass at or after it. Internal loop jumps
+    /// preserve and increment this value.
+    loop_pass: u32,
     auth_running: bool,
     /// Track-gain volume normalisation (attenuation-only, see
     /// `auth::player_config`). Shared with in-flight authentication so it can
@@ -252,6 +257,7 @@ impl Engine {
             seek_should_play: false,
             loop_decoder_eof: false,
             loop_jump_pending: false,
+            loop_pass: 1,
             auth_running: false,
             normalisation: Arc::new(AtomicBool::new(normalisation)),
             pending_auth: None,
@@ -278,7 +284,7 @@ impl Engine {
         track_id: String,
         duration_ms: u32,
         cuts: Vec<TimeRange>,
-        loop_range: Option<TimeRange>,
+        loop_range: Option<LoopRange>,
     ) -> Result<TrackEditDefinition, String> {
         self.track_edits
             .save_definition(track_id, duration_ms, cuts, loop_range)
@@ -1105,16 +1111,21 @@ impl Engine {
         match signal {
             // Deliberately not gated on `playing`: the boundary was reached,
             // and the jump is what re-arms the pipeline to emit the next one.
-            AudioSignal::LoopBoundary { position_ms }
-                if self.current_loop_start() == Some(position_ms) =>
-            {
+            AudioSignal::LoopBoundary { position_ms } => {
+                let Some(loop_range) = self.current_loop() else {
+                    return false;
+                };
+                if loop_range.start_ms != position_ms || self.loop_pass >= loop_range.play_count {
+                    return false;
+                }
+                self.loop_pass += 1;
                 self.loop_jump_pending = true;
                 let result = if self.loop_decoder_eof {
                     let start_playing = self.state.playing;
                     self.update_position(position_ms);
-                    self.load_current(start_playing)
+                    self.load_current_at_loop_pass(start_playing)
                 } else {
-                    self.seek_source(position_ms).map(|_| ())
+                    self.seek_source_at_loop_pass(position_ms).map(|_| ())
                 };
                 if let Err(error) = result {
                     self.state.playing = false;
@@ -1122,7 +1133,6 @@ impl Engine {
                 }
                 true
             }
-            _ => false,
         }
     }
     pub fn shutdown(&mut self) {
@@ -1141,13 +1151,18 @@ impl Engine {
         }
     }
 
-    fn configure_current_audio(&self, position_ms: u32) {
+    fn configure_current_audio_at_loop_pass(&self, position_ms: u32, loop_pass: u32) {
         let edit = self
             .state
             .current_index
             .and_then(|index| self.state.queue.get(index))
             .and_then(|track| track.effective_edit.clone());
-        crate::audio::configure_customization(edit, self.state.playback_speed, position_ms);
+        crate::audio::configure_customization_at_loop_pass(
+            edit,
+            self.state.playback_speed,
+            position_ms,
+            loop_pass,
+        );
     }
 
     fn configure_current_audio_after_natural_boundary(&self, position_ms: u32) {
@@ -1162,13 +1177,41 @@ impl Engine {
             position_ms,
         );
     }
-    fn current_loop_start(&self) -> Option<u32> {
+    fn current_loop(&self) -> Option<LoopRange> {
         self.state
             .current_index
             .and_then(|index| self.state.queue.get(index))
             .and_then(|track| track.effective_edit.as_ref())
             .and_then(|edit| edit.loop_range)
-            .map(|range| range.start_ms)
+    }
+
+    fn loop_pass_for_position(&self, position_ms: u32) -> u32 {
+        self.current_loop()
+            .filter(|loop_range| position_ms >= loop_range.end_ms)
+            .map_or(1, |loop_range| loop_range.play_count.max(1))
+    }
+
+    fn reset_loop_pass_for_position(&mut self, position_ms: u32) {
+        self.loop_pass = self.loop_pass_for_position(position_ms);
+    }
+
+    /// A speed change rebuilds the customization at the current source
+    /// position, but it is not a user seek: an internal repeated pass must
+    /// survive that rebuild. A position at or beyond the loop end is always
+    /// the completed pass so a missing marker cannot re-enter the loop.
+    fn preserve_loop_pass_for_position(&mut self, position_ms: u32) {
+        if self
+            .current_loop()
+            .is_some_and(|loop_range| position_ms >= loop_range.end_ms)
+        {
+            self.reset_loop_pass_for_position(position_ms);
+        } else {
+            self.loop_pass = self.loop_pass.max(1);
+        }
+    }
+
+    fn current_loop_start(&self) -> Option<u32> {
+        self.current_loop().map(|range| range.start_ms)
     }
 
     fn ensure_ready(&self) -> Result<(), String> {
@@ -1231,6 +1274,7 @@ impl Engine {
         self.shuffle_pool.clear();
         self.state.error = None;
         self.loading_failed = false;
+        self.loop_pass = 1;
         self.current_needs_load = false;
         self.recent_track_changes.clear();
         self.recent_unavailable.clear();
@@ -1253,7 +1297,7 @@ impl Engine {
         &mut self,
         track: TrackRef,
         cuts: Vec<TimeRange>,
-        loop_range: Option<TimeRange>,
+        loop_range: Option<LoopRange>,
         position_ms: u32,
     ) -> Result<bool, String> {
         let track = with_preview_edit(track, cuts, loop_range)?;
@@ -1340,6 +1384,7 @@ impl Engine {
         self.history.clear();
         self.rebuild_shuffle_pool();
         self.play_request_id = None;
+        self.reset_loop_pass_for_position(self.state.position_ms);
         self.loading_failed = false;
         self.current_needs_load = playable_index.is_some();
         self.recent_track_changes.clear();
@@ -1438,6 +1483,13 @@ impl Engine {
     }
 
     fn seek_source(&mut self, position_ms: u32) -> Result<bool, String> {
+        let position = position_ms.min(self.state.duration_ms);
+        self.reset_loop_pass_for_position(position);
+        self.loop_jump_pending = false;
+        self.seek_source_at_loop_pass(position)
+    }
+
+    fn seek_source_at_loop_pass(&mut self, position_ms: u32) -> Result<bool, String> {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
@@ -1445,11 +1497,11 @@ impl Engine {
         if self.loop_decoder_eof {
             let start_playing = self.state.playing;
             self.update_position(position);
-            self.load_current(start_playing)?;
+            self.load_current_at_loop_pass(start_playing)?;
             self.state.error = None;
             return Ok(true);
         }
-        self.configure_current_audio(position);
+        self.configure_current_audio_at_loop_pass(position, self.loop_pass);
         if self.current_needs_load {
             self.update_position(position);
             self.state.error = None;
@@ -1461,7 +1513,7 @@ impl Engine {
             // while preserving the current play/pause intent.
             let start_playing = self.state.playing;
             self.update_position(position);
-            self.load_current(start_playing)?;
+            self.load_current_at_loop_pass(start_playing)?;
             self.state.error = None;
             return Ok(true);
         }
@@ -1596,10 +1648,12 @@ impl Engine {
         self.state.playback_speed = speed;
         if self.state.current_index.is_some() {
             let position = self.state.position_ms;
+            self.preserve_loop_pass_for_position(position);
+            self.loop_jump_pending = false;
             if self.current_needs_load {
-                self.configure_current_audio(position);
+                self.configure_current_audio_at_loop_pass(position, self.loop_pass);
             } else {
-                self.seek_source(position)?;
+                self.seek_source_at_loop_pass(position)?;
             }
         } else {
             crate::audio::configure_customization(None, speed, 0);
@@ -1750,10 +1804,16 @@ impl Engine {
     }
 
     fn load_current(&mut self, start_playing: bool) -> Result<(), String> {
+        self.reset_loop_pass_for_position(self.state.position_ms);
+        self.load_current_at_loop_pass(start_playing)
+    }
+
+    fn load_current_at_loop_pass(&mut self, start_playing: bool) -> Result<(), String> {
         self.load_current_with_boundary(start_playing, false)
     }
 
     fn load_current_after_natural_boundary(&mut self, start_playing: bool) -> Result<(), String> {
+        self.loop_pass = 1;
         self.load_current_with_boundary(start_playing, true)
     }
 
@@ -1776,7 +1836,7 @@ impl Engine {
         if natural_boundary {
             self.configure_current_audio_after_natural_boundary(position_ms);
         } else {
-            self.configure_current_audio(position_ms);
+            self.configure_current_audio_at_loop_pass(position_ms, self.loop_pass);
         }
         let next_uri = self
             .peek_next_index()
@@ -1974,11 +2034,15 @@ impl Engine {
                 play_request_id,
                 track_id,
             } if self.is_current_event(play_request_id, &track_id) => {
-                if let Some(position_ms) = self.current_loop_start() {
+                if self
+                    .current_loop()
+                    .is_some_and(|loop_range| self.loop_pass < loop_range.play_count)
+                {
                     if self.loop_jump_pending {
+                        let position_ms = self.current_loop_start().unwrap_or(0);
                         let start_playing = self.state.playing;
                         self.update_position(position_ms);
-                        if let Err(error) = self.load_current(start_playing) {
+                        if let Err(error) = self.load_current_at_loop_pass(start_playing) {
                             self.state.playing = false;
                             self.state.error = Some(error);
                         }
@@ -2071,6 +2135,7 @@ impl Engine {
         self.current_needs_load = self.state.current_index.is_some();
         self.loop_decoder_eof = false;
         self.loop_jump_pending = false;
+        self.loop_pass = 1;
         self.seek_in_flight = false;
         self.seek_should_play = false;
         self.recent_track_changes.clear();
@@ -2097,7 +2162,7 @@ fn fill_queue_context(queue: &mut [TrackRef], fallback: &str) {
 fn with_preview_edit(
     mut track: TrackRef,
     cuts: Vec<TimeRange>,
-    loop_range: Option<TimeRange>,
+    loop_range: Option<LoopRange>,
 ) -> Result<TrackRef, String> {
     let edit = TrackEdit { cuts, loop_range };
     validate_definition(&track.id, track.duration_ms, &edit.cuts, edit.loop_range)?;
@@ -2201,7 +2266,9 @@ mod tests {
     use crate::io::ProtocolWriter;
     use librespot_core::SpotifyUri;
     use librespot_playback::player::PlayerEvent;
-    use spotify_playback_engine::protocol::{RepeatMode, TimeRange, TrackEdit, TrackRef};
+    use spotify_playback_engine::protocol::{
+        LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef,
+    };
 
     fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
         test_engine_in(PathBuf::new())
@@ -2261,7 +2328,7 @@ mod tests {
     fn edited_playback_state(
         duration_ms: u32,
         cuts: Vec<TimeRange>,
-        loop_range: Option<TimeRange>,
+        loop_range: Option<LoopRange>,
     ) -> PlaybackState {
         let mut state = playback_state(duration_ms);
         state.queue[0].id = "0123456789ABCDEFGHIJKL".to_owned();
@@ -2272,6 +2339,14 @@ mod tests {
 
     fn range(start_ms: u32, end_ms: u32) -> TimeRange {
         TimeRange { start_ms, end_ms }
+    }
+
+    fn loop_range(start_ms: u32, end_ms: u32, play_count: u32) -> LoopRange {
+        LoopRange {
+            start_ms,
+            end_ms,
+            play_count,
+        }
     }
 
     fn playing_engine() -> Engine {
@@ -2339,10 +2414,7 @@ mod tests {
                 end_ms: 12_000,
             },
         ];
-        let loop_range = Some(TimeRange {
-            start_ms: 20_000,
-            end_ms: 25_000,
-        });
+        let loop_range = Some(loop_range(20_000, 25_000, 2));
         let preview =
             with_preview_edit(track.clone(), cuts.clone(), loop_range).expect("valid draft");
         assert_eq!(
@@ -2514,10 +2586,7 @@ mod tests {
         engine.state.playing = true;
         engine.state.queue[0].effective_edit = Some(spotify_playback_engine::protocol::TrackEdit {
             cuts: Vec::new(),
-            loop_range: Some(TimeRange {
-                start_ms: 1_500,
-                end_ms: 2_000,
-            }),
+            loop_range: Some(loop_range(1_500, 2_000, 2)),
         });
         assert!(!engine.on_player_event(PlayerEvent::EndOfTrack {
             play_request_id: 7,
@@ -2539,10 +2608,7 @@ mod tests {
         engine.state.playing = true;
         engine.state.queue[0].effective_edit = Some(spotify_playback_engine::protocol::TrackEdit {
             cuts: Vec::new(),
-            loop_range: Some(TimeRange {
-                start_ms: 900,
-                end_ms: 1_000,
-            }),
+            loop_range: Some(loop_range(900, 1_000, 2)),
         });
         engine.loop_jump_pending = true;
         assert!(engine.on_player_event(PlayerEvent::EndOfTrack {
@@ -2555,6 +2621,144 @@ mod tests {
             "the EOF race immediately reloaded and consumed the pending jump"
         );
     }
+
+    #[test]
+    fn fresh_loads_and_seeks_derive_loop_pass_from_source_position() {
+        for (position_ms, expected_pass) in
+            [(0, 1), (20_000, 1), (39_999, 1), (40_000, 3), (80_000, 3)]
+        {
+            let (mut engine, _) = test_engine();
+            engine.state =
+                edited_playback_state(100_000, Vec::new(), Some(loop_range(20_000, 40_000, 3)));
+            engine.state.position_ms = position_ms;
+            engine.current_needs_load = true;
+
+            engine
+                .seek_source(position_ms)
+                .expect("unloaded seek should not need a player");
+            assert_eq!(engine.loop_pass, expected_pass);
+        }
+
+        for (position_ms, expected_pass) in [(0, 1), (20_000, 1), (40_000, 3), (80_000, 3)] {
+            let (mut engine, _) = test_engine();
+            engine.state =
+                edited_playback_state(100_000, Vec::new(), Some(loop_range(20_000, 40_000, 3)));
+            engine.state.position_ms = position_ms;
+
+            assert!(
+                engine.load_current(true).is_err(),
+                "the capture engine has no player"
+            );
+            assert_eq!(engine.loop_pass, expected_pass);
+        }
+    }
+
+    #[test]
+    fn preview_load_at_or_after_loop_end_starts_the_completed_pass() {
+        let (mut engine, _) = test_engine();
+        let track = TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 100_000,
+            ..TrackRef::default()
+        };
+
+        assert!(
+            engine
+                .preview_track_edit(
+                    track,
+                    Vec::new(),
+                    Some(loop_range(20_000, 40_000, 2)),
+                    40_000,
+                )
+                .is_err(),
+            "the capture engine has no player"
+        );
+        assert_eq!(engine.state.position_ms, 40_000);
+        assert_eq!(engine.loop_pass, 2);
+    }
+
+    #[test]
+    fn eof_at_or_after_loop_end_advances_without_waiting_for_a_marker() {
+        for position_ms in [40_000, 80_000] {
+            let mut engine = playing_engine();
+            engine.state.duration_ms = 100_000;
+            engine.state.queue[0].duration_ms = 100_000;
+            engine.state.queue[0].effective_edit =
+                Some(spotify_playback_engine::protocol::TrackEdit {
+                    cuts: Vec::new(),
+                    loop_range: Some(loop_range(20_000, 40_000, 3)),
+                });
+            engine.state.position_ms = position_ms;
+            engine.reset_loop_pass_for_position(position_ms);
+
+            assert_eq!(engine.loop_pass, 3);
+            assert!(engine.on_player_event(PlayerEvent::EndOfTrack {
+                play_request_id: 7,
+                track_id: track_uri(),
+            }));
+            assert!(!engine.loop_decoder_eof);
+            assert!(!engine.loop_jump_pending);
+            assert_eq!(engine.state.position_ms, 100_000);
+        }
+    }
+
+    #[test]
+    fn finite_loop_markers_stop_after_the_requested_total_passes() {
+        for play_count in [2, 3] {
+            let mut engine = playing_engine();
+            engine.state.duration_ms = 100_000;
+            engine.state.queue[0].duration_ms = 100_000;
+            engine.state.queue[0].effective_edit =
+                Some(spotify_playback_engine::protocol::TrackEdit {
+                    cuts: Vec::new(),
+                    loop_range: Some(loop_range(20_000, 40_000, play_count)),
+                });
+            engine.state.playing = true;
+            engine.current_needs_load = true;
+            let mut markers = 0;
+
+            for pass in 2..=play_count {
+                assert!(engine.on_audio_signal(AudioSignal::LoopBoundary {
+                    position_ms: 20_000,
+                }));
+                assert_eq!(engine.loop_pass, pass);
+                markers += 1;
+            }
+            assert_eq!(markers, play_count - 1);
+            assert!(!engine.on_audio_signal(AudioSignal::LoopBoundary {
+                position_ms: 20_000,
+            }));
+            assert_eq!(engine.loop_pass, play_count);
+        }
+    }
+
+    #[test]
+    fn speed_reconfiguration_preserves_internal_pass_and_finishes_at_loop_end() {
+        let (mut engine, _) = test_engine();
+        engine.state =
+            edited_playback_state(100_000, Vec::new(), Some(loop_range(20_000, 40_000, 3)));
+        engine.current_needs_load = true;
+        engine.state.position_ms = 25_000;
+        engine.loop_pass = 2;
+
+        assert_eq!(engine.set_playback_speed(1.5), Ok(true));
+        assert_eq!(engine.loop_pass, 2);
+
+        engine.state.position_ms = 40_000;
+        assert_eq!(engine.set_playback_speed(2.0), Ok(true));
+        assert_eq!(engine.loop_pass, 3);
+
+        let (mut loaded_engine, _) = test_engine();
+        loaded_engine.state =
+            edited_playback_state(100_000, Vec::new(), Some(loop_range(20_000, 40_000, 3)));
+        loaded_engine.state.position_ms = 25_000;
+        loaded_engine.loop_pass = 2;
+        loaded_engine.loop_decoder_eof = true;
+        assert!(loaded_engine.set_playback_speed(1.5).is_err());
+        assert_eq!(loaded_engine.loop_pass, 2);
+    }
+
     #[test]
     fn unavailable_recovery_rearms_a_fresh_loading_request() {
         let mut engine = playing_engine();
@@ -2925,13 +3129,17 @@ mod tests {
         loop_engine.state = edited_playback_state(
             100_000,
             vec![range(10_000, 60_000)],
-            Some(range(70_000, 80_000)),
+            Some(loop_range(70_000, 80_000, 3)),
         );
         loop_engine.state.playing = true;
         loop_engine.current_needs_load = true;
         assert!(loop_engine.on_audio_signal(AudioSignal::LoopBoundary {
             position_ms: 70_000,
         }));
+        assert!(loop_engine.on_audio_signal(AudioSignal::LoopBoundary {
+            position_ms: 70_000,
+        }));
+        assert_eq!(loop_engine.loop_pass, 3);
         assert_eq!(loop_engine.state.position_ms, 70_000);
         assert_eq!(
             loop_engine.transport_position_and_duration(),

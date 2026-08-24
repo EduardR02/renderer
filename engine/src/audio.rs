@@ -184,7 +184,19 @@ pub fn install_signal_sender(sender: mpsc::UnboundedSender<AudioSignal>) {
 }
 
 pub fn configure_customization(edit: Option<TrackEdit>, speed: f32, position_ms: u32) {
-    set_customization(edit, speed, position_ms, true);
+    configure_customization_at_loop_pass(edit, speed, position_ms, 1);
+}
+
+/// Installs a discontinuous customization at a known finite-loop pass. The
+/// engine uses this only for an internal loop jump; ordinary loads and seeks
+/// always start at pass one through [`configure_customization`].
+pub fn configure_customization_at_loop_pass(
+    edit: Option<TrackEdit>,
+    speed: f32,
+    position_ms: u32,
+    loop_pass: u32,
+) {
+    set_customization(edit, speed, position_ms, true, loop_pass);
 }
 
 /// Installs the next gapless track without discarding audio already queued from
@@ -195,14 +207,21 @@ pub fn configure_customization_after_natural_boundary(
     speed: f32,
     position_ms: u32,
 ) {
-    set_customization(edit, speed, position_ms, false);
+    set_customization(edit, speed, position_ms, false, 1);
 }
 
-fn set_customization(edit: Option<TrackEdit>, speed: f32, position_ms: u32, discontinuous: bool) {
+fn set_customization(
+    edit: Option<TrackEdit>,
+    speed: f32,
+    position_ms: u32,
+    discontinuous: bool,
+    loop_pass: u32,
+) {
     let config = PipelineConfig {
         edit,
         speed,
         position_ms,
+        loop_pass: loop_pass.max(1),
     };
     let active = config.active();
     let mut customization = CUSTOMIZATION
@@ -1436,6 +1455,7 @@ mod tests {
             edit: None,
             speed,
             position_ms: 0,
+            loop_pass: 1,
         });
         let input = vec![0.25; frames * NUM_CHANNELS as usize];
         let mut already_emitted = Vec::new();

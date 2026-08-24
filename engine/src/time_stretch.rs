@@ -21,6 +21,10 @@ pub struct PipelineConfig {
     pub edit: Option<TrackEdit>,
     pub speed: f32,
     pub position_ms: u32,
+    /// One-based audible pass through a finite loop. Fresh loads and user
+    /// seeks use pass one before the loop end and the final pass at or after
+    /// it; an internal loop jump increments it.
+    pub loop_pass: u32,
 }
 
 impl PipelineConfig {
@@ -42,7 +46,7 @@ impl AudioPipeline {
             edit: config
                 .edit
                 .as_ref()
-                .map(|edit| SampleEdit::new(edit, config.position_ms)),
+                .map(|edit| SampleEdit::new(edit, config.position_ms, config.loop_pass)),
             stretcher: (config.speed != 1.0).then(|| Wsola::new(config.speed)),
             filtered: Vec::new(),
             loop_sent: false,
@@ -101,7 +105,7 @@ struct SampleEdit {
     frame: u64,
     cuts: Vec<SampleRange>,
     cut_index: usize,
-    loop_range: Option<SampleRange>,
+    loop_range: Option<SampleLoop>,
 }
 
 #[derive(Clone, Copy)]
@@ -110,8 +114,15 @@ struct SampleRange {
     end: u64,
 }
 
+#[derive(Clone, Copy)]
+struct SampleLoop {
+    range: SampleRange,
+    play_count: u32,
+    pass: u32,
+}
+
 impl SampleEdit {
-    fn new(edit: &TrackEdit, position_ms: u32) -> Self {
+    fn new(edit: &TrackEdit, position_ms: u32, loop_pass: u32) -> Self {
         let cuts: Vec<_> = edit.cuts.iter().copied().map(sample_range).collect();
         let frame = ms_to_frame(position_ms);
         let cut_index = cuts.partition_point(|cut| cut.end <= frame);
@@ -119,7 +130,21 @@ impl SampleEdit {
             frame,
             cuts,
             cut_index,
-            loop_range: edit.loop_range.map(sample_range),
+            loop_range: edit.loop_range.map(|loop_range| {
+                let pass = if position_ms >= loop_range.end_ms {
+                    loop_range.play_count.max(1)
+                } else {
+                    loop_pass.max(1)
+                };
+                SampleLoop {
+                    range: sample_range(TimeRange {
+                        start_ms: loop_range.start_ms,
+                        end_ms: loop_range.end_ms,
+                    }),
+                    play_count: loop_range.play_count,
+                    pass,
+                }
+            }),
         }
     }
 
@@ -128,8 +153,8 @@ impl SampleEdit {
         output.reserve(input.len());
         for source in input.chunks_exact(CHANNELS) {
             if let Some(loop_range) = self.loop_range {
-                if self.frame >= loop_range.end {
-                    return Some(frame_to_ms(loop_range.start));
+                if loop_range.pass < loop_range.play_count && self.frame >= loop_range.range.end {
+                    return Some(frame_to_ms(loop_range.range.start));
                 }
             }
             while self
@@ -149,8 +174,8 @@ impl SampleEdit {
             self.frame += 1;
         }
         if let Some(loop_range) = self.loop_range {
-            if self.frame >= loop_range.end {
-                return Some(frame_to_ms(loop_range.start));
+            if loop_range.pass < loop_range.play_count && self.frame >= loop_range.range.end {
+                return Some(frame_to_ms(loop_range.range.start));
             }
         }
         None
@@ -596,6 +621,7 @@ fn similarity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spotify_playback_engine::protocol::LoopRange;
 
     fn stereo_tone(frames: usize, frequency: f32, right_scale: f32) -> Vec<f32> {
         let mut samples = Vec::with_capacity(frames * CHANNELS);
@@ -638,6 +664,7 @@ mod tests {
             edit: Some(edit),
             speed,
             position_ms,
+            loop_pass: 1,
         });
         let mut output = Vec::new();
         let mut packet_output = Vec::new();
@@ -868,9 +895,10 @@ mod tests {
                 start_ms: 5,
                 end_ms: 10,
             }],
-            loop_range: Some(TimeRange {
+            loop_range: Some(LoopRange {
                 start_ms: 20,
                 end_ms: 55,
+                play_count: 2,
             }),
         };
         let start = ms_to_frame(20) as usize;
@@ -885,6 +913,67 @@ mod tests {
                 output.len() / CHANNELS,
                 (audible_frames as f64 / f64::from(speed)).round() as usize,
                 "speed {speed} must flush exactly through the original-time loop end"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_loop_emits_exactly_the_requested_number_of_passes() {
+        for play_count in [2, 3] {
+            let edit = TrackEdit {
+                cuts: Vec::new(),
+                loop_range: Some(LoopRange {
+                    start_ms: 20,
+                    end_ms: 40,
+                    play_count,
+                }),
+            };
+            let total_frames = ms_to_frame(80) as usize;
+            let loop_start = ms_to_frame(20) as usize;
+            let input = source_ramp(0, total_frames);
+
+            let mut first = SampleEdit::new(&edit, 0, 1);
+            let mut output = Vec::new();
+            assert_eq!(first.process(&input, &mut output), Some(20));
+
+            for pass in 2..=play_count {
+                let mut repeated = SampleEdit::new(&edit, 20, pass);
+                let repeated_input = source_ramp(loop_start, total_frames - loop_start);
+                output.clear();
+                let marker = repeated.process(&repeated_input, &mut output);
+                if pass < play_count {
+                    assert_eq!(marker, Some(20));
+                } else {
+                    assert_eq!(marker, None);
+                    assert_eq!(output.len(), (total_frames - loop_start) * CHANNELS);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn starting_at_or_after_loop_end_never_emits_a_loop_marker() {
+        let edit = TrackEdit {
+            cuts: Vec::new(),
+            loop_range: Some(LoopRange {
+                start_ms: 20,
+                end_ms: 40,
+                play_count: 3,
+            }),
+        };
+        let total_frames = ms_to_frame(80) as usize;
+
+        for position_ms in [40, 41, 80] {
+            let start_frame = ms_to_frame(position_ms) as usize;
+            let input = source_ramp(start_frame, total_frames - start_frame);
+            let (output, loop_to) =
+                pipeline_in_packets(edit.clone(), 1.0, position_ms, &input, &[127, 882, 2_048]);
+
+            assert_eq!(loop_to, None, "position {position_ms} must be a final pass");
+            assert_eq!(
+                output.len() / CHANNELS,
+                total_frames - start_frame,
+                "position {position_ms} must retain the natural EOF tail"
             );
         }
     }

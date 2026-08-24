@@ -10,11 +10,18 @@ pub struct TimeRange {
     pub end_ms: u32,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LoopRange {
+    pub start_ms: u32,
+    pub end_ms: u32,
+    pub play_count: u32,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TrackEdit {
     pub cuts: Vec<TimeRange>,
-    pub loop_range: Option<TimeRange>,
+    pub loop_range: Option<LoopRange>,
 }
 
 impl TrackEdit {
@@ -169,7 +176,7 @@ pub enum Command {
         track: TrackRef,
         cuts: Vec<TimeRange>,
         #[serde(default)]
-        loop_range: Option<TimeRange>,
+        loop_range: Option<LoopRange>,
         position_ms: u32,
     },
     PlayQueueIndex {
@@ -228,7 +235,7 @@ pub enum Command {
         duration_ms: u32,
         cuts: Vec<TimeRange>,
         #[serde(default)]
-        loop_range: Option<TimeRange>,
+        loop_range: Option<LoopRange>,
     },
     DeleteTrackEdit {
         track_id: String,
@@ -832,9 +839,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ArtistRef, AuthState, BrowseResponse, Command, PlaylistRecommendations, PlaylistRef,
-        PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse, StateEvent,
-        TimeRange, TrackRef,
+        ArtistRef, AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations,
+        PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
+        StateEvent, TrackRef,
     };
 
     #[test]
@@ -1139,7 +1146,7 @@ mod tests {
                 {"start_ms": 1000, "end_ms": 2500},
                 {"start_ms": 10000, "end_ms": 12000}
             ],
-            "loop_range": {"start_ms": 5000, "end_ms": 9000},
+            "loop_range": {"start_ms": 5000, "end_ms": 9000, "play_count": 2},
             "position_ms": 42000
         }))
         .unwrap();
@@ -1156,12 +1163,31 @@ mod tests {
         assert_eq!(cuts.len(), 2);
         assert_eq!(
             loop_range,
-            Some(TimeRange {
+            Some(LoopRange {
                 start_ms: 5_000,
                 end_ms: 9_000,
+                play_count: 2,
             })
         );
         assert_eq!(position_ms, 42_000);
+    }
+
+    #[test]
+    fn old_infinite_loop_objects_without_play_count_are_rejected() {
+        let error = serde_json::from_value::<Request>(json!({
+            "request_id": "request-old-loop",
+            "type": "preview_track_edit",
+            "track": {
+                "id": "0123456789ABCDEFGHIJKL",
+                "uri": "spotify:track:0123456789ABCDEFGHIJKL",
+                "duration_ms": 240000
+            },
+            "cuts": [],
+            "loop_range": {"start_ms": 5000, "end_ms": 9000},
+            "position_ms": 0
+        }))
+        .expect_err("the old infinite loop shape must not deserialize");
+        assert!(error.to_string().contains("play_count"));
     }
 
     #[test]
@@ -1553,7 +1579,7 @@ mod tests {
         let payload = super::TrackWaveform {
             track_id: "0123456789ABCDEFGHIJKL".to_owned(),
             duration_ms: 25,
-            interval_ms: 10,
+            interval_ms: 1,
             bin_count: 3,
             peaks_base64: "AAD//w==".to_owned(),
         };
@@ -1565,7 +1591,7 @@ mod tests {
             data: Some(&payload),
         })
         .unwrap();
-        assert_eq!(response["data"]["interval_ms"], 10);
+        assert_eq!(response["data"]["interval_ms"], 1);
         assert_eq!(response["data"]["bin_count"], 3);
         assert_eq!(response["data"]["peaks_base64"], "AAD//w==");
     }

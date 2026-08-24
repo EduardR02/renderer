@@ -1149,14 +1149,14 @@ mod tests {
         let waveform = TrackWaveform::from(EngineTrackWaveform {
             track_id: "0123456789ABCDEFGHIJKL".into(),
             duration_ms: 25,
-            interval_ms: 10,
+            interval_ms: 1,
             bin_count: 3,
             peaks_base64: "AAAAAAAAAAAAAAAA".into(),
         });
         let json = serde_json::to_value(waveform).unwrap();
         assert_eq!(json["track_id"], "0123456789ABCDEFGHIJKL");
         assert_eq!(json["duration_ms"], 25);
-        assert_eq!(json["interval_ms"], 10);
+        assert_eq!(json["interval_ms"], 1);
         assert_eq!(json["bin_count"], 3);
         assert_eq!(json["peaks_base64"], "AAAAAAAAAAAAAAAA");
     }
