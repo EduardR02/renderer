@@ -12,10 +12,7 @@ const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug)]
 pub enum Input {
     Request(Request),
-    Invalid {
-        request_id: String,
-        error: String,
-    },
+    Invalid { request_id: String, error: String },
     Eof,
 }
 

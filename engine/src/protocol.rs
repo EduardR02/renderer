@@ -37,17 +37,16 @@ pub struct TrackEditStatus {
     pub enabled: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
-pub struct WaveformPeak {
-    pub min: f32,
-    pub max: f32,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+/// Canonical full-track 10 ms waveform envelope. `peaks_base64` is packed
+/// little-endian `(min_i16, max_i16)` pairs and contains exactly `bin_count`
+/// pairs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrackWaveform {
     pub track_id: String,
     pub duration_ms: u32,
-    pub peaks: Vec<WaveformPeak>,
+    pub interval_ms: u16,
+    pub bin_count: u32,
+    pub peaks_base64: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -72,6 +71,8 @@ pub struct TrackRef {
     pub album_id: String,
     pub album_name: String,
     pub cover_url: String,
+    /// Original source duration. Cuts do not change queue metadata; transport
+    /// events expose the compiled duration separately.
     pub duration_ms: u32,
     /// Lifetime Spotify play count when the browse surface supplies it.
     /// Album rows and artist Popular rows do; playlists/search/queue do not.
@@ -104,7 +105,8 @@ pub struct TrackRef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub context: String,
     /// Immutable playback edit resolved when this item enters a queue. Browse
-    /// results leave it absent; queue restore retains it verbatim.
+    /// results leave it absent; queue restore re-resolves it against the live
+    /// edit store before mapping the saved transport position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_edit: Option<TrackEdit>,
 }
@@ -146,17 +148,29 @@ pub enum Command {
     PlayQueue {
         queue: Vec<TrackRef>,
         index: usize,
+        /// Position in the compiled transport timeline.
         position_ms: u32,
         #[serde(default)]
         context: String,
     },
     /// Installs a paused queue/playhead without asking librespot to load audio.
+    /// Snapshot positions are in the compiled transport timeline and are
+    /// mapped only after the live edit definitions have been resolved.
     RestoreQueue {
         queue: Vec<TrackRef>,
         index: usize,
         position_ms: u32,
         #[serde(default)]
         context: String,
+    },
+    /// Replaces the queue with one track carrying the editor's exact draft.
+    /// The position remains in the original source timeline.
+    PreviewTrackEdit {
+        track: TrackRef,
+        cuts: Vec<TimeRange>,
+        #[serde(default)]
+        loop_range: Option<TimeRange>,
+        position_ms: u32,
     },
     PlayQueueIndex {
         index: usize,
@@ -166,6 +180,7 @@ pub enum Command {
     Next,
     Previous,
     Seek {
+        /// Position in the compiled transport timeline.
         position_ms: u32,
     },
     SetVolume {
@@ -197,6 +212,12 @@ pub enum Command {
         from: usize,
         to: usize,
     },
+    GetTrackWaveform {
+        track_id: String,
+    },
+    CancelTrackWaveform {
+        track_id: String,
+    },
     GetTrackEdit {
         track_id: String,
         #[serde(default)]
@@ -217,27 +238,9 @@ pub enum Command {
         track_id: String,
         enabled: bool,
     },
-    ExtractTrackWaveform {
-        track_id: String,
-        points: u16,
-    },
-    /// One bounded page of the local listening history. This command is
+    /// One newest-first, bounded snapshot of local listening history. This is
     /// deliberately available before Spotify authentication is ready.
-    ///
-    /// The filter and the order are applied HERE, over the whole journal,
-    /// because they have to be: a client that filters the pages it happens to
-    /// have loaded is searching a window, not a history.
-    GetHistory {
-        #[serde(default)]
-        offset: usize,
-        #[serde(default = "default_history_page_size")]
-        limit: usize,
-        /// Case-insensitive substring over track title and artist names.
-        #[serde(default)]
-        query: String,
-        #[serde(default)]
-        sort: HistorySort,
-    },
+    GetHistory,
     /// Removes all finalized and in-progress local listening history rows.
     ClearHistory,
     Shutdown,
@@ -365,15 +368,12 @@ pub enum Command {
     /// ReplayGain-style constant gain from Spotify's embedded loudness tags).
     /// The engine rebuilds its player so a live session picks the change up
     /// immediately; without a session it applies at the next successful login.
-    SetNormalisation { enabled: bool },
+    SetNormalisation {
+        enabled: bool,
+    },
 }
 
-fn default_history_page_size() -> usize {
-    40
-}
-
-/// One logical local listening-history row. The persisted format contains
-/// exactly these durable facts; track metadata lives in a bounded sidecar.
+/// One logical local listening-history row.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct HistoryRow {
@@ -385,38 +385,15 @@ pub struct HistoryRow {
     pub context: String,
 }
 
-/// A history row plus separately retained track metadata for rendering and
-/// replay. Older rows may have no metadata when their sidecar entry expired.
+/// A history row plus sanitized track metadata for rendering and replay.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HistoryItem {
     #[serde(flatten)]
     pub row: HistoryRow,
-    pub track: Option<TrackRef>,
+    pub track: TrackRef,
 }
 
-/// How a listening-history page is ordered. Recency is the log's own order;
-/// the other two exist because a long log gets searched rather than read, and
-/// a search wants its hits gathered by name.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum HistorySort {
-    #[default]
-    Recent,
-    Oldest,
-    Title,
-    Artist,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct HistoryPage {
-    pub entries: Vec<HistoryItem>,
-    pub next_offset: Option<usize>,
-    /// Rows matching the query, across the whole journal. The client sizes its
-    /// virtual list from this, so it is the count AFTER filtering.
-    pub total: usize,
-}
 fn default_browse_page_size() -> usize {
     20
 }
@@ -822,6 +799,8 @@ pub struct StateEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     pub playing: bool,
+    /// Position and duration in the compiled transport timeline. Queue row
+    /// durations and edit ranges remain in original-source coordinates.
     pub position_ms: u32,
     pub duration_ms: u32,
     pub volume: u8,
@@ -843,6 +822,7 @@ pub struct StateEvent<'a> {
 pub struct PositionEvent {
     #[serde(rename = "type")]
     pub kind: &'static str,
+    /// Compiled transport position and one-pass compiled duration.
     pub position_ms: u32,
     pub duration_ms: u32,
 }
@@ -852,9 +832,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AuthState, ArtistRef, BrowseResponse, Command, PlaylistRecommendations, PlaylistRef,
+        ArtistRef, AuthState, BrowseResponse, Command, PlaylistRecommendations, PlaylistRef,
         PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse, StateEvent,
-        TrackRef,
+        TimeRange, TrackRef,
     };
 
     #[test]
@@ -1052,6 +1032,16 @@ mod tests {
     }
 
     #[test]
+    fn get_history_is_a_zero_argument_command() {
+        let request: Request = serde_json::from_value(json!({
+            "request_id": "request-history",
+            "type": "get_history",
+        }))
+        .unwrap();
+        assert!(matches!(request.command, Command::GetHistory));
+    }
+
+    #[test]
     fn login_and_logout_commands_deserialize_from_the_line_protocol() {
         let login: Request = serde_json::from_value(json!({
             "request_id": "request-9",
@@ -1101,7 +1091,10 @@ mod tests {
             "index": 79,
         }))
         .unwrap();
-        assert!(matches!(jump.command, Command::PlayQueueIndex { index: 79 }));
+        assert!(matches!(
+            jump.command,
+            Command::PlayQueueIndex { index: 79 }
+        ));
     }
 
     #[test]
@@ -1130,6 +1123,45 @@ mod tests {
         assert_eq!(position_ms, 42_000);
         assert!(!queue[0].unavailable);
         assert!(queue[0].unavailable_reason.is_none());
+    }
+
+    #[test]
+    fn preview_track_edit_deserializes_the_exact_draft_shape() {
+        let preview: Request = serde_json::from_value(json!({
+            "request_id": "request-preview",
+            "type": "preview_track_edit",
+            "track": {
+                "id": "0123456789ABCDEFGHIJKL",
+                "uri": "spotify:track:0123456789ABCDEFGHIJKL",
+                "duration_ms": 240000
+            },
+            "cuts": [
+                {"start_ms": 1000, "end_ms": 2500},
+                {"start_ms": 10000, "end_ms": 12000}
+            ],
+            "loop_range": {"start_ms": 5000, "end_ms": 9000},
+            "position_ms": 42000
+        }))
+        .unwrap();
+        let Command::PreviewTrackEdit {
+            track,
+            cuts,
+            loop_range,
+            position_ms,
+        } = preview.command
+        else {
+            panic!("preview_track_edit must parse as its dedicated command");
+        };
+        assert_eq!(track.id, "0123456789ABCDEFGHIJKL");
+        assert_eq!(cuts.len(), 2);
+        assert_eq!(
+            loop_range,
+            Some(TimeRange {
+                start_ms: 5_000,
+                end_ms: 9_000,
+            })
+        );
+        assert_eq!(position_ms, 42_000);
     }
 
     #[test]
@@ -1181,7 +1213,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             catalogue.command,
-            Command::BrowseArtistCatalogue { offset: 0, limit: 4, .. }
+            Command::BrowseArtistCatalogue {
+                offset: 0,
+                limit: 4,
+                ..
+            }
         ));
 
         let search: Request = serde_json::from_value(json!({
@@ -1434,7 +1470,10 @@ mod tests {
         assert_eq!(response["data"]["seed"]["name"], "Seed");
         assert_eq!(response["data"]["tracks"][0]["name"], "Seed");
         assert_eq!(response["data"]["seed_kind"], "track");
-        assert_eq!(response["data"]["cover_url"], "https://i.scdn.co/image/radio-cover");
+        assert_eq!(
+            response["data"]["cover_url"],
+            "https://i.scdn.co/image/radio-cover"
+        );
         assert!(response["data"].get("seed_artist").is_none());
 
         let artist_payload = RadioBrowse {
@@ -1483,5 +1522,51 @@ mod tests {
         .unwrap();
         assert_eq!(response["data"]["playlist_id"], "1123456789ABCDEFGHIJKL");
         assert_eq!(response["data"]["tracks"], json!([]));
+    }
+
+    #[test]
+    fn waveform_commands_and_payload_match_the_line_protocol() {
+        let get: Request = serde_json::from_value(json!({
+            "request_id": "waveform-1",
+            "type": "get_track_waveform",
+            "track_id": "0123456789ABCDEFGHIJKL",
+        }))
+        .unwrap();
+        assert!(matches!(
+            get.command,
+            Command::GetTrackWaveform { track_id }
+                if track_id == "0123456789ABCDEFGHIJKL"
+        ));
+
+        let cancel: Request = serde_json::from_value(json!({
+            "request_id": "waveform-2",
+            "type": "cancel_track_waveform",
+            "track_id": "0123456789ABCDEFGHIJKL",
+        }))
+        .unwrap();
+        assert!(matches!(
+            cancel.command,
+            Command::CancelTrackWaveform { track_id }
+                if track_id == "0123456789ABCDEFGHIJKL"
+        ));
+
+        let payload = super::TrackWaveform {
+            track_id: "0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 25,
+            interval_ms: 10,
+            bin_count: 3,
+            peaks_base64: "AAD//w==".to_owned(),
+        };
+        let response = serde_json::to_value(BrowseResponse {
+            kind: "get_track_waveform",
+            request_id: "waveform-1",
+            ok: true,
+            error: None,
+            data: Some(&payload),
+        })
+        .unwrap();
+        assert_eq!(response["data"]["interval_ms"], 10);
+        assert_eq!(response["data"]["bin_count"], 3);
+        assert_eq!(response["data"]["peaks_base64"], "AAD//w==");
     }
 }

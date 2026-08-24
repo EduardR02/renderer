@@ -26,6 +26,7 @@ use spotify_playback_engine::protocol::{
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+use waveform::WaveformService;
 
 const AUDIO_CACHE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 const POSITION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -77,10 +78,6 @@ enum BrowseOutcome {
     Canvas {
         request_id: String,
         result: Result<Option<Canvas>, String>,
-    },
-    Waveform {
-        request_id: String,
-        result: Result<TrackWaveform, String>,
     },
     Search {
         request_id: String,
@@ -146,12 +143,12 @@ fn configure_audio_fetch() {
 fn main() -> ExitCode {
     let (state_directory, log_file, audio_cache_limit_bytes, normalisation) =
         match parse_arguments(std::env::args_os().skip(1).collect()) {
-        Ok(arguments) => arguments,
-        Err(error) => {
-            eprintln!("SpotifyPlaybackEngine: {error}");
-            return ExitCode::from(2);
-        }
-    };
+            Ok(arguments) => arguments,
+            Err(error) => {
+                eprintln!("SpotifyPlaybackEngine: {error}");
+                return ExitCode::from(2);
+            }
+        };
     let writer = match ProtocolWriter::capture_stdout() {
         Ok(writer) => writer,
         Err(error) => {
@@ -169,13 +166,16 @@ fn main() -> ExitCode {
 
     let (cache, temporary_directory, credentials_file) =
         match create_state(&state_directory, audio_cache_limit_bytes) {
-        Ok(state) => state,
-        Err(error) => {
-            eprintln!("SpotifyPlaybackEngine: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!("SpotifyPlaybackEngine: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("SpotifyPlaybackEngine: could not start async runtime: {error}");
@@ -217,6 +217,8 @@ async fn run(
 
     configure_audio_fetch();
     audio::install_signal_sender(audio_sender);
+    let (mut waveform_service, mut waveform_receiver) =
+        WaveformService::new(cache.clone(), &state_directory)?;
 
     let mut engine = Engine::new(
         writer,
@@ -240,18 +242,55 @@ async fn run(
                         let request_id = request.request_id;
                         match request.command {
                             Command::Shutdown => {
+                                let cancelled: Result<TrackWaveform, String> =
+                                    Err("waveform service is shutting down".to_owned());
+                                for pending_id in waveform_service.shutdown() {
+                                    engine.send_browse_response(
+                                        &pending_id,
+                                        "get_track_waveform",
+                                        &cancelled,
+                                    )?;
+                                }
                                 let success = Ok(true);
                                 engine.send_response(&request_id, &success)?;
                                 engine.shutdown();
                                 break;
                             }
-                            Command::GetHistory { offset, limit, query, sort } => {
-                                let result = engine.history_page(offset, limit, &query, sort);
+                            Command::GetHistory => {
+                                let result = engine.history();
                                 engine.send_browse_response(&request_id, "history", &result)?;
                             }
                             Command::ClearHistory => {
                                 let result = engine.clear_history();
                                 engine.send_response(&request_id, &result)?;
+                            }
+                            Command::GetTrackWaveform { track_id } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        waveform_service.request(request_id, track_id, session);
+                                    }
+                                    Err(error) => {
+                                        let result: Result<TrackWaveform, String> = Err(error);
+                                        engine.send_browse_response(
+                                            &request_id,
+                                            "get_track_waveform",
+                                            &result,
+                                        )?;
+                                    }
+                                }
+                            }
+                            Command::CancelTrackWaveform { track_id } => {
+                                let cancelled: Result<TrackWaveform, String> =
+                                    Err("waveform request was cancelled".to_owned());
+                                for pending_id in waveform_service.cancel(&track_id) {
+                                    engine.send_browse_response(
+                                        &pending_id,
+                                        "get_track_waveform",
+                                        &cancelled,
+                                    )?;
+                                }
+                                let success = Ok(true);
+                                engine.send_response(&request_id, &success)?;
                             }
                             Command::GetTrackEdit { track_id, playlist_id } => {
                                 let result: Result<_, String> =
@@ -481,29 +520,6 @@ async fn run(
                                     }
                                 }
                             }
-                            Command::ExtractTrackWaveform { track_id, points } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        // Blocking pool, not a runtime worker:
-                                        // extraction decodes a whole track with
-                                        // network-backed reads and no await
-                                        // points, which would otherwise occupy
-                                        // one worker thread for seconds.
-                                        let handle = tokio::runtime::Handle::current();
-                                        tokio::task::spawn_blocking(move || {
-                                            let result = handle.block_on(waveform::extract(&session, &track_id, points));
-                                            let _ = sender.send(BrowseOutcome::Waveform { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Waveform {
-                                            request_id,
-                                            result: Err(error),
-                                        });
-                                    }
-                                }
-                            }
                             Command::BrowseSearch { query, limit } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -620,6 +636,7 @@ async fn run(
                         })?;
                     }
                     Input::Eof => {
+                        waveform_service.shutdown();
                         engine.shutdown();
                         break;
                     }
@@ -686,9 +703,6 @@ async fn run(
                         BrowseOutcome::Canvas { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_canvas", &result)?;
                         }
-                        BrowseOutcome::Waveform { request_id, result } => {
-                            engine.send_browse_response(&request_id, "extract_track_waveform", &result)?;
-                        }
                         BrowseOutcome::Search { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_search", &result)?;
                         }
@@ -697,6 +711,19 @@ async fn run(
                         }
                         BrowseOutcome::VoidEdit { request_id, kind, result } => {
                             engine.send_edit_response(&request_id, kind, &result)?;
+                        }
+                    }
+                }
+            }
+            outcome = waveform_receiver.recv() => {
+                if let Some(outcome) = outcome {
+                    if let Some((request_ids, result)) = waveform_service.complete(outcome) {
+                        for request_id in request_ids {
+                            engine.send_browse_response(
+                                &request_id,
+                                "get_track_waveform",
+                                &result,
+                            )?;
                         }
                     }
                 }
@@ -763,10 +790,9 @@ fn parse_arguments(
                     return Err("--audio-cache-limit-mb given more than once".to_owned());
                 }
                 audio_cache_limit_seen = true;
-                let mb = value
-                    .to_string_lossy()
-                    .parse::<u64>()
-                    .map_err(|_| "--audio-cache-limit-mb must be a non-negative integer".to_owned())?;
+                let mb = value.to_string_lossy().parse::<u64>().map_err(|_| {
+                    "--audio-cache-limit-mb must be a non-negative integer".to_owned()
+                })?;
                 audio_cache_limit_bytes = if mb == 0 {
                     None
                 } else {
@@ -783,7 +809,7 @@ fn parse_arguments(
                     other => {
                         return Err(format!(
                             "--normalisation must be \"true\" or \"false\", got {other}"
-                        ))
+                        ));
                     }
                 };
             }
@@ -791,9 +817,15 @@ fn parse_arguments(
         }
         index += 2;
     }
-    let state_directory = state_directory
-        .ok_or_else(|| "usage: SpotifyPlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned())?;
-    Ok((state_directory, log_file, audio_cache_limit_bytes, normalisation))
+    let state_directory = state_directory.ok_or_else(|| {
+        "usage: SpotifyPlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned()
+    })?;
+    Ok((
+        state_directory,
+        log_file,
+        audio_cache_limit_bytes,
+        normalisation,
+    ))
 }
 
 /// One panic report: thread, payload, location, and a captured backtrace.
@@ -811,9 +843,7 @@ fn format_panic_report(thread: &str, info: &std::panic::PanicHookInfo<'_>) -> St
         .map(|location| format!("{location}"))
         .unwrap_or_else(|| "unknown location".to_owned());
     let backtrace = std::backtrace::Backtrace::capture();
-    format!(
-        "thread '{thread}' panicked at {location}:\n{payload}\nstack backtrace:\n{backtrace}"
-    )
+    format!("thread '{thread}' panicked at {location}:\n{payload}\nstack backtrace:\n{backtrace}")
 }
 
 /// Appends one panic report to the engine log file. Called from the panic
@@ -881,7 +911,10 @@ fn version_audio_cache(state_directory: &std::path::Path) -> Result<(), String> 
                 std::fs::remove_file(&path)
             };
             if let Err(error) = result {
-                eprintln!("could not clear stale audio cache entry {}: {error}", path.display());
+                eprintln!(
+                    "could not clear stale audio cache entry {}: {error}",
+                    path.display()
+                );
             }
         }
         std::fs::write(&marker, expected)
@@ -913,9 +946,7 @@ fn create_state(
     .map_err(|error| format!("could not initialize the app-owned cache: {error}"))?;
     // librespot stores credentials as credentials.json inside the credentials
     // directory; `logout` removes it (Cache offers no removal API).
-    let credentials_file = state_directory
-        .join("credentials")
-        .join("credentials.json");
+    let credentials_file = state_directory.join("credentials").join("credentials.json");
     Ok((cache, temporary, credentials_file))
 }
 
@@ -996,7 +1027,10 @@ mod tests {
         fs::write(audio.join("0123456789abcdef"), b"junk").expect("fixture file");
 
         version_audio_cache(&scratch.directory).expect("version bump succeeds");
-        assert!(!audio.join("0123456789abcdef").exists(), "stale file cleared");
+        assert!(
+            !audio.join("0123456789abcdef").exists(),
+            "stale file cleared"
+        );
         assert!(!audio.join("ab").exists(), "stale subdirectory cleared");
         assert_eq!(
             fs::read_to_string(audio.join("cache-version")).expect("marker written"),
@@ -1011,7 +1045,10 @@ mod tests {
         // A later layout version clears everything again (one-time per bump).
         fs::write(audio.join("cache-version"), "1\n").expect("stale marker");
         version_audio_cache(&scratch.directory).expect("second bump");
-        assert!(!audio.join("fresh-entry").exists(), "old-layout entries cleared");
+        assert!(
+            !audio.join("fresh-entry").exists(),
+            "old-layout entries cleared"
+        );
         assert_eq!(
             fs::read_to_string(audio.join("cache-version")).expect("marker rewritten"),
             format!("{AUDIO_CACHE_VERSION}\n")
@@ -1156,13 +1193,7 @@ mod tests {
             "unknown flag rejected"
         );
         assert!(
-            parse_arguments(os(&[
-                "--state-dir",
-                "C:\\a",
-                "--state-dir",
-                "C:\\b",
-            ]))
-            .is_err(),
+            parse_arguments(os(&["--state-dir", "C:\\a", "--state-dir", "C:\\b",])).is_err(),
             "duplicate state dir rejected"
         );
         assert!(
@@ -1213,7 +1244,11 @@ mod tests {
         };
         let _ = std::panic::take_hook(); // drop the test hook
         assert!(captured.is_err());
-        let report = report.lock().expect("report lock").take().expect("hook ran");
+        let report = report
+            .lock()
+            .expect("report lock")
+            .take()
+            .expect("hook ran");
         assert!(report.contains("panicked at"));
         assert!(report.contains("test payload"));
         assert!(report.contains("stack backtrace"));

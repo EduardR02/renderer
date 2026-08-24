@@ -309,8 +309,7 @@ mod tests {
     #[test]
     fn reconstruction_error_stays_below_the_codec_floor() {
         for freq in [100.0, 1_000.0, 5_000.0, 10_000.0, 15_000.0, 19_000.0] {
-            let mut resampler =
-                Resampler::new(IN_RATE, OUT_RATE, CHANNELS).expect("rates differ");
+            let mut resampler = Resampler::new(IN_RATE, OUT_RATE, CHANNELS).expect("rates differ");
             let out = resample_all(&mut resampler, &tone(freq, 2), 1024);
             let db = error_db(&out, freq);
             assert!(
@@ -346,8 +345,7 @@ mod tests {
         let ideal = frames_in as u64 * u64::from(OUT_RATE) / u64::from(IN_RATE);
 
         for chunk in [256usize, 1152, 4096, 32_768] {
-            let mut resampler =
-                Resampler::new(IN_RATE, OUT_RATE, CHANNELS).expect("rates differ");
+            let mut resampler = Resampler::new(IN_RATE, OUT_RATE, CHANNELS).expect("rates differ");
             let out = resample_all(&mut resampler, &input, chunk * CHANNELS as usize);
             let frames_out = (out.len() / CHANNELS as usize) as u64;
             // The only shortfall permitted is the look-ahead the filter has not
@@ -357,7 +355,10 @@ mod tests {
                 shortfall <= TAPS as u64,
                 "chunk {chunk}: produced {frames_out} frames, ideal {ideal}"
             );
-            assert!(frames_out <= ideal, "chunk {chunk}: produced more than ideal");
+            assert!(
+                frames_out <= ideal,
+                "chunk {chunk}: produced more than ideal"
+            );
         }
     }
 
@@ -367,7 +368,9 @@ mod tests {
     fn every_phase_has_unity_gain() {
         let resampler = Resampler::new(IN_RATE, OUT_RATE, CHANNELS).expect("rates differ");
         for phase in 0..resampler.table_phases {
-            let sum: f32 = resampler.phases[phase * TAPS..(phase + 1) * TAPS].iter().sum();
+            let sum: f32 = resampler.phases[phase * TAPS..(phase + 1) * TAPS]
+                .iter()
+                .sum();
             assert!(
                 (sum - 1.0).abs() < 1e-5,
                 "phase {phase} sums to {sum}, which would modulate the signal"

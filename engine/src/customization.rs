@@ -48,6 +48,7 @@ impl StoredDefinition {
 pub struct TrackEditStore {
     path: PathBuf,
     data: StoredEdits,
+    load_error: Option<String>,
 }
 
 impl TrackEditStore {
@@ -81,7 +82,11 @@ impl TrackEditStore {
                 return Err(format!("could not read {}: {error}", path.display()));
             }
         };
-        Ok(Self { path, data })
+        Ok(Self {
+            path,
+            data,
+            load_error: None,
+        })
     }
     pub fn load_or_empty(state_directory: &Path) -> Self {
         match Self::load(state_directory) {
@@ -94,6 +99,7 @@ impl TrackEditStore {
                         version: STORE_VERSION,
                         ..StoredEdits::default()
                     },
+                    load_error: Some(error),
                 }
             }
         }
@@ -121,6 +127,7 @@ impl TrackEditStore {
         cuts: Vec<TimeRange>,
         loop_range: Option<TimeRange>,
     ) -> Result<TrackEditDefinition, String> {
+        self.ensure_writable()?;
         validate_definition(&track_id, duration_ms, &cuts, loop_range)?;
         let stored = StoredDefinition {
             duration_ms,
@@ -144,6 +151,7 @@ impl TrackEditStore {
     }
 
     pub fn delete_definition(&mut self, track_id: &str) -> Result<(), String> {
+        self.ensure_writable()?;
         let previous_definition = self.data.definitions.remove(track_id);
         let previous_enablement = self.data.playlist_enablement.clone();
         self.data.playlist_enablement.retain(|_, tracks| {
@@ -168,6 +176,7 @@ impl TrackEditStore {
         track_id: &str,
         enabled: bool,
     ) -> Result<(), String> {
+        self.ensure_writable()?;
         validate_identifier("playlist id", playlist_id)?;
         validate_identifier("track id", track_id)?;
         if enabled && !self.data.definitions.contains_key(track_id) {
@@ -218,7 +227,17 @@ impl TrackEditStore {
             .is_some_and(|tracks| tracks.contains(track_id))
     }
 
+    fn ensure_writable(&self) -> Result<(), String> {
+        match &self.load_error {
+            Some(error) => Err(format!(
+                "track edit store is read-only because its snapshot could not be loaded: {error}"
+            )),
+            None => Ok(()),
+        }
+    }
+
     fn persist(&self) -> Result<(), String> {
+        self.ensure_writable()?;
         let parent = self
             .path
             .parent()
@@ -277,6 +296,67 @@ fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result
     }
 }
 
+/// A transport view of one source track. Cut ranges are absent from this
+/// timeline; positions at a cut seam resolve to the first source millisecond
+/// after that cut.
+///
+/// Callers construct this only after [`validate_definition`] has accepted the
+/// cuts, so mapping can stay allocation-free and linear in the usually tiny
+/// edit list.
+#[derive(Clone, Copy, Debug)]
+pub struct EditTimeline<'a> {
+    source_duration_ms: u32,
+    compiled_duration_ms: u32,
+    cuts: &'a [TimeRange],
+}
+
+impl<'a> EditTimeline<'a> {
+    pub fn new(source_duration_ms: u32, cuts: &'a [TimeRange]) -> Self {
+        let compiled_duration_ms = cuts.iter().fold(source_duration_ms, |duration, cut| {
+            duration - (cut.end_ms - cut.start_ms)
+        });
+        Self {
+            source_duration_ms,
+            compiled_duration_ms,
+            cuts,
+        }
+    }
+
+    pub fn compiled_duration_ms(self) -> u32 {
+        self.compiled_duration_ms
+    }
+
+    pub fn source_to_compiled(self, position_ms: u32) -> u32 {
+        let position_ms = position_ms.min(self.source_duration_ms);
+        let mut removed_ms = 0;
+        for cut in self.cuts {
+            if position_ms < cut.start_ms {
+                break;
+            }
+            if position_ms < cut.end_ms {
+                return cut.start_ms - removed_ms;
+            }
+            removed_ms += cut.end_ms - cut.start_ms;
+        }
+        position_ms - removed_ms
+    }
+
+    pub fn compiled_to_source(self, position_ms: u32) -> u32 {
+        let position_ms = position_ms.min(self.compiled_duration_ms());
+        let mut removed_ms = 0;
+        for cut in self.cuts {
+            let seam_ms = cut.start_ms - removed_ms;
+            if position_ms < seam_ms {
+                break;
+            }
+            removed_ms += cut.end_ms - cut.start_ms;
+        }
+        position_ms
+            .saturating_add(removed_ms)
+            .min(self.source_duration_ms)
+    }
+}
+
 pub fn validate_definition(
     track_id: &str,
     duration_ms: u32,
@@ -298,6 +378,13 @@ pub fn validate_definition(
             return Err("cut ranges must be sorted and non-overlapping".to_owned());
         }
         previous_end = range.end_ms;
+    }
+    let removed_ms: u64 = cuts
+        .iter()
+        .map(|range| u64::from(range.end_ms - range.start_ms))
+        .sum();
+    if removed_ms >= u64::from(duration_ms) {
+        return Err("cut ranges must leave at least one millisecond of the track".to_owned());
     }
 
     if let Some(loop_range) = loop_range {
@@ -373,6 +460,91 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_cuts_that_remove_the_entire_track() {
+        assert!(validate_definition("track", 10_000, &[range(0, 10_000)], None).is_err());
+        assert!(
+            validate_definition(
+                "track",
+                10_000,
+                &[range(0, 4_000), range(4_000, 10_000)],
+                None,
+            )
+            .is_err()
+        );
+        assert!(validate_definition("track", 10_000, &[range(0, 9_999)], None).is_ok());
+    }
+
+    #[test]
+    fn edit_timeline_maps_identity_seams_and_multiple_cuts() {
+        let identity = EditTimeline::new(10_000, &[]);
+        assert_eq!(identity.compiled_duration_ms(), 10_000);
+        for position in [0, 1, 4_999, 10_000, u32::MAX] {
+            let clamped = position.min(10_000);
+            assert_eq!(identity.source_to_compiled(position), clamped);
+            assert_eq!(identity.compiled_to_source(position), clamped);
+        }
+
+        let cuts = [
+            range(0, 1_000),
+            range(3_000, 5_000),
+            range(5_000, 6_000),
+            range(9_000, 10_000),
+        ];
+        let timeline = EditTimeline::new(10_000, &cuts);
+        assert_eq!(timeline.compiled_duration_ms(), 5_000);
+        assert_eq!(
+            timeline.source_to_compiled(500),
+            0,
+            "inside a cut maps to its seam"
+        );
+        assert_eq!(
+            timeline.compiled_to_source(0),
+            1_000,
+            "a seam maps after its cut"
+        );
+        assert_eq!(timeline.source_to_compiled(4_000), 2_000);
+        assert_eq!(
+            timeline.compiled_to_source(2_000),
+            6_000,
+            "adjacent cuts at one seam are crossed together"
+        );
+        assert_eq!(
+            timeline.compiled_to_source(5_000),
+            10_000,
+            "an ending cut is skipped"
+        );
+
+        for source in [1_000, 1_500, 2_999, 6_000, 7_500, 8_999, 10_000] {
+            assert_eq!(
+                timeline.compiled_to_source(timeline.source_to_compiled(source)),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn edit_timeline_is_monotonic_and_handles_an_all_but_one_ms_cut() {
+        let cuts = [range(0, 9_999)];
+        let timeline = EditTimeline::new(10_000, &cuts);
+        assert_eq!(timeline.compiled_duration_ms(), 1);
+        assert_eq!(timeline.compiled_to_source(0), 9_999);
+        assert_eq!(timeline.compiled_to_source(1), 10_000);
+
+        let mut previous = 0;
+        for source in 0..=10_000 {
+            let compiled = timeline.source_to_compiled(source);
+            assert!(compiled >= previous);
+            previous = compiled;
+        }
+        let mut previous = 0;
+        for compiled in 0..=timeline.compiled_duration_ms() {
+            let source = timeline.compiled_to_source(compiled);
+            assert!(source >= previous);
+            previous = source;
+        }
+    }
+
+    #[test]
     fn only_an_enabled_playlist_context_resolves_an_edit() {
         let root = std::env::temp_dir().join(format!(
             "spotify-renderer-track-edit-test-{}-{}",
@@ -394,6 +566,42 @@ mod tests {
         assert!(store.resolve("track", 10_000, "album:one").is_none());
         store.delete_definition("track").unwrap();
         assert!(!store.status("track", Some("one")).enabled);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn unreadable_snapshot_fails_closed_without_destroying_it() {
+        let root = std::env::temp_dir().join(format!(
+            "spotify-renderer-track-edit-corrupt-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(STORE_FILE);
+        let corrupt = b"{not valid json";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let mut store = TrackEditStore::load_or_empty(&root);
+        let save_error = store
+            .save_definition("track".to_owned(), 10_000, vec![range(1_000, 2_000)], None)
+            .unwrap_err();
+        assert!(save_error.contains("read-only"));
+        assert!(
+            store
+                .set_enabled("playlist", "track", true)
+                .unwrap_err()
+                .contains("read-only")
+        );
+        assert!(
+            store
+                .delete_definition("track")
+                .unwrap_err()
+                .contains("read-only")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

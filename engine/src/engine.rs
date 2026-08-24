@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use librespot_core::SpotifyUri;
@@ -9,26 +10,26 @@ use librespot_playback::mixer::{Mixer, softmixer::SoftMixer};
 use librespot_playback::player::{Player, PlayerEvent};
 use tokio::sync::mpsc;
 
-use crate::auth::{
-    PendingAuth, PlaybackHandles, complete_oauth, connect_cached, percent_to_volume,
-    prepare_oauth,
-};
 use crate::audio::AudioSignal;
-use crate::customization::{TrackEditStore, validate_definition};
+use crate::auth::{
+    PendingAuth, PlaybackHandles, complete_oauth, connect_cached, create_playback,
+    percent_to_volume, prepare_oauth,
+};
+use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
 use crate::io::ProtocolWriter;
-use spotify_playback_engine::protocol::{
-    AuthState, BrowseResponse, Command, HistoryPage, HistorySort, PositionEvent, RepeatMode, Response,
-    StateEvent, TimeRange, TrackEditDefinition, TrackEditStatus, TrackRef,
-};
 use serde::Serialize;
+use spotify_playback_engine::protocol::{
+    AuthState, BrowseResponse, Command, HistoryItem, PositionEvent, RepeatMode, Response,
+    StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus, TrackRef,
+};
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
 /// restart window (OnPrevious in app.cpp) so both sides agree.
 const PREVIOUS_RESTART_THRESHOLD_MS: u32 = 3_000;
-/// Minimum spacing between command-driven track changes (PlayQueue, Next,
-/// Previous). Loading an uncached track fetches its audio decryption key
-/// from Spotify's key service, which rate-limits bursts ("Unable to load
+/// Minimum spacing between command-driven track changes (queue replacement,
+/// queue index changes, Next, and Previous). Loading an uncached track fetches
+/// its audio key from Spotify's key service, which rate-limits bursts ("Unable to load
 /// key, continuing without decryption") and playback dies with decoder
 /// errors. 250 ms bounds key requests to roughly 4-8/s while keeping rapid
 /// next/prev responsive; presses are delayed, never dropped. Natural
@@ -123,23 +124,27 @@ pub struct Engine {
     listening_history: ListeningHistory,
     random_state: u64,
     generation: u64,
-    /// A seek is mid-transition (the player was paused by [`Engine::seek`]).
+    /// A seek is mid-transition (the player was paused by [`Engine::seek_source`]).
     /// While set, the transient pause event from the seek is suppressed, and
     /// a stale Playing event cannot override the seek's requested play/pause
     /// intent.
     seek_in_flight: bool,
     /// Whether the seek that set `seek_in_flight` was issued while playing.
     seek_should_play: bool,
+    /// The decoder reached physical EOF while a loop boundary was still
+    /// draining through the output queue. `Player::seek` is invalid in
+    /// librespot's EndOfTrack state, so the audible marker reloads the same
+    /// track instead.
+    loop_decoder_eof: bool,
+    /// The audible marker has requested a loop jump but librespot has not yet
+    /// confirmed the new load/position. If EOF wins that race, reload instead
+    /// of waiting for a marker that was already consumed.
+    loop_jump_pending: bool,
     auth_running: bool,
     /// Track-gain volume normalisation (attenuation-only, see
-    /// `auth::player_config`). Fixed for the lifetime of one player; changing
-    /// it rebuilds the player.
-    normalisation: bool,
-    /// A normalisation change that arrived while an authentication attempt was
-    /// in flight. The attempt captured the old value, so once it lands the
-    /// health tick rebuilds the player with the new one. See
-    /// [`Engine::set_normalisation`] and [`Engine::tick_session_health`].
-    rebuild_after_auth: bool,
+    /// `auth::player_config`). Shared with in-flight authentication so it can
+    /// build the latest preference without reconnecting the session.
+    normalisation: Arc<AtomicBool>,
     /// The prepared OAuth attempt whose authorize URL is published in
     /// `needs_login` state; `login` consumes it so the UI opens exactly the
     /// URL the flow listens for. Regenerated per attempt.
@@ -165,21 +170,27 @@ struct PlaybackState {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum PositionSpace {
+    Source,
+    Transport,
+}
+
 pub enum AuthSignal {
     Complete {
         generation: u64,
         result: Result<PlaybackHandles, String>,
     },
+    PlayerRebuilt {
+        generation: u64,
+        normalisation: bool,
+        result: Result<PlaybackHandles, String>,
+    },
 }
 
 pub enum PlayerSignal {
-    Event {
-        generation: u64,
-        event: PlayerEvent,
-    },
-    Closed {
-        generation: u64,
-    },
+    Event { generation: u64, event: PlayerEvent },
+    Closed { generation: u64 },
 }
 
 impl Engine {
@@ -239,22 +250,16 @@ impl Engine {
             generation: 0,
             seek_in_flight: false,
             seek_should_play: false,
+            loop_decoder_eof: false,
+            loop_jump_pending: false,
             auth_running: false,
-            normalisation,
-            rebuild_after_auth: false,
+            normalisation: Arc::new(AtomicBool::new(normalisation)),
             pending_auth: None,
         }
     }
 
-
-    pub fn history_page(
-        &self,
-        offset: usize,
-        limit: usize,
-        query: &str,
-        sort: HistorySort,
-    ) -> Result<HistoryPage, String> {
-        self.listening_history.page(offset, limit, query, sort)
+    pub fn history(&self) -> Result<Vec<HistoryItem>, String> {
+        self.listening_history.snapshot()
     }
 
     pub fn clear_history(&mut self) -> Result<bool, String> {
@@ -264,11 +269,7 @@ impl Engine {
     pub fn writer(&self) -> &ProtocolWriter {
         &self.writer
     }
-    pub fn track_edit_status(
-        &self,
-        track_id: &str,
-        playlist_id: Option<&str>,
-    ) -> TrackEditStatus {
+    pub fn track_edit_status(&self, track_id: &str, playlist_id: Option<&str>) -> TrackEditStatus {
         self.track_edits.status(track_id, playlist_id)
     }
 
@@ -293,8 +294,7 @@ impl Engine {
         track_id: &str,
         enabled: bool,
     ) -> Result<(), String> {
-        self.track_edits
-            .set_enabled(playlist_id, track_id, enabled)
+        self.track_edits.set_enabled(playlist_id, track_id, enabled)
     }
 
     pub fn emit_state(&self) -> Result<(), String> {
@@ -303,6 +303,7 @@ impl Engine {
             .current_index
             .and_then(|index| self.state.queue.get(index))
             .map(|track| track.uri.as_str());
+        let (position_ms, duration_ms) = self.transport_position_and_duration();
         self.writer.send(&StateEvent {
             kind: "state",
             ready: self.state.ready,
@@ -310,8 +311,8 @@ impl Engine {
             auth_url: self.state.auth_url.as_deref(),
             playing: self.state.playing,
             username: self.session.as_ref().map(|session| session.username()),
-            position_ms: self.state.position_ms,
-            duration_ms: self.state.duration_ms,
+            position_ms,
+            duration_ms,
             volume: self.state.volume,
             shuffle: self.state.shuffle,
             repeat: self.state.repeat,
@@ -331,11 +332,40 @@ impl Engine {
     /// while playing: paused positions are static and project from the last
     /// full state.
     pub fn emit_position(&self) -> Result<(), String> {
+        let (position_ms, duration_ms) = self.transport_position_and_duration();
         self.writer.send(&PositionEvent {
             kind: "position",
-            position_ms: self.state.position_ms,
-            duration_ms: self.state.duration_ms,
+            position_ms,
+            duration_ms,
         })
+    }
+
+    fn current_timeline(&self) -> EditTimeline<'_> {
+        let cuts = self
+            .state
+            .current_index
+            .and_then(|index| self.state.queue.get(index))
+            .and_then(|track| track.effective_edit.as_ref())
+            .map(|edit| edit.cuts.as_slice())
+            .unwrap_or_default();
+        EditTimeline::new(self.state.duration_ms, cuts)
+    }
+
+    fn transport_position_and_duration(&self) -> (u32, u32) {
+        let timeline = self.current_timeline();
+        (
+            timeline.source_to_compiled(self.state.position_ms),
+            timeline.compiled_duration_ms(),
+        )
+    }
+
+    fn transport_to_source(&self, position_ms: u32) -> u32 {
+        self.current_timeline().compiled_to_source(position_ms)
+    }
+
+    fn update_transport_position(&mut self, position_ms: u32) {
+        let source_position_ms = self.transport_to_source(position_ms);
+        self.update_position(source_position_ms);
     }
 
     /// Records an authoritative playback position and re-anchors the drift
@@ -359,14 +389,19 @@ impl Engine {
         let Some((anchor_position_ms, anchor_time)) = self.position_anchor else {
             return false;
         };
-        let elapsed_ms = (anchor_time.elapsed().as_secs_f64()
-            * 1_000.0
-            * f64::from(self.state.playback_speed))
-        .round()
-        .min(f64::from(u32::MAX)) as u32;
-        self.state.position_ms = anchor_position_ms
-            .saturating_add(elapsed_ms)
-            .min(self.state.duration_ms);
+        let elapsed_ms =
+            (anchor_time.elapsed().as_secs_f64() * 1_000.0 * f64::from(self.state.playback_speed))
+                .round()
+                .min(f64::from(u32::MAX)) as u32;
+        let source_position_ms = {
+            let timeline = self.current_timeline();
+            let compiled_anchor_ms = timeline.source_to_compiled(anchor_position_ms);
+            let compiled_position_ms = compiled_anchor_ms
+                .saturating_add(elapsed_ms)
+                .min(timeline.compiled_duration_ms());
+            timeline.compiled_to_source(compiled_position_ms)
+        };
+        self.state.position_ms = source_position_ms;
         true
     }
 
@@ -417,20 +452,9 @@ impl Engine {
     /// [`RECONNECT_BACKOFF_MIN`]. Reconnecting also re-arms `Ready`, so the
     /// frontend's existing "not ready" handling covers the gap without needing
     /// to know a reconnect happened.
-    pub fn tick_session_health(
-        &mut self,
-        sender: &mpsc::UnboundedSender<AuthSignal>,
-    ) -> bool {
+    pub fn tick_session_health(&mut self, sender: &mpsc::UnboundedSender<AuthSignal>) -> bool {
         if self.auth_running {
             return false;
-        }
-        // A normalisation change that was parked behind an in-flight
-        // authentication attempt applies now that the attempt has landed.
-        if self.rebuild_after_auth {
-            self.rebuild_after_auth = false;
-            self.resume_after_reconnect = self.state.playing;
-            self.start_authentication(sender.clone());
-            return true;
         }
         let dead = self
             .session
@@ -451,8 +475,7 @@ impl Engine {
             self.resume_after_reconnect = self.state.playing;
             self.state.ready = false;
             self.state.playing = false;
-            self.state.error =
-                Some("the Spotify connection dropped; reconnecting".to_owned());
+            self.state.error = Some("the Spotify connection dropped; reconnecting".to_owned());
             eprintln!("Spotify session went invalid; reconnecting");
             return true;
         };
@@ -471,32 +494,31 @@ impl Engine {
 
     /// Enables or disables track-gain volume normalisation.
     ///
-    /// The setting is baked into the player at construction, so a change on a
-    /// live session rebuilds the player from cached credentials — the same
-    /// deliberate reconnect `tick_session_health` performs, queue and play
-    /// intent preserved. While an authentication attempt is in flight the
-    /// attempt has already captured the old value; the change is parked in
-    /// `rebuild_after_auth` and applied by the health tick once it lands.
-    /// With no session at all (`needs_login`) the flag simply waits for the
-    /// next successful login. Returns whether state should be emitted.
+    /// A live change constructs only a new player against the existing
+    /// authenticated session. Authentication in flight shares the atomic
+    /// preference and therefore builds its first player with the latest value.
     pub fn set_normalisation(
         &mut self,
         enabled: bool,
         sender: &mpsc::UnboundedSender<AuthSignal>,
     ) -> bool {
-        if self.normalisation == enabled {
+        if self.normalisation.swap(enabled, Ordering::AcqRel) == enabled {
             return false;
         }
-        self.normalisation = enabled;
-        if self.auth_running {
-            self.rebuild_after_auth = true;
+        let Some(session) = self.session.clone() else {
             return true;
-        }
-        if self.state.auth_state == AuthState::NeedsLogin {
-            return true;
-        }
-        self.resume_after_reconnect = self.state.playing;
-        self.start_authentication(sender.clone());
+        };
+        let cache = self.cache.clone();
+        let sender = sender.clone();
+        let generation = self.generation;
+        tokio::spawn(async move {
+            let result = create_playback(session, cache, enabled).await;
+            let _ = sender.send(AuthSignal::PlayerRebuilt {
+                generation,
+                normalisation: enabled,
+                result,
+            });
+        });
         true
     }
 
@@ -522,7 +544,7 @@ impl Engine {
         }
         let cache = self.cache.clone();
         let temporary_directory = self.temporary_directory.clone();
-        let normalisation = self.normalisation;
+        let normalisation = Arc::clone(&self.normalisation);
         tokio::spawn(async move {
             let result = connect_cached(cache, temporary_directory, normalisation).await;
             let _ = sender.send(AuthSignal::Complete { generation, result });
@@ -562,7 +584,10 @@ impl Engine {
     /// Starts the OAuth flow on demand, consuming the prepared attempt so the
     /// flow listens for exactly the authorize URL the UI opened. No-op while a
     /// session is live (`Ready`) or a flow is already running.
-    pub fn login(&mut self, auth_sender: &mpsc::UnboundedSender<AuthSignal>) -> Result<bool, String> {
+    pub fn login(
+        &mut self,
+        auth_sender: &mpsc::UnboundedSender<AuthSignal>,
+    ) -> Result<bool, String> {
         if self.state.auth_state == AuthState::Ready {
             return Ok(true);
         }
@@ -574,7 +599,7 @@ impl Engine {
         let auth_sender = auth_sender.clone();
         let cache = self.cache.clone();
         let temporary_directory = self.temporary_directory.clone();
-        let normalisation = self.normalisation;
+        let normalisation = Arc::clone(&self.normalisation);
         tokio::spawn(async move {
             let result = complete_oauth(cache, temporary_directory, pending, normalisation).await;
             let _ = auth_sender.send(AuthSignal::Complete { generation, result });
@@ -639,73 +664,120 @@ impl Engine {
         signal: AuthSignal,
         player_sender: mpsc::UnboundedSender<PlayerSignal>,
     ) -> bool {
-        let AuthSignal::Complete { generation, result } = signal;
-        if generation != self.generation {
-            return false;
-        }
-        self.auth_running = false;
-        match result {
-            Ok(handles) => {
-                let had_queue = self.state.current_index.is_some();
-                let restored_volume = self.state.volume;
-                let resume = had_queue && self.resume_after_reconnect;
-                self.resume_after_reconnect = false;
-                self.state.ready = true;
-                self.state.auth_state = AuthState::Ready;
-                self.state.volume = if had_queue {
-                    restored_volume
-                } else {
-                    handles.volume_percent
-                };
-                self.state.error = None;
-                // The attempt is spent: the URL it published no longer applies.
-                self.state.auth_url = None;
-                self.pending_auth = None;
-                self.player = Some(handles.player);
-                self.mixer = Some(handles.mixer);
-                self.session = Some(handles.session);
-                if had_queue {
-                    let volume = percent_to_volume(restored_volume);
-                    if let Some(mixer) = &self.mixer {
-                        mixer.set_volume(volume);
-                    }
-                    crate::audio::set_sink_volume(volume);
-                    self.current_needs_load = true;
-                    self.state.playing = resume;
-                    if resume {
-                        if let Err(error) = self.load_current(true) {
-                            self.state.playing = false;
-                            self.state.error = Some(error);
+        match signal {
+            AuthSignal::Complete { generation, result } => {
+                if generation != self.generation {
+                    return false;
+                }
+                self.auth_running = false;
+                match result {
+                    Ok(handles) => {
+                        let had_queue = self.state.current_index.is_some();
+                        let restored_volume = self.state.volume;
+                        let resume = had_queue && self.resume_after_reconnect;
+                        self.resume_after_reconnect = false;
+                        self.state.ready = true;
+                        self.state.auth_state = AuthState::Ready;
+                        self.state.volume = if had_queue {
+                            restored_volume
+                        } else {
+                            handles.volume_percent
+                        };
+                        self.state.error = None;
+                        self.state.auth_url = None;
+                        self.pending_auth = None;
+                        self.player = Some(handles.player);
+                        self.mixer = Some(handles.mixer);
+                        self.session = Some(handles.session);
+                        if had_queue {
+                            let volume = percent_to_volume(restored_volume);
+                            if let Some(mixer) = &self.mixer {
+                                mixer.set_volume(volume);
+                            }
+                            crate::audio::set_sink_volume(volume);
+                            self.current_needs_load = true;
+                            self.state.playing = resume;
+                            if resume {
+                                if let Err(error) = self.load_current(true) {
+                                    self.state.playing = false;
+                                    self.state.error = Some(error);
+                                }
+                            }
                         }
+                        self.next_reconnect = None;
+                        self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
+                        Self::forward_player_events(handles.events, generation, player_sender);
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!("Spotify playback authentication failed: {error}");
+                        self.enter_needs_login();
+                        self.state.error = Some(error);
+                        true
                     }
                 }
-                // A live session again: drop any reconnect schedule and reset
-                // the backoff so the next outage recovers quickly too.
-                self.next_reconnect = None;
-                self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
-                let mut events = handles.events;
-                tokio::spawn(async move {
-                    while let Some(event) = events.recv().await {
-                        if player_sender
-                            .send(PlayerSignal::Event { generation, event })
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    let _ = player_sender.send(PlayerSignal::Closed { generation });
-                });
-                true
             }
-            Err(error) => {
-                eprintln!("Spotify playback authentication failed: {error}");
-                // A failed login returns to needs_login with a fresh URL so
-                // the user can retry with the Log in button.
-                self.enter_needs_login();
-                self.state.error = Some(error);
+            AuthSignal::PlayerRebuilt {
+                generation,
+                normalisation,
+                result,
+            } => {
+                if generation != self.generation
+                    || self.normalisation.load(Ordering::Acquire) != normalisation
+                {
+                    return false;
+                }
+                let handles = match result {
+                    Ok(handles) => handles,
+                    Err(error) => {
+                        self.state.error =
+                            Some(format!("could not rebuild the audio player: {error}"));
+                        return true;
+                    }
+                };
+
+                let was_playing = self.state.playing;
+                if let Some(player) = self.player.take() {
+                    player.stop();
+                }
+                self.generation = self.generation.wrapping_add(1);
+                let generation = self.generation;
+                let volume = percent_to_volume(self.state.volume);
+                handles.mixer.set_volume(volume);
+                crate::audio::set_sink_volume(volume);
+                self.player = Some(handles.player);
+                self.mixer = Some(handles.mixer);
+                self.current_needs_load = self.state.current_index.is_some();
+                self.play_request_id = None;
+                self.state.error = None;
+                if was_playing {
+                    if let Err(error) = self.load_current(true) {
+                        self.state.playing = false;
+                        self.state.error = Some(error);
+                    }
+                }
+                Self::forward_player_events(handles.events, generation, player_sender);
                 true
             }
         }
+    }
+
+    fn forward_player_events(
+        mut events: librespot_playback::player::PlayerEventChannel,
+        generation: u64,
+        player_sender: mpsc::UnboundedSender<PlayerSignal>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if player_sender
+                    .send(PlayerSignal::Event { generation, event })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = player_sender.send(PlayerSignal::Closed { generation });
+        });
     }
 
     /// Removes timestamps older than a burst window without treating a clock
@@ -749,11 +821,7 @@ impl Engine {
             now,
             TRACK_CHANGE_BURST_WINDOW,
         );
-        Self::prune_recent_times(
-            &mut self.recent_unavailable,
-            now,
-            UNAVAILABLE_BURST_WINDOW,
-        );
+        Self::prune_recent_times(&mut self.recent_unavailable, now, UNAVAILABLE_BURST_WINDOW);
         let clustered = self.recent_unavailable.len() >= 1
             || self.recent_track_changes.len() >= TRACK_CHANGE_BURST_MINIMUM;
         self.recent_unavailable.push_back(now);
@@ -772,8 +840,11 @@ impl Engine {
     /// bounded rate instead of bursting audio-key requests at Spotify's key
     /// service. Delays the command loop briefly; presses are never dropped.
     async fn pace_track_change(&mut self) {
-        let wait =
-            track_change_wait(self.last_track_change, Instant::now(), TRACK_CHANGE_MIN_INTERVAL);
+        let wait = track_change_wait(
+            self.last_track_change,
+            Instant::now(),
+            TRACK_CHANGE_MIN_INTERVAL,
+        );
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
         }
@@ -791,7 +862,7 @@ impl Engine {
             }
             return Ok(true);
         }
-        if matches!(&command, Command::GetHistory { .. }) {
+        if matches!(&command, Command::GetHistory) {
             return Ok(true);
         }
         if matches!(&command, Command::ClearHistory) {
@@ -815,6 +886,7 @@ impl Engine {
         if matches!(
             &command,
             Command::PlayQueue { .. }
+                | Command::PreviewTrackEdit { .. }
                 | Command::PlayQueueIndex { .. }
                 | Command::Next
                 | Command::Previous
@@ -823,7 +895,7 @@ impl Engine {
         }
         match command {
             Command::Status
-            | Command::GetHistory { .. }
+            | Command::GetHistory
             | Command::ClearHistory
             | Command::Shutdown
             | Command::Login
@@ -841,11 +913,12 @@ impl Engine {
             | Command::BrowseSearch { .. }
             | Command::BrowseTrackCredits { .. }
             | Command::BrowseCanvas { .. }
+            | Command::GetTrackWaveform { .. }
+            | Command::CancelTrackWaveform { .. }
             | Command::GetTrackEdit { .. }
             | Command::SaveTrackEdit { .. }
             | Command::DeleteTrackEdit { .. }
             | Command::SetPlaylistTrackEditEnabled { .. }
-            | Command::ExtractTrackWaveform { .. }
             | Command::EditCreatePlaylist { .. }
             | Command::EditRenamePlaylist { .. }
             | Command::EditDeletePlaylist { .. }
@@ -864,12 +937,18 @@ impl Engine {
                 position_ms,
                 context,
             } => self.restore_queue(queue, index, position_ms, context),
+            Command::PreviewTrackEdit {
+                track,
+                cuts,
+                loop_range,
+                position_ms,
+            } => self.preview_track_edit(track, cuts, loop_range, position_ms),
             Command::PlayQueueIndex { index } => self.play_queue_index(index),
             Command::Play => self.play(),
             Command::Pause => self.pause(),
             Command::Next => self.advance(false),
             Command::Previous => self.previous(),
-            Command::Seek { position_ms } => self.seek(position_ms),
+            Command::Seek { position_ms } => self.seek_transport(position_ms),
             Command::SetVolume { percent } => self.set_volume(percent),
             Command::SetShuffle { enabled } => self.set_shuffle(enabled),
             Command::SetRepeat { mode } => self.set_repeat(mode),
@@ -943,18 +1022,22 @@ impl Engine {
     /// player yet). The clone is handed to spawned browse tasks so the
     /// command loop never blocks on network resolution.
     pub fn browse_session_clone(&self) -> Result<librespot_core::Session, String> {
-        self.session.clone().ok_or_else(|| match self.state.auth_state {
-            AuthState::Authenticating => "Spotify authentication is still in progress".to_owned(),
-            AuthState::NeedsLogin => {
-                "Spotify login is required; use the Log in button in Settings".to_owned()
-            }
-            AuthState::Error => self
-                .state
-                .error
-                .clone()
-                .unwrap_or_else(|| "Spotify authentication failed".to_owned()),
-            AuthState::Ready => "the Spotify session is unavailable".to_owned(),
-        })
+        self.session
+            .clone()
+            .ok_or_else(|| match self.state.auth_state {
+                AuthState::Authenticating => {
+                    "Spotify authentication is still in progress".to_owned()
+                }
+                AuthState::NeedsLogin => {
+                    "Spotify login is required; use the Log in button in Settings".to_owned()
+                }
+                AuthState::Error => self
+                    .state
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Spotify authentication failed".to_owned()),
+                AuthState::Ready => "the Spotify session is unavailable".to_owned(),
+            })
     }
 
     /// Best-effort eviction of a track's cached audio files, run off the
@@ -1021,14 +1104,19 @@ impl Engine {
     pub fn on_audio_signal(&mut self, signal: AudioSignal) -> bool {
         match signal {
             // Deliberately not gated on `playing`: the boundary was reached,
-            // and the seek is what re-arms the pipeline to emit the next one.
-            // Dropping it because a pause raced the signal would leave the
-            // loop silently dead for the rest of the track, and `seek`
-            // preserves the paused intent anyway.
+            // and the jump is what re-arms the pipeline to emit the next one.
             AudioSignal::LoopBoundary { position_ms }
                 if self.current_loop_start() == Some(position_ms) =>
             {
-                if let Err(error) = self.seek(position_ms) {
+                self.loop_jump_pending = true;
+                let result = if self.loop_decoder_eof {
+                    let start_playing = self.state.playing;
+                    self.update_position(position_ms);
+                    self.load_current(start_playing)
+                } else {
+                    self.seek_source(position_ms).map(|_| ())
+                };
+                if let Err(error) = result {
                     self.state.playing = false;
                     self.state.error = Some(error);
                 }
@@ -1037,7 +1125,6 @@ impl Engine {
             _ => false,
         }
     }
-
     pub fn shutdown(&mut self) {
         self.auth_running = false;
         self.generation = self.generation.wrapping_add(1);
@@ -1063,6 +1150,18 @@ impl Engine {
         crate::audio::configure_customization(edit, self.state.playback_speed, position_ms);
     }
 
+    fn configure_current_audio_after_natural_boundary(&self, position_ms: u32) {
+        let edit = self
+            .state
+            .current_index
+            .and_then(|index| self.state.queue.get(index))
+            .and_then(|track| track.effective_edit.clone());
+        crate::audio::configure_customization_after_natural_boundary(
+            edit,
+            self.state.playback_speed,
+            position_ms,
+        );
+    }
     fn current_loop_start(&self) -> Option<u32> {
         self.state
             .current_index
@@ -1077,7 +1176,9 @@ impl Engine {
             Ok(())
         } else {
             Err(match self.state.auth_state {
-                AuthState::Authenticating => "Spotify authentication is still in progress".to_owned(),
+                AuthState::Authenticating => {
+                    "Spotify authentication is still in progress".to_owned()
+                }
                 AuthState::NeedsLogin => {
                     "Spotify login is required; use the Log in button in Settings".to_owned()
                 }
@@ -1097,7 +1198,6 @@ impl Engine {
             .ok_or_else(|| "the local audio player is unavailable".to_owned())
     }
 
-
     fn finalize_listening(&mut self, completed: bool) {
         let _ = self.listening_history.finalize(completed);
     }
@@ -1113,21 +1213,13 @@ impl Engine {
         for track in queue {
             parse_track_uri(track)?;
             if let Some(edit) = &track.effective_edit {
-                validate_definition(
-                    &track.id,
-                    track.duration_ms,
-                    &edit.cuts,
-                    edit.loop_range,
-                )?;
+                validate_definition(&track.id, track.duration_ms, &edit.cuts, edit.loop_range)?;
             }
         }
         Ok(())
     }
 
-    fn install_empty_or_unavailable_queue(
-        &mut self,
-        queue: Vec<TrackRef>,
-    ) -> Result<bool, String> {
+    fn install_empty_or_unavailable_queue(&mut self, queue: Vec<TrackRef>) -> Result<bool, String> {
         self.finalize_listening(false);
         self.player()?.stop();
         self.state.queue = queue;
@@ -1154,6 +1246,30 @@ impl Engine {
     ) -> Result<bool, String> {
         fill_queue_context(&mut queue, &context);
         self.resolve_queue_edits(&mut queue);
+        self.play_resolved_queue(queue, index, position_ms, PositionSpace::Transport)
+    }
+
+    fn preview_track_edit(
+        &mut self,
+        track: TrackRef,
+        cuts: Vec<TimeRange>,
+        loop_range: Option<TimeRange>,
+        position_ms: u32,
+    ) -> Result<bool, String> {
+        let track = with_preview_edit(track, cuts, loop_range)?;
+        self.play_resolved_queue(vec![track], 0, position_ms, PositionSpace::Source)
+    }
+
+    /// Installs queue rows whose `effective_edit` values are already final.
+    /// Preview uses this path so its draft is never resolved against the
+    /// persisted edit store.
+    fn play_resolved_queue(
+        &mut self,
+        queue: Vec<TrackRef>,
+        index: usize,
+        position_ms: u32,
+        position_space: PositionSpace,
+    ) -> Result<bool, String> {
         Self::validate_queue(&queue, index)?;
         let Some(playable_index) = first_available_from(&queue, index) else {
             return self.install_empty_or_unavailable_queue(queue);
@@ -1163,11 +1279,15 @@ impl Engine {
         self.state.queue = queue;
         self.state.current_index = Some(playable_index);
         self.state.duration_ms = self.state.queue[playable_index].duration_ms;
-        self.update_position(if playable_index == index {
+        let position_ms = if playable_index == index {
             position_ms
         } else {
             0
-        });
+        };
+        match position_space {
+            PositionSpace::Source => self.update_position(position_ms),
+            PositionSpace::Transport => self.update_transport_position(position_ms),
+        }
         self.state.playing = true;
         self.state.error = None;
         self.history.clear();
@@ -1189,13 +1309,13 @@ impl Engine {
         position_ms: u32,
         context: String,
     ) -> Result<bool, String> {
-        Self::validate_queue(&queue, index)?;
         fill_queue_context(&mut queue, &context);
         // The snapshot carries whatever edits were resolved when it was
         // written, which may since have been deleted or disabled. Every other
         // queue install re-resolves against the store; this one must too, or a
         // restart replays an edit the store no longer holds.
         self.resolve_queue_edits(&mut queue);
+        Self::validate_queue(&queue, index)?;
         self.finalize_listening(false);
         if let Some(player) = &self.player {
             player.stop();
@@ -1210,11 +1330,11 @@ impl Engine {
         self.state.duration_ms = playable_index
             .map(|current| self.state.queue[current].duration_ms)
             .unwrap_or(0);
-        self.update_position(if playable_index == Some(index) {
-            position_ms
+        if playable_index == Some(index) {
+            self.update_transport_position(position_ms);
         } else {
-            0
-        });
+            self.update_transport_position(0);
+        }
         self.state.playing = false;
         self.state.error = None;
         self.history.clear();
@@ -1255,7 +1375,7 @@ impl Engine {
         }
         self.state.current_index = Some(index);
         self.state.duration_ms = duration_ms;
-        self.update_position(0);
+        self.update_transport_position(0);
         self.state.playing = true;
         self.state.error = None;
         self.rebuild_shuffle_pool();
@@ -1279,7 +1399,7 @@ impl Engine {
             || (self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms)
         {
             if !self.loading_failed && !self.current_needs_load {
-                self.state.position_ms = 0;
+                self.update_transport_position(0);
             }
             self.load_current(true)?;
         } else {
@@ -1312,11 +1432,23 @@ impl Engine {
         Ok(true)
     }
 
-    fn seek(&mut self, position_ms: u32) -> Result<bool, String> {
+    fn seek_transport(&mut self, position_ms: u32) -> Result<bool, String> {
+        let source_position_ms = self.transport_to_source(position_ms);
+        self.seek_source(source_position_ms)
+    }
+
+    fn seek_source(&mut self, position_ms: u32) -> Result<bool, String> {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
         let position = position_ms.min(self.state.duration_ms);
+        if self.loop_decoder_eof {
+            let start_playing = self.state.playing;
+            self.update_position(position);
+            self.load_current(start_playing)?;
+            self.state.error = None;
+            return Ok(true);
+        }
         self.configure_current_audio(position);
         if self.current_needs_load {
             self.update_position(position);
@@ -1367,7 +1499,7 @@ impl Engine {
             }
             self.state.current_index = Some(index);
             self.state.duration_ms = self.state.queue[index].duration_ms;
-            self.update_position(0);
+            self.update_transport_position(0);
             self.state.error = None;
             let start_playing = self.state.playing;
             self.load_current(start_playing)?;
@@ -1375,7 +1507,7 @@ impl Engine {
         } else {
             // No earlier track (first track, or already restarting): seek the
             // current track back to its beginning instead of erroring.
-            self.seek(0)
+            self.seek_transport(0)
         }
     }
 
@@ -1386,7 +1518,11 @@ impl Engine {
     /// index the queue (stale after a mutation) are dropped instead of
     /// panicking.
     fn previous_index(&mut self) -> Option<usize> {
-        if self.state.position_ms > PREVIOUS_RESTART_THRESHOLD_MS {
+        if self
+            .current_timeline()
+            .source_to_compiled(self.state.position_ms)
+            > PREVIOUS_RESTART_THRESHOLD_MS
+        {
             return None;
         }
         while let Some(index) = self.history.pop() {
@@ -1410,9 +1546,9 @@ impl Engine {
 
     fn advance(&mut self, at_end: bool) -> Result<bool, String> {
         if at_end {
-            // A natural end-of-track advance is not user-paced, but it
-            // refreshes the change clock so a press right after a track ends
-            // is not double-waited (the load has already started).
+            // Flush delayed speed/cut output before changing configuration.
+            // The queue itself remains live so the tail can drain audibly.
+            crate::audio::finish_natural_boundary()?;
             self.last_track_change = Some(Instant::now());
         }
         let current = self
@@ -1428,12 +1564,21 @@ impl Engine {
                 }
                 self.state.current_index = Some(index);
                 self.state.duration_ms = self.state.queue[index].duration_ms;
-                self.update_position(0);
+                self.update_transport_position(0);
                 self.state.error = None;
-                self.load_current(true)?;
+                if at_end {
+                    self.load_current_after_natural_boundary(true)?;
+                } else {
+                    self.load_current(true)?;
+                }
             }
             None => {
-                self.player()?.stop();
+                // At natural EOF librespot is already in EndOfTrack. Calling
+                // stop here would clear correctly queued audio before the
+                // device drains it; explicit queue exhaustion still stops.
+                if !at_end {
+                    self.player()?.stop();
+                }
                 self.state.playing = false;
                 self.update_position(self.state.duration_ms);
             }
@@ -1454,7 +1599,7 @@ impl Engine {
             if self.current_needs_load {
                 self.configure_current_audio(position);
             } else {
-                self.seek(position)?;
+                self.seek_source(position)?;
             }
         } else {
             crate::audio::configure_customization(None, speed, 0);
@@ -1563,7 +1708,7 @@ impl Engine {
                 self.state.duration_ms = replacement
                     .map(|replacement| self.state.queue[replacement].duration_ms)
                     .unwrap_or(0);
-                self.update_position(0);
+                self.update_transport_position(0);
                 if replacement.is_some() {
                     reload = true;
                 } else {
@@ -1605,24 +1750,42 @@ impl Engine {
     }
 
     fn load_current(&mut self, start_playing: bool) -> Result<(), String> {
+        self.load_current_with_boundary(start_playing, false)
+    }
+
+    fn load_current_after_natural_boundary(&mut self, start_playing: bool) -> Result<(), String> {
+        self.load_current_with_boundary(start_playing, true)
+    }
+
+    fn load_current_with_boundary(
+        &mut self,
+        start_playing: bool,
+        natural_boundary: bool,
+    ) -> Result<(), String> {
         let index = self
             .state
             .current_index
             .ok_or_else(|| "the queue has no current track".to_owned())?;
-        let track = self.state.queue.get(index).ok_or_else(|| {
-            "the queue has no current track (index out of range)".to_owned()
-        })?;
+        let track = self
+            .state
+            .queue
+            .get(index)
+            .ok_or_else(|| "the queue has no current track (index out of range)".to_owned())?;
         let uri = playable_track_uri(track)?;
         let position_ms = self.state.position_ms;
-        self.configure_current_audio(position_ms);
+        if natural_boundary {
+            self.configure_current_audio_after_natural_boundary(position_ms);
+        } else {
+            self.configure_current_audio(position_ms);
+        }
         let next_uri = self
             .peek_next_index()
             .and_then(|next| playable_track_uri(&self.state.queue[next]).ok());
         self.play_request_id = None;
         self.seek_in_flight = false;
         self.seek_should_play = false;
-        // Clone the Arc so the immutable borrow of `self.player` ends before
-        // the recovery bookkeeping below mutates the engine.
+        self.loop_decoder_eof = false;
+        self.loop_jump_pending = false;
         let player = Arc::clone(self.player()?);
         self.loading_failed = false;
         self.current_needs_load = false;
@@ -1686,17 +1849,12 @@ impl Engine {
             return Some(current);
         }
         if self.state.shuffle {
-            return self
-                .shuffle_pool
-                .iter()
-                .rev()
-                .copied()
-                .find(|index| {
-                    self.state
-                        .queue
-                        .get(*index)
-                        .is_some_and(|track| !track.unavailable)
-                });
+            return self.shuffle_pool.iter().rev().copied().find(|index| {
+                self.state
+                    .queue
+                    .get(*index)
+                    .is_some_and(|track| !track.unavailable)
+            });
         }
         sequential_available_index(&self.state.queue, current, self.state.repeat)
     }
@@ -1707,9 +1865,10 @@ impl Engine {
             return;
         }
         let current = self.state.current_index;
-        self.shuffle_pool.extend((0..self.state.queue.len()).filter(|index| {
-            Some(*index) != current && !self.state.queue[*index].unavailable
-        }));
+        self.shuffle_pool.extend(
+            (0..self.state.queue.len())
+                .filter(|index| Some(*index) != current && !self.state.queue[*index].unavailable),
+        );
         for index in (1..self.shuffle_pool.len()).rev() {
             let swap = (self.next_random() as usize) % (index + 1);
             self.shuffle_pool.swap(index, swap);
@@ -1741,6 +1900,7 @@ impl Engine {
                 // play/pause intent already held in `state.playing`.
                 self.loading_failed = false;
                 self.update_position(position_ms);
+                self.loop_jump_pending = false;
                 self.state.error = None;
                 true
             }
@@ -1757,6 +1917,7 @@ impl Engine {
                 self.seek_in_flight = false;
                 self.seek_should_play = false;
                 self.loading_failed = false;
+                self.loop_jump_pending = false;
                 self.clear_unavailable_burst();
                 if !suppress_playing {
                     if let Some(index) = self.state.current_index {
@@ -1813,7 +1974,20 @@ impl Engine {
                 play_request_id,
                 track_id,
             } if self.is_current_event(play_request_id, &track_id) => {
-                if self.current_loop_start().is_some() {
+                if let Some(position_ms) = self.current_loop_start() {
+                    if self.loop_jump_pending {
+                        let start_playing = self.state.playing;
+                        self.update_position(position_ms);
+                        if let Err(error) = self.load_current(start_playing) {
+                            self.state.playing = false;
+                            self.state.error = Some(error);
+                        }
+                        return true;
+                    }
+                    // The audible loop marker owns continuation. If it has not
+                    // drained yet, remember that seek is no longer legal and
+                    // reload the same track when the marker arrives.
+                    self.loop_decoder_eof = true;
                     return false;
                 }
                 if let Err(error) = self.advance(true) {
@@ -1895,6 +2069,8 @@ impl Engine {
         self.play_request_id = None;
         self.loading_failed = false;
         self.current_needs_load = self.state.current_index.is_some();
+        self.loop_decoder_eof = false;
+        self.loop_jump_pending = false;
         self.seek_in_flight = false;
         self.seek_should_play = false;
         self.recent_track_changes.clear();
@@ -1917,11 +2093,26 @@ fn fill_queue_context(queue: &mut [TrackRef], fallback: &str) {
         }
     }
 }
+
+fn with_preview_edit(
+    mut track: TrackRef,
+    cuts: Vec<TimeRange>,
+    loop_range: Option<TimeRange>,
+) -> Result<TrackRef, String> {
+    let edit = TrackEdit { cuts, loop_range };
+    validate_definition(&track.id, track.duration_ms, &edit.cuts, edit.loop_range)?;
+    track.effective_edit = Some(edit);
+    Ok(track)
+}
+
 fn parse_track_uri(track: &TrackRef) -> Result<SpotifyUri, String> {
     let uri = SpotifyUri::from_uri(&track.uri)
         .map_err(|error| format!("invalid Spotify track URI '{}': {error}", track.uri))?;
     if !matches!(&uri, SpotifyUri::Track { .. }) {
-        return Err(format!("queue item is not a Spotify track URI: {}", track.uri));
+        return Err(format!(
+            "queue item is not a Spotify track URI: {}",
+            track.uri
+        ));
     }
     Ok(uri)
 }
@@ -1961,11 +2152,7 @@ fn sequential_available_index(
 }
 
 #[cfg(test)]
-fn sequential_next_index(
-    current: usize,
-    queue_len: usize,
-    repeat: RepeatMode,
-) -> Option<usize> {
+fn sequential_next_index(current: usize, queue_len: usize, repeat: RepeatMode) -> Option<usize> {
     if current + 1 < queue_len {
         Some(current + 1)
     } else if repeat == RepeatMode::Context && queue_len > 0 {
@@ -2001,22 +2188,26 @@ fn track_change_wait(last: Option<Instant>, now: Instant, interval: Duration) ->
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::Ordering};
     use std::time::{Duration, Instant};
 
-
-    use librespot_core::SpotifyUri;
-    use librespot_playback::player::PlayerEvent;
     use super::{
-        first_available_from, first_available_wrapping, remap_current_index_after_move,
-        sequential_available_index, sequential_next_index, track_change_wait, AuthSignal, Engine,
-        PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
-        TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW,
+        AudioSignal, AuthSignal, Engine, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX,
+        RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
+        UNAVAILABLE_BURST_WINDOW, first_available_from, first_available_wrapping,
+        remap_current_index_after_move, sequential_available_index, sequential_next_index,
+        track_change_wait, with_preview_edit,
     };
     use crate::io::ProtocolWriter;
-    use spotify_playback_engine::protocol::{RepeatMode, TrackRef};
+    use librespot_core::SpotifyUri;
+    use librespot_playback::player::PlayerEvent;
+    use spotify_playback_engine::protocol::{RepeatMode, TimeRange, TrackEdit, TrackRef};
 
     fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
+        test_engine_in(PathBuf::new())
+    }
+
+    fn test_engine_in(state_directory: PathBuf) -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
         let (writer, buffer) = ProtocolWriter::capture();
         let cache = librespot_core::cache::Cache::new(
             None::<PathBuf>,
@@ -2031,7 +2222,7 @@ mod tests {
                 cache,
                 PathBuf::new(),
                 PathBuf::new(),
-                PathBuf::new(),
+                state_directory,
                 false,
             ),
             buffer,
@@ -2067,6 +2258,22 @@ mod tests {
         }
     }
 
+    fn edited_playback_state(
+        duration_ms: u32,
+        cuts: Vec<TimeRange>,
+        loop_range: Option<TimeRange>,
+    ) -> PlaybackState {
+        let mut state = playback_state(duration_ms);
+        state.queue[0].id = "0123456789ABCDEFGHIJKL".to_owned();
+        state.queue[0].duration_ms = duration_ms;
+        state.queue[0].effective_edit = Some(TrackEdit { cuts, loop_range });
+        state
+    }
+
+    fn range(start_ms: u32, end_ms: u32) -> TimeRange {
+        TimeRange { start_ms, end_ms }
+    }
+
     fn playing_engine() -> Engine {
         let (mut engine, _) = test_engine();
         engine.state = playback_state(240_000);
@@ -2099,13 +2306,84 @@ mod tests {
             playable.clone(),
         ];
 
-        assert_eq!(engine.restore_queue(queue, 0, 42_000, String::new()), Ok(true));
+        assert_eq!(
+            engine.restore_queue(queue, 0, 42_000, String::new()),
+            Ok(true)
+        );
         assert_eq!(engine.state.current_index, Some(1));
-        assert_eq!(engine.state.position_ms, 0, "a skipped seed cannot keep its seek");
+        assert_eq!(
+            engine.state.position_ms, 0,
+            "a skipped seed cannot keep its seek"
+        );
         assert_eq!(engine.state.duration_ms, playable.duration_ms);
         assert!(!engine.state.playing);
         assert!(engine.current_needs_load);
         assert!(engine.play_request_id.is_none());
+    }
+
+    #[test]
+    fn preview_draft_is_validated_frozen_on_the_row_and_visible_in_state() {
+        let track = TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..TrackRef::default()
+        };
+        let cuts = vec![
+            TimeRange {
+                start_ms: 1_000,
+                end_ms: 2_500,
+            },
+            TimeRange {
+                start_ms: 10_000,
+                end_ms: 12_000,
+            },
+        ];
+        let loop_range = Some(TimeRange {
+            start_ms: 20_000,
+            end_ms: 25_000,
+        });
+        let preview =
+            with_preview_edit(track.clone(), cuts.clone(), loop_range).expect("valid draft");
+        assert_eq!(
+            preview.effective_edit,
+            Some(spotify_playback_engine::protocol::TrackEdit {
+                cuts: cuts.clone(),
+                loop_range,
+            })
+        );
+
+        let (mut engine, buffer) = test_engine();
+        engine.state = playback_state(track.duration_ms);
+        engine.state.queue = vec![preview];
+        engine.emit_state().expect("preview state emits");
+        let line: serde_json::Value = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            serde_json::from_slice(&std::mem::take(&mut *bytes)).expect("valid state JSON")
+        };
+        assert_eq!(
+            line["queue"][0]["effective_edit"],
+            serde_json::json!({"cuts": cuts, "loop_range": loop_range})
+        );
+
+        assert!(
+            with_preview_edit(
+                track,
+                vec![
+                    TimeRange {
+                        start_ms: 10_000,
+                        end_ms: 12_000,
+                    },
+                    TimeRange {
+                        start_ms: 11_000,
+                        end_ms: 13_000,
+                    },
+                ],
+                None,
+            )
+            .is_err(),
+            "preview must use the same sorted/non-overlapping validation as persistence"
+        );
     }
 
     #[test]
@@ -2231,6 +2509,53 @@ mod tests {
     }
 
     #[test]
+    fn loop_marker_reloads_when_decoder_eof_arrived_first() {
+        let mut engine = playing_engine();
+        engine.state.playing = true;
+        engine.state.queue[0].effective_edit = Some(spotify_playback_engine::protocol::TrackEdit {
+            cuts: Vec::new(),
+            loop_range: Some(TimeRange {
+                start_ms: 1_500,
+                end_ms: 2_000,
+            }),
+        });
+        assert!(!engine.on_player_event(PlayerEvent::EndOfTrack {
+            play_request_id: 7,
+            track_id: track_uri(),
+        }));
+        assert!(engine.loop_decoder_eof);
+
+        assert!(engine.on_audio_signal(AudioSignal::LoopBoundary { position_ms: 1_500 }));
+        assert_eq!(engine.state.position_ms, 1_500);
+        assert!(
+            !engine.loop_decoder_eof,
+            "the EOF continuation used load_current, not invalid EndOfTrack seek"
+        );
+    }
+
+    #[test]
+    fn loop_eof_after_an_audible_marker_does_not_wait_for_a_second_marker() {
+        let mut engine = playing_engine();
+        engine.state.playing = true;
+        engine.state.queue[0].effective_edit = Some(spotify_playback_engine::protocol::TrackEdit {
+            cuts: Vec::new(),
+            loop_range: Some(TimeRange {
+                start_ms: 900,
+                end_ms: 1_000,
+            }),
+        });
+        engine.loop_jump_pending = true;
+        assert!(engine.on_player_event(PlayerEvent::EndOfTrack {
+            play_request_id: 7,
+            track_id: track_uri(),
+        }));
+        assert_eq!(engine.state.position_ms, 900);
+        assert!(
+            !engine.loop_jump_pending,
+            "the EOF race immediately reloaded and consumed the pending jump"
+        );
+    }
+    #[test]
     fn unavailable_recovery_rearms_a_fresh_loading_request() {
         let mut engine = playing_engine();
         let uri = track_uri();
@@ -2249,9 +2574,7 @@ mod tests {
 
         // A retry gets a new player request id, then Loading clears the
         // failed-loader marker before playback begins.
-        assert!(!engine.on_player_event(PlayerEvent::PlayRequestIdChanged {
-            play_request_id: 8,
-        }));
+        assert!(!engine.on_player_event(PlayerEvent::PlayRequestIdChanged { play_request_id: 8 }));
         assert!(engine.on_player_event(PlayerEvent::Loading {
             play_request_id: 8,
             track_id: uri.clone(),
@@ -2273,10 +2596,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_session_librespot_invalidated_is_noticed_and_reconnected_with_backoff() {
         let (mut engine, _) = test_engine();
-        let session = librespot_core::Session::new(
-            librespot_core::SessionConfig::default(),
-            None,
-        );
+        let session = librespot_core::Session::new(librespot_core::SessionConfig::default(), None);
         // Exactly what librespot does to itself when the access point drops.
         session.shutdown();
         assert!(session.is_invalid());
@@ -2338,7 +2658,10 @@ mod tests {
         ));
         engine.next_reconnect = Some(Instant::now());
         assert!(!engine.tick_session_health(&sender));
-        assert!(engine.next_reconnect.is_none(), "a live session is not a corpse");
+        assert!(
+            engine.next_reconnect.is_none(),
+            "a live session is not a corpse"
+        );
     }
 
     /// The regression that made the classifier inert: it was sized against how
@@ -2373,20 +2696,15 @@ mod tests {
 
         // One quiet load failure is eligible for the corrupt-cache cleanup.
         engine.note_track_change(start);
-        assert!(!engine.unavailable_is_clustered(
-            start + Duration::from_millis(10)
-        ));
+        assert!(!engine.unavailable_is_clustered(start + Duration::from_millis(10)));
 
         // A second failure shortly afterward is clustered, so valid cache
         // files are preserved while the key/network burst settles.
-        assert!(engine.unavailable_is_clustered(
-            start + Duration::from_millis(20)
-        ));
+        assert!(engine.unavailable_is_clustered(start + Duration::from_millis(20)));
 
         // After both windows expire, cleanup is eligible again.
         let quiet = start
-            + TRACK_CHANGE_BURST_WINDOW
-            .max(UNAVAILABLE_BURST_WINDOW)
+            + TRACK_CHANGE_BURST_WINDOW.max(UNAVAILABLE_BURST_WINDOW)
             + Duration::from_millis(25);
         assert!(!engine.unavailable_is_clustered(quiet));
 
@@ -2394,9 +2712,7 @@ mod tests {
         // a rapid-click burst.
         engine.note_track_change(quiet);
         engine.note_track_change(quiet + Duration::from_millis(100));
-        assert!(engine.unavailable_is_clustered(
-            quiet + Duration::from_millis(200)
-        ));
+        assert!(engine.unavailable_is_clustered(quiet + Duration::from_millis(200)));
     }
 
     #[test]
@@ -2476,8 +2792,211 @@ mod tests {
             (15_000..16_000).contains(&position_ms),
             "position projects from the anchor: {position_ms}"
         );
-        assert!(!object.contains_key("queue"), "a heartbeat never carries the queue");
-        assert!(!object.contains_key("playing"), "a heartbeat carries no flags");
+        assert!(
+            !object.contains_key("queue"),
+            "a heartbeat never carries the queue"
+        );
+        assert!(
+            !object.contains_key("playing"),
+            "a heartbeat carries no flags"
+        );
+    }
+
+    #[test]
+    fn edited_state_and_heartbeat_serialize_compiled_transport_scalars() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = edited_playback_state(100_000, vec![range(10_000, 60_000)], None);
+        engine.update_position(65_000);
+
+        engine.emit_state().expect("edited state emits");
+        let state: serde_json::Value = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            serde_json::from_slice(&std::mem::take(&mut *bytes)).expect("state json")
+        };
+        assert_eq!(state["position_ms"], 15_000);
+        assert_eq!(state["duration_ms"], 50_000);
+        assert_eq!(
+            state["queue"][0]["duration_ms"], 100_000,
+            "queue metadata stays in source coordinates"
+        );
+
+        engine.update_position(100_000);
+        engine.emit_position().expect("edited heartbeat emits");
+        let heartbeat: serde_json::Value = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            serde_json::from_slice(&std::mem::take(&mut *bytes)).expect("heartbeat json")
+        };
+        assert_eq!(heartbeat["position_ms"], 50_000);
+        assert_eq!(heartbeat["duration_ms"], 50_000);
+    }
+
+    #[test]
+    fn unedited_state_serialization_keeps_source_scalars_unchanged() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = playback_state(100_000);
+        engine.update_position(65_000);
+        engine.emit_state().expect("unedited state emits");
+        let state: serde_json::Value = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            serde_json::from_slice(&std::mem::take(&mut *bytes)).expect("state json")
+        };
+        assert_eq!(state["position_ms"], 65_000);
+        assert_eq!(state["duration_ms"], 100_000);
+    }
+
+    #[test]
+    fn edited_tick_crosses_a_long_cut_continuously_at_every_speed() {
+        for (speed, expected_compiled_ms, expected_source_ms) in [
+            (0.5, 10_500_u32, 60_500_u32),
+            (1.0, 11_500_u32, 61_500_u32),
+            (2.0, 13_500_u32, 63_500_u32),
+        ] {
+            let (mut engine, _) = test_engine();
+            engine.state = edited_playback_state(100_000, vec![range(10_000, 60_000)], None);
+            engine.state.playing = true;
+            engine.state.playback_speed = speed;
+            engine.position_anchor = Some((9_500, Instant::now() - Duration::from_secs(2)));
+
+            assert!(engine.tick_position());
+            let (compiled_ms, duration_ms) = engine.transport_position_and_duration();
+            assert_eq!(duration_ms, 50_000);
+            assert!(
+                compiled_ms.abs_diff(expected_compiled_ms) <= 5,
+                "{speed}x projected to {compiled_ms}, expected {expected_compiled_ms}"
+            );
+            assert!(
+                engine.state.position_ms.abs_diff(expected_source_ms) <= 5,
+                "{speed}x source projection did not skip the cut"
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_seek_canonicalizes_every_cut_seam_to_audible_source() {
+        let (mut engine, _) = test_engine();
+        engine.state = edited_playback_state(
+            10_000,
+            vec![range(0, 1_000), range(3_000, 6_000), range(9_000, 10_000)],
+            None,
+        );
+        engine.current_needs_load = true;
+
+        engine.seek_transport(0).expect("seek at starting seam");
+        assert_eq!(engine.state.position_ms, 1_000);
+        engine.seek_transport(2_000).expect("seek at middle seam");
+        assert_eq!(engine.state.position_ms, 6_000);
+        engine
+            .seek_transport(u32::MAX)
+            .expect("seek clamps at compiled EOF");
+        assert_eq!(engine.state.position_ms, 10_000);
+        assert!(
+            !engine.state.queue[0]
+                .effective_edit
+                .as_ref()
+                .unwrap()
+                .cuts
+                .iter()
+                .any(|cut| {
+                    cut.start_ms <= engine.state.position_ms
+                        && engine.state.position_ms < cut.end_ms
+                })
+        );
+    }
+
+    #[test]
+    fn preview_and_internal_loop_seek_keep_source_coordinates() {
+        let (mut preview_engine, _) = test_engine();
+        let track = TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 100_000,
+            ..TrackRef::default()
+        };
+        let error = preview_engine
+            .preview_track_edit(track, vec![range(10_000, 60_000)], None, 40_000)
+            .expect_err("the test engine has no player");
+        assert!(error.contains("player"));
+        assert_eq!(
+            preview_engine.state.position_ms, 40_000,
+            "editor preview position remains in the source timeline"
+        );
+
+        let (mut loop_engine, _) = test_engine();
+        loop_engine.state = edited_playback_state(
+            100_000,
+            vec![range(10_000, 60_000)],
+            Some(range(70_000, 80_000)),
+        );
+        loop_engine.state.playing = true;
+        loop_engine.current_needs_load = true;
+        assert!(loop_engine.on_audio_signal(AudioSignal::LoopBoundary {
+            position_ms: 70_000,
+        }));
+        assert_eq!(loop_engine.state.position_ms, 70_000);
+        assert_eq!(
+            loop_engine.transport_position_and_duration(),
+            (20_000, 50_000),
+            "the visible playhead wraps to the mapped loop start"
+        );
+    }
+
+    #[test]
+    fn restore_maps_the_compiled_snapshot_after_resolving_live_edits() {
+        let root = std::env::temp_dir().join(format!(
+            "spotify-renderer-compiled-restore-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (mut engine, _) = test_engine_in(root.clone());
+        engine
+            .track_edits
+            .save_definition(
+                "0123456789ABCDEFGHIJKL".to_owned(),
+                100_000,
+                vec![range(10_000, 60_000)],
+                None,
+            )
+            .unwrap();
+        engine
+            .track_edits
+            .set_enabled("playlist", "0123456789ABCDEFGHIJKL", true)
+            .unwrap();
+        let track = TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 100_000,
+            context: "playlist:playlist".to_owned(),
+            ..TrackRef::default()
+        };
+
+        engine
+            .restore_queue(vec![track], 0, 10_000, String::new())
+            .expect("restore");
+        assert_eq!(
+            engine.state.position_ms, 60_000,
+            "the exact compiled seam restores after the cut"
+        );
+        assert!(!engine.state.playing);
+        assert!(engine.current_needs_load);
+        assert_eq!(engine.transport_position_and_duration(), (10_000, 50_000));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn previous_restart_uses_the_compiled_beginning() {
+        let (mut engine, _) = test_engine();
+        engine.state = edited_playback_state(10_000, vec![range(0, 1_000)], None);
+        engine.state.position_ms = 5_000;
+        engine.current_needs_load = true;
+
+        engine.previous().expect("restart");
+        assert_eq!(engine.state.position_ms, 1_000);
+        assert_eq!(engine.transport_position_and_duration().0, 0);
     }
 
     #[test]
@@ -2524,17 +3043,25 @@ mod tests {
         // dropped instead of panicking; the fallback still applies.
         engine.history.clear();
         engine.history.push(99);
-        assert_eq!(engine.previous_index(), Some(0), "falls back to current - 1");
+        assert_eq!(
+            engine.previous_index(),
+            Some(0),
+            "falls back to current - 1"
+        );
         engine.state.current_index = Some(0);
         engine.history.push(99);
-        assert_eq!(engine.previous_index(), None, "first track: restart in place");
+        assert_eq!(
+            engine.previous_index(),
+            None,
+            "first track: restart in place"
+        );
     }
 
     #[test]
     fn previous_without_a_player_errors_gracefully() {
         let mut engine = playing_engine();
         engine.state.position_ms = 0;
-        // No previous target -> seek(0) -> no player attached: the command must
+        // No previous target -> transport seek to zero -> no player attached:
         // fail with an error, never panic or unwrap an empty queue.
         assert!(engine.previous().is_err());
         engine.state.current_index = None;
@@ -2549,14 +3076,17 @@ mod tests {
         assert!(engine.previous().is_err());
         assert!(engine.advance(false).is_err());
         assert!(engine.load_current(true).is_err());
-        assert!(!engine.on_player_signal(PlayerSignal::Event {
-            generation: engine.generation,
-            event: PlayerEvent::Playing {
-                play_request_id: engine.play_request_id.unwrap_or(7),
-                track_id: track_uri(),
-                position_ms: 0,
-            },
-        }), "events for a missing queue index are ignored, not panicked");
+        assert!(
+            !engine.on_player_signal(PlayerSignal::Event {
+                generation: engine.generation,
+                event: PlayerEvent::Playing {
+                    play_request_id: engine.play_request_id.unwrap_or(7),
+                    track_id: track_uri(),
+                    position_ms: 0,
+                },
+            }),
+            "events for a missing queue index are ignored, not panicked"
+        );
         engine.state.current_index = None;
         assert!(engine.previous().is_err());
         assert!(engine.advance(false).is_err());
@@ -2567,10 +3097,7 @@ mod tests {
     fn sequential_queue_stops_or_wraps_at_the_end() {
         assert_eq!(sequential_next_index(0, 3, RepeatMode::Off), Some(1));
         assert_eq!(sequential_next_index(2, 3, RepeatMode::Off), None);
-        assert_eq!(
-            sequential_next_index(2, 3, RepeatMode::Context),
-            Some(0)
-        );
+        assert_eq!(sequential_next_index(2, 3, RepeatMode::Context), Some(0));
         assert_eq!(sequential_next_index(0, 0, RepeatMode::Context), None);
     }
 
@@ -2685,14 +3212,19 @@ mod tests {
         engine.state.playing = true;
 
         assert!(engine.logout().expect("logout succeeds"));
-        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin);
+        assert!(
+            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin
+        );
         assert!(!engine.state.ready);
         assert!(!engine.state.playing);
         assert!(engine.state.current_index.is_none());
         assert!(engine.state.queue.is_empty());
         let published_url = engine.state.auth_url.clone().expect("auth url published");
         assert!(published_url.starts_with("https://accounts.spotify.com/authorize?"));
-        assert!(!fixture.credentials_exist(), "credentials file must be removed");
+        assert!(
+            !fixture.credentials_exist(),
+            "credentials file must be removed"
+        );
 
         engine.emit_state().expect("state emits");
         let line = {
@@ -2716,19 +3248,20 @@ mod tests {
             None,
         )
         .expect("cache");
-        let mut engine =
-            Engine::new(
-                writer,
-                cache,
-                PathBuf::new(),
-                fixture.credentials_file(),
-                fixture.directory.clone(),
-                false,
-            );
+        let mut engine = Engine::new(
+            writer,
+            cache,
+            PathBuf::new(),
+            fixture.credentials_file(),
+            fixture.directory.clone(),
+            false,
+        );
         assert!(engine.logout().expect("first logout"));
         assert!(!fixture.credentials_exist());
         assert!(engine.logout().expect("second logout is a no-op"));
-        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin);
+        assert!(
+            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin
+        );
     }
 
     #[test]
@@ -2737,7 +3270,9 @@ mod tests {
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         engine.start_authentication(sender);
         assert!(!engine.auth_running, "no implicit flow may start");
-        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin);
+        assert!(
+            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin
+        );
         assert!(engine.state.auth_url.is_some());
 
         engine.emit_state().expect("state emits");
@@ -2747,9 +3282,11 @@ mod tests {
         };
         let value: serde_json::Value = serde_json::from_slice(&line).expect("state json");
         assert_eq!(value["auth_state"], "needs_login");
-        assert!(value["auth_url"].as_str().is_some_and(|url| {
-            url.starts_with("https://accounts.spotify.com/authorize?")
-        }));
+        assert!(
+            value["auth_url"]
+                .as_str()
+                .is_some_and(|url| { url.starts_with("https://accounts.spotify.com/authorize?") })
+        );
     }
 
     #[test]
@@ -2757,7 +3294,11 @@ mod tests {
         let mut engine = playing_engine(); // ready with a player-less state
         engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Ready;
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        assert!(engine.login(&sender).expect("login no-ops when authenticated"));
+        assert!(
+            engine
+                .login(&sender)
+                .expect("login no-ops when authenticated")
+        );
         assert!(!engine.auth_running);
         assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Ready);
     }
@@ -2769,7 +3310,11 @@ mod tests {
         engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?running".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        assert!(engine.login(&sender).expect("login no-ops while authenticating"));
+        assert!(
+            engine
+                .login(&sender)
+                .expect("login no-ops while authenticating")
+        );
         assert!(engine.auth_running);
         assert_eq!(
             engine.state.auth_url.as_deref(),
@@ -2779,67 +3324,41 @@ mod tests {
     }
 
     #[test]
-    fn set_normalisation_stores_the_flag_and_parks_the_rebuild_behind_a_live_attempt() {
+    fn normalisation_change_during_auth_updates_shared_preference_without_reconnect() {
         let mut engine = test_engine().0;
-        assert!(!engine.normalisation, "engines start with normalisation off");
-        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-
-        // Same value: nothing changes and nothing is scheduled.
-        assert!(!engine.set_normalisation(false, &sender));
-
-        // A change while an attempt is in flight must not tear that attempt
-        // down; the rebuild is parked for the health tick instead.
+        assert!(!engine.normalisation.load(Ordering::Acquire));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         engine.auth_running = true;
         engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
+
         assert!(engine.set_normalisation(true, &sender));
-        assert!(engine.normalisation);
-        assert!(engine.rebuild_after_auth, "the in-flight attempt has the old value");
-        assert!(!engine.resume_after_reconnect, "no resume intent is set yet");
+        assert!(engine.normalisation.load(Ordering::Acquire));
+        assert!(
+            engine.auth_running,
+            "the existing authentication keeps running"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "no reconnect or parallel player build is scheduled without a live session"
+        );
+        assert!(
+            !engine.tick_session_health(&sender),
+            "the health tick has no normalisation rebuild machinery"
+        );
     }
 
     #[test]
-    fn set_normalisation_without_a_session_waits_for_the_next_login() {
+    fn normalisation_without_a_session_waits_for_the_next_login() {
         let mut engine = test_engine().0;
         engine.enter_needs_login();
-        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine.set_normalisation(true, &sender));
-        assert!(engine.normalisation);
-        assert!(
-            !engine.rebuild_after_auth,
-            "with no session there is nothing to rebuild"
-        );
+        assert!(engine.normalisation.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_err());
         assert_eq!(
             engine.state.auth_state,
             spotify_playback_engine::protocol::AuthState::NeedsLogin,
             "the login flow itself must not be disturbed"
-        );
-    }
-
-    #[test]
-    fn the_health_tick_applies_a_parked_normalisation_rebuild_once_the_attempt_lands() {
-        let mut engine = test_engine().0;
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        engine.auth_running = true;
-        assert!(engine.set_normalisation(true, &sender));
-        assert!(engine.rebuild_after_auth);
-
-        // The attempt is still running: the tick must leave everything alone.
-        assert!(!engine.tick_session_health(&sender));
-        assert!(engine.rebuild_after_auth);
-
-        // The attempt lands; the next tick performs the parked rebuild.
-        // test_engine holds no cached credentials, so the rebuild itself ends
-        // in needs_login — with real credentials it would reconnect and
-        // resume; here the observable contract is that the parked change is
-        // consumed exactly once and start_authentication ran.
-        engine.auth_running = false;
-        engine.state.playing = true;
-        assert!(engine.tick_session_health(&sender));
-        assert!(!engine.rebuild_after_auth, "the parked change is consumed");
-        assert_eq!(
-            engine.state.auth_state,
-            spotify_playback_engine::protocol::AuthState::NeedsLogin,
-            "the rebuild ran (to needs_login without credentials)"
         );
     }
 
@@ -2853,8 +3372,13 @@ mod tests {
             .clone()
             .expect("needs_login publishes a url");
         let pending = engine.begin_login_flow().expect("flow begins");
-        assert_eq!(pending.auth_url, published, "the flow must use the published URL");
-        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating);
+        assert_eq!(
+            pending.auth_url, published,
+            "the flow must use the published URL"
+        );
+        assert!(
+            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating
+        );
         assert!(engine.auth_running);
         assert_eq!(engine.state.auth_url.as_deref(), Some(published.as_str()));
         assert!(engine.pending_auth.is_none());
@@ -2865,9 +3389,18 @@ mod tests {
         let mut engine = test_engine().0;
         engine.state.auth_state = spotify_playback_engine::protocol::AuthState::NeedsLogin;
         let pending = engine.begin_login_flow().expect("flow begins");
-        assert!(pending.auth_url.starts_with("https://accounts.spotify.com/authorize?"));
-        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating);
-        assert_eq!(engine.state.auth_url.as_deref(), Some(pending.auth_url.as_str()));
+        assert!(
+            pending
+                .auth_url
+                .starts_with("https://accounts.spotify.com/authorize?")
+        );
+        assert!(
+            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating
+        );
+        assert_eq!(
+            engine.state.auth_url.as_deref(),
+            Some(pending.auth_url.as_str())
+        );
     }
 
     #[test]
@@ -2883,7 +3416,9 @@ mod tests {
             },
             sender,
         ));
-        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin);
+        assert!(
+            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin
+        );
         assert!(!engine.state.ready);
         assert!(!engine.auth_running);
         let retry_url = engine.state.auth_url.clone().expect("retry url published");
@@ -2891,9 +3426,13 @@ mod tests {
             retry_url, "https://accounts.spotify.com/authorize?first",
             "a retry must regenerate the URL"
         );
-        assert!(engine.state.error.as_deref().is_some_and(|error| {
-            error.contains("Spotify authentication failed")
-        }));
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("Spotify authentication failed") })
+        );
     }
 
     #[test]

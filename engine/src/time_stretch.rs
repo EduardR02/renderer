@@ -10,6 +10,11 @@ const SEARCH_INTERVAL_MS: i64 = 30;
 /// block; re-picking it repeats audio and reads as buzz. Heuristic constant
 /// from Chromium.
 const EXCLUDE_HALF_FRAMES: i64 = 80;
+/// Candidate positions and correlation samples are both decimated during the
+/// broad search. The winning neighbourhood is then evaluated at full
+/// resolution, reducing the normal search from roughly 2.3 million stereo
+/// multiply-accumulates to under 170,000 without quantising the final offset.
+const SEARCH_DECIMATION: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
@@ -73,6 +78,14 @@ impl AudioPipeline {
             loop_to
         } else {
             None
+        }
+    }
+    /// Completes a natural stream boundary. Unlike `reset_buffers`, this makes
+    /// the stretcher's delayed overlap region audible before resetting it.
+    pub fn finish(&mut self, output: &mut Vec<f32>) {
+        output.clear();
+        if let Some(stretcher) = &mut self.stretcher {
+            stretcher.finish(output);
         }
     }
 
@@ -163,13 +176,7 @@ fn frames_for_ms(ms: i64) -> usize {
 /// from the rolling input buffer, zero-filling anything before the start of
 /// the stream. Free function so callers can mutably borrow other `Wsola`
 /// scratch buffers without borrow-splitting fights.
-fn extract(
-    input: &[f32],
-    input_start: usize,
-    abs_start: i64,
-    frames: usize,
-    dest: &mut Vec<f32>,
-) {
+fn extract(input: &[f32], input_start: usize, abs_start: i64, frames: usize, dest: &mut Vec<f32>) {
     dest.clear();
     dest.resize(frames * CHANNELS, 0.0);
     let rel = abs_start - input_start as i64;
@@ -189,7 +196,6 @@ fn frame_to_ms(frame: u64) -> u32 {
     ((frame * 1_000 + u64::from(SAMPLE_RATE) / 2) / u64::from(SAMPLE_RATE)).min(u64::from(u32::MAX))
         as u32
 }
-
 
 /// Streaming WSOLA stretcher ported from Chromium's AudioRendererAlgorithm
 /// (media/filters/audio_renderer_algorithm.cc + wsola_internals.cc, BSD
@@ -219,6 +225,11 @@ pub struct Wsola {
     input: Vec<f32>,
     /// Absolute frame index of `input[0]` since stream start.
     input_start: usize,
+    /// Real source frames accepted since the last reset (padding used to flush
+    /// EOF is deliberately excluded).
+    input_frames: usize,
+    /// Frames already returned to the caller.
+    emitted_frames: usize,
     /// Output-time position, in output frames.
     output_time: f64,
     /// Absolute frame index of the next target block (natural continuation).
@@ -233,6 +244,10 @@ pub struct Wsola {
     target_buf: Vec<f32>,
     opt_buf: Vec<f32>,
     work_buf: Vec<f32>,
+    /// Scalar candidate/target sample pairs evaluated. Kept as a cheap integer
+    /// so tests can pin the work reduction instead of timing noisy CI hosts.
+    search_comparisons: usize,
+    search_count: usize,
 }
 
 impl Wsola {
@@ -271,6 +286,8 @@ impl Wsola {
             transition,
             input: Vec::new(),
             input_start: 0,
+            input_frames: 0,
+            emitted_frames: 0,
             output_time: 0.0,
             target_idx: 0,
             search_idx: -center_offset,
@@ -279,37 +296,59 @@ impl Wsola {
             target_buf: vec![0.0; window * CHANNELS],
             opt_buf: vec![0.0; window * CHANNELS],
             work_buf: vec![0.0; window * CHANNELS],
+            search_comparisons: 0,
+            search_count: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.input.clear();
         self.input_start = 0;
+        self.input_frames = 0;
+        self.emitted_frames = 0;
         self.output_time = 0.0;
         self.target_idx = 0;
         self.search_idx = -self.center_offset;
         self.staged.clear();
         self.staged_complete = 0;
+        self.search_comparisons = 0;
+        self.search_count = 0;
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
         debug_assert!(input.len().is_multiple_of(CHANNELS));
+        self.input_frames += input.len() / CHANNELS;
         self.input.extend_from_slice(input);
         while self.can_perform() {
             self.iterate();
         }
-        let done = self.staged_complete * CHANNELS;
-        output.extend_from_slice(&self.staged[..done]);
-        self.staged.drain(..done);
-        self.staged_complete = 0;
+        self.emit_complete(output);
     }
 
     pub fn finish(&mut self, output: &mut Vec<f32>) {
-        // Flush everything staged, including the not-yet-completed blend
-        // region: a loop boundary must stay audible even when it lands inside
-        // one window.
-        output.extend_from_slice(&self.staged);
+        let wanted = (self.input_frames as f64 / self.speed as f64).round() as usize;
+        while self.emitted_frames + self.staged.len() / CHANNELS < wanted {
+            let required_end = (self.target_idx + self.window as i64)
+                .max(self.search_idx + self.search_size() as i64)
+                .max(self.input_start as i64);
+            let required_frames = (required_end - self.input_start as i64) as usize;
+            self.input.resize(required_frames * CHANNELS, 0.0);
+            if !self.can_perform() {
+                break;
+            }
+            self.iterate();
+        }
+        let remaining = wanted.saturating_sub(self.emitted_frames) * CHANNELS;
+        output.extend_from_slice(&self.staged[..remaining.min(self.staged.len())]);
         self.reset();
+    }
+
+    fn emit_complete(&mut self, output: &mut Vec<f32>) {
+        let done = self.staged_complete * CHANNELS;
+        output.extend_from_slice(&self.staged[..done]);
+        self.staged.drain(..done);
+        self.emitted_frames += self.staged_complete;
+        self.staged_complete = 0;
     }
 
     fn can_perform(&self) -> bool {
@@ -331,39 +370,36 @@ impl Wsola {
     fn iterate(&mut self) {
         let window = self.window;
         let hop = self.hop;
-        let mut optimal_abs;
 
-        if self.target_within_search_region() {
+        let optimal_abs = if self.target_within_search_region() {
             // The natural continuation sits inside the search region: no
             // search needed, the target block IS the optimal block.
-            optimal_abs = self.target_idx;
-            extract(&self.input, self.input_start, self.target_idx, window, &mut self.work_buf);
+            extract(
+                &self.input,
+                self.input_start,
+                self.target_idx,
+                window,
+                &mut self.work_buf,
+            );
+            self.target_idx
         } else {
             self.extract_target(self.target_idx, window);
 
             // Exclude the band around the previously chosen block: matching
             // it again repeats audio and reads as buzz. Heuristic constant
-            // from Chromium (±160 frames).
+            // from Chromium.
             let exclude_center = self.target_idx - hop as i64 - self.search_idx;
             let exclude_low = exclude_center - EXCLUDE_HALF_FRAMES;
             let exclude_high = exclude_center + EXCLUDE_HALF_FRAMES;
-
-            let mut best = 0usize;
-            let mut best_similarity = f32::NEG_INFINITY;
-            for candidate in 0..self.num_candidates {
-                let candidate_i = candidate as i64;
-                if candidate_i >= exclude_low && candidate_i <= exclude_high {
-                    continue;
-                }
-                let similarity = self.similarity(self.search_idx, candidate_i, &self.target_buf);
-                if similarity > best_similarity {
-                    best_similarity = similarity;
-                    best = candidate;
-                }
-            }
-
-            optimal_abs = self.search_idx + best as i64;
-            extract(&self.input, self.input_start, optimal_abs, window, &mut self.opt_buf);
+            let best = self.find_optimal_candidate(exclude_low, exclude_high);
+            let optimal_abs = self.search_idx + best as i64;
+            extract(
+                &self.input,
+                self.input_start,
+                optimal_abs,
+                window,
+                &mut self.opt_buf,
+            );
 
             // Transition blend: the target (best continuation of what was
             // just emitted) leads with falling weight while the optimal block
@@ -377,7 +413,8 @@ impl Wsola {
                         self.opt_buf[index] * w_opt + self.target_buf[index] * w_target;
                 }
             }
-        }
+            optimal_abs
+        };
 
         // Overlap-add into staging: blend the staged second half against the
         // block's first half, then stage the block's second half verbatim.
@@ -419,51 +456,141 @@ impl Wsola {
 
     fn target_within_search_region(&self) -> bool {
         self.target_idx >= self.search_idx
-            && self.target_idx + self.window as i64
-                <= self.search_idx + self.search_size() as i64
+            && self.target_idx + self.window as i64 <= self.search_idx + self.search_size() as i64
     }
 
     /// Copies `frames` interleaved frames starting at absolute frame
     /// `abs_start`, zero-filling anything before the start of the stream.
     fn extract_target(&mut self, abs_start: i64, frames: usize) {
-        extract(&self.input, self.input_start, abs_start, frames, &mut self.target_buf);
+        extract(
+            &self.input,
+            self.input_start,
+            abs_start,
+            frames,
+            &mut self.target_buf,
+        );
     }
 
-
-    /// Per-channel normalized cross-similarity between the target block and
-    /// the candidate starting at absolute frame `search_abs + candidate`,
-    /// summed. Candidate samples from before the stream start read as zeros
-    /// (Chromium's zero-prepend). Chromium's
-    /// `MultiChannelSimilarityMeasure`.
-    fn similarity(&self, search_abs: i64, candidate: i64, target: &[f32]) -> f32 {
-        let origin = self.input_start as i64;
-        let first = search_abs + candidate;
-        // Frames falling before the stream are zeros: they contribute nothing
-        // to the dot product or the candidate energy.
-        let zero_frames = ((origin - first).clamp(0, self.window as i64)) as usize;
-        let mut sum = 0.0f32;
-        for channel in 0..CHANNELS {
-            let mut dot = 0.0f32;
-            let mut energy_target = 0.0f32;
-            let mut energy_candidate = 0.0f32;
-            for n in 0..zero_frames {
-                let t = target[n * CHANNELS + channel];
-                energy_target += t * t;
-            }
-            for n in zero_frames..self.window {
-                let t = target[n * CHANNELS + channel];
-                let index =
-                    ((first - origin + n as i64) as usize) * CHANNELS + channel;
-                let c = self.input[index];
-                dot += t * c;
-                energy_target += t * t;
-                energy_candidate += c * c;
-            }
-            sum += dot / (energy_target * energy_candidate).sqrt().max(1.0e-12);
+    fn find_optimal_candidate(&mut self, exclude_low: i64, exclude_high: i64) -> usize {
+        self.search_count += 1;
+        let mut best = None;
+        let mut best_similarity = f32::NEG_INFINITY;
+        let last = self.num_candidates - 1;
+        let mut candidate = 0;
+        while candidate < self.num_candidates {
+            self.consider_candidate(
+                candidate,
+                SEARCH_DECIMATION,
+                exclude_low,
+                exclude_high,
+                &mut best,
+                &mut best_similarity,
+            );
+            candidate += SEARCH_DECIMATION;
         }
-        sum
+        if last % SEARCH_DECIMATION != 0 {
+            self.consider_candidate(
+                last,
+                SEARCH_DECIMATION,
+                exclude_low,
+                exclude_high,
+                &mut best,
+                &mut best_similarity,
+            );
+        }
+
+        let coarse = best.unwrap_or(0);
+        let low = coarse.saturating_sub(SEARCH_DECIMATION - 1);
+        let high = (coarse + SEARCH_DECIMATION - 1).min(last);
+        best = None;
+        best_similarity = f32::NEG_INFINITY;
+        for candidate in low..=high {
+            self.consider_candidate(
+                candidate,
+                1,
+                exclude_low,
+                exclude_high,
+                &mut best,
+                &mut best_similarity,
+            );
+        }
+        best.unwrap_or(coarse)
     }
 
+    fn consider_candidate(
+        &mut self,
+        candidate: usize,
+        sample_step: usize,
+        exclude_low: i64,
+        exclude_high: i64,
+        best: &mut Option<usize>,
+        best_similarity: &mut f32,
+    ) {
+        let candidate_i = candidate as i64;
+        if candidate_i >= exclude_low && candidate_i <= exclude_high {
+            return;
+        }
+        let (similarity, comparisons) = similarity(
+            &self.input,
+            self.input_start,
+            self.search_idx,
+            candidate_i,
+            self.window,
+            &self.target_buf,
+            sample_step,
+        );
+        self.search_comparisons += comparisons;
+        if similarity > *best_similarity {
+            *best_similarity = similarity;
+            *best = Some(candidate);
+        }
+    }
+
+    #[cfg(test)]
+    fn search_comparisons(&self) -> usize {
+        self.search_comparisons
+    }
+}
+
+/// Per-channel normalized cross-similarity between the target block and a
+/// candidate. `sample_step` decimates only the broad measurement; refinement
+/// always calls this with one.
+fn similarity(
+    input: &[f32],
+    input_start: usize,
+    search_abs: i64,
+    candidate: i64,
+    window: usize,
+    target: &[f32],
+    sample_step: usize,
+) -> (f32, usize) {
+    let origin = input_start as i64;
+    let first = search_abs + candidate;
+    let zero_frames = ((origin - first).clamp(0, window as i64)) as usize;
+    let first_sample = zero_frames.div_ceil(sample_step) * sample_step;
+    let mut sum = 0.0f32;
+    let mut comparisons = 0;
+    for channel in 0..CHANNELS {
+        let mut dot = 0.0f32;
+        let mut energy_target = 0.0f32;
+        let mut energy_candidate = 0.0f32;
+        for n in (0..zero_frames).step_by(sample_step) {
+            let t = target[n * CHANNELS + channel];
+            energy_target += t * t;
+            comparisons += 1;
+        }
+        for n in (first_sample..window).step_by(sample_step) {
+            let t = target[n * CHANNELS + channel];
+            let index = ((first - origin + n as i64) as usize) * CHANNELS + channel;
+            let c = input[index];
+            dot += t * c;
+            energy_target += t * t;
+            energy_candidate += c * c;
+            comparisons += 1;
+        }
+        sum += dot / (energy_target * energy_candidate).sqrt().max(1.0e-12);
+    }
+    (sum, comparisons)
 }
 
 #[cfg(test)]
@@ -498,6 +625,47 @@ mod tests {
         }
         stretcher.finish(&mut output);
         output
+    }
+
+    fn pipeline_in_packets(
+        edit: TrackEdit,
+        speed: f32,
+        position_ms: u32,
+        input: &[f32],
+        packet_frames: &[usize],
+    ) -> (Vec<f32>, Option<u32>) {
+        let mut pipeline = AudioPipeline::new(&PipelineConfig {
+            edit: Some(edit),
+            speed,
+            position_ms,
+        });
+        let mut output = Vec::new();
+        let mut packet_output = Vec::new();
+        let mut frame = 0;
+        let total = input.len() / CHANNELS;
+        let mut packet = 0;
+        let mut loop_to = None;
+        while frame < total && loop_to.is_none() {
+            let count = packet_frames[packet % packet_frames.len()].min(total - frame);
+            loop_to = pipeline.process(
+                &input[frame * CHANNELS..(frame + count) * CHANNELS],
+                &mut packet_output,
+            );
+            output.extend_from_slice(&packet_output);
+            frame += count;
+            packet += 1;
+        }
+        if loop_to.is_none() {
+            pipeline.finish(&mut packet_output);
+            output.extend_from_slice(&packet_output);
+        }
+        (output, loop_to)
+    }
+
+    fn source_ramp(start_frame: usize, frames: usize) -> Vec<f32> {
+        (start_frame..start_frame + frames)
+            .flat_map(|frame| [frame as f32, -(frame as f32)])
+            .collect()
     }
 
     fn positive_crossing_frequency(samples: &[f32]) -> f32 {
@@ -574,33 +742,181 @@ mod tests {
     }
 
     #[test]
-    fn cut_ranges_remove_samples_without_inserting_silence() {
+    fn cuts_are_exact_and_packet_boundary_independent_at_one_x() {
         let edit = TrackEdit {
-            cuts: vec![TimeRange {
-                start_ms: 10,
-                end_ms: 20,
-            }],
+            cuts: vec![
+                TimeRange {
+                    start_ms: 10,
+                    end_ms: 30,
+                },
+                TimeRange {
+                    start_ms: 50,
+                    end_ms: 70,
+                },
+                TimeRange {
+                    start_ms: 90,
+                    end_ms: 100,
+                },
+            ],
             loop_range: None,
         };
-        let mut pipeline = AudioPipeline::new(&PipelineConfig {
-            edit: Some(edit),
-            speed: 1.0,
-            position_ms: 0,
-        });
-        let frames = ms_to_frame(30) as usize;
-        let input: Vec<f32> = (0..frames)
-            .flat_map(|frame| [frame as f32, -(frame as f32)])
+        let frames = ms_to_frame(100) as usize;
+        let input = source_ramp(0, frames);
+        let expected: Vec<_> = input
+            .chunks_exact(CHANNELS)
+            .enumerate()
+            .filter(|(frame, _)| {
+                !edit.cuts.iter().any(|cut| {
+                    *frame >= ms_to_frame(cut.start_ms) as usize
+                        && *frame < ms_to_frame(cut.end_ms) as usize
+                })
+            })
+            .flat_map(|(_, frame)| frame.iter().copied())
             .collect();
-        let mut output = Vec::new();
-        assert_eq!(pipeline.process(&input, &mut output), None);
+
+        let (whole, _) = pipeline_in_packets(edit.clone(), 1.0, 0, &input, &[frames]);
+        let (packet_aligned, _) =
+            pipeline_in_packets(edit.clone(), 1.0, 0, &input, &[ms_to_frame(10) as usize]);
+        let (irregular, _) = pipeline_in_packets(edit, 1.0, 0, &input, &[127, 441, 997]);
+        assert_eq!(whole, expected);
+        assert_eq!(packet_aligned, expected);
+        assert_eq!(irregular, expected);
+    }
+
+    #[test]
+    fn edited_duration_is_source_minus_cuts_at_every_supported_speed_extreme() {
+        let edit = TrackEdit {
+            cuts: vec![
+                TimeRange {
+                    start_ms: 20,
+                    end_ms: 80,
+                },
+                TimeRange {
+                    start_ms: 120,
+                    end_ms: 150,
+                },
+                TimeRange {
+                    start_ms: 180,
+                    end_ms: 200,
+                },
+            ],
+            loop_range: None,
+        };
+        let source_frames = ms_to_frame(200) as usize;
+        let removed_frames: usize = edit
+            .cuts
+            .iter()
+            .map(|cut| (ms_to_frame(cut.end_ms) - ms_to_frame(cut.start_ms)) as usize)
+            .sum();
+        let audible_frames = source_frames - removed_frames;
+        let input = stereo_tone(source_frames, 440.0, -0.25);
+
+        for speed in [0.5, 1.0, 2.0] {
+            let (output, loop_to) =
+                pipeline_in_packets(edit.clone(), speed, 0, &input, &[882, 2_205, 311]);
+            assert_eq!(loop_to, None);
+            assert_eq!(
+                output.len() / CHANNELS,
+                (audible_frames as f64 / f64::from(speed)).round() as usize,
+                "speed {speed} must apply only after cuts and retain the natural EOF tail"
+            );
+        }
+    }
+
+    #[test]
+    fn source_time_seek_inside_a_cut_resumes_at_the_cut_end() {
+        let edit = TrackEdit {
+            cuts: vec![
+                TimeRange {
+                    start_ms: 40,
+                    end_ms: 70,
+                },
+                TimeRange {
+                    start_ms: 90,
+                    end_ms: 110,
+                },
+            ],
+            loop_range: None,
+        };
+        let position_ms = 50;
+        let start = ms_to_frame(position_ms) as usize;
+        let end = ms_to_frame(130) as usize;
+        let input = source_ramp(start, end - start);
+        let (output, _) = pipeline_in_packets(edit, 1.0, position_ms, &input, &[127, 1_024, 333]);
+        let audible_source_frames: Vec<_> = output
+            .chunks_exact(CHANNELS)
+            .map(|frame| frame[0] as usize)
+            .collect();
+
         assert_eq!(
-            output.len() / CHANNELS,
-            frames - (ms_to_frame(20) - ms_to_frame(10)) as usize
+            audible_source_frames.first().copied(),
+            Some(ms_to_frame(70) as usize)
         );
         assert!(
-            output
-                .chunks_exact(CHANNELS)
-                .all(|frame| frame[0] != 0.0 || frame[1] == 0.0)
+            audible_source_frames
+                .iter()
+                .all(|frame| *frame < ms_to_frame(90) as usize
+                    || *frame >= ms_to_frame(110) as usize)
         );
+        assert_eq!(audible_source_frames.last().copied(), Some(end - 1));
+    }
+
+    #[test]
+    fn loop_boundary_uses_original_time_after_cuts_and_speed() {
+        let edit = TrackEdit {
+            cuts: vec![TimeRange {
+                start_ms: 5,
+                end_ms: 10,
+            }],
+            loop_range: Some(TimeRange {
+                start_ms: 20,
+                end_ms: 55,
+            }),
+        };
+        let start = ms_to_frame(20) as usize;
+        let input = stereo_tone(ms_to_frame(80) as usize - start, 523.25, 1.0);
+        let audible_frames = (ms_to_frame(55) - ms_to_frame(20)) as usize;
+
+        for speed in [0.5, 1.0, 2.0] {
+            let (output, loop_to) =
+                pipeline_in_packets(edit.clone(), speed, 20, &input, &[127, 882, 2_048]);
+            assert_eq!(loop_to, Some(20));
+            assert_eq!(
+                output.len() / CHANNELS,
+                (audible_frames as f64 / f64::from(speed)).round() as usize,
+                "speed {speed} must flush exactly through the original-time loop end"
+            );
+        }
+    }
+
+    #[test]
+    fn coarse_search_materially_reduces_correlation_work() {
+        let input = stereo_tone(SAMPLE_RATE as usize * 2, 440.0, 0.7);
+        let mut stretcher = Wsola::new(2.0);
+        let mut output = Vec::new();
+        stretcher.process(&input, &mut output);
+
+        let exhaustive_per_search = stretcher.num_candidates * stretcher.window * CHANNELS;
+        assert!(stretcher.search_count > 0, "the 2x path must search");
+        let average = stretcher.search_comparisons() / stretcher.search_count;
+        assert!(
+            average * 8 < exhaustive_per_search,
+            "decimation/refinement averaged {average} comparisons versus \
+             {exhaustive_per_search} for exhaustive search"
+        );
+    }
+
+    #[test]
+    fn finish_preserves_the_exact_delayed_eof_duration() {
+        let frames = frames_for_ms(37);
+        let input = stereo_tone(frames, 611.0, -0.25);
+        for speed in [0.5, 0.75, 1.25, 2.0] {
+            let output = stretch_in_packets(&input, speed, &[127, 293]);
+            assert_eq!(
+                output.len() / CHANNELS,
+                (frames as f64 / speed as f64).round() as usize,
+                "speed {speed} dropped or invented the WSOLA EOF tail"
+            );
+        }
     }
 }

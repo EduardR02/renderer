@@ -1,73 +1,143 @@
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::VecDeque;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use spotify_playback_engine::protocol::{
-    HistoryItem, HistoryPage, HistoryRow, HistorySort, TrackRef,
-};
+use serde::{Deserialize, Serialize};
+use spotify_playback_engine::protocol::{HistoryItem, HistoryRow, TrackRef};
 
-const HISTORY_FILE: &str = "listening_history.jsonl";
-const CURRENT_FILE: &str = "listening_history.current.json";
-const METADATA_FILE: &str = "listening_history_tracks.json";
-/// The file is a bounded append-only journal. Compaction happens only after a
-/// finalized transition crosses this limit, never on a position heartbeat.
-const MAX_HISTORY_ROWS: usize = 2_000;
-const MAX_METADATA_ENTRIES: usize = 2_500;
-const MAX_PAGE_LIMIT: usize = 100;
+const HISTORY_FILE: &str = "listening_history.json";
+const HISTORY_VERSION: u32 = 1;
+const MAX_HISTORY_ITEMS: usize = 2_000;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedActive {
+    item: HistoryItem,
+    duration_ms: u32,
+}
 
 struct ActivePlay {
-    row: HistoryRow,
-    duration_ms: u32,
+    persisted: PersistedActive,
     playing_since: Option<Instant>,
 }
 
-/// Crash-safe local listening history.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredHistory {
+    version: u32,
+    finalized: VecDeque<HistoryItem>,
+    active: Option<PersistedActive>,
+}
+
+#[derive(Serialize)]
+struct StoredHistoryRef<'a> {
+    version: u32,
+    finalized: &'a VecDeque<HistoryItem>,
+    active: Option<&'a PersistedActive>,
+}
+
+/// A bounded, memory-resident listening history backed by one atomic snapshot.
 ///
-/// Finalized rows are individual JSON lines. The currently active row is an
-/// atomic single-row file, so a heartbeat never rewrites the history journal.
-/// Pause/finalize/track transitions update that small file; finalization then
-/// appends one complete row and removes the active marker.
+/// The file always contains finalized rows and the recoverable active row
+/// together. It is loaded once; reads never revisit disk. An unreadable or
+/// invalid snapshot leaves the store read-only so a later playback event cannot
+/// replace user data with a fresh empty history.
 pub struct ListeningHistory {
     root: PathBuf,
+    finalized: VecDeque<HistoryItem>,
     active: Option<ActivePlay>,
+    load_error: Option<String>,
 }
 
 impl ListeningHistory {
     pub fn new(root: PathBuf) -> Self {
-        let mut history = Self { root, active: None };
-        if !history.root.as_os_str().is_empty() {
-            history.recover_active();
+        if root.as_os_str().is_empty() {
+            return Self {
+                root,
+                finalized: VecDeque::new(),
+                active: None,
+                load_error: None,
+            };
         }
-        history
+
+        let path = root.join(HISTORY_FILE);
+        match fs::read(&path) {
+            Ok(bytes) => match parse_snapshot(&path, &bytes) {
+                Ok(stored) => Self {
+                    root,
+                    finalized: stored.finalized,
+                    active: stored.active.map(|persisted| ActivePlay {
+                        persisted,
+                        playing_since: None,
+                    }),
+                    load_error: None,
+                },
+                Err(error) => {
+                    eprintln!("listening history persistence disabled: {error}");
+                    Self::read_only(root, error)
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self {
+                root,
+                finalized: VecDeque::new(),
+                active: None,
+                load_error: None,
+            },
+            Err(error) => {
+                let error = format!("could not read {}: {error}", path.display());
+                eprintln!("listening history persistence disabled: {error}");
+                Self::read_only(root, error)
+            }
+        }
     }
 
-    /// Begins a logical play only after the player emitted its authoritative
-    /// `Playing` event. A pause/resume never calls this method again.
+    fn read_only(root: PathBuf, error: String) -> Self {
+        Self {
+            root,
+            finalized: VecDeque::new(),
+            active: None,
+            load_error: Some(error),
+        }
+    }
+
+    /// Begins a logical play only after the authoritative `Playing` event.
+    /// Replacing an active play finalizes it and installs the new active row in
+    /// the same durable snapshot.
     pub fn start(&mut self, track: &TrackRef) {
-        if self.root.as_os_str().is_empty() {
+        if self.root.as_os_str().is_empty() || !self.writable() {
             return;
         }
-        let _ = self.finalize(false);
-        let row = HistoryRow {
-            track_id: track.id.clone(),
-            started_at: now_millis(),
-            ms_played: 0,
-            completed: false,
-            context: compact_context(&track.context),
-        };
-        self.remember_track(track);
+
+        self.accrue_active();
+        if let Some(previous) = self.active.take() {
+            self.finalized.push_back(previous.persisted.item);
+        }
         self.active = Some(ActivePlay {
-            row,
-            duration_ms: track.duration_ms,
+            persisted: PersistedActive {
+                item: HistoryItem {
+                    row: HistoryRow {
+                        track_id: track.id.clone(),
+                        started_at: now_millis(),
+                        ms_played: 0,
+                        completed: false,
+                        context: compact_context(&track.context),
+                    },
+                    track: sanitize_track(track),
+                },
+                duration_ms: track.duration_ms,
+            },
             playing_since: Some(Instant::now()),
         });
-        self.persist_active();
+        self.enforce_bound();
+        if let Err(error) = self.persist() {
+            // Keep the complete new state in memory. Pause, finalize, or the
+            // next track transition will retry the same atomic snapshot.
+            eprintln!("could not persist active listening history row: {error}");
+        }
     }
 
-    /// Arms elapsed-time accounting for a resumed play. This is intentionally
-    /// in-memory until a meaningful transition persists the active row.
     pub fn resume(&mut self) {
         if let Some(active) = self.active.as_mut() {
             if active.playing_since.is_none() {
@@ -76,13 +146,11 @@ impl ListeningHistory {
         }
     }
 
-    /// Starts a new row for a different track, or resumes the existing row
-    /// when librespot reports Playing again after a pause/seek.
     pub fn start_or_resume(&mut self, track: &TrackRef) {
         let same_track = self
             .active
             .as_ref()
-            .is_some_and(|active| active.row.track_id == track.id);
+            .is_some_and(|active| active.persisted.item.row.track_id == track.id);
         if same_track {
             self.resume();
         } else {
@@ -90,116 +158,111 @@ impl ListeningHistory {
         }
     }
 
-    /// Captures the time spent playing before a user pause without creating a
-    /// second row. The active marker remains on disk for crash recovery.
     pub fn pause(&mut self) {
+        if !self.writable() {
+            return;
+        }
         self.accrue_active();
-        self.persist_active();
+        if self.active.is_some() {
+            if let Err(error) = self.persist() {
+                eprintln!("could not persist paused listening history row: {error}");
+            }
+        }
     }
 
-    /// Finalizes the current logical play. Natural end marks it completed and
-    /// uses the known track duration; every other transition keeps the
-    /// measured elapsed duration and leaves `completed` false.
+    /// Finalizes the current play. A failed atomic replace restores the active
+    /// row in memory, allowing a later transition to retry without duplication.
     pub fn finalize(&mut self, completed: bool) -> bool {
+        if !self.writable() {
+            return false;
+        }
         if self.active.is_none() {
             return true;
         }
+
         self.accrue_active();
-        let active = self.active.as_mut().expect("active play checked above");
+        let mut active = self.active.take().expect("active play checked above");
         if completed {
-            active.row.completed = true;
-            active.row.ms_played = u64::from(active.duration_ms);
+            active.persisted.item.row.completed = true;
+            active.persisted.item.row.ms_played = u64::from(active.persisted.duration_ms);
         }
-        let row = active.row.clone();
-        if let Err(error) = self.append_row(&row) {
+
+        let dropped = if self.finalized.len() >= MAX_HISTORY_ITEMS {
+            self.finalized.pop_front()
+        } else {
+            None
+        };
+        self.finalized.push_back(active.persisted.item.clone());
+        if let Err(error) = self.persist() {
+            self.finalized.pop_back();
+            if let Some(item) = dropped {
+                self.finalized.push_front(item);
+            }
+            self.active = Some(active);
             eprintln!("could not persist listening history row: {error}");
-            self.persist_active();
             return false;
         }
-        self.active = None;
-        let _ = fs::remove_file(self.current_path());
         true
     }
 
-    /// Drops both finalized and active rows. A play that was cleared while it
-    /// is still running is intentionally no longer resurrected on its later
-    /// pause/end transition; its next actual track start may create a row.
+    /// Returns one capped snapshot, newest first, including the current play.
+    pub fn snapshot(&self) -> Result<Vec<HistoryItem>, String> {
+        if let Some(error) = &self.load_error {
+            return Err(format!("listening history is read-only: {error}"));
+        }
+        if self.root.as_os_str().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut items = Vec::with_capacity(
+            (self.finalized.len() + usize::from(self.active.is_some())).min(MAX_HISTORY_ITEMS),
+        );
+        if let Some(active) = &self.active {
+            let mut item = active.persisted.item.clone();
+            if active.playing_since.is_some() {
+                item.row.ms_played = item
+                    .row
+                    .ms_played
+                    .saturating_add(elapsed_ms(active.playing_since))
+                    .min(u64::from(active.persisted.duration_ms));
+            }
+            items.push(item);
+        }
+        items.extend(self.finalized.iter().rev().cloned());
+        items.truncate(MAX_HISTORY_ITEMS);
+        Ok(items)
+    }
+
     pub fn clear(&mut self) -> Result<(), String> {
+        self.ensure_writable()?;
         if self.root.as_os_str().is_empty() {
             return Ok(());
         }
-        self.active = None;
-        remove_if_present(&self.history_path())?;
-        remove_if_present(&self.current_path())?;
-        remove_if_present(&self.metadata_path())?;
+
+        let finalized = std::mem::take(&mut self.finalized);
+        let active = self.active.take();
+        if let Err(error) = self.persist() {
+            self.finalized = finalized;
+            self.active = active;
+            return Err(error);
+        }
         Ok(())
     }
 
-    /// One page of the journal, filtered and ordered before it is sliced.
-    ///
-    /// The whole journal is read per page. That is deliberate rather than
-    /// careless: the file is capped at [`MAX_HISTORY_ROWS`], the client asks
-    /// for a page only when it scrolls into one, and a filter or an order over
-    /// anything less than every row is wrong — a partial answer that looks
-    /// like a complete one.
-    pub fn page(
-        &self,
-        offset: usize,
-        limit: usize,
-        query: &str,
-        sort: HistorySort,
-    ) -> Result<HistoryPage, String> {
-        if self.root.as_os_str().is_empty() {
-            return Ok(HistoryPage::default());
+    fn writable(&self) -> bool {
+        if let Some(error) = &self.load_error {
+            eprintln!("listening history mutation rejected: {error}");
+            false
+        } else {
+            true
         }
-        let limit = limit.clamp(1, MAX_PAGE_LIMIT);
-        let mut rows = self.read_rows()?;
-        if let Some(active) = &self.active {
-            let mut current = active.row.clone();
-            if active.playing_since.is_some() {
-                current.ms_played = current
-                    .ms_played
-                    .saturating_add(elapsed_ms(active.playing_since))
-                    .min(u64::from(active.duration_ms));
-            }
-            rows.push(current);
-        }
-        let metadata = self.read_metadata();
-        let needle = query.trim().to_lowercase();
-        let mut items: Vec<HistoryItem> = rows
-            .into_iter()
-            .map(|row| HistoryItem {
-                track: metadata.get(&row.track_id).cloned(),
-                row,
-            })
-            .filter(|item| needle.is_empty() || matches_query(item, &needle))
-            .collect();
-        sort_items(&mut items, sort);
-
-        let total = items.len();
-        let entries = items.into_iter().skip(offset).take(limit).collect();
-        let next_offset = (offset + limit < total).then_some(offset + limit);
-        Ok(HistoryPage {
-            entries,
-            next_offset,
-            total,
-        })
     }
 
-    fn recover_active(&mut self) {
-        let Ok(bytes) = fs::read(self.current_path()) else {
-            return;
-        };
-        let Ok(row) = serde_json::from_slice::<HistoryRow>(&bytes) else {
-            let _ = fs::remove_file(self.current_path());
-            return;
-        };
-        // A process can die after appending but before removing the marker.
-        // Compare the last valid row before appending so recovery is idempotent.
-        if self.last_row().as_ref() != Some(&row) {
-            let _ = self.append_row(&row);
+    fn ensure_writable(&self) -> Result<(), String> {
+        match &self.load_error {
+            Some(error) => Err(format!("listening history is read-only: {error}")),
+            None => Ok(()),
         }
-        let _ = fs::remove_file(self.current_path());
     }
 
     fn accrue_active(&mut self) {
@@ -209,215 +272,95 @@ impl ListeningHistory {
         let Some(since) = active.playing_since.take() else {
             return;
         };
-        active.row.ms_played = active
+        active.persisted.item.row.ms_played = active
+            .persisted
+            .item
             .row
             .ms_played
             .saturating_add(elapsed_ms(Some(since)))
-            .min(u64::from(active.duration_ms));
+            .min(u64::from(active.persisted.duration_ms));
     }
 
-    fn persist_active(&self) {
-        let Some(active) = &self.active else {
-            return;
-        };
-        if let Err(error) = write_json_atomic(&self.current_path(), &active.row) {
-            eprintln!("could not persist active listening history row: {error}");
+    fn enforce_bound(&mut self) {
+        let finalized_limit = MAX_HISTORY_ITEMS - usize::from(self.active.is_some());
+        while self.finalized.len() > finalized_limit {
+            self.finalized.pop_front();
         }
     }
 
-    fn append_row(&self, row: &HistoryRow) -> Result<(), String> {
-        /* One read serves both jobs below — the duplicate guard that makes
-           crash recovery idempotent, and the decision to compact. It used to
-           read the whole journal twice per append, once for each. */
-        let mut rows = self.read_rows()?;
-        if rows.last() == Some(row) {
+    fn persist(&self) -> Result<(), String> {
+        if self.root.as_os_str().is_empty() {
             return Ok(());
         }
-        fs::create_dir_all(&self.root)
-            .map_err(|error| format!("could not create history directory: {error}"))?;
-        let bytes = serde_json::to_vec(row)
-            .map_err(|error| format!("could not serialize history row: {error}"))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.history_path())
-            .map_err(|error| format!("could not append listening history: {error}"))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.sync_data())
-            .map_err(|error| format!("could not append listening history: {error}"))?;
-        if rows.len() >= MAX_HISTORY_ROWS {
-            rows.push(row.clone());
-            self.compact(rows);
-        }
-        Ok(())
-    }
-
-    /// Rewrites the journal with only its newest [`MAX_HISTORY_ROWS`] rows.
-    fn compact(&self, mut rows: Vec<HistoryRow>) {
-        rows.drain(..rows.len() - MAX_HISTORY_ROWS);
-        let mut bytes = Vec::new();
-        for row in rows {
-            if let Ok(encoded) = serde_json::to_vec(&row) {
-                bytes.extend_from_slice(&encoded);
-                bytes.push(b'\n');
-            }
-        }
-        let _ = write_bytes_atomic(&self.history_path(), &bytes);
-    }
-
-    fn read_rows(&self) -> Result<Vec<HistoryRow>, String> {
-        let file = match File::open(self.history_path()) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(format!("could not read listening history: {error}")),
+        self.ensure_writable()?;
+        let snapshot = StoredHistoryRef {
+            version: HISTORY_VERSION,
+            finalized: &self.finalized,
+            active: self.active.as_ref().map(|active| &active.persisted),
         };
-        let mut rows = Vec::with_capacity(MAX_HISTORY_ROWS.min(128));
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else { break };
-            if let Ok(row) = serde_json::from_str::<HistoryRow>(&line) {
-                rows.push(row);
-            }
-        }
-        /* Trimmed once at the end rather than per line: an over-long file only
-           happens when compaction has not caught up, and shifting the whole
-           vector down by one on every line past the cap made reading such a
-           file quadratic. */
-        if rows.len() > MAX_HISTORY_ROWS {
-            rows.drain(..rows.len() - MAX_HISTORY_ROWS);
-        }
-        Ok(rows)
-    }
-
-    fn last_row(&self) -> Option<HistoryRow> {
-        self.read_rows().ok()?.pop()
-    }
-
-    fn remember_track(&self, track: &TrackRef) {
-        let mut metadata = self.read_metadata();
-        /* Replaying something already recorded changes nothing, and the write
-           this skips is a full rewrite of the sidecar plus an fsync — on the
-           engine's own loop, at the moment a track starts. Repeats are the
-           common case in a play log. */
-        if metadata
-            .get(&track.id)
-            .is_some_and(|known| same_metadata(known, track))
-        {
-            return;
-        }
-        metadata.insert(track.id.clone(), track.clone());
-        if metadata.len() > MAX_METADATA_ENTRIES {
-            self.evict_metadata(&mut metadata, &track.id);
-        }
-        if let Err(error) = write_json_atomic(&self.metadata_path(), &metadata) {
-            eprintln!("could not persist listening history metadata: {error}");
-        }
-    }
-
-    /// Drops the sidecar entries no visible row needs any more.
-    ///
-    /// This used to remove `metadata.keys().next()` until the map fit, which is
-    /// an ARBITRARY key: `HashMap` iteration order has nothing to do with age,
-    /// so the entry evicted could be — and on a full map one time in
-    /// [`MAX_METADATA_ENTRIES`] was — the track that had just started playing,
-    /// whose brand new row would then render as "metadata expired". The journal
-    /// is the only record of age there is, so it decides.
-    fn evict_metadata(&self, metadata: &mut HashMap<String, TrackRef>, keep: &str) {
-        let rows = self.read_rows().unwrap_or_default();
-        let mut wanted = HashSet::with_capacity(MAX_METADATA_ENTRIES);
-        wanted.insert(keep);
-        for row in rows.iter().rev() {
-            if wanted.len() >= MAX_METADATA_ENTRIES {
-                break;
-            }
-            wanted.insert(row.track_id.as_str());
-        }
-        metadata.retain(|id, _| wanted.contains(id.as_str()));
-    }
-
-    fn read_metadata(&self) -> HashMap<String, TrackRef> {
-        fs::read(self.metadata_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
-    }
-
-    fn history_path(&self) -> PathBuf {
-        self.root.join(HISTORY_FILE)
-    }
-
-    fn current_path(&self) -> PathBuf {
-        self.root.join(CURRENT_FILE)
-    }
-
-    fn metadata_path(&self) -> PathBuf {
-        self.root.join(METADATA_FILE)
+        write_json_atomic(&self.root.join(HISTORY_FILE), &snapshot)
     }
 }
 
-/// Whether the sidecar already describes this track the way the history view
-/// would render it. The volatile fields a `TrackRef` also carries — whether
-/// the audio happens to be cached right now, which queue context it arrived
-/// in, the edit resolved for that queue entry, the browse surface's play count
-/// — say nothing about the track and would otherwise force a full rewrite of
-/// the sidecar every time the same song came round again.
-fn same_metadata(known: &TrackRef, track: &TrackRef) -> bool {
-    known.id == track.id
-        && known.uri == track.uri
-        && known.name == track.name
-        && known.artist_names == track.artist_names
-        && known.artist_ids == track.artist_ids
-        && known.artist_id == track.artist_id
-        && known.album_id == track.album_id
-        && known.album_name == track.album_name
-        && known.cover_url == track.cover_url
-        && known.duration_ms == track.duration_ms
-        && known.unavailable == track.unavailable
+fn parse_snapshot(path: &Path, bytes: &[u8]) -> Result<StoredHistory, String> {
+    let stored: StoredHistory = serde_json::from_slice(bytes)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    if stored.version != HISTORY_VERSION {
+        return Err(format!(
+            "unsupported listening history version {} (expected {HISTORY_VERSION})",
+            stored.version
+        ));
+    }
+    let count = stored.finalized.len() + usize::from(stored.active.is_some());
+    if count > MAX_HISTORY_ITEMS {
+        return Err(format!(
+            "invalid listening history: {count} rows exceeds the {MAX_HISTORY_ITEMS}-row cap"
+        ));
+    }
+    for item in stored
+        .finalized
+        .iter()
+        .chain(stored.active.iter().map(|active| &active.item))
+    {
+        validate_item(item)?;
+    }
+    Ok(stored)
 }
 
-/// A row with no surviving metadata has no title and no artist, so there is
-/// nothing for a title/artist filter to match — it drops out rather than
-/// matching everything.
-fn matches_query(item: &HistoryItem, needle: &str) -> bool {
-    let Some(track) = &item.track else {
-        return false;
-    };
-    track.name.to_lowercase().contains(needle)
-        || track
-            .artist_names
-            .iter()
-            .any(|name| name.to_lowercase().contains(needle))
+fn validate_item(item: &HistoryItem) -> Result<(), String> {
+    if item.row.track_id.is_empty() {
+        return Err("invalid listening history: empty track id".to_owned());
+    }
+    let track = &item.track;
+    if track.id != item.row.track_id {
+        return Err("invalid listening history: row and track ids differ".to_owned());
+    }
+    if track.play_count.is_some()
+        || track.added_at.is_some()
+        || track.unavailable
+        || track.unavailable_reason.is_some()
+        || track.cached
+        || !track.context.is_empty()
+        || track.effective_edit.is_some()
+    {
+        return Err("invalid listening history: track contains volatile playback data".to_owned());
+    }
+    Ok(())
 }
 
-fn sort_items(items: &mut [HistoryItem], sort: HistorySort) {
-    /// Sorting a play log by name still leaves ties — the same song played
-    /// twenty times — and those read best newest-first, the same as the
-    /// default order.
-    fn recency_key(item: &HistoryItem) -> std::cmp::Reverse<i64> {
-        std::cmp::Reverse(item.row.started_at)
-    }
-    fn title_key(item: &HistoryItem) -> String {
-        item.track
-            .as_ref()
-            .map(|track| track.name.to_lowercase())
-            .unwrap_or_default()
-    }
-    fn artist_key(item: &HistoryItem) -> String {
-        item.track
-            .as_ref()
-            .and_then(|track| track.artist_names.first())
-            .map(|name| name.to_lowercase())
-            .unwrap_or_default()
-    }
-
-    match sort {
-        HistorySort::Recent => items.sort_by_key(recency_key),
-        HistorySort::Oldest => items.sort_by_key(|item| item.row.started_at),
-        HistorySort::Title => items.sort_by_key(|item| (title_key(item), recency_key(item))),
-        HistorySort::Artist => {
-            items.sort_by_key(|item| (artist_key(item), title_key(item), recency_key(item)))
-        }
-    }
+/// Retains identity and display metadata only. History replay must resolve its
+/// current context, edit, availability, and cache state instead of reviving a
+/// stale browse/queue snapshot.
+fn sanitize_track(track: &TrackRef) -> TrackRef {
+    let mut track = track.clone();
+    track.play_count = None;
+    track.added_at = None;
+    track.unavailable = false;
+    track.unavailable_reason = None;
+    track.cached = false;
+    track.context.clear();
+    track.effective_edit = None;
+    track
 }
 
 fn compact_context(context: &str) -> String {
@@ -441,32 +384,20 @@ fn elapsed_ms(since: Option<Instant>) -> u64 {
         .unwrap_or(0)
 }
 
-fn remove_if_present(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
-    }
-}
-
-fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("could not serialize {}: {error}", path.display()))?;
-    write_bytes_atomic(path, &bytes)
-}
-
-fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     }
-    let temp = path.with_extension("json.tmp");
-    let mut file = File::create(&temp)
-        .map_err(|error| format!("could not create {}: {error}", temp.display()))?;
-    file.write_all(bytes)
+    let temporary = path.with_extension("json.tmp");
+    let mut file = File::create(&temporary)
+        .map_err(|error| format!("could not create {}: {error}", temporary.display()))?;
+    file.write_all(&bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
-    replace_file_atomically(&temp, path)
+        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+    replace_file_atomically(&temporary, path)
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
 }
 
@@ -512,12 +443,8 @@ fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spotify_playback_engine::protocol::{TimeRange, TrackEdit};
 
-    /// Tests run in one process and in parallel, and `now_millis` is not
-    /// unique at that resolution — two of them starting in the same
-    /// millisecond used to share a directory, so each saw the other's rows and
-    /// had its files deleted mid-run. The counter is what actually separates
-    /// them.
     fn scratch() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -528,95 +455,117 @@ mod tests {
         ))
     }
 
+    fn track(id: &str) -> TrackRef {
+        TrackRef {
+            id: id.to_owned(),
+            uri: format!("spotify:track:{id}"),
+            name: format!("Track {id}"),
+            artist_names: vec!["Artist".to_owned()],
+            duration_ms: 180_000,
+            play_count: Some(42),
+            added_at: Some(123),
+            unavailable: true,
+            unavailable_reason: Some("country".to_owned()),
+            cached: true,
+            context: " playlist:source ".to_owned(),
+            effective_edit: Some(TrackEdit {
+                cuts: vec![TimeRange {
+                    start_ms: 1,
+                    end_ms: 2,
+                }],
+                loop_range: None,
+            }),
+            ..TrackRef::default()
+        }
+    }
+
     #[test]
-    fn one_play_survives_pause_resume_and_finalizes_once() {
+    fn finalized_and_active_rows_share_one_recoverable_snapshot() {
         let root = scratch();
         let mut history = ListeningHistory::new(root.clone());
-        let track = TrackRef {
-            id: "0123456789ABCDEFGHIJKL".to_owned(),
-            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
-            name: "Track".to_owned(),
-            duration_ms: 180_000,
-            context: "playlist:source".to_owned(),
-            ..TrackRef::default()
-        };
-
-        history.start(&track);
-        history.pause();
-        history.resume();
+        history.start(&track("finalized"));
         assert!(history.finalize(true));
+        history.start(&track("active"));
+        history.pause();
 
-        let page = history.page(0, 40, "", HistorySort::Recent).unwrap();
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.total, 1);
-        assert_eq!(page.entries[0].row.track_id, track.id);
-        assert_eq!(page.entries[0].row.context, "playlist:source");
-        assert_eq!(page.entries[0].row.ms_played, 180_000);
-        assert!(page.entries[0].row.completed);
-        assert_eq!(page.entries[0].track.as_ref().unwrap().name, "Track");
-        assert!(page.next_offset.is_none());
+        let recovered = ListeningHistory::new(root.clone());
+        let items = recovered.snapshot().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].row.track_id, "active");
+        assert!(!items[0].row.completed);
+        assert_eq!(items[1].row.track_id, "finalized");
+        assert!(items[1].row.completed);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
 
-        history.clear().unwrap();
-        assert!(
-            history
-                .page(0, 40, "", HistorySort::Recent)
-                .unwrap()
-                .entries
-                .is_empty()
-        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn a_page_filters_and_orders_the_whole_journal_before_slicing() {
+    fn snapshot_is_newest_first_and_caps_active_plus_finalized() {
         let root = scratch();
         let mut history = ListeningHistory::new(root.clone());
-        let plays = [
-            ("aaaaaaaaaaaaaaaaaaaaaa", "Zebra", "Bowie"),
-            ("bbbbbbbbbbbbbbbbbbbbbb", "Apple", "Aphex"),
-            ("cccccccccccccccccccccc", "Mango", "Bowie"),
-        ];
-        for (id, name, artist) in plays {
-            let track = TrackRef {
-                id: id.to_owned(),
-                uri: format!("spotify:track:{id}"),
-                name: name.to_owned(),
-                artist_names: vec![artist.to_owned()],
-                duration_ms: 1_000,
-                ..TrackRef::default()
-            };
-            history.start(&track);
-            assert!(history.finalize(true));
+        for index in 0..MAX_HISTORY_ITEMS {
+            let track = track(&format!("track-{index}"));
+            history.finalized.push_back(HistoryItem {
+                row: HistoryRow {
+                    track_id: track.id.clone(),
+                    started_at: index as i64,
+                    ..HistoryRow::default()
+                },
+                track: sanitize_track(&track),
+            });
         }
+        history.start(&track("active"));
 
-        let names = |page: &HistoryPage| {
-            page.entries
-                .iter()
-                .map(|entry| entry.track.as_ref().unwrap().name.clone())
-                .collect::<Vec<_>>()
-        };
+        let recovered = ListeningHistory::new(root.clone());
+        let items = recovered.snapshot().unwrap();
+        assert_eq!(items.len(), MAX_HISTORY_ITEMS);
+        assert_eq!(items[0].row.track_id, "active");
+        assert_eq!(items[1].row.track_id, "track-1999");
+        assert_eq!(items.last().unwrap().row.track_id, "track-1");
 
-        // Newest first, and the second page continues the same ordering.
-        let recent = history.page(0, 2, "", HistorySort::Recent).unwrap();
-        assert_eq!(names(&recent), vec!["Mango", "Apple"]);
-        assert_eq!(recent.total, 3);
-        assert_eq!(recent.next_offset, Some(2));
-        assert_eq!(
-            names(&history.page(2, 2, "", HistorySort::Recent).unwrap()),
-            vec!["Zebra"]
-        );
+        let _ = fs::remove_dir_all(root);
+    }
 
-        assert_eq!(
-            names(&history.page(0, 40, "", HistorySort::Title).unwrap()),
-            vec!["Apple", "Mango", "Zebra"]
-        );
+    #[test]
+    fn corrupt_or_legacy_store_is_never_replaced_by_playback() {
+        let root = scratch();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(HISTORY_FILE);
+        let corrupt = br#"{"legacy":"jsonl-sidecar"}"#;
+        fs::write(&path, corrupt).unwrap();
 
-        // The filter runs over every row, not over the first page of them.
-        let filtered = history.page(0, 1, "bowie", HistorySort::Title).unwrap();
-        assert_eq!(filtered.total, 2);
-        assert_eq!(names(&filtered), vec!["Mango"]);
+        let mut history = ListeningHistory::new(root.clone());
+        assert!(history.snapshot().unwrap_err().contains("read-only"));
+        history.start(&track("new"));
+        assert!(!history.finalize(true));
+        assert!(history.clear().unwrap_err().contains("read-only"));
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
 
-        history.clear().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persisted_track_metadata_is_safe_to_replay() {
+        let root = scratch();
+        let mut history = ListeningHistory::new(root.clone());
+        history.start(&track("sanitized"));
+        history.pause();
+
+        let recovered = ListeningHistory::new(root.clone());
+        let items = recovered.snapshot().unwrap();
+        let item = &items[0];
+        assert_eq!(item.row.context, "playlist:source");
+        let track = &item.track;
+        assert_eq!(track.name, "Track sanitized");
+        assert!(track.play_count.is_none());
+        assert!(track.added_at.is_none());
+        assert!(!track.unavailable);
+        assert!(track.unavailable_reason.is_none());
+        assert!(!track.cached);
+        assert!(track.context.is_empty());
+        assert!(track.effective_edit.is_none());
+
         let _ = fs::remove_dir_all(root);
     }
 }

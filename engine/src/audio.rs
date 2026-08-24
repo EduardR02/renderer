@@ -155,14 +155,26 @@ static LIVE_SINK: Mutex<Weak<rodio::Sink>> = Mutex::new(Weak::new());
 static SINK_VOLUME: AtomicU16 = AtomicU16::new(u16::MAX);
 const LIVE_SINK_POISON_MSG: &str = "live rodio sink registry should not be poisoned";
 static LIVE_RING: Mutex<Weak<SampleRing>> = Mutex::new(Weak::new());
+static LIVE_PROCESSING: Mutex<Weak<Mutex<AudioProcessing>>> = Mutex::new(Weak::new());
 static CUSTOMIZATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CUSTOMIZATION_REVISION: AtomicU64 = AtomicU64::new(0);
-static CUSTOMIZATION: Mutex<Option<PipelineConfig>> = Mutex::new(None);
+static CUSTOMIZATION: Mutex<Customization> = Mutex::new(Customization {
+    config: None,
+    discontinuous: false,
+});
 static AUDIO_SIGNAL_SENDER: Mutex<Option<mpsc::UnboundedSender<AudioSignal>>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug)]
 pub enum AudioSignal {
     LoopBoundary { position_ms: u32 },
+}
+
+struct Customization {
+    config: Option<PipelineConfig>,
+    /// Sticky until the sink consumes the newest revision: if a seek/config
+    /// reset is followed by a natural track setup before another decoder
+    /// packet arrives, the old filter state still must not survive.
+    discontinuous: bool,
 }
 
 pub fn install_signal_sender(sender: mpsc::UnboundedSender<AudioSignal>) {
@@ -172,34 +184,84 @@ pub fn install_signal_sender(sender: mpsc::UnboundedSender<AudioSignal>) {
 }
 
 pub fn configure_customization(edit: Option<TrackEdit>, speed: f32, position_ms: u32) {
+    set_customization(edit, speed, position_ms, true);
+}
+
+/// Installs the next gapless track without discarding audio already queued from
+/// the natural boundary. The outgoing pipeline is flushed separately by
+/// [`finish_natural_boundary`].
+pub fn configure_customization_after_natural_boundary(
+    edit: Option<TrackEdit>,
+    speed: f32,
+    position_ms: u32,
+) {
+    set_customization(edit, speed, position_ms, false);
+}
+
+fn set_customization(edit: Option<TrackEdit>, speed: f32, position_ms: u32, discontinuous: bool) {
     let config = PipelineConfig {
         edit,
         speed,
         position_ms,
     };
     let active = config.active();
-    *CUSTOMIZATION
+    let mut customization = CUSTOMIZATION
         .lock()
-        .expect("audio customization should not be poisoned") = active.then_some(config);
+        .expect("audio customization should not be poisoned");
+    customization.config = active.then_some(config);
+    customization.discontinuous |= discontinuous;
+    CUSTOMIZATION_ACTIVE.store(active, Ordering::Release);
     CUSTOMIZATION_REVISION.fetch_add(1, Ordering::Release);
-    let was_active = CUSTOMIZATION_ACTIVE.swap(active, Ordering::AcqRel);
-    // Clearing the ring discards audio that is decoded, resampled and queued
-    // but not yet played. That is required when the pipeline changes what the
-    // samples are, and destructive otherwise: every track load reconfigures,
-    // and gapless playback (`gapless: true`) never stops the sink between
-    // tracks, so clearing unconditionally cut the last WRITE_AHEAD_MS off the
-    // end of every track. Seek and speed changes reach `RodioSink::stop`,
-    // which clears on its own.
-    if !active && !was_active {
-        return;
+    drop(customization);
+
+    if discontinuous {
+        if let Some(ring) = LIVE_RING
+            .lock()
+            .expect("live sample ring should not be poisoned")
+            .upgrade()
+        {
+            ring.clear();
+        }
     }
-    if let Some(ring) = LIVE_RING
+}
+
+/// Flushes the delayed WSOLA overlap region at decoder EOF without resetting
+/// the output queue. This is intentionally separate from `stop`: a natural
+/// boundary must drain audibly, while pause/seek/config changes are
+/// discontinuities and discard stale queued audio.
+pub fn finish_natural_boundary() -> Result<(), String> {
+    let Some(processing) = LIVE_PROCESSING
+        .lock()
+        .expect("live audio processing registry should not be poisoned")
+        .upgrade()
+    else {
+        return Ok(());
+    };
+    let Some(ring) = LIVE_RING
         .lock()
         .expect("live sample ring should not be poisoned")
         .upgrade()
+    else {
+        return Ok(());
+    };
+
+    let mut queued = Vec::new();
     {
-        ring.clear();
+        let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tail = Vec::new();
+        if let Some(pipeline) = &mut processing.pipeline {
+            pipeline.finish(&mut tail);
+        }
+        match &mut processing.resampler {
+            Some(resampler) => resampler.process(&tail, &mut queued),
+            None => queued = tail,
+        }
     }
+    if queued.is_empty() {
+        return Ok(());
+    }
+    ring.push_marked(queued, None, WRITE_DRAIN_TIMEOUT)
+        .map_err(|()| "rodio sink stalled while flushing the natural EOF tail".to_owned())
 }
 
 #[derive(Debug)]
@@ -301,11 +363,12 @@ const RODIO_BOOTSTRAP_SPAN_SAMPLES: usize = 512;
 
 /// Audio handed from the player thread to the audio callback.
 ///
-/// The producer ([`RodioSink::write`]) pushes whole decoded packets and blocks
-/// with a deadline when the ring is full; the consumer ([`LiveSource`]) takes
-/// one packet at a time. Locking once per packet (~20 ms) rather than once per
-/// sample keeps the audio callback's cost negligible, and rodio's own sink
-/// already takes several mutexes on the audio thread every 5 ms
+/// The producer ([`RodioSink::write`]) pushes each decoded packet's processed
+/// samples as one ring packet, omitting packets removed entirely by cuts, and
+/// blocks with a deadline when the ring is full. The consumer ([`LiveSource`])
+/// takes one packet at a time. Locking once per packet (~20 ms) rather than
+/// once per sample keeps the callback cost negligible. Rodio's own sink takes
+/// several mutexes on the audio thread every 5 ms
 /// (`Sink::append`'s `periodic_access` closure), so this adds no new class of
 /// contention.
 struct SampleRing {
@@ -329,6 +392,7 @@ struct SampleRing {
 struct RingPacket {
     samples: Vec<f32>,
     loop_to_ms: Option<u32>,
+    boundary_id: u64,
 }
 
 struct RingState {
@@ -336,6 +400,8 @@ struct RingState {
     /// Kept alongside `packets` so the producer's fullness check is a field
     /// read rather than a walk of the deque.
     queued_samples: usize,
+    next_boundary_id: u64,
+    consumed_boundary_id: u64,
 }
 
 impl SampleRing {
@@ -345,6 +411,8 @@ impl SampleRing {
             state: Mutex::new(RingState {
                 packets: VecDeque::with_capacity(64),
                 queued_samples: 0,
+                next_boundary_id: 0,
+                consumed_boundary_id: 0,
             }),
             space_freed: Condvar::new(),
             generation: AtomicU64::new(0),
@@ -370,32 +438,55 @@ impl SampleRing {
         self.push_marked(packet, None, timeout)
     }
 
-
     fn push_marked(
         &self,
         samples: Vec<f32>,
         loop_to_ms: Option<u32>,
         timeout: Duration,
     ) -> Result<(), ()> {
+        let generation = self.generation.load(Ordering::Acquire);
         let deadline = Instant::now() + timeout;
         let mut state = self.lock();
         while state.queued_samples >= self.capacity {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(());
             };
-            // `wait_timeout` can wake spuriously, so the fullness test above is
-            // the loop condition rather than the timeout result.
             let (guard, _) = self
                 .space_freed
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(PoisonError::into_inner);
             state = guard;
         }
+        let boundary_id = if loop_to_ms.is_some() {
+            state.next_boundary_id = state.next_boundary_id.wrapping_add(1);
+            state.next_boundary_id
+        } else {
+            0
+        };
         state.queued_samples += samples.len();
         state.packets.push_back(RingPacket {
             samples,
             loop_to_ms,
+            boundary_id,
         });
+
+        // A loop marker is flow control, not a notification attached to an
+        // otherwise ordinary packet. Hold the decoder here until the audio
+        // callback reaches it; this bounds decode/network run-ahead even when
+        // every packet beyond the loop is filtered to empty.
+        while boundary_id != 0
+            && state.consumed_boundary_id < boundary_id
+            && self.generation.load(Ordering::Acquire) == generation
+        {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(());
+            };
+            let (guard, _) = self
+                .space_freed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = guard;
+        }
         Ok(())
     }
 
@@ -409,12 +500,23 @@ impl SampleRing {
         Some(packet)
     }
 
+    fn acknowledge_boundary(&self, boundary_id: u64) {
+        if boundary_id == 0 {
+            return;
+        }
+        let mut state = self.lock();
+        state.consumed_boundary_id = state.consumed_boundary_id.max(boundary_id);
+        drop(state);
+        self.space_freed.notify_all();
+    }
+
     /// Drops every queued packet and tells [`LiveSource`] to drop the one it
     /// holds. Non-blocking: this is what makes `stop()` instant.
     fn clear(&self) {
         let mut state = self.lock();
         state.packets.clear();
         state.queued_samples = 0;
+        state.consumed_boundary_id = state.next_boundary_id;
         self.generation.fetch_add(1, Ordering::Release);
         drop(state);
         self.space_freed.notify_all();
@@ -489,6 +591,8 @@ impl Iterator for LiveSource {
                 {
                     let _ = sender.send(AudioSignal::LoopBoundary { position_ms });
                 }
+                let boundary_id = std::mem::take(&mut self.packet.boundary_id);
+                self.ring.acknowledge_boundary(boundary_id);
             }
             match self.ring.pop() {
                 Some(packet) => {
@@ -546,33 +650,50 @@ fn attach_live_source(sink: &rodio::Sink, ring: &Arc<SampleRing>, rate: rodio::S
     sink.append(LiveSource::new(ring.clone(), rate));
 }
 
-pub struct RodioSink {
-    rodio_sink: Option<Arc<rodio::Sink>>,
-    ring: Arc<SampleRing>,
-    output_rate: rodio::SampleRate,
-    /// `None` when the device already runs at librespot's rate and the samples
-    /// need no conversion.
+struct AudioProcessing {
     resampler: Option<Resampler>,
     pipeline_revision: u64,
     pipeline: Option<AudioPipeline>,
-    _stream: rodio::OutputStream,
 }
 
-impl RodioSink {
+impl AudioProcessing {
     fn synchronize_pipeline(&mut self, revision: u64) {
         if self.pipeline_revision == revision {
             return;
         }
-        let config = CUSTOMIZATION
-            .lock()
-            .expect("audio customization should not be poisoned")
-            .clone();
+        let (config, discontinuous) = {
+            let mut customization = CUSTOMIZATION
+                .lock()
+                .expect("audio customization should not be poisoned");
+            let config = customization.config.clone();
+            let discontinuous = std::mem::take(&mut customization.discontinuous);
+            (config, discontinuous)
+        };
         self.pipeline = config.as_ref().map(AudioPipeline::new);
         self.pipeline_revision = revision;
+        if discontinuous {
+            if let Some(resampler) = &mut self.resampler {
+                resampler.reset();
+            }
+        }
+    }
+
+    fn reset(&mut self) {
         if let Some(resampler) = &mut self.resampler {
             resampler.reset();
         }
+        if let Some(pipeline) = &mut self.pipeline {
+            pipeline.reset_buffers();
+        }
     }
+}
+
+pub struct RodioSink {
+    rodio_sink: Option<Arc<rodio::Sink>>,
+    ring: Arc<SampleRing>,
+    output_rate: rodio::SampleRate,
+    processing: Arc<Mutex<AudioProcessing>>,
+    _stream: rodio::OutputStream,
 }
 
 /// Maps a u16 volume (librespot's 0..=65535 scale) to rodio gain using the
@@ -594,10 +715,7 @@ fn volume_to_gain(volume: u16) -> f32 {
 /// write-ahead buffer plays out.
 pub fn set_sink_volume(volume: u16) {
     SINK_VOLUME.store(volume, Ordering::Release);
-    let sink = LIVE_SINK
-        .lock()
-        .expect(LIVE_SINK_POISON_MSG)
-        .upgrade();
+    let sink = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG).upgrade();
     if let Some(sink) = sink {
         sink.set_volume(volume_to_gain(volume));
     }
@@ -697,10 +815,22 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
     let stream = create_stream(&host, format).expect("rodio stream could not open");
     let output_rate = stream.config().sample_rate();
     let resampler = Resampler::new(SAMPLE_RATE, output_rate, NUM_CHANNELS as u16);
+    let resampling = resampler.is_some();
     let ring = SampleRing::new(write_ahead_samples(output_rate));
     *LIVE_RING
         .lock()
         .expect("live sample ring should not be poisoned") = Arc::downgrade(&ring);
+    let processing = Arc::new(Mutex::new(AudioProcessing {
+        resampler,
+        pipeline_revision: CUSTOMIZATION_REVISION
+            .load(Ordering::Acquire)
+            .wrapping_sub(1),
+        pipeline: None,
+    }));
+    *LIVE_PROCESSING
+        .lock()
+        .expect("live audio processing registry should not be poisoned") =
+        Arc::downgrade(&processing);
 
     // The one fact that decides output fidelity, and the one that is otherwise
     // invisible: which rate the device actually opened at, and therefore
@@ -711,9 +841,10 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
         stream.config().channel_count(),
         stream.config().sample_format(),
         SAMPLE_RATE,
-        match &resampler {
-            Some(_) => "resampling",
-            None => "no resampling (device is at the decoder's rate)",
+        if resampling {
+            "resampling"
+        } else {
+            "no resampling (device is at the decoder's rate)"
         }
     );
 
@@ -730,9 +861,7 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
         rodio_sink: None,
         ring,
         output_rate,
-        resampler,
-        pipeline_revision: CUSTOMIZATION_REVISION.load(Ordering::Acquire).wrapping_sub(1),
-        pipeline: None,
+        processing,
         _stream: stream,
     }
 }
@@ -771,15 +900,10 @@ impl Sink for RodioSink {
     /// ring is not consumed while stopped.
     fn stop(&mut self) -> SinkResult<()> {
         self.ring.clear();
-        // The resampler holds most of a filter length of the audio that was
-        // playing. Without this, a seek or a track change would splice ~0.7 ms
-        // of the old position onto the front of the new one.
-        if let Some(resampler) = &mut self.resampler {
-            resampler.reset();
-        }
-        if let Some(pipeline) = &mut self.pipeline {
-            pipeline.reset_buffers();
-        }
+        self.processing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reset();
         if let Some(sink) = &self.rodio_sink {
             sink.pause();
         }
@@ -802,43 +926,40 @@ impl Sink for RodioSink {
         }
 
         let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
-        self.synchronize_pipeline(revision);
-        // Branching on the pipeline rather than on CUSTOMIZATION_ACTIVE keeps
-        // this to one observation: the flag is published after the revision, so
-        // a configure landing between the two reads could claim an active
-        // customization while the pipeline was still absent.
-        let (processed, loop_to_ms) = if let Some(pipeline) = self.pipeline.as_mut() {
-            let mut processed = Vec::new();
-            let loop_to_ms = pipeline.process(&samples_f32, &mut processed);
-            // An empty result still has to reach the ring when it carries a
-            // loop marker: dropping the packet would strand the marker, and
-            // the pipeline only emits one per loop, so playback would stall
-            // silently and forever.
-            if processed.is_empty() && loop_to_ms.is_none() {
-                return Ok(());
-            }
-            (processed, loop_to_ms)
-        } else {
-            // Load-bearing bypass: the ordinary 1.0/no-edit path hands the
-            // converter output directly to the existing resampler/ring flow.
-            (samples_f32, None)
-        };
+        let (queued, loop_to_ms) = {
+            let mut processing = self
+                .processing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            processing.synchronize_pipeline(revision);
+            let (processed, loop_to_ms) = if let Some(pipeline) = processing.pipeline.as_mut() {
+                let mut processed = Vec::new();
+                let loop_to_ms = pipeline.process(&samples_f32, &mut processed);
+                (processed, loop_to_ms)
+            } else {
+                // Load-bearing bypass: the ordinary 1.0/no-edit path hands
+                // converter output directly to the resampler/ring flow.
+                (samples_f32, None)
+            };
 
-        // Resample to the device's rate here, on the player thread, rather than
-        // letting rodio do it with linear interpolation on the audio thread.
-        // See "Playback rate and fidelity" in the module docs. The ring
-        // therefore holds device-rate audio from this point on.
-        let queued = match &mut self.resampler {
-            Some(resampler) => {
-                let mut resampled = Vec::new();
-                resampler.process(&processed, &mut resampled);
-                if resampled.is_empty() && loop_to_ms.is_none() {
-                    return Ok(());
+            let queued = match &mut processing.resampler {
+                Some(resampler) => {
+                    let mut resampled = Vec::new();
+                    resampler.process(&processed, &mut resampled);
+                    resampled
                 }
-                resampled
-            }
-            None => processed,
+                None => processed,
+            };
+            (queued, loop_to_ms)
         };
+        // Do not pace an empty customized packet. The ring's queued audible
+        // samples already provide normal backpressure; sleeping for removed
+        // source frames makes LiveSource emit underrun silence for the cut's
+        // original duration, turning a cut into a mute.
+
+        if queued.is_empty() && loop_to_ms.is_none() {
+            return Ok(());
+        }
 
         // Backpressure: the ring holds about WRITE_AHEAD_MS of audio, small
         // enough that seek/volume/track changes land almost immediately, large
@@ -863,9 +984,8 @@ mod tests {
     /// Every test here models the reference rig: a 48 kHz device, which is what
     /// the ring is sized for once the resampler has run.
     const OUT_RATE: rodio::SampleRate = 48_000;
-    const TEST_RING_CAPACITY: usize = OUT_RATE as usize * NUM_CHANNELS as usize
-        * WRITE_AHEAD_MS
-        / 1000;
+    const TEST_RING_CAPACITY: usize =
+        OUT_RATE as usize * NUM_CHANNELS as usize * WRITE_AHEAD_MS / 1000;
 
     fn test_ring() -> Arc<SampleRing> {
         SampleRing::new(TEST_RING_CAPACITY)
@@ -902,8 +1022,7 @@ mod tests {
     #[test]
     fn write_ahead_stays_in_latency_budget_at_every_device_rate() {
         for rate in [SAMPLE_RATE, 48_000, 96_000, 192_000] {
-            let ms = write_ahead_samples(rate) as f64 / f64::from(rate)
-                / f64::from(NUM_CHANNELS)
+            let ms = write_ahead_samples(rate) as f64 / f64::from(rate) / f64::from(NUM_CHANNELS)
                 * 1000.0;
             assert!(
                 (100.0..=200.0).contains(&ms),
@@ -999,8 +1118,13 @@ mod tests {
             silence.len().is_multiple_of(NUM_CHANNELS as usize),
             "silence must be emitted in whole frames"
         );
-        ring.push(vec![5.0, 6.0], Duration::from_millis(50)).unwrap();
-        assert_eq!(source.next(), Some(5.0), "audio resumes on the left channel");
+        ring.push(vec![5.0, 6.0], Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(
+            source.next(),
+            Some(5.0),
+            "audio resumes on the left channel"
+        );
         assert_eq!(source.next(), Some(6.0));
     }
 
@@ -1013,7 +1137,11 @@ mod tests {
         ring.push(vec![1.0; 4], Duration::from_millis(50)).unwrap();
         let mut source = LiveSource::new(ring, SAMPLE_RATE);
         for i in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
-            assert_eq!(source.next(), Some(0.0), "priming sample {i} must be silent");
+            assert_eq!(
+                source.next(),
+                Some(0.0),
+                "priming sample {i} must be silent"
+            );
         }
         assert_eq!(source.next(), Some(1.0));
         assert!(
@@ -1131,7 +1259,11 @@ mod tests {
             // output goes and stays quiet. If the tail were genuinely dropped
             // rather than merely un-pulled, no amount of extra pulling would
             // recover it and the counts below would come up short.
-            silent_blocks = if block_had_audio { 0 } else { silent_blocks + 1 };
+            silent_blocks = if block_had_audio {
+                0
+            } else {
+                silent_blocks + 1
+            };
             if fed_samples == total_samples && silent_blocks >= 4 {
                 break;
             }
@@ -1173,8 +1305,7 @@ mod tests {
     /// audio rate.
     #[test]
     fn live_source_is_idle_before_start_and_while_paused() {
-        const TWENTY_MS_SAMPLES: usize =
-            OUT_RATE as usize * NUM_CHANNELS as usize * 20 / 1000;
+        const TWENTY_MS_SAMPLES: usize = OUT_RATE as usize * NUM_CHANNELS as usize * 20 / 1000;
 
         let (sink, queue) = rodio::Sink::new();
         let (mixer_in, mut mixer_out) =
@@ -1199,7 +1330,11 @@ mod tests {
         for _ in 0..TWENTY_MS_SAMPLES * 4 {
             mixer_out.next();
         }
-        assert_eq!(ring.queued_samples(), 0, "start must attach and poll the source");
+        assert_eq!(
+            ring.queued_samples(),
+            0,
+            "start must attach and poll the source"
+        );
 
         sink.pause();
         for _ in 0..TWENTY_MS_SAMPLES {
@@ -1219,7 +1354,11 @@ mod tests {
         for _ in 0..TWENTY_MS_SAMPLES * 4 {
             mixer_out.next();
         }
-        assert_eq!(ring.queued_samples(), 0, "resume must poll the existing source");
+        assert_eq!(
+            ring.queued_samples(),
+            0,
+            "resume must poll the existing source"
+        );
     }
 
     /// `configure_customization` owns process-wide statics, so the tests that
@@ -1261,13 +1400,10 @@ mod tests {
         configure_customization(None, 1.0, 0);
     }
 
-    /// Every track load reconfigures, and gapless playback never stops the
-    /// sink in between, so a reconfigure that clears the ring unconditionally
-    /// throws away the decoded tail of the outgoing track — WRITE_AHEAD_MS of
-    /// it, on every single track. Only a reconfigure that changes what the
-    /// samples are has earned the discontinuity.
+    /// Natural gapless setup must preserve the outgoing queue, while every
+    /// discontinuous seek/config reset must discard it.
     #[test]
-    fn reconfiguring_an_unarmed_pipeline_keeps_the_queued_tail() {
+    fn natural_and_discontinuous_boundaries_have_distinct_queue_semantics() {
         let _guard = customization_guard();
         let ring = test_ring();
         *LIVE_RING
@@ -1275,26 +1411,55 @@ mod tests {
             .expect("live sample ring should not be poisoned") = Arc::downgrade(&ring);
 
         ring.push(packet(1024), Duration::from_millis(50)).unwrap();
-        configure_customization(None, 1.0, 0);
+        configure_customization_after_natural_boundary(None, 1.0, 0);
         assert_eq!(
             ring.queued_samples(),
             1024,
-            "an ordinary track change must not drop the previous track's tail"
+            "a natural track boundary must leave the audible tail queued"
         );
 
         configure_customization(None, 1.25, 0);
         assert_eq!(
             ring.queued_samples(),
             0,
-            "arming the pipeline changes the samples, so the queue is stale"
+            "a speed/config discontinuity must discard stale queued samples"
         );
+    }
 
-        ring.push(packet(1024), Duration::from_millis(50)).unwrap();
-        configure_customization(None, 1.0, 0);
+    #[test]
+    fn natural_eof_flushes_wsola_tail_into_the_live_queue() {
+        let _guard = customization_guard();
+        let ring = test_ring();
+        let speed = 0.5;
+        let frames = SAMPLE_RATE as usize * 37 / 1_000;
+        let mut pipeline = AudioPipeline::new(&PipelineConfig {
+            edit: None,
+            speed,
+            position_ms: 0,
+        });
+        let input = vec![0.25; frames * NUM_CHANNELS as usize];
+        let mut already_emitted = Vec::new();
+        pipeline.process(&input, &mut already_emitted);
+        let processing = Arc::new(Mutex::new(AudioProcessing {
+            resampler: None,
+            pipeline_revision: CUSTOMIZATION_REVISION.load(Ordering::Acquire),
+            pipeline: Some(pipeline),
+        }));
+        *LIVE_RING
+            .lock()
+            .expect("live sample ring should not be poisoned") = Arc::downgrade(&ring);
+        *LIVE_PROCESSING
+            .lock()
+            .expect("live audio processing registry should not be poisoned") =
+            Arc::downgrade(&processing);
+
+        finish_natural_boundary().expect("the output queue has room");
+        let expected_total =
+            (frames as f64 / speed as f64).round() as usize * NUM_CHANNELS as usize;
         assert_eq!(
             ring.queued_samples(),
-            0,
-            "disarming it is equally a discontinuity"
+            expected_total - already_emitted.len(),
+            "every delayed WSOLA sample must be queued before natural advance"
         );
     }
 
@@ -1306,20 +1471,57 @@ mod tests {
         let ring = test_ring();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         install_signal_sender(sender);
-        ring.push_marked(Vec::new(), Some(4_200), Duration::from_millis(50))
-            .unwrap();
-        ring.push_marked(packet(2), None, Duration::from_millis(50))
-            .unwrap();
+        let producer_ring = Arc::clone(&ring);
+        let producer = std::thread::spawn(move || {
+            producer_ring
+                .push_marked(Vec::new(), Some(4_200), Duration::from_secs(1))
+                .unwrap();
+        });
+        while ring.lock().next_boundary_id == 0 {
+            std::thread::yield_now();
+        }
 
         let mut source = LiveSource::new(Arc::clone(&ring), OUT_RATE);
         for _ in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
             source.next();
         }
-        assert_eq!(source.next(), Some(1.0), "the audio behind the marker plays");
+        // Pulling once drains the empty marker, acknowledges its backpressure,
+        // and returns underrun silence without indexing the empty vector.
+        assert_eq!(source.next(), Some(0.0));
+        producer.join().unwrap();
         match receiver.try_recv() {
             Ok(AudioSignal::LoopBoundary { position_ms }) => assert_eq!(position_ms, 4_200),
             other => panic!("expected the loop boundary, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn loop_marker_blocks_the_decoder_until_it_is_audible() {
+        let ring = test_ring();
+        let producer_ring = Arc::clone(&ring);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            producer_ring
+                .push_marked(Vec::new(), Some(900), Duration::from_secs(1))
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "the decoder ran past a queued loop boundary"
+        );
+        while ring.lock().next_boundary_id == 0 {
+            std::thread::yield_now();
+        }
+
+        let mut source = LiveSource::new(ring, OUT_RATE);
+        for _ in 0..=RODIO_BOOTSTRAP_SPAN_SAMPLES {
+            source.next();
+        }
+        done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("audible boundary releases decoder backpressure");
+        producer.join().unwrap();
     }
 
     /// The rodio gain curve must mirror librespot's default SoftMixer

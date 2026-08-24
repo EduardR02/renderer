@@ -1,13 +1,14 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
+use librespot_core::Session;
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
-use librespot_core::Session;
 use librespot_playback::config::{
     AudioFormat, Bitrate, NormalisationMethod, NormalisationType, PlayerConfig,
 };
@@ -80,7 +81,7 @@ pub fn prepare_oauth() -> Result<PendingAuth, String> {
 pub async fn connect_cached(
     cache: Cache,
     temporary_directory: PathBuf,
-    normalisation: bool,
+    normalisation: Arc<AtomicBool>,
 ) -> Result<PlaybackHandles, String> {
     let credentials = cache
         .credentials()
@@ -89,7 +90,7 @@ pub async fn connect_cached(
     session_config.tmp_dir = temporary_directory;
     let session = Session::new(session_config, Some(cache.clone()));
     match session.connect(credentials, false).await {
-        Ok(()) => create_playback(session, cache, normalisation).await,
+        Ok(()) => create_playback_latest(session, cache, normalisation).await,
         Err(error) => {
             eprintln!("cached Spotify credentials were rejected: {error}");
             session.shutdown();
@@ -105,7 +106,7 @@ pub async fn complete_oauth(
     cache: Cache,
     temporary_directory: PathBuf,
     pending: PendingAuth,
-    normalisation: bool,
+    normalisation: Arc<AtomicBool>,
 ) -> Result<PlaybackHandles, String> {
     eprintln!("Browse to: {}", pending.auth_url);
     let access_token = tokio::task::spawn_blocking(move || run_oauth_flow(pending))
@@ -122,7 +123,7 @@ pub async fn complete_oauth(
         session.shutdown();
         return Err(format!("Spotify authentication failed: {error}"));
     }
-    create_playback(session, cache, normalisation).await
+    create_playback_latest(session, cache, normalisation).await
 }
 
 /// Blocking OAuth half of [`complete_oauth`]: loopback listener + token
@@ -208,9 +209,10 @@ fn oauth_listener_addr() -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("OAuth redirect URI has no listenable socket: {OAUTH_REDIRECT_URI}"))
 }
 
-fn basic_client(
-) -> Result<BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>, String>
-{
+fn basic_client() -> Result<
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>,
+    String,
+> {
     let client_id = SessionConfig::default().client_id;
     Ok(BasicClient::new(ClientId::new(client_id))
         .set_auth_uri(
@@ -259,7 +261,30 @@ fn player_config(normalisation: bool) -> PlayerConfig {
     }
 }
 
-async fn create_playback(
+async fn create_playback_latest(
+    session: Session,
+    cache: Cache,
+    normalisation: Arc<AtomicBool>,
+) -> Result<PlaybackHandles, String> {
+    loop {
+        let enabled = normalisation.load(Ordering::Acquire);
+        let handles = match create_playback(session.clone(), cache.clone(), enabled).await {
+            Ok(handles) => handles,
+            Err(error) => {
+                session.shutdown();
+                return Err(error);
+            }
+        };
+        if normalisation.load(Ordering::Acquire) == enabled {
+            return Ok(handles);
+        }
+        // The preference changed while the player was opening. Keep the
+        // authenticated session and retry only player construction.
+        handles.player.stop();
+    }
+}
+
+pub async fn create_playback(
     session: Session,
     cache: Cache,
     normalisation: bool,
@@ -299,11 +324,9 @@ async fn create_playback(
     .await
     .map_err(|error| format!("audio initialization worker failed: {error}"))?;
     if let Err(error) = audio_result {
-        session.shutdown();
         return Err(error);
     }
     if player.is_invalid() {
-        session.shutdown();
         return Err("WASAPI/rodio player terminated during initialization".to_owned());
     }
 
@@ -329,7 +352,7 @@ fn volume_to_percent(volume: u16) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_oauth_code, oauth_listener_addr, player_config, prepare_oauth, OAUTH_REDIRECT_URI,
+        OAUTH_REDIRECT_URI, extract_oauth_code, oauth_listener_addr, player_config, prepare_oauth,
     };
 
     #[test]
@@ -401,8 +424,7 @@ mod tests {
 
     #[test]
     fn oauth_callback_code_extracts_from_the_redirect_path() {
-        let code = extract_oauth_code("/login?code=abc123&state=xyz")
-            .expect("code present");
+        let code = extract_oauth_code("/login?code=abc123&state=xyz").expect("code present");
         assert_eq!(code.secret(), "abc123");
         assert!(
             extract_oauth_code("/login?error=access_denied").is_err(),

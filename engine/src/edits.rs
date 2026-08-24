@@ -36,8 +36,8 @@ use http::Method;
 use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{Metadata, Playlist};
 use librespot_protocol as protocol;
-use protocol::playlist4_external as p4;
 use protobuf::Message;
+use protocol::playlist4_external as p4;
 use serde::Deserialize;
 
 use spotify_playback_engine::protocol::PlaylistRef;
@@ -230,10 +230,7 @@ async fn post_playlist_changes(
 
 /// Applies ops to the user's rootlist via
 /// `/playlist/v2/user/{user}/rootlist/changes`.
-async fn post_rootlist_changes(
-    session: &Session,
-    ops: Vec<p4::Op>,
-) -> Result<(), String> {
+async fn post_rootlist_changes(session: &Session, ops: Vec<p4::Op>) -> Result<(), String> {
     let revision = rootlist_revision(session).await?;
     let mut changes = list_changes(&revision, ops);
     if let Some(delta) = changes.deltas.first_mut() {
@@ -258,7 +255,9 @@ fn validate_track_uris(uris: &[String]) -> Result<(), String> {
         let parsed = SpotifyUri::from_uri(uri)
             .map_err(|error| format!("invalid Spotify track URI '{uri}': {error}"))?;
         if !matches!(&parsed, SpotifyUri::Track { .. }) {
-            return Err(format!("playlist edit item is not a Spotify track URI: {uri}"));
+            return Err(format!(
+                "playlist edit item is not a Spotify track URI: {uri}"
+            ));
         }
     }
     Ok(())
@@ -323,11 +322,7 @@ pub async fn delete_playlist(session: &Session, id: &str) -> Result<(), String> 
 }
 
 /// Appends tracks to a playlist via an ADD change.
-pub async fn add_tracks(
-    session: &Session,
-    id: &str,
-    uris: &[String],
-) -> Result<(), String> {
+pub async fn add_tracks(session: &Session, id: &str, uris: &[String]) -> Result<(), String> {
     if uris.is_empty() {
         return Err("no tracks to add".to_owned());
     }
@@ -336,11 +331,7 @@ pub async fn add_tracks(
 }
 
 /// Removes tracks by URI via a REM change (`items_as_key`).
-pub async fn remove_tracks(
-    session: &Session,
-    id: &str,
-    uris: &[String],
-) -> Result<(), String> {
+pub async fn remove_tracks(session: &Session, id: &str, uris: &[String]) -> Result<(), String> {
     if uris.is_empty() {
         return Err("no tracks to remove".to_owned());
     }
@@ -399,7 +390,9 @@ mod tests {
 
     #[test]
     fn remove_tracks_op_keys_items_by_uri() {
-        let op = round_trip(&remove_tracks_op(&["spotify:track:0123456789ABCDEFGHIJKL".to_owned()]));
+        let op = round_trip(&remove_tracks_op(&[
+            "spotify:track:0123456789ABCDEFGHIJKL".to_owned()
+        ]));
         assert_eq!(op.kind(), p4::op::Kind::REM);
         let rem = op.rem.unwrap();
         assert_eq!(rem.items_as_key, Some(true));
@@ -443,7 +436,9 @@ mod tests {
         );
         assert_eq!(add_body.add_last, Some(true));
 
-        let rem = round_trip(&rootlist_remove_op("spotify:playlist:0123456789ABCDEFGHIJKL"));
+        let rem = round_trip(&rootlist_remove_op(
+            "spotify:playlist:0123456789ABCDEFGHIJKL",
+        ));
         assert_eq!(rem.kind(), p4::op::Kind::REM);
         let rem_body = rem.rem.unwrap();
         assert_eq!(rem_body.items_as_key, Some(true));
@@ -456,13 +451,21 @@ mod tests {
     #[test]
     fn list_changes_wraps_ops_with_the_base_revision() {
         let base = vec![0xde, 0xad, 0xbe, 0xef];
-        let changes = list_changes(&base, vec![add_tracks_op(&["spotify:track:2abcdefghijklmnopqrstu".to_owned()])]);
+        let changes = list_changes(
+            &base,
+            vec![add_tracks_op(&[
+                "spotify:track:2abcdefghijklmnopqrstu".to_owned()
+            ])],
+        );
         assert_eq!(changes.base_revision.as_deref(), Some(&base[..]));
         assert_eq!(changes.want_resulting_revisions, Some(true));
         assert_eq!(changes.deltas.len(), 1);
         assert_eq!(changes.deltas[0].ops.len(), 1);
         assert_eq!(changes.deltas[0].ops[0].kind(), p4::op::Kind::ADD);
-        assert!(changes.deltas[0].info.is_none(), "info is attached per-session");
+        assert!(
+            changes.deltas[0].info.is_none(),
+            "info is attached per-session"
+        );
     }
 
     #[test]
