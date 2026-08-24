@@ -12,6 +12,7 @@
     goBack,
     goForward,
     ui,
+    api,
     maybeBackfillLazyQueue,
   } from "./lib/state.svelte.js";
   import IconSprite from "./components/IconSprite.svelte";
@@ -140,7 +141,34 @@
         goForward();
         return;
       }
+      // Hardware media keys work even while typing — that is their point.
+      // (Unfocused delivery is the SMTC integration's job.)
+      if (e.key === "MediaPlayPause") {
+        e.preventDefault();
+        togglePlay();
+        return;
+      }
+      if (e.key === "MediaTrackNext") {
+        e.preventDefault();
+        api.next();
+        return;
+      }
+      if (e.key === "MediaTrackPrevious") {
+        e.preventDefault();
+        api.previous();
+        return;
+      }
       if (typing) return;
+      if ((e.ctrlKey || e.metaKey) && e.key === "ArrowRight") {
+        e.preventDefault();
+        api.next();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === "ArrowLeft") {
+        e.preventDefault();
+        api.previous();
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         togglePlay();
