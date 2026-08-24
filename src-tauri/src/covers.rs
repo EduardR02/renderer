@@ -119,7 +119,10 @@ mod tests {
 
     #[test]
     fn content_type_sniffing_recognizes_common_formats() {
-        assert_eq!(sniff_content_type(&[0x89, b'P', b'N', b'G', 0x0D]), "image/png");
+        assert_eq!(
+            sniff_content_type(&[0x89, b'P', b'N', b'G', 0x0D]),
+            "image/png"
+        );
         assert_eq!(sniff_content_type(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
         assert_eq!(
             sniff_content_type(b"RIFF\x24\x00\x00\x00WEBPVP8 "),

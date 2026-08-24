@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{
     align_artist_ids, cover_urls_from_tracks, forget_cached_audio, CacheStats, CacheUsage,
-    PlaybackState, Playlist,
-    PlaylistDetail, Track,
+    PlaybackState, Playlist, PlaylistDetail, Track,
 };
 
 /// Number of playlists requested from the engine's rootlist browse.
@@ -53,7 +52,7 @@ impl Default for AppSettings {
     }
 }
 
-pub const PLAYBACK_STATE_VERSION: u32 = 2;
+pub const PLAYBACK_STATE_VERSION: u32 = 3;
 
 /// App-owned durable playback state. Deliberately excludes `playing`: every
 /// normal process start restores paused, while crash-only resume intent stays
@@ -63,6 +62,8 @@ pub struct PlaybackSnapshot {
     pub version: u32,
     pub queue: Vec<Track>,
     pub current_index: Option<usize>,
+    /// Position in the compiled transport timeline. Queue durations and edit
+    /// ranges remain in original-source coordinates.
     pub position_ms: u32,
     pub volume: u8,
     pub shuffle: bool,
@@ -98,7 +99,9 @@ impl PlaybackSnapshot {
             && matches!(self.repeat.as_str(), "off" | "context" | "track")
             && self.playback_speed.is_finite()
             && (0.5..=2.0).contains(&self.playback_speed)
-            && self.current_index.is_none_or(|index| index < self.queue.len())
+            && self
+                .current_index
+                .is_none_or(|index| index < self.queue.len())
             && (!self.queue.is_empty() || self.current_index.is_none())
             && self.queue.iter().all(|track| {
                 track.uri.starts_with("spotify:track:")
@@ -348,11 +351,11 @@ pub fn upsert_tracks_cache(entries: &mut Vec<PlaylistTracksEntry>, entry: Playli
 
 /// Combines cached tracks with the library playlist metadata into the full
 /// detail payload the UI renders.
-pub fn playlist_detail_from_cache(
-    state: &AppState,
-    entry: PlaylistTracksEntry,
-) -> PlaylistDetail {
-    let meta = state.playlists.iter().find(|playlist| playlist.id == entry.id);
+pub fn playlist_detail_from_cache(state: &AppState, entry: PlaylistTracksEntry) -> PlaylistDetail {
+    let meta = state
+        .playlists
+        .iter()
+        .find(|playlist| playlist.id == entry.id);
     let mut playlist = meta.cloned().unwrap_or_else(|| Playlist {
         id: entry.id.clone(),
         uri: format!("spotify:playlist:{}", entry.id),
@@ -414,9 +417,7 @@ pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
 /// active ones: the sort is stable and their key is the minimum. This is the
 /// order consumed by both the sidebar and Home's remaining-library grid.
 pub fn order_by_last_activity(playlists: &mut [Playlist]) {
-    playlists.sort_by_key(|playlist| {
-        std::cmp::Reverse(playlist.last_activity.unwrap_or(i64::MIN))
-    });
+    playlists.sort_by_key(|playlist| std::cmp::Reverse(playlist.last_activity.unwrap_or(i64::MIN)));
 }
 
 /// Stamps `id` as used in the library at `at` and re-sorts the list.
@@ -522,8 +523,12 @@ pub fn compute_cache_stats() -> CacheStats {
 /// helper; no user input becomes a path. A partial clear is reported instead
 /// of pretending success when Windows still has a file open.
 pub fn clear_cache_directory(root: &Path, keep: &[&str]) -> Result<(), String> {
-    std::fs::create_dir_all(root)
-        .map_err(|error| format!("could not create cache directory {}: {error}", root.display()))?;
+    std::fs::create_dir_all(root).map_err(|error| {
+        format!(
+            "could not create cache directory {}: {error}",
+            root.display()
+        )
+    })?;
     let entries = std::fs::read_dir(root)
         .map_err(|error| format!("could not read cache directory {}: {error}", root.display()))?;
     let mut failures = Vec::new();
@@ -544,7 +549,11 @@ pub fn clear_cache_directory(root: &Path, keep: &[&str]) -> Result<(), String> {
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(format!("could not remove {} cache item(s): {}", failures.len(), failures.join("; ")))
+        Err(format!(
+            "could not remove {} cache item(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ))
     }
 }
 
@@ -607,7 +616,11 @@ fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let moved = unsafe {
         MoveFileExW(
             source.as_ptr(),
@@ -686,7 +699,9 @@ mod tests {
         snapshot.position_ms = 84_000;
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
         assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot));
-        assert!(!playback_state_path(&dir).with_extension("json.tmp").exists());
+        assert!(!playback_state_path(&dir)
+            .with_extension("json.tmp")
+            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -706,6 +721,15 @@ mod tests {
         )
         .unwrap();
         assert!(load_playback_snapshot_from(&dir).is_none());
+        std::fs::write(
+            playback_state_path(&dir),
+            br#"{"version":2,"queue":[{"id":"0123456789ABCDEFGHIJKL","uri":"spotify:track:0123456789ABCDEFGHIJKL","duration_ms":240000}],"current_index":0,"position_ms":42000,"volume":50,"shuffle":false,"repeat":"off","playback_speed":1.0}"#,
+        )
+        .unwrap();
+        assert!(
+            load_playback_snapshot_from(&dir).is_none(),
+            "source-coordinate snapshots must not be restored as compiled positions"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -891,7 +915,11 @@ mod tests {
         assert_eq!(playlists[1].last_activity, Some(100));
 
         // A missing playlist cannot create either kind of stamp.
-        assert!(!touch_playlist_activity(&mut playlists, "not-followed", 300));
+        assert!(!touch_playlist_activity(
+            &mut playlists,
+            "not-followed",
+            300
+        ));
     }
 
     #[test]
@@ -1054,7 +1082,10 @@ mod tests {
             id: "p1".into(),
             fetched_at: Some(42),
             revision: "rev".into(),
-            tracks: vec![Track { cached: true, ..track("t") }],
+            tracks: vec![Track {
+                cached: true,
+                ..track("t")
+            }],
         }];
         save_tracks_cache(&dir, &entries);
         assert!(

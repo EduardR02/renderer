@@ -4,18 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
-use serde_json::json;
-use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use crate::app::{
-    AppSettings, AppState, PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS,
-    LIBRARY_LENGTH,
     carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
     load_app_settings, load_playlist_list, now_secs, order_by_last_activity,
     playlist_detail_from_cache, save_app_settings, save_playlist_list, save_tracks_cache,
     touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, upsert_playlist,
-    upsert_tracks_cache,
+    upsert_tracks_cache, AppSettings, AppState, PlaylistListCache, PlaylistTracksEntry,
+    CACHE_STATS_TTL_SECS, LIBRARY_LENGTH,
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
@@ -23,9 +18,14 @@ use crate::log;
 use crate::media_keys;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
-    ArtistReleasePageDetail, CacheStats, HistoryPage, LikedSongsDetail, Playlist, PlaylistDetail,
+    ArtistReleasePageDetail, CacheStats, HistoryEntry, LikedSongsDetail, Playlist, PlaylistDetail,
     PlaylistRecommendationsDetail, RadioDetail, SearchResult, Track, TrackCreditsDetail,
+    TrackWaveform,
 };
+use parking_lot::Mutex;
+use serde_json::json;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
 // ---------------------------------------------------------------------------
 // Playback commands
@@ -62,7 +62,10 @@ pub async fn set_volume(client: State<'_, Arc<EngineClient>>, percent: u8) -> Re
 }
 
 #[tauri::command]
-pub async fn set_shuffle(client: State<'_, Arc<EngineClient>>, enabled: bool) -> Result<(), String> {
+pub async fn set_shuffle(
+    client: State<'_, Arc<EngineClient>>,
+    enabled: bool,
+) -> Result<(), String> {
     client.set_shuffle(enabled).await
 }
 
@@ -87,6 +90,19 @@ pub async fn play_queue(
     context: String,
 ) -> Result<(), String> {
     client.play_queue(&queue, index, 0, &context).await
+}
+
+#[tauri::command]
+pub async fn preview_track_edit(
+    client: State<'_, Arc<EngineClient>>,
+    track: Track,
+    cuts: Vec<spotify_playback_engine::protocol::TimeRange>,
+    loop_range: Option<spotify_playback_engine::protocol::TimeRange>,
+    position_ms: u32,
+) -> Result<(), String> {
+    client
+        .preview_track_edit(&track, &cuts, loop_range, position_ms)
+        .await
 }
 
 #[tauri::command]
@@ -116,7 +132,10 @@ pub async fn add_queue_batch(
 }
 
 #[tauri::command]
-pub async fn remove_queue(client: State<'_, Arc<EngineClient>>, index: usize) -> Result<(), String> {
+pub async fn remove_queue(
+    client: State<'_, Arc<EngineClient>>,
+    index: usize,
+) -> Result<(), String> {
     client.remove_queue(index).await
 }
 
@@ -132,34 +151,37 @@ pub async fn move_queue(
 #[tauri::command]
 pub async fn get_history(
     client: State<'_, Arc<EngineClient>>,
-    offset: Option<usize>,
-    limit: Option<usize>,
-    query: Option<String>,
-    sort: Option<String>,
-) -> Result<HistoryPage, String> {
-    // An order the engine does not know is the default order, not an error:
-    // the view's dropdown is the only thing that sends this, and a stale
-    // value from it should still return the history.
-    let sort = match sort.as_deref() {
-        Some("oldest") => "oldest",
-        Some("title") => "title",
-        Some("artist") => "artist",
-        _ => "recent",
-    };
+) -> Result<Vec<HistoryEntry>, String> {
     Ok(client
-        .get_history(
-            offset.unwrap_or(0),
-            limit.unwrap_or(40).clamp(1, 100),
-            query.as_deref().unwrap_or_default(),
-            sort,
-        )
+        .get_history()
         .await?
-        .into())
+        .into_iter()
+        .map(HistoryEntry::from)
+        .collect())
 }
 
 #[tauri::command]
 pub async fn clear_history(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
     client.clear_history().await
+}
+
+#[tauri::command]
+pub async fn get_track_waveform(
+    client: State<'_, Arc<EngineClient>>,
+    track_id: String,
+) -> Result<TrackWaveform, String> {
+    client
+        .get_track_waveform(&track_id)
+        .await
+        .map(TrackWaveform::from)
+}
+
+#[tauri::command]
+pub async fn cancel_track_waveform(
+    client: State<'_, Arc<EngineClient>>,
+    track_id: String,
+) -> Result<(), String> {
+    client.cancel_track_waveform(&track_id).await
 }
 
 #[tauri::command]
@@ -203,17 +225,6 @@ pub async fn set_playlist_track_edit_enabled(
 ) -> Result<(), String> {
     client
         .set_playlist_track_edit_enabled(&playlist_id, &track_id, enabled)
-        .await
-}
-
-#[tauri::command]
-pub async fn extract_track_waveform(
-    client: State<'_, Arc<EngineClient>>,
-    track_id: String,
-    points: Option<u16>,
-) -> Result<spotify_playback_engine::protocol::TrackWaveform, String> {
-    client
-        .extract_track_waveform(&track_id, points.unwrap_or(768).clamp(64, 4096))
         .await
 }
 
@@ -533,10 +544,7 @@ pub async fn get_cover(url: String) -> Result<String, String> {
 ///
 /// Browsing or editing a playlist deliberately does not count as playback.
 #[tauri::command]
-pub async fn touch_playlist(
-    state: State<'_, Mutex<AppState>>,
-    id: String,
-) -> Result<(), String> {
+pub async fn touch_playlist(state: State<'_, Mutex<AppState>>, id: String) -> Result<(), String> {
     let (dir, cache) = {
         let mut guard = state.lock();
         if !touch_playlist_played(&mut guard.playlists, &id, now_secs()) {
@@ -623,7 +631,11 @@ fn restore_autostart_registration(app: &AppHandle, enabled: bool) -> Result<(), 
         manager.disable()
     };
     result.map_err(|error| {
-        let action = if enabled { "restore enabled" } else { "restore disabled" };
+        let action = if enabled {
+            "restore enabled"
+        } else {
+            "restore disabled"
+        };
         format!("could not {action} launch-at-login registration: {error}")
     })
 }
@@ -642,10 +654,7 @@ pub fn set_audio_cache_limit(mb: u64) -> Result<AppSettings, String> {
 /// Updates the OS registration before persisting the preference. If writing
 /// the preference fails, restore the registration to its previous state.
 #[tauri::command]
-pub fn set_launch_at_login(
-    app: AppHandle,
-    enabled: bool,
-) -> Result<AppSettings, String> {
+pub fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<AppSettings, String> {
     let mut settings = load_app_settings();
     let was_enabled = set_autostart_registration(&app, enabled)?;
     settings.launch_at_login = enabled;
@@ -799,6 +808,30 @@ pub async fn consume_states(app: AppHandle) {
                 media_keys::update_position(heartbeat.position_ms);
                 continue;
             }
+            Ok(StateLine::Disconnected) => {
+                let disconnected = {
+                    let managed = app.state::<Mutex<AppState>>();
+                    let mut guard = managed.lock();
+                    guard.playback.playing = false;
+                    guard.playback.auth_state = "disconnected".to_owned();
+                    guard.playback.error = "playback engine disconnected".to_owned();
+                    guard.playback.clone()
+                };
+                let _ = app.emit("state", &disconnected);
+                let _ = app.emit(
+                    "session",
+                    json!({
+                        "auth_state": "disconnected",
+                        "username": &disconnected.username,
+                        "error": &disconnected.error,
+                    }),
+                );
+                media_keys::update_disconnected();
+                previous_identity =
+                    Some(("disconnected".to_owned(), disconnected.username.clone()));
+                last_error = disconnected.error;
+                continue;
+            }
             // The engine out-ran this consumer; the next line re-syncs
             // (a skipped full state gets re-emitted by the engine, and a
             // skipped heartbeat is just one projection step).
@@ -879,10 +912,7 @@ pub async fn consume_states(app: AppHandle) {
 /// Applies settings before installing the paused queue. Normal startup ends
 /// here; crash recovery alone follows with Play when the captured state was
 /// playing.
-async fn restore_playback(
-    client: &EngineClient,
-    snapshot: &RestoreSnapshot,
-) -> Result<(), String> {
+async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> Result<(), String> {
     client.set_volume(snapshot.volume).await?;
     client.set_shuffle(snapshot.shuffle).await?;
     client.set_repeat(&snapshot.repeat).await?;
@@ -999,15 +1029,15 @@ fn spawn_refresh_playlist(app: AppHandle, id: String) {
         let state = app.state::<Mutex<AppState>>();
         match fetch_playlist(&state, &client, &id).await {
             /* Tell the window, do not just warm the cache.
-               This refresh used to update the caches and stop there, so the
-               fresh payload was only ever seen the NEXT time the playlist was
-               opened. Download marks made that obvious: `cached` is stripped
-               when the track cache is loaded from disk, deliberately, since a
-               pruned audio cache must not leave phantom marks behind — so a
-               cache-served open showed none, the refresh quietly learned the
-               real ones, and they appeared on the second open. Anything else
-               that changed server-side had the same one-open lag; the marks
-               were just the visible case. */
+            This refresh used to update the caches and stop there, so the
+            fresh payload was only ever seen the NEXT time the playlist was
+            opened. Download marks made that obvious: `cached` is stripped
+            when the track cache is loaded from disk, deliberately, since a
+            pruned audio cache must not leave phantom marks behind — so a
+            cache-served open showed none, the refresh quietly learned the
+            real ones, and they appeared on the second open. Anything else
+            that changed server-side had the same one-open lag; the marks
+            were just the visible case. */
             Ok(detail) => {
                 let _ = app.emit("playlist", &detail);
             }

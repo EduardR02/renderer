@@ -11,24 +11,27 @@
 //! consumer. Button presses arrive on a system thread inside the attached
 //! callback and are forwarded to the engine client as spawned async tasks.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
+    SeekDirection,
 };
 
 use crate::engine_client::EngineClient;
 use crate::log;
 use crate::types::PlaybackState;
 
-use std::pin::Pin;
-
 /// Last-known playing flag, so the overlay's toggle button maps to the right
 /// engine command even though its press arrives on a foreign thread.
 static PLAYING: AtomicBool = AtomicBool::new(false);
+static POSITION_MS: AtomicU64 = AtomicU64::new(0);
+static DURATION_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Published only after the controls attached successfully; every update
 /// helper below becomes a no-op until then, so a failed registration costs
@@ -94,20 +97,25 @@ fn run_controls(
         log::warn(&format!("could not attach media-key handlers: {error:?}"));
         return;
     }
+    #[cfg(windows)]
+    if let Err(error) = disable_unsupported_seek_buttons(hwnd) {
+        log::warn(&format!(
+            "could not disable unsupported fast-forward/rewind controls: {error}"
+        ));
+    }
+
+    // Publish the sender before asking for status. Otherwise a fast response
+    // can arrive in the gap and be dropped, leaving SMTC stale until the next
+    // full engine state.
+    if UPDATES.set(sender).is_err() {
+        return;
+    }
     log::info("media keys registered (SMTC)");
 
-    // Registration raced the first engine state: if that line already passed,
-    // nothing would re-send this track's metadata until the NEXT change (a
-    // paused queue emits no heartbeats). One status request guarantees a full
-    // state lands after attach.
     let refresh = client.clone();
     tauri::async_runtime::spawn(async move {
         let _ = refresh.request("status", serde_json::Value::Null).await;
     });
-
-    if UPDATES.set(sender).is_err() {
-        return;
-    }
 
     // Metadata only changes with the track; resending it on every heartbeat
     // makes Windows repaint the flyout for nothing. Transport status and the
@@ -140,10 +148,20 @@ fn run_controls(
                 }
                 controls.set_playback(transport(playing, position_ms))
             }
-            Update::Position(position_ms) => controls
-                .set_playback(transport(PLAYING.load(Ordering::Relaxed), position_ms)),
+            Update::Position(position_ms) => {
+                controls.set_playback(transport(PLAYING.load(Ordering::Relaxed), position_ms))
+            }
             Update::Stopped => {
+                PLAYING.store(false, Ordering::Relaxed);
                 last_uri.clear();
+                #[cfg(windows)]
+                if let Err(error) = clear_windows_metadata(hwnd) {
+                    log::warn(&format!("could not clear media metadata: {error}"));
+                }
+                #[cfg(not(windows))]
+                if let Err(error) = controls.set_metadata(MediaMetadata::default()) {
+                    log::warn(&format!("could not clear media metadata: {error:?}"));
+                }
                 controls.set_playback(MediaPlayback::Stopped)
             }
         };
@@ -167,18 +185,45 @@ fn handle_event(event: MediaControlEvent, client: &Arc<EngineClient>) {
     let client = client.clone();
     // Each `async move` block is its own anonymous type, so the arms must
     // erase to one boxed future for the match to typecheck.
-    let task: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = match event {
-        E::Play => Some(Box::pin(async move { let _ = client.play().await; })),
-        E::Pause | E::Stop => Some(Box::pin(async move { let _ = client.pause().await; })),
+    let task: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = match event {
+        E::Play => Some(Box::pin(async move {
+            let _ = client.play().await;
+        })),
+        E::Pause | E::Stop => Some(Box::pin(async move {
+            let _ = client.pause().await;
+        })),
         E::Toggle => {
             if PLAYING.load(Ordering::Relaxed) {
-                Some(Box::pin(async move { let _ = client.pause().await; }))
+                Some(Box::pin(async move {
+                    let _ = client.pause().await;
+                }))
             } else {
-                Some(Box::pin(async move { let _ = client.play().await; }))
+                Some(Box::pin(async move {
+                    let _ = client.play().await;
+                }))
             }
         }
-        E::Next => Some(Box::pin(async move { let _ = client.next().await; })),
-        E::Previous => Some(Box::pin(async move { let _ = client.previous().await; })),
+        E::Next => Some(Box::pin(async move {
+            let _ = client.next().await;
+        })),
+        E::Previous => Some(Box::pin(async move {
+            let _ = client.previous().await;
+        })),
+        E::SetPosition(position) => {
+            let position_ms = absolute_seek_target(duration_ms(position.0));
+            Some(Box::pin(async move {
+                let _ = client.seek(position_ms).await;
+            }))
+        }
+        E::SeekBy(direction, amount) => {
+            let position_ms = relative_seek_target(direction, duration_ms(amount));
+            Some(Box::pin(async move {
+                let _ = client.seek(position_ms).await;
+            }))
+        }
+        // Souvlaki exposes Windows' indeterminate FF/RW buttons as `Seek`.
+        // They have no honest target, so those buttons are disabled at attach.
+        E::Seek(_) => None,
         _ => None,
     };
     if let Some(task) = task {
@@ -186,21 +231,82 @@ fn handle_event(event: MediaControlEvent, client: &Arc<EngineClient>) {
     }
 }
 
+fn duration_ms(duration: Duration) -> u32 {
+    duration.as_millis().min(u32::MAX as u128) as u32
+}
+
+fn absolute_seek_target(position_ms: u32) -> u32 {
+    let duration = DURATION_MS.load(Ordering::Relaxed).min(u32::MAX as u64) as u32;
+    if duration == 0 {
+        position_ms
+    } else {
+        position_ms.min(duration)
+    }
+}
+
+fn relative_seek_target(direction: SeekDirection, amount_ms: u32) -> u32 {
+    let position = POSITION_MS.load(Ordering::Relaxed).min(u32::MAX as u64) as u32;
+    let duration = DURATION_MS.load(Ordering::Relaxed).min(u32::MAX as u64) as u32;
+    let target = match direction {
+        SeekDirection::Forward => position.saturating_add(amount_ms),
+        SeekDirection::Backward => position.saturating_sub(amount_ms),
+    };
+    if duration == 0 {
+        target
+    } else {
+        target.min(duration)
+    }
+}
+
+#[cfg(windows)]
+fn windows_controls(
+    hwnd: usize,
+) -> windows::core::Result<windows::Media::SystemMediaTransportControls> {
+    use windows::Media::SystemMediaTransportControls;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::WinRT::ISystemMediaTransportControlsInterop;
+
+    let interop = windows::core::factory::<
+        SystemMediaTransportControls,
+        ISystemMediaTransportControlsInterop,
+    >()?;
+    unsafe { interop.GetForWindow(HWND(hwnd as isize)) }
+}
+
+#[cfg(windows)]
+fn disable_unsupported_seek_buttons(hwnd: usize) -> windows::core::Result<()> {
+    let controls = windows_controls(hwnd)?;
+    controls.SetIsFastForwardEnabled(false)?;
+    controls.SetIsRewindEnabled(false)
+}
+
+#[cfg(windows)]
+fn clear_windows_metadata(hwnd: usize) -> windows::core::Result<()> {
+    let updater = windows_controls(hwnd)?.DisplayUpdater()?;
+    updater.ClearAll()?;
+    updater.Update()?;
+    Ok(())
+}
+
 /// Mirrors one full engine state into the media session. Cheap: a channel
 /// send; the owning thread deduplicates metadata against the previous track.
 pub fn update_state(state: &PlaybackState) {
     PLAYING.store(state.playing, Ordering::Relaxed);
+    POSITION_MS.store(state.position_ms as u64, Ordering::Relaxed);
     let Some(sender) = UPDATES.get() else {
         return;
     };
     let Some(track) = state.current_index.and_then(|index| state.queue.get(index)) else {
+        DURATION_MS.store(0, Ordering::Relaxed);
         let _ = sender.send(Update::Stopped);
         return;
     };
+    let duration_ms = track_duration(state.duration_ms, track.duration_ms);
+    DURATION_MS.store(duration_ms as u64, Ordering::Relaxed);
     let _ = sender.send(Update::State {
         playing: state.playing,
         position_ms: state.position_ms,
-        duration_ms: track_duration(state.duration_ms, track.duration_ms),
+        duration_ms,
         uri: state.current_uri.clone(),
         title: track.name.clone(),
         artist: track.artist_names.join(", "),
@@ -212,6 +318,7 @@ pub fn update_state(state: &PlaybackState) {
 /// Mirrors a position heartbeat. Skipped entirely while paused: a frozen
 /// playhead is already what the last transport update described.
 pub fn update_position(position_ms: u32) {
+    POSITION_MS.store(position_ms as u64, Ordering::Relaxed);
     if !PLAYING.load(Ordering::Relaxed) {
         return;
     }
@@ -220,6 +327,20 @@ pub fn update_position(position_ms: u32) {
     }
 }
 
+/// Clears transport and metadata immediately while the engine is unavailable.
+pub fn update_disconnected() {
+    PLAYING.store(false, Ordering::Relaxed);
+    POSITION_MS.store(0, Ordering::Relaxed);
+    DURATION_MS.store(0, Ordering::Relaxed);
+    if let Some(sender) = UPDATES.get() {
+        let _ = sender.send(Update::Stopped);
+    }
+}
+
 fn track_duration(fallback_ms: u32, track_ms: u32) -> u32 {
-    if track_ms > 0 { track_ms } else { fallback_ms }
+    if track_ms > 0 {
+        track_ms
+    } else {
+        fallback_ms
+    }
 }

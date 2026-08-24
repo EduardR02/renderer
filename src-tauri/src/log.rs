@@ -71,9 +71,7 @@ fn format_timestamp_utc(secs: u64, millis: u32) -> String {
     let minutes = (seconds_of_day % 3_600) / 60;
     let seconds = seconds_of_day % 60;
     let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02}.{millis:03}"
-    )
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
 /// Days since the Unix epoch -> (year, month, day), Gregorian, proleptic.
@@ -100,9 +98,15 @@ mod tests {
         assert_eq!(format_timestamp_utc(0, 0), "1970-01-01 00:00:00.000");
         assert_eq!(format_timestamp_utc(86_400, 5), "1970-01-02 00:00:00.005");
         // 2000-02-29: leap day across a century boundary.
-        assert_eq!(format_timestamp_utc(951_782_400, 0), "2000-02-29 00:00:00.000");
+        assert_eq!(
+            format_timestamp_utc(951_782_400, 0),
+            "2000-02-29 00:00:00.000"
+        );
         // 2024-07-03 09:46:40 UTC.
-        assert_eq!(format_timestamp_utc(1_720_000_000, 999), "2024-07-03 09:46:40.999");
+        assert_eq!(
+            format_timestamp_utc(1_720_000_000, 999),
+            "2024-07-03 09:46:40.999"
+        );
         assert_eq!(
             format_timestamp_utc(1_719_964_800 + 86_399, 1),
             "2024-07-03 23:59:59.001"
@@ -122,8 +126,8 @@ mod tests {
         init(dir.clone());
         info("engine spawned (pid 123)");
         warn("engine exited; respawning in 2s");
-        let contents = std::fs::read_to_string(dir.join("spotify_renderer.log"))
-            .expect("log file written");
+        let contents =
+            std::fs::read_to_string(dir.join("spotify_renderer.log")).expect("log file written");
         // Other tests (the engine round-trip) may append to the configured
         // log concurrently, so assert presence, not an exact line count.
         assert!(
@@ -135,10 +139,7 @@ mod tests {
             "warn line present: {contents}"
         );
         for line in contents.lines() {
-            assert!(
-                line.starts_with('['),
-                "every line is timestamped: {line:?}"
-            );
+            assert!(line.starts_with('['), "every line is timestamped: {line:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

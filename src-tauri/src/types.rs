@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use spotify_playback_engine::protocol::{
     AlbumBrowse, AlbumRef, ArtistBrowse, ArtistCataloguePage, ArtistOverview, ArtistPick,
     ArtistPickItem, ArtistRef, ArtistReleaseCounts, ArtistReleasePage, ArtistReleases,
-    ArtistTopCity, CreditArtist, CreditRole, HistoryPage as EngineHistoryPage, LikedSongsPage,
-    PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse,
-    TrackCredits, TrackEdit, TrackRef,
+    ArtistTopCity, CreditArtist, CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage,
+    PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, TrackCredits,
+    TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -138,42 +138,49 @@ impl From<Track> for TrackRef {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+/// Frontend-facing copy of the engine waveform payload. Keeping this at the
+/// Tauri boundary makes the line-protocol conversion explicit while preserving
+/// the shared snake_case field contract.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TrackWaveform {
+    pub track_id: String,
+    pub duration_ms: u32,
+    pub interval_ms: u16,
+    pub bin_count: u32,
+    pub peaks_base64: String,
+}
+
+impl From<EngineTrackWaveform> for TrackWaveform {
+    fn from(waveform: EngineTrackWaveform) -> Self {
+        Self {
+            track_id: waveform.track_id,
+            duration_ms: waveform.duration_ms,
+            interval_ms: waveform.interval_ms,
+            bin_count: waveform.bin_count,
+            peaks_base64: waveform.peaks_base64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct HistoryEntry {
     pub track_id: String,
     pub started_at: i64,
     pub ms_played: u64,
     pub completed: bool,
     pub context: String,
-    pub track: Option<Track>,
+    pub track: Track,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HistoryPage {
-    pub entries: Vec<HistoryEntry>,
-    pub next_offset: Option<usize>,
-    pub total: usize,
-}
-
-impl From<EngineHistoryPage> for HistoryPage {
-    fn from(page: EngineHistoryPage) -> Self {
+impl From<EngineHistoryItem> for HistoryEntry {
+    fn from(entry: EngineHistoryItem) -> Self {
         Self {
-            entries: page
-                .entries
-                .into_iter()
-                .map(|entry| HistoryEntry {
-                    track_id: entry.row.track_id,
-                    started_at: entry.row.started_at,
-                    ms_played: entry.row.ms_played,
-                    completed: entry.row.completed,
-                    context: entry.row.context,
-                    track: entry.track.map(Track::from),
-                })
-                .collect(),
-            next_offset: page.next_offset,
-            total: page.total,
+            track_id: entry.row.track_id,
+            started_at: entry.row.started_at,
+            ms_played: entry.row.ms_played,
+            completed: entry.row.completed,
+            context: entry.row.context,
+            track: Track::from(entry.track),
         }
     }
 }
@@ -300,7 +307,9 @@ pub fn cover_urls_from_tracks(tracks: &[Track]) -> Vec<String> {
 /// entries are empty ids, which already means "not linkable".
 pub fn align_artist_ids(track: &mut Track) {
     if track.artist_ids.len() != track.artist_names.len() {
-        track.artist_ids.resize(track.artist_names.len(), String::new());
+        track
+            .artist_ids
+            .resize(track.artist_names.len(), String::new());
     }
 }
 
@@ -395,7 +404,11 @@ impl From<PlaylistRecommendations> for PlaylistRecommendationsDetail {
     fn from(recommendations: PlaylistRecommendations) -> Self {
         Self {
             playlist_id: recommendations.playlist_id,
-            tracks: recommendations.tracks.into_iter().map(Track::from).collect(),
+            tracks: recommendations
+                .tracks
+                .into_iter()
+                .map(Track::from)
+                .collect(),
         }
     }
 }
@@ -673,11 +686,7 @@ impl From<ArtistOverview> for ArtistOverviewDetail {
                 .into_iter()
                 .map(Artist::from)
                 .collect(),
-            discovered_on: overview
-                .discovered_on
-                .iter()
-                .map(Playlist::from)
-                .collect(),
+            discovered_on: overview.discovered_on.iter().map(Playlist::from).collect(),
             artist_playlists: overview
                 .artist_playlists
                 .iter()
@@ -738,7 +747,6 @@ impl From<SearchBrowse> for SearchResult {
         }
     }
 }
-
 
 /// One contributor in a track's credits.
 ///
@@ -929,6 +937,34 @@ mod tests {
     }
 
     #[test]
+    fn history_item_conversion_preserves_the_flat_snapshot_contract() {
+        let item = EngineHistoryItem {
+            row: spotify_playback_engine::protocol::HistoryRow {
+                track_id: "track-1".into(),
+                started_at: 1_725_000_123_456,
+                ms_played: 91_000,
+                completed: true,
+                context: "playlist:mix".into(),
+            },
+            track: TrackRef {
+                id: "track-1".into(),
+                uri: "spotify:track:track-1".into(),
+                name: "Song".into(),
+                artist_names: vec!["Artist".into()],
+                ..TrackRef::default()
+            },
+        };
+
+        let entry = HistoryEntry::from(item);
+        assert_eq!(entry.track_id, "track-1");
+        assert_eq!(entry.started_at, 1_725_000_123_456);
+        assert_eq!(entry.ms_played, 91_000);
+        assert!(entry.completed);
+        assert_eq!(entry.context, "playlist:mix");
+        assert_eq!(entry.track.name, "Song");
+    }
+
+    #[test]
     fn cover_candidates_take_the_first_four_distinct_covers() {
         let covers = ["a", "a", "b", "c", "b", "d", "e"];
         let tracks: Vec<Track> = covers.iter().map(|url| track(url)).collect();
@@ -1106,5 +1142,22 @@ mod tests {
         assert_eq!(json["monthly_listeners"], 3_400);
         assert_eq!(json["popular_releases"][0]["name"], "Popular");
         assert_eq!(json["related_artists"][0]["name"], "Related");
+    }
+
+    #[test]
+    fn waveform_conversion_preserves_packed_payload_and_wire_names() {
+        let waveform = TrackWaveform::from(EngineTrackWaveform {
+            track_id: "0123456789ABCDEFGHIJKL".into(),
+            duration_ms: 25,
+            interval_ms: 10,
+            bin_count: 3,
+            peaks_base64: "AAAAAAAAAAAAAAAA".into(),
+        });
+        let json = serde_json::to_value(waveform).unwrap();
+        assert_eq!(json["track_id"], "0123456789ABCDEFGHIJKL");
+        assert_eq!(json["duration_ms"], 25);
+        assert_eq!(json["interval_ms"], 10);
+        assert_eq!(json["bin_count"], 3);
+        assert_eq!(json["peaks_base64"], "AAAAAAAAAAAAAAAA");
     }
 }

@@ -24,6 +24,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["custom-protocol"] }
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
@@ -32,3 +33,6 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 sha1 = "0.10"
 souvlaki = "0.8"
 spotify-playback-engine = { path = "../engine" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.44", features = ["Foundation", "Media", "Win32_Foundation", "Win32_System_WinRT"] }

@@ -10,15 +10,32 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tauri::Manager;
-use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
-use app::{AppState, data_dir, load_app_settings, load_tracks_cache};
+use app::{data_dir, load_app_settings, load_tracks_cache, save_app_settings, AppState};
 use engine_client::EngineClient;
 
-fn sync_autostart(app: &tauri::AppHandle, enabled: bool) {
-    let manager = app.autolaunch();
-    let actual = match manager.is_enabled() {
-        Ok(value) => value,
+fn restore_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        log::warn("could not find the main window for the second app launch");
+        return;
+    };
+    if let Err(error) = window.unminimize() {
+        log::warn(&format!("could not restore the main window: {error}"));
+    }
+    if let Err(error) = window.show() {
+        log::warn(&format!("could not show the main window: {error}"));
+    }
+    if let Err(error) = window.set_focus() {
+        log::warn(&format!("could not focus the main window: {error}"));
+    }
+}
+
+/// Treats the OS registration as authoritative without mutating it. In
+/// particular, disabling this app in Windows Startup Apps must not be undone
+/// by the next launch. Only `set_launch_at_login` changes the registration.
+fn reconcile_autostart_preference(app: &tauri::AppHandle, settings: &mut app::AppSettings) {
+    let actual = match tauri_plugin_autostart::ManagerExt::autolaunch(app).is_enabled() {
+        Ok(actual) => actual,
         Err(error) => {
             log::warn(&format!(
                 "could not read launch-at-login registration at startup: {error}"
@@ -26,19 +43,13 @@ fn sync_autostart(app: &tauri::AppHandle, enabled: bool) {
             return;
         }
     };
-    if actual == enabled {
+    if settings.launch_at_login == actual {
         return;
     }
-
-    let result = if enabled {
-        manager.enable()
-    } else {
-        manager.disable()
-    };
-    if let Err(error) = result {
-        let action = if enabled { "enable" } else { "disable" };
+    settings.launch_at_login = actual;
+    if let Err(error) = save_app_settings(settings) {
         log::warn(&format!(
-            "could not {action} launch-at-login registration at startup: {error}"
+            "could not persist launch-at-login registration state: {error}"
         ));
     }
 }
@@ -47,6 +58,11 @@ fn sync_autostart(app: &tauri::AppHandle, enabled: bool) {
 pub fn run() {
     log::init(app::logs_dir());
     tauri::Builder::default()
+        // This MUST be the first plugin: its second-process callback runs
+        // before setup, so no duplicate state or playback engine is created.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            restore_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -63,6 +79,7 @@ pub fn run() {
             commands::set_repeat,
             commands::set_playback_speed,
             commands::play_queue,
+            commands::preview_track_edit,
             commands::play_queue_index,
             commands::add_queue,
             commands::add_queue_batch,
@@ -70,11 +87,12 @@ pub fn run() {
             commands::move_queue,
             commands::get_history,
             commands::clear_history,
+            commands::get_track_waveform,
+            commands::cancel_track_waveform,
             commands::get_track_edit,
             commands::save_track_edit,
             commands::delete_track_edit,
             commands::set_playlist_track_edit_enabled,
-            commands::extract_track_waveform,
             commands::search,
             commands::browse_playlists,
             commands::browse_playlist,
@@ -110,13 +128,14 @@ pub fn run() {
             commands::touch_playlist_activity,
         ])
         .setup(|app| {
-            let startup_settings = load_app_settings();
-            let startup_handle = app.handle().clone();
-            sync_autostart(&startup_handle, startup_settings.launch_at_login);
+            let mut startup_settings = load_app_settings();
+            reconcile_autostart_preference(app.handle(), &mut startup_settings);
             if startup_settings.start_minimized {
                 if let Some(window) = app.get_webview_window("main") {
                     if let Err(error) = window.show() {
-                        log::warn(&format!("could not show the main window at startup: {error}"));
+                        log::warn(&format!(
+                            "could not show the main window at startup: {error}"
+                        ));
                     }
                     if let Err(error) = window.minimize() {
                         log::warn(&format!(

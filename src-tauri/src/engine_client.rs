@@ -12,7 +12,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -21,8 +23,8 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, watch};
 
 use crate::app::{
-    PlaybackSnapshot, clear_playback_snapshot, engine_state_dir, load_app_settings,
-    load_playback_snapshot, save_playback_snapshot,
+    clear_playback_snapshot, engine_state_dir, load_app_settings, load_playback_snapshot,
+    save_playback_snapshot, PlaybackSnapshot,
 };
 use crate::log;
 use crate::types::{PlaybackState, Track};
@@ -31,17 +33,17 @@ use crate::types::{PlaybackState, Track};
 /// commands run network round-trips inside the engine.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const BROWSE_TIMEOUT: Duration = Duration::from_secs(30);
+const WAVEFORM_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Engine respawn backoff bounds.
 const RESPAWN_BACKOFF_START: Duration = Duration::from_secs(2);
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Playback state is persisted while the app runs, not only on a clean exit,
-/// because a crash or a hard kill would otherwise lose the queue entirely.
-/// These bounds keep that cheap: at most one small write every
-/// [`PERSIST_MIN_INTERVAL`], and a moving playhead alone never triggers one
-/// until it has drifted [`PERSIST_POSITION_DRIFT_MS`] from what is on disk.
+/// Playback-state writes are coalesced on one background thread. Successful
+/// writes are throttled, while transient failures retry promptly without
+/// claiming that the snapshot was committed.
 const PERSIST_MIN_INTERVAL: Duration = Duration::from_secs(5);
+const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const PERSIST_POSITION_DRIFT_MS: u32 = 15_000;
 
 /// Roll the engine log once past this size, keeping one previous generation.
@@ -77,14 +79,15 @@ pub struct PositionHeartbeat {
     pub duration_ms: u32,
 }
 
-/// One playback line the engine emitted, fanned out to subscribers in wire
-/// order. Heartbeats share the channel with full states so a consumer can
-/// never apply an older heartbeat after a newer full state (two channels
-/// would race them).
+/// One playback or lifecycle event, fanned out to subscribers in wire order.
+/// Heartbeats share the channel with full states so a consumer can never
+/// apply an older heartbeat after a newer full state; `Disconnected` marks
+/// the gap between an engine EOF and its replacement becoming ready.
 #[derive(Clone, Debug)]
 pub enum StateLine {
     State(PlaybackState),
     Position(PositionHeartbeat),
+    Disconnected,
 }
 
 /// Queue/settings captured either from the durable app snapshot (normal
@@ -94,6 +97,8 @@ pub enum StateLine {
 pub struct RestoreSnapshot {
     pub queue: Vec<Track>,
     pub current_index: Option<usize>,
+    /// Position in the compiled transport timeline. The engine maps it after
+    /// resolving the active edit against the live edit store.
     pub position_ms: u32,
     pub volume: u8,
     pub shuffle: bool,
@@ -202,8 +207,7 @@ impl RestoreSnapshot {
     }
 }
 
-/// What the last write put on disk, so the rate limit can skip a write that
-/// would change nothing.
+/// What the writer last committed to disk.
 #[derive(Debug)]
 struct PersistedSnapshot {
     written_at: Instant,
@@ -212,13 +216,90 @@ struct PersistedSnapshot {
 
 impl PersistedSnapshot {
     /// Position alone is exempt until it has drifted far enough to be worth a
-    /// write: it moves on every heartbeat, nothing else does.
+    /// write. Compare fields directly so checking the threshold never clones
+    /// the queue.
     fn superseded_by(&self, next: &PlaybackSnapshot) -> bool {
-        let mut rebased = next.clone();
-        rebased.position_ms = self.snapshot.position_ms;
-        rebased != self.snapshot
-            || next.position_ms.abs_diff(self.snapshot.position_ms) >= PERSIST_POSITION_DRIFT_MS
+        let previous = &self.snapshot;
+        previous.version != next.version
+            || previous.queue != next.queue
+            || previous.current_index != next.current_index
+            || previous.volume != next.volume
+            || previous.shuffle != next.shuffle
+            || previous.repeat != next.repeat
+            || previous.playback_speed != next.playback_speed
+            || next.position_ms.abs_diff(previous.position_ms) >= PERSIST_POSITION_DRIFT_MS
     }
+}
+
+#[derive(Debug, Default)]
+struct PersistenceSchedule {
+    committed: Option<PersistedSnapshot>,
+    committed_generation: u64,
+    pending_generation: Option<u64>,
+    retry_at: Option<Instant>,
+}
+
+impl PersistenceSchedule {
+    fn mark_dirty(&mut self, generation: u64) {
+        if generation > self.committed_generation {
+            self.pending_generation = Some(
+                self.pending_generation
+                    .map_or(generation, |pending| pending.max(generation)),
+            );
+        }
+    }
+
+    fn wait_for(&self, now: Instant) -> Option<Duration> {
+        self.pending_generation.map(|_| {
+            let deadline = self.retry_at.unwrap_or_else(|| {
+                self.committed
+                    .as_ref()
+                    .map_or(now, |committed| committed.written_at + PERSIST_MIN_INTERVAL)
+            });
+            deadline.saturating_duration_since(now)
+        })
+    }
+
+    fn should_write(&self, snapshot: &PlaybackSnapshot) -> bool {
+        self.committed
+            .as_ref()
+            .is_none_or(|committed| committed.superseded_by(snapshot))
+    }
+
+    fn record_unchanged(&mut self, attempted_generation: u64, latest_generation: u64) {
+        self.committed_generation = self.committed_generation.max(attempted_generation);
+        self.pending_generation =
+            (latest_generation > self.committed_generation).then_some(latest_generation);
+        self.retry_at = None;
+    }
+
+    fn record_success(
+        &mut self,
+        snapshot: PlaybackSnapshot,
+        attempted_generation: u64,
+        latest_generation: u64,
+        written_at: Instant,
+    ) {
+        self.committed = Some(PersistedSnapshot {
+            written_at,
+            snapshot,
+        });
+        self.committed_generation = attempted_generation;
+        self.pending_generation =
+            (latest_generation > attempted_generation).then_some(latest_generation);
+        self.retry_at = None;
+    }
+
+    fn record_failure(&mut self, latest_generation: u64, now: Instant) {
+        self.mark_dirty(latest_generation);
+        self.retry_at = Some(now + PERSIST_RETRY_INTERVAL);
+    }
+}
+
+enum PersistCommand {
+    Dirty(u64),
+    Clear(mpsc::Sender<Result<(), String>>),
+    Shutdown(mpsc::Sender<Result<(), String>>),
 }
 
 #[derive(Debug, Clone)]
@@ -236,7 +317,9 @@ pub struct EngineClient {
     exit_tx: watch::Sender<bool>,
     last_state: Mutex<Option<PlaybackState>>,
     restore_pending: Mutex<Option<RestorePlan>>,
-    last_persisted: Mutex<Option<PersistedSnapshot>>,
+    persist_tx: SyncSender<PersistCommand>,
+    persist_generation: AtomicU64,
+    persist_thread: Mutex<Option<JoinHandle<()>>>,
     next_request_id: AtomicU64,
     shutting_down: AtomicBool,
 }
@@ -247,6 +330,7 @@ impl EngineClient {
     pub fn start() -> Arc<Self> {
         let (state_tx, _) = tokio::sync::broadcast::channel(64);
         let (exit_tx, _) = watch::channel(false);
+        let (persist_tx, persist_rx) = mpsc::sync_channel(1);
         let restore_pending = load_playback_snapshot().map(|snapshot| RestorePlan {
             snapshot: RestoreSnapshot::from_durable(snapshot),
             sent: false,
@@ -260,10 +344,13 @@ impl EngineClient {
             exit_tx,
             last_state: Mutex::new(None),
             restore_pending: Mutex::new(restore_pending),
-            last_persisted: Mutex::new(None),
+            persist_tx,
+            persist_generation: AtomicU64::new(0),
+            persist_thread: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         });
+        *client.persist_thread.lock() = Some(spawn_persistence_writer(&client, persist_rx));
         if let Err(error) = client.spawn_engine() {
             log::error(&format!("engine spawn failed at startup: {error}"));
         }
@@ -393,10 +480,16 @@ impl EngineClient {
             .arg(settings.normalisation.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(match OpenOptions::new().create(true).append(true).open(&engine_log) {
-                Ok(file) => Stdio::from(file),
-                Err(_) => Stdio::null(),
-            })
+            .stderr(
+                match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&engine_log)
+                {
+                    Ok(file) => Stdio::from(file),
+                    Err(_) => Stdio::null(),
+                },
+            )
             // Info level surfaces librespot's "Connecting to AP ..." lines
             // and apresolve failures; the default warn level only shows
             // failures, which hides whether the engine is even trying.
@@ -444,6 +537,7 @@ impl EngineClient {
     /// Writes one request line and awaits its reply.
     pub async fn request(&self, kind: &str, args: Value) -> Result<EngineReply, String> {
         let request_id = self.next_request_id();
+        let cancellation_track_id = waveform_timeout_cancellation(kind, &args);
         let (sender, receiver) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
@@ -455,14 +549,7 @@ impl EngineClient {
             pending.remove(&request_id);
             return Err(error);
         }
-        let timeout = if kind.starts_with("browse_")
-            || kind.starts_with("edit_")
-            || kind == "extract_track_waveform"
-        {
-            BROWSE_TIMEOUT
-        } else {
-            COMMAND_TIMEOUT
-        };
+        let timeout = request_timeout(kind);
         match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(reply)) if reply.ok => Ok(reply),
             Ok(Ok(reply)) => Err(reply
@@ -472,6 +559,19 @@ impl EngineClient {
             Err(_) => {
                 let mut pending = self.pending.lock().await;
                 pending.remove(&request_id);
+                if let Some(track_id) = cancellation_track_id {
+                    // The caller has stopped waiting, so release the engine's
+                    // one global waveform worker as well. This is deliberately
+                    // untracked: cancellation is idempotent and its response
+                    // has no payload the shell needs.
+                    let cancel_id = self.next_request_id();
+                    let cancel = build_line(
+                        &cancel_id,
+                        "cancel_track_waveform",
+                        json!({"track_id": track_id}),
+                    );
+                    let _ = self.write_line(&cancel);
+                }
                 Err(format!(
                     "engine did not answer {kind} within {}s",
                     timeout.as_secs()
@@ -573,6 +673,26 @@ impl EngineClient {
         .map(|_| ())
     }
 
+    pub async fn preview_track_edit(
+        &self,
+        track: &Track,
+        cuts: &[spotify_playback_engine::protocol::TimeRange],
+        loop_range: Option<spotify_playback_engine::protocol::TimeRange>,
+        position_ms: u32,
+    ) -> Result<(), String> {
+        self.request(
+            "preview_track_edit",
+            json!({
+                "track": track,
+                "cuts": cuts,
+                "loop_range": loop_range,
+                "position_ms": position_ms,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn restore_queue(
         &self,
         queue: &[Track],
@@ -605,11 +725,7 @@ impl EngineClient {
             .map(|_| ())
     }
 
-    pub async fn add_queue_batch(
-        &self,
-        tracks: &[Track],
-        context: &str,
-    ) -> Result<(), String> {
+    pub async fn add_queue_batch(&self, tracks: &[Track], context: &str) -> Result<(), String> {
         self.request(
             "add_queue_batch",
             json!({"tracks": tracks, "context": context}),
@@ -630,26 +746,33 @@ impl EngineClient {
             .map(|_| ())
     }
 
-
     pub async fn get_history(
         &self,
-        offset: usize,
-        limit: usize,
-        query: &str,
-        sort: &str,
-    ) -> Result<spotify_playback_engine::protocol::HistoryPage, String> {
-        let reply = self
-            .request(
-                "get_history",
-                json!({"offset": offset, "limit": limit, "query": query, "sort": sort}),
-            )
-            .await?;
+    ) -> Result<Vec<spotify_playback_engine::protocol::HistoryItem>, String> {
+        let reply = self.request("get_history", Value::Null).await?;
         parse_data(reply, "get_history")
     }
 
     pub async fn clear_history(&self) -> Result<(), String> {
         self.request("clear_history", Value::Null).await.map(|_| ())
     }
+
+    pub async fn get_track_waveform(
+        &self,
+        track_id: &str,
+    ) -> Result<spotify_playback_engine::protocol::TrackWaveform, String> {
+        let reply = self
+            .request("get_track_waveform", json!({"track_id": track_id}))
+            .await?;
+        parse_data(reply, "get_track_waveform")
+    }
+
+    pub async fn cancel_track_waveform(&self, track_id: &str) -> Result<(), String> {
+        self.request("cancel_track_waveform", json!({"track_id": track_id}))
+            .await
+            .map(|_| ())
+    }
+
     pub async fn login(&self) -> Result<(), String> {
         self.request("login", Value::Null).await.map(|_| ())
     }
@@ -667,8 +790,19 @@ impl EngineClient {
         self.request("logout", Value::Null).await?;
         self.clear_restore_pending();
         *self.last_state.lock() = None;
-        clear_playback_snapshot()?;
-        Ok(())
+        self.clear_persisted_playback_state()
+    }
+
+    fn clear_persisted_playback_state(&self) -> Result<(), String> {
+        // Invalidates any snapshot an in-flight attempt captured before logout.
+        self.persist_generation.fetch_add(1, Ordering::AcqRel);
+        let (result_tx, result_rx) = mpsc::channel();
+        self.persist_tx
+            .send(PersistCommand::Clear(result_tx))
+            .map_err(|_| "playback-state writer is unavailable".to_owned())?;
+        result_rx
+            .recv()
+            .map_err(|error| format!("playback-state writer stopped during clear: {error}"))?
     }
 
     // ------------------------------------------------------------------
@@ -679,7 +813,9 @@ impl EngineClient {
         &self,
         length: usize,
     ) -> Result<Vec<spotify_playback_engine::protocol::PlaylistRef>, String> {
-        let reply = self.request("browse_playlists", json!({"length": length})).await?;
+        let reply = self
+            .request("browse_playlists", json!({"length": length}))
+            .await?;
         parse_data(reply, "browse_playlists")
     }
 
@@ -844,20 +980,6 @@ impl EngineClient {
         .map(|_| ())
     }
 
-    pub async fn extract_track_waveform(
-        &self,
-        track_id: &str,
-        points: u16,
-    ) -> Result<spotify_playback_engine::protocol::TrackWaveform, String> {
-        let reply = self
-            .request(
-                "extract_track_waveform",
-                json!({"track_id": track_id, "points": points}),
-            )
-            .await?;
-        parse_data(reply, "extract_track_waveform")
-    }
-
     pub async fn browse_search(
         &self,
         query: &str,
@@ -887,7 +1009,9 @@ impl EngineClient {
     }
 
     pub async fn delete_playlist(&self, id: &str) -> Result<(), String> {
-        let _ = self.request("edit_delete_playlist", json!({"id": id})).await?;
+        let _ = self
+            .request("edit_delete_playlist", json!({"id": id}))
+            .await?;
         Ok(())
     }
 
@@ -900,7 +1024,10 @@ impl EngineClient {
 
     pub async fn remove_playlist_tracks(&self, id: &str, uris: &[String]) -> Result<(), String> {
         let _ = self
-            .request("edit_remove_playlist_tracks", json!({"id": id, "uris": uris}))
+            .request(
+                "edit_remove_playlist_tracks",
+                json!({"id": id, "uris": uris}),
+            )
             .await?;
         Ok(())
     }
@@ -920,16 +1047,30 @@ impl EngineClient {
         Ok(())
     }
 
-    /// Persists one heartbeat-freshened snapshot unconditionally, then
-    /// gracefully stops the engine. [`EngineClient::maybe_persist`] has
-    /// usually written the same thing already; this is the exit path's
-    /// guarantee that the final position is not lost.
+    /// Requests an unthrottled final flush from the sole persistence writer,
+    /// waits for it to finish, then gracefully stops the engine.
     pub fn shutdown_engine(&self) {
         log::info("engine shutdown requested");
-        if let Err(error) = self.persist_playback_state() {
-            log::warn(&format!("could not persist playback state: {error}"));
-        }
         self.shutting_down.store(true, Ordering::SeqCst);
+
+        let (result_tx, result_rx) = mpsc::channel();
+        if self
+            .persist_tx
+            .send(PersistCommand::Shutdown(result_tx))
+            .is_ok()
+        {
+            match result_rx.recv() {
+                Ok(Err(error)) => log::warn(&format!("could not persist playback state: {error}")),
+                Err(error) => log::warn(&format!(
+                    "playback-state writer stopped before shutdown flush: {error}"
+                )),
+                Ok(Ok(())) => {}
+            }
+        }
+        if let Some(writer) = self.persist_thread.lock().take() {
+            let _ = writer.join();
+        }
+
         let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
         let _ = self.write_line(&line);
         std::thread::sleep(Duration::from_millis(400));
@@ -940,63 +1081,41 @@ impl EngineClient {
         *self.stdin.lock() = None;
     }
 
-    /// Rate-limited persistence from the reader thread, so an unclean exit
-    /// (crash, hard kill, machine shutdown) still leaves a usable queue on
-    /// disk. Restoring one is the whole point of the snapshot, and writing it
-    /// only from the exit path meant any exit that skipped that path silently
-    /// dropped what was playing. Skipped while a restore is in flight, where
-    /// `last_state` is deliberately stale.
-    fn maybe_persist(&self) {
-        let Some(state) = self
-            .last_state
-            .lock()
-            .as_ref()
-            .filter(|state| state.auth_state == "ready")
-            .cloned()
-        else {
-            return;
-        };
-        if self.restore_pending.lock().is_some() {
-            return;
-        }
-        let snapshot = PlaybackSnapshot::from_playback(&state);
-        let mut guard = self.last_persisted.lock();
-        if let Some(previous) = guard.as_ref() {
-            if previous.written_at.elapsed() < PERSIST_MIN_INTERVAL
-                || !previous.superseded_by(&snapshot)
-            {
-                return;
+    /// O(1) reader-thread notification. The bounded channel coalesces bursts;
+    /// the generation lets the writer detect changes that arrived while it
+    /// cloned or wrote a previous snapshot.
+    fn mark_persistence_dirty(&self) {
+        let generation = self.persist_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        match self.persist_tx.try_send(PersistCommand::Dirty(generation)) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) if self.shutting_down.load(Ordering::Relaxed) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                log::warn("playback-state writer is unavailable");
             }
         }
-        let written_at = Instant::now();
-        if let Err(error) = save_playback_snapshot(&snapshot) {
-            log::warn(&format!("could not persist playback state: {error}"));
-        }
-        // Recorded even on failure: a snapshot the validator rejects must not
-        // retry, and log, on every heartbeat.
-        *guard = Some(PersistedSnapshot {
-            written_at,
-            snapshot,
-        });
     }
 
-    fn persist_playback_state(&self) -> Result<(), String> {
-        let snapshot = self
-            .last_state
+    /// Clones and normalizes the queue only when the writer's deadline has
+    /// arrived. Restore intermediates are never durable state.
+    fn playback_snapshot_for_writer(&self, include_restore: bool) -> Option<PlaybackSnapshot> {
+        if !include_restore && self.restore_pending.lock().is_some() {
+            return None;
+        }
+        self.last_state
             .lock()
             .as_ref()
             .filter(|state| state.auth_state == "ready")
             .map(PlaybackSnapshot::from_playback)
             .or_else(|| {
-                self.restore_pending
-                    .lock()
-                    .as_ref()
-                    .map(|plan| plan.snapshot.durable())
-            });
-        match snapshot {
-            Some(snapshot) => save_playback_snapshot(&snapshot),
-            None => Ok(()),
-        }
+                if include_restore {
+                    self.restore_pending
+                        .lock()
+                        .as_ref()
+                        .map(|plan| plan.snapshot.durable())
+                } else {
+                    None
+                }
+            })
     }
 
     // ------------------------------------------------------------------
@@ -1015,18 +1134,23 @@ impl EngineClient {
         drop(pending);
         if !suppress_snapshot {
             *self.last_state.lock() = Some(state.clone());
-            self.maybe_persist();
+            self.mark_persistence_dirty();
         }
         let _ = self.state_tx.send(StateLine::State(state.clone()));
     }
 
     /// Applies a scalar position heartbeat to the heartbeat-fresh last state.
     fn on_position(&self, heartbeat: PositionHeartbeat) {
-        if let Some(last) = self.last_state.lock().as_mut() {
+        let changed = if let Some(last) = self.last_state.lock().as_mut() {
             last.position_ms = heartbeat.position_ms;
             last.duration_ms = heartbeat.duration_ms;
+            true
+        } else {
+            false
+        };
+        if changed {
+            self.mark_persistence_dirty();
         }
-        self.maybe_persist();
         let _ = self.state_tx.send(StateLine::Position(heartbeat));
     }
 
@@ -1054,6 +1178,7 @@ impl EngineClient {
         } else if let Some(plan) = restore.as_mut() {
             plan.sent = false;
         }
+        let _ = self.state_tx.send(StateLine::Disconnected);
         *self.stdin.lock() = None;
         *self.process.lock() = None;
         let _ = self.exit_tx.send(true);
@@ -1063,6 +1188,91 @@ impl EngineClient {
         let mut pending = self.pending.blocking_lock();
         if let Some(sender) = pending.remove(request_id) {
             let _ = sender.send(reply);
+        }
+    }
+}
+
+fn spawn_persistence_writer(
+    client: &Arc<EngineClient>,
+    receiver: Receiver<PersistCommand>,
+) -> JoinHandle<()> {
+    let client = Arc::downgrade(client);
+    std::thread::Builder::new()
+        .name("playback-state-writer".to_owned())
+        .spawn(move || run_persistence_writer(client, receiver))
+        .expect("could not start playback-state writer")
+}
+
+fn run_persistence_writer(client: Weak<EngineClient>, receiver: Receiver<PersistCommand>) {
+    let mut schedule = PersistenceSchedule::default();
+    loop {
+        let command = match schedule.wait_for(Instant::now()) {
+            Some(wait) => match receiver.recv_timeout(wait) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+            None => match receiver.recv() {
+                Ok(command) => Some(command),
+                Err(_) => return,
+            },
+        };
+
+        match command {
+            Some(PersistCommand::Dirty(generation)) => {
+                schedule.mark_dirty(generation);
+            }
+            Some(PersistCommand::Clear(result_tx)) => {
+                let result = clear_playback_snapshot();
+                if result.is_ok() {
+                    schedule = PersistenceSchedule::default();
+                    schedule.committed_generation = client.upgrade().map_or(0, |client| {
+                        client.persist_generation.load(Ordering::Acquire)
+                    });
+                }
+                let _ = result_tx.send(result);
+            }
+            Some(PersistCommand::Shutdown(result_tx)) => {
+                let result = client
+                    .upgrade()
+                    .and_then(|client| client.playback_snapshot_for_writer(true))
+                    .map_or(Ok(()), |snapshot| save_playback_snapshot(&snapshot));
+                let _ = result_tx.send(result);
+                return;
+            }
+            None => {
+                let Some(client) = client.upgrade() else {
+                    return;
+                };
+                // The queued wake may represent an older generation because
+                // the bounded channel coalesces bursts. Snapshot the current
+                // generation at the deadline so this attempt commits exactly
+                // the state it is about to clone.
+                let attempted_generation = client.persist_generation.load(Ordering::Acquire);
+                let Some(snapshot) = client.playback_snapshot_for_writer(false) else {
+                    let latest = client.persist_generation.load(Ordering::Acquire);
+                    schedule.record_unchanged(attempted_generation, latest);
+                    continue;
+                };
+                if !schedule.should_write(&snapshot) {
+                    let latest = client.persist_generation.load(Ordering::Acquire);
+                    schedule.record_unchanged(attempted_generation, latest);
+                    continue;
+                }
+
+                let written_at = Instant::now();
+                match save_playback_snapshot(&snapshot) {
+                    Ok(()) => {
+                        let latest = client.persist_generation.load(Ordering::Acquire);
+                        schedule.record_success(snapshot, attempted_generation, latest, written_at);
+                    }
+                    Err(error) => {
+                        log::warn(&format!("could not persist playback state: {error}"));
+                        let latest = client.persist_generation.load(Ordering::Acquire);
+                        schedule.record_failure(latest.max(attempted_generation), written_at);
+                    }
+                }
+            }
         }
     }
 }
@@ -1198,9 +1408,29 @@ fn rotate_if_large(path: &Path) {
     }
 }
 
+fn request_timeout(kind: &str) -> Duration {
+    if kind == "get_track_waveform" {
+        WAVEFORM_TIMEOUT
+    } else if kind.starts_with("browse_") || kind.starts_with("edit_") {
+        BROWSE_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
+    }
+}
+
+fn waveform_timeout_cancellation(kind: &str, args: &Value) -> Option<String> {
+    if kind != "get_track_waveform" {
+        return None;
+    }
+    args.get("track_id")?.as_str().map(str::to_owned)
+}
+
 fn build_line(request_id: &str, kind: &str, args: Value) -> String {
     let mut object = Map::new();
-    object.insert("request_id".to_owned(), Value::String(request_id.to_owned()));
+    object.insert(
+        "request_id".to_owned(),
+        Value::String(request_id.to_owned()),
+    );
     object.insert("type".to_owned(), Value::String(kind.to_owned()));
     if let Value::Object(fields) = args {
         object.extend(fields);
@@ -1208,10 +1438,7 @@ fn build_line(request_id: &str, kind: &str, args: Value) -> String {
     serde_json::to_string(&Value::Object(object)).expect("request serialization cannot fail")
 }
 
-fn parse_data<T: serde::de::DeserializeOwned>(
-    reply: EngineReply,
-    kind: &str,
-) -> Result<T, String> {
+fn parse_data<T: serde::de::DeserializeOwned>(reply: EngineReply, kind: &str) -> Result<T, String> {
     let data = reply
         .data
         .ok_or_else(|| format!("{kind} reply carried no payload"))?;
@@ -1233,22 +1460,14 @@ fn locate_engine() -> Option<PathBuf> {
     if sibling.is_file() {
         return Some(sibling);
     }
-    // Repository layout: <repo>/engine/target/release/SpotifyPlaybackEngine.exe.
-    for depth in 1..=3 {
-        let mut candidate = exe_dir.clone();
-        for _ in 0..depth {
-            candidate.push("..");
-        }
-        candidate = candidate
-            .join("engine")
-            .join("target")
-            .join("release")
-            .join("SpotifyPlaybackEngine.exe");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    // Workspace builds use the same target directory as the bundler resource:
+    // <repo>/target/release/SpotifyPlaybackEngine.exe. Do not fall back to an
+    // engine-local target tree; that would create a second artifact contract.
+    let workspace_release = exe_dir
+        .parent()?
+        .join("release")
+        .join("SpotifyPlaybackEngine.exe");
+    workspace_release.is_file().then_some(workspace_release)
 }
 
 #[cfg(test)]
@@ -1260,6 +1479,7 @@ mod tests {
     fn client_with_last_state(state: PlaybackState) -> Arc<EngineClient> {
         let (state_tx, _) = tokio::sync::broadcast::channel(64);
         let (exit_tx, _) = tokio::sync::watch::channel(false);
+        let (persist_tx, _persist_rx) = mpsc::sync_channel(1);
         Arc::new(EngineClient {
             state_dir: PathBuf::new(),
             pending: tokio::sync::Mutex::new(HashMap::new()),
@@ -1269,7 +1489,9 @@ mod tests {
             exit_tx,
             last_state: Mutex::new(Some(state)),
             restore_pending: Mutex::new(None),
-            last_persisted: Mutex::new(None),
+            persist_tx,
+            persist_generation: AtomicU64::new(0),
+            persist_thread: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         })
@@ -1282,8 +1504,108 @@ mod tests {
         }
     }
 
-    /// The heartbeat calls `maybe_persist` several times a second. Rewriting
-    /// the queue each time would be pure churn, so only a real change — or a
+    #[test]
+    fn waveform_requests_use_the_long_timeout_and_shared_wire_shape() {
+        assert_eq!(
+            request_timeout("get_track_waveform"),
+            Duration::from_secs(300)
+        );
+        assert_eq!(request_timeout("cancel_track_waveform"), COMMAND_TIMEOUT);
+        assert_eq!(request_timeout("browse_album"), BROWSE_TIMEOUT);
+        assert_eq!(
+            waveform_timeout_cancellation(
+                "get_track_waveform",
+                &json!({"track_id": "0123456789ABCDEFGHIJKL"}),
+            )
+            .as_deref(),
+            Some("0123456789ABCDEFGHIJKL"),
+        );
+        assert!(waveform_timeout_cancellation(
+            "cancel_track_waveform",
+            &json!({"track_id": "0123456789ABCDEFGHIJKL"}),
+        )
+        .is_none());
+
+        let line = build_line(
+            "waveform-1",
+            "get_track_waveform",
+            json!({"track_id": "0123456789ABCDEFGHIJKL"}),
+        );
+        let request: spotify_playback_engine::protocol::Request =
+            serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            request.command,
+            spotify_playback_engine::protocol::Command::GetTrackWaveform { track_id }
+                if track_id == "0123456789ABCDEFGHIJKL"
+        ));
+    }
+
+    #[test]
+    fn preview_request_uses_the_shared_track_edit_wire_shape() {
+        let track = Track {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        };
+        let cuts = vec![spotify_playback_engine::protocol::TimeRange {
+            start_ms: 1_000,
+            end_ms: 2_500,
+        }];
+        let loop_range = Some(spotify_playback_engine::protocol::TimeRange {
+            start_ms: 5_000,
+            end_ms: 9_000,
+        });
+        let line = build_line(
+            "preview-1",
+            "preview_track_edit",
+            json!({
+                "track": track,
+                "cuts": cuts,
+                "loop_range": loop_range,
+                "position_ms": 42_000,
+            }),
+        );
+        let request: spotify_playback_engine::protocol::Request =
+            serde_json::from_str(&line).unwrap();
+        let spotify_playback_engine::protocol::Command::PreviewTrackEdit {
+            track,
+            cuts,
+            loop_range,
+            position_ms,
+        } = request.command
+        else {
+            panic!("Tauri preview request must retain the dedicated engine shape");
+        };
+        assert_eq!(track.uri, "spotify:track:0123456789ABCDEFGHIJKL");
+        assert_eq!(cuts.len(), 1);
+        assert_eq!(loop_range.unwrap().end_ms, 9_000);
+        assert_eq!(position_ms, 42_000);
+    }
+
+    #[test]
+    fn waveform_response_payload_is_typed_at_the_client_boundary() {
+        let waveform: spotify_playback_engine::protocol::TrackWaveform = parse_data(
+            EngineReply {
+                ok: true,
+                error: None,
+                data: Some(json!({
+                    "track_id": "0123456789ABCDEFGHIJKL",
+                    "duration_ms": 25,
+                    "interval_ms": 10,
+                    "bin_count": 3,
+                    "peaks_base64": "AAAAAAAAAAAAAAAA",
+                })),
+            },
+            "get_track_waveform",
+        )
+        .unwrap();
+        assert_eq!(waveform.bin_count, 3);
+        assert_eq!(waveform.interval_ms, 10);
+    }
+
+    /// Heartbeats notify the writer several times a second. Rewriting the
+    /// queue each time would be pure churn, so only a real change — or a
     /// playhead that has moved far enough to be worth restoring to — counts.
     #[test]
     fn only_a_real_change_or_a_drifted_playhead_supersedes_the_written_snapshot() {
@@ -1320,6 +1642,70 @@ mod tests {
             written.superseded_by(&PlaybackSnapshot::from_playback(&paused_elsewhere)),
             "anything but the playhead is worth a write immediately"
         );
+    }
+
+    #[test]
+    fn persistence_coalesces_dirty_generations_until_the_write_deadline() {
+        let started = Instant::now();
+        let snapshot = PlaybackSnapshot::from_playback(&PlaybackState::default());
+        let mut schedule = PersistenceSchedule::default();
+
+        schedule.mark_dirty(1);
+        schedule.mark_dirty(2);
+        assert_eq!(schedule.pending_generation, Some(2));
+        assert_eq!(schedule.wait_for(started), Some(Duration::ZERO));
+
+        schedule.record_success(snapshot, 2, 2, started);
+        schedule.mark_dirty(3);
+        schedule.mark_dirty(4);
+        assert_eq!(schedule.pending_generation, Some(4));
+        assert_eq!(
+            schedule.wait_for(started + Duration::from_secs(2)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            schedule.wait_for(started + PERSIST_MIN_INTERVAL),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn persistence_failure_does_not_advance_the_committed_marker_and_retries() {
+        let started = Instant::now();
+        let original = PlaybackSnapshot::from_playback(&PlaybackState::default());
+        let mut changed = original.clone();
+        changed.volume = 42;
+        let mut schedule = PersistenceSchedule::default();
+        schedule.record_success(original.clone(), 1, 1, started);
+        schedule.mark_dirty(2);
+
+        let failed_at = started + PERSIST_MIN_INTERVAL;
+        schedule.record_failure(2, failed_at);
+        assert_eq!(schedule.committed_generation, 1);
+        assert_eq!(
+            schedule.committed.as_ref().map(|value| &value.snapshot),
+            Some(&original)
+        );
+        assert_eq!(schedule.wait_for(failed_at), Some(PERSIST_RETRY_INTERVAL));
+        assert!(schedule.should_write(&changed));
+
+        schedule.record_success(changed.clone(), 2, 2, failed_at + PERSIST_RETRY_INTERVAL);
+        assert_eq!(schedule.committed_generation, 2);
+        assert_eq!(
+            schedule.committed.as_ref().map(|value| &value.snapshot),
+            Some(&changed)
+        );
+        assert_eq!(schedule.wait_for(Instant::now()), None);
+    }
+
+    #[test]
+    fn persistence_keeps_a_newer_generation_dirty_after_a_success() {
+        let mut schedule = PersistenceSchedule::default();
+        let snapshot = PlaybackSnapshot::from_playback(&PlaybackState::default());
+        schedule.mark_dirty(1);
+        schedule.record_success(snapshot, 1, 3, Instant::now());
+        assert_eq!(schedule.committed_generation, 1);
+        assert_eq!(schedule.pending_generation, Some(3));
     }
 
     #[test]
@@ -1402,7 +1788,12 @@ mod tests {
             "ok": true,
         }));
         match reply {
-            Some(Line::Reply { request_id, ok, error, data }) => {
+            Some(Line::Reply {
+                request_id,
+                ok,
+                error,
+                data,
+            }) => {
                 assert_eq!(request_id, "request-7");
                 assert!(ok);
                 assert!(error.is_none());
@@ -1447,6 +1838,7 @@ mod tests {
                 assert_eq!(heartbeat.duration_ms, 240_000);
             }
             StateLine::State(_) => panic!("heartbeat must not arrive as a full state"),
+            StateLine::Disconnected => panic!("heartbeat path must stay connected"),
         }
     }
 
@@ -1582,10 +1974,20 @@ mod tests {
         }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         for candidate in [
-            root.join("target").join("debug").join("SpotifyPlaybackEngine.exe"),
-            root.join("target").join("release").join("SpotifyPlaybackEngine.exe"),
-            root.join("engine").join("target").join("debug").join("SpotifyPlaybackEngine.exe"),
-            root.join("engine").join("target").join("release").join("SpotifyPlaybackEngine.exe"),
+            root.join("target")
+                .join("debug")
+                .join("SpotifyPlaybackEngine.exe"),
+            root.join("target")
+                .join("release")
+                .join("SpotifyPlaybackEngine.exe"),
+            root.join("engine")
+                .join("target")
+                .join("debug")
+                .join("SpotifyPlaybackEngine.exe"),
+            root.join("engine")
+                .join("target")
+                .join("release")
+                .join("SpotifyPlaybackEngine.exe"),
         ] {
             if candidate.is_file() {
                 return Some(candidate);
@@ -1622,7 +2024,10 @@ mod tests {
         // publish its first broadcast before this receiver exists. Production
         // performs the same post-subscription status sync during setup; do it
         // explicitly here to make the wire test deterministic.
-        client.status().await.expect("initial status command round-trips");
+        client
+            .status()
+            .await
+            .expect("initial status command round-trips");
 
         // The engine announces its session in response to the status sync.
         let first = match tokio::time::timeout(Duration::from_secs(20), lines.recv())
@@ -1632,9 +2037,13 @@ mod tests {
         {
             StateLine::State(state) => state,
             StateLine::Position(_) => panic!("the initial line is a full state, not a heartbeat"),
+            StateLine::Disconnected => panic!("engine disconnected before its initial state"),
         };
         assert!(!first.auth_state.is_empty());
-        assert_eq!(first.auth_state, "needs_login", "fresh state dir has no session");
+        assert_eq!(
+            first.auth_state, "needs_login",
+            "fresh state dir has no session"
+        );
 
         // A command round-trip: status is answered and re-emits the state.
         client.status().await.expect("status command round-trips");
@@ -1645,6 +2054,7 @@ mod tests {
         {
             StateLine::State(state) => state,
             StateLine::Position(_) => panic!("status re-emits a full state"),
+            StateLine::Disconnected => panic!("engine disconnected before the status state"),
         };
         assert_eq!(after_status.auth_state, first.auth_state);
 
