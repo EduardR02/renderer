@@ -7,10 +7,10 @@ use std::time::Duration;
 use crate::app::{
     AppSettings, AppState, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH, PlaylistListCache,
     PlaylistTracksEntry, carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir,
-    engine_state_dir, load_app_settings, load_playlist_list, now_secs, order_by_last_activity,
-    playlist_detail_from_cache, save_app_settings, save_playlist_list, save_tracks_cache,
-    touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, upsert_playlist,
-    upsert_tracks_cache,
+    engine_state_dir, is_followed_playlist, load_app_settings, load_playlist_list, now_secs,
+    order_by_last_activity, playlist_detail_from_cache, save_app_settings, save_playlist_list,
+    save_tracks_cache, touch_playlist_activity as stamp_playlist_activity, touch_playlist_played,
+    upsert_playlist, upsert_tracks_cache,
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
@@ -958,8 +958,8 @@ fn load_library_from_disk(app: &AppHandle) {
 /// One background library-refresh chain: a fetch, then capped-exponential
 /// retries so a transient browse failure (engine still coming up, spclient
 /// hiccup) does not leave the library permanently stale. Only one chain runs
-/// at a time; concurrent triggers (ready transitions, playlist edits, the
-/// frontend boot pull) coalesce onto it.
+/// at a time; concurrent triggers (ready transitions and playlist edits)
+/// coalesce onto it.
 fn spawn_refresh_library(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<Arc<EngineClient>>();
@@ -1027,7 +1027,20 @@ fn spawn_refresh_playlist(app: AppHandle, id: String) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
-        match fetch_playlist(&state, &client, &id).await {
+        {
+            let mut guard = state.lock();
+            if !guard.start_playlist_refresh(&id) {
+                return;
+            }
+        }
+
+        let result = fetch_playlist(&state, &client, &id).await;
+        {
+            let mut guard = state.lock();
+            guard.finish_playlist_refresh(&id);
+        }
+
+        match result {
             /* Tell the window, do not just warm the cache.
             This refresh used to update the caches and stop there, so the
             fresh payload was only ever seen the NEXT time the playlist was
@@ -1081,8 +1094,9 @@ async fn fetch_library(
     Ok(playlists)
 }
 
-/// Engine round-trip for one playlist; updates the tracks cache and the
-/// library entry (snapshot id, track total) and saves both caches.
+/// Engine round-trip for one playlist; always updates the bounded tracks
+/// cache. Only a playlist already present in the rootlist-backed library also
+/// updates and persists the library entry.
 async fn fetch_playlist(
     state: &Mutex<AppState>,
     client: &EngineClient,
@@ -1100,18 +1114,23 @@ async fn fetch_playlist(
             tracks: detail.tracks.clone(),
         },
     );
-    upsert_playlist(&mut guard.playlists, detail.playlist.clone());
+    let should_persist_library = is_followed_playlist(&guard.playlists, id);
+    if should_persist_library {
+        upsert_playlist(&mut guard.playlists, detail.playlist.clone());
+    }
     let dir = guard.data_dir.clone();
-    let list_cache = PlaylistListCache {
+    let list_cache = should_persist_library.then(|| PlaylistListCache {
         version: 1,
         fetched_at: guard.playlists_fetched_at,
         me_id: guard.me_id.clone(),
         playlists: guard.playlists.clone(),
-    };
+    });
     let tracks_cache = guard.tracks_cache.clone();
     drop(guard);
     save_tracks_cache(&dir, &tracks_cache);
-    save_playlist_list(&dir, &list_cache);
+    if let Some(list_cache) = list_cache {
+        save_playlist_list(&dir, &list_cache);
+    }
     Ok(detail)
 }
 

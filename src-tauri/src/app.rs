@@ -5,11 +5,13 @@
 //! the old app's layout so existing user data migrates unchanged. Covers are
 //! raw image bytes keyed by `sha1(url)`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use spotify_playback_engine::protocol::sanitize_playlist_description;
+
+use spotify_playback_engine::protocol::normalize_canonical_playlist_description;
 
 use crate::types::{
     CacheStats, CacheUsage, PlaybackState, Playlist, PlaylistDetail, Track, align_artist_ids,
@@ -129,6 +131,10 @@ pub struct AppState {
     pub tracks_cache: Vec<PlaylistTracksEntry>,
     #[serde(skip)]
     pub data_dir: PathBuf,
+    /// Playlist ids with a background detail refresh currently in flight.
+    /// This is process-local bookkeeping and is deliberately not serialized.
+    #[serde(skip)]
+    playlist_refreshing: HashSet<String>,
     /// True while a background library refresh (with retries) is running.
     #[serde(skip)]
     pub library_fetching: bool,
@@ -152,10 +158,19 @@ impl AppState {
             playlists_fetched_at: None,
             tracks_cache: Vec::new(),
             data_dir,
+            playlist_refreshing: HashSet::new(),
             library_fetching: false,
             library_refresh_queued: false,
             cache_stats: None,
         }
+    }
+
+    pub(crate) fn start_playlist_refresh(&mut self, id: &str) -> bool {
+        self.playlist_refreshing.insert(id.to_owned())
+    }
+
+    pub(crate) fn finish_playlist_refresh(&mut self, id: &str) {
+        self.playlist_refreshing.remove(id);
     }
 }
 
@@ -280,7 +295,7 @@ pub fn load_playlist_list(dir: &Path) -> Option<PlaylistListCache> {
     let bytes = std::fs::read(dir.join("playlist_list.json")).ok()?;
     let mut cache: PlaylistListCache = serde_json::from_slice(&bytes).ok()?;
     for playlist in &mut cache.playlists {
-        playlist.description = sanitize_playlist_description(&playlist.description);
+        playlist.description = normalize_canonical_playlist_description(&playlist.description);
     }
     Some(cache)
 }
@@ -366,7 +381,7 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: PlaylistTracksEntry) 
         uri: format!("spotify:playlist:{}", entry.id),
         ..Playlist::default()
     });
-    playlist.description = sanitize_playlist_description(&playlist.description);
+    playlist.description = normalize_canonical_playlist_description(&playlist.description);
     playlist.tracks_total = entry.tracks.len() as u32;
     playlist.snapshot_id = entry.revision;
     // These tracks are what the detail page renders, so its candidates come
@@ -385,12 +400,15 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: PlaylistTracksEntry) 
 /// description when Spotify omits it; incoming empty values never overwrite
 /// those fields from the existing library snapshot.
 pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
-    playlist.description = sanitize_playlist_description(&playlist.description);
+    playlist.description = normalize_canonical_playlist_description(&playlist.description);
     if let Some(existing) = playlists.iter_mut().find(|entry| entry.id == playlist.id) {
         playlist.last_played = playlist.last_played.or(existing.last_played);
         playlist.last_activity = playlist.last_activity.or(existing.last_activity);
         if playlist.description.is_empty() {
-            playlist.description = sanitize_playlist_description(&existing.description);
+            playlist.description = normalize_canonical_playlist_description(&existing.description);
+        }
+        if playlist.cover_url.is_empty() {
+            playlist.cover_url = existing.cover_url.clone();
         }
         *existing = playlist;
     } else {
@@ -398,12 +416,21 @@ pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
     }
 }
 
-/// Copies the fields the rootlist cannot produce — the description, revision,
-/// derived cover candidates, and local activity timestamps — from the previous
-/// library snapshot onto a freshly fetched one.
+/// Reports whether a playlist belongs to the rootlist-backed library.
 ///
-/// The rootlist carries none of them, so a plain replacement would blank all
-/// five fields on every library refresh. For the candidates that is not
+/// Browsing a public playlist may still populate the bounded tracks cache, but
+/// only a playlist already present here may update the library snapshot.
+pub fn is_followed_playlist(playlists: &[Playlist], id: &str) -> bool {
+    playlists.iter().any(|playlist| playlist.id == id)
+}
+
+/// Copies fields the rootlist cannot reliably produce — the description,
+/// previously browsed cover candidates, a missing cover URL, revision, and
+/// local activity timestamps — from the previous library snapshot onto a
+/// freshly fetched one.
+///
+/// The rootlist is intentionally sparse, so a plain replacement would blank
+/// these fields on every library refresh. For the candidates that is not
 /// cosmetic: they are derived from a browse of the playlist itself, so a wipe
 /// would drop the sidebar and home-grid mosaics back to monogram tiles until
 /// each playlist happens to be browsed again. The timestamps likewise must
@@ -411,14 +438,19 @@ pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
 /// Home does not lose its listening history.
 pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
     for playlist in fresh.iter_mut() {
-        playlist.description = sanitize_playlist_description(&playlist.description);
+        playlist.description = normalize_canonical_playlist_description(&playlist.description);
         if let Some(old) = previous.iter().find(|entry| entry.id == playlist.id) {
+            // Rootlist is sparse: preserve a browsed cover when its row has no
+            // picture, but let a newly supplied rootlist cover win.
+            if playlist.cover_url.is_empty() {
+                playlist.cover_url = old.cover_url.clone();
+            }
             playlist.cover_urls = old.cover_urls.clone();
             playlist.snapshot_id = old.snapshot_id.clone();
             playlist.last_played = old.last_played;
             playlist.last_activity = old.last_activity;
             if playlist.description.is_empty() {
-                playlist.description = sanitize_playlist_description(&old.description);
+                playlist.description = normalize_canonical_playlist_description(&old.description);
             }
         }
     }
@@ -764,6 +796,43 @@ mod tests {
     }
 
     #[test]
+    fn playlist_refresh_state_coalesces_same_id_but_allows_other_ids() {
+        let mut state = AppState::new(PathBuf::from("unused"));
+
+        assert!(state.start_playlist_refresh("p1"));
+        assert!(!state.start_playlist_refresh("p1"));
+        assert!(state.start_playlist_refresh("p2"));
+
+        state.finish_playlist_refresh("p1");
+        assert!(state.start_playlist_refresh("p1"));
+        state.finish_playlist_refresh("p1");
+        state.finish_playlist_refresh("p2");
+    }
+
+    #[test]
+    fn followed_browse_updates_library_but_public_browse_does_not_insert() {
+        let mut followed = vec![playlist("followed")];
+        assert!(is_followed_playlist(&followed, "followed"));
+        if is_followed_playlist(&followed, "followed") {
+            upsert_playlist(
+                &mut followed,
+                Playlist {
+                    snapshot_id: "rev-new".into(),
+                    ..playlist("followed")
+                },
+            );
+        }
+        assert_eq!(followed[0].snapshot_id, "rev-new");
+
+        let mut public = Vec::new();
+        assert!(!is_followed_playlist(&public, "public"));
+        if is_followed_playlist(&public, "public") {
+            upsert_playlist(&mut public, playlist("public"));
+        }
+        assert!(public.is_empty());
+    }
+
+    #[test]
     fn tracks_cache_keeps_most_recent_first_and_caps_at_25() {
         let mut cache = Vec::new();
         for id in 0..30 {
@@ -863,6 +932,24 @@ mod tests {
         assert!(fresh[1].cover_urls.is_empty());
         assert_eq!(fresh[1].last_played, None);
         assert_eq!(fresh[1].last_activity, None);
+    }
+
+    #[test]
+    fn a_sparse_rootlist_row_does_not_erase_a_browsed_cover() {
+        let previous = vec![Playlist {
+            cover_url: "https://i.scdn.co/image/full".into(),
+            ..playlist("p1")
+        }];
+        let mut fresh = vec![
+            playlist("p1"),
+            Playlist {
+                cover_url: "https://i.scdn.co/image/new".into(),
+                ..playlist("p1")
+            },
+        ];
+        carry_local_fields(&previous, &mut fresh);
+        assert_eq!(fresh[0].cover_url, "https://i.scdn.co/image/full");
+        assert_eq!(fresh[1].cover_url, "https://i.scdn.co/image/new");
     }
 
     #[test]

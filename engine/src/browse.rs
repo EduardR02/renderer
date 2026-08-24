@@ -1201,7 +1201,12 @@ fn playlist_ref_from_rootlist(
         id: id.to_base62().unwrap_or_default(),
         uri: raw_uri.to_owned(),
         name: attributes.and_then(|a| a.name.clone()).unwrap_or_default(),
-        owner_id: meta.owner_username.clone().or(user).unwrap_or_default(),
+        owner_id: meta
+            .owner_username
+            .clone()
+            .filter(|owner| !owner.is_empty())
+            .or(user)
+            .unwrap_or_default(),
         // The rootlist carries owner usernames but no display names or
         // descriptions; descriptions arrive from playlist metadata/search.
         description: None,
@@ -4806,6 +4811,19 @@ mod tests {
             refs[1].cover_url.as_deref(),
             Some("https://mosaic.scdn.co/640/abc")
         );
+    }
+
+    #[test]
+    fn rootlist_empty_owner_username_falls_back_to_uri_owner() {
+        let item = RootlistItemJson {
+            uri: Some("spotify:user:alice:playlist:0123456789ABCDEFGHIJKL".to_owned()),
+        };
+        let meta = RootlistMetaItemJson {
+            owner_username: Some(String::new()),
+            ..RootlistMetaItemJson::default()
+        };
+        let reference = playlist_ref_from_rootlist(&item, &meta).unwrap();
+        assert_eq!(reference.owner_id, "alice");
     }
 
     #[test]

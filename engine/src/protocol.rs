@@ -527,29 +527,9 @@ fn decode_html_entities(value: &str) -> String {
     decoded
 }
 
-/// Removes markup from playlist descriptions before they cross the engine
-/// boundary. Spotify stores descriptions as rich text (usually a short HTML
-/// fragment); cards render them as plain text, never as `{@html}`. Keeping the
-/// normalisation here also means cached/Tauri payloads have one stable shape.
-pub fn sanitize_playlist_description(value: &str) -> String {
-    let mut text = String::with_capacity(value.len());
-    let mut in_tag = false;
-    for character in value.chars() {
-        if in_tag {
-            if character == '>' {
-                in_tag = false;
-                text.push(' ');
-            }
-        } else if character == '<' {
-            in_tag = true;
-            text.push(' ');
-        } else {
-            text.push(character);
-        }
-    }
-    let text = decode_html_entities(&text);
-    let mut normalized = String::with_capacity(text.len());
-    for (index, word) in text.split_whitespace().enumerate() {
+fn normalize_plain_text(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for (index, word) in value.split_whitespace().enumerate() {
         let starts_with_punctuation = word
             .as_bytes()
             .first()
@@ -560,6 +540,62 @@ pub fn sanitize_playlist_description(value: &str) -> String {
         normalized.push_str(word);
     }
     normalized
+}
+
+fn strip_playlist_markup(value: &str) -> String {
+    let mut text = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        let Some(relative_open) = value[cursor..].find('<') else {
+            text.push_str(&value[cursor..]);
+            break;
+        };
+        let open = cursor + relative_open;
+        text.push_str(&value[cursor..open]);
+        if value[open..].starts_with("<!--") {
+            let Some(relative_end) = value[open + 4..].find("-->") else {
+                text.push_str(&value[open..]);
+                break;
+            };
+            text.push(' ');
+            cursor = open + 4 + relative_end + 3;
+            continue;
+        }
+        let Some(relative_close) = value[open + 1..].find('>') else {
+            // A malformed/incomplete tag is still user-visible text. Dropping
+            // the rest of a description here would corrupt otherwise useful
+            // copy, and Svelte escapes it safely when rendered.
+            text.push_str(&value[open..]);
+            break;
+        };
+        text.push(' ');
+        cursor = open + 1 + relative_close + 1;
+    }
+    text
+}
+
+/// Removes markup from playlist descriptions before they cross the engine
+/// boundary. Spotify stores descriptions as rich text (usually a short HTML
+/// fragment); cards render them as plain text, never as `{@html}`. Keeping the
+/// normalisation here also means cached/Tauri payloads have one stable shape.
+pub fn sanitize_playlist_description(value: &str) -> String {
+    let text = decode_html_entities(&strip_playlist_markup(value));
+    normalize_plain_text(&text)
+}
+
+/// Normalises a description that has already crossed the engine boundary.
+///
+/// Engine payloads are canonical plain text, so decoding entities again would
+/// turn a literal `&lt;tag&gt;` into markup and can erase it on a later card
+/// render. Tauri/cache callers still need to accept older raw fragments, for
+/// which the presence of a complete tag is an unambiguous signal to run the
+/// full sanitizer. Entity-only canonical text is intentionally left alone.
+pub fn normalize_canonical_playlist_description(value: &str) -> String {
+    if value.contains('<') && value.contains('>') {
+        sanitize_playlist_description(value)
+    } else {
+        normalize_plain_text(value)
+    }
 }
 
 /// Playlist reference inside browse responses. `owner_id` is the owning user's
@@ -967,7 +1003,8 @@ mod tests {
     use super::{
         ArtistRef, AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations,
         PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
-        StateEvent, TrackRef, sanitize_playlist_description,
+        StateEvent, TrackRef, normalize_canonical_playlist_description,
+        sanitize_playlist_description,
     };
 
     #[test]
@@ -1411,6 +1448,34 @@ mod tests {
         );
         assert_eq!(sanitize_playlist_description("&#x1F3B5; &#169;"), "🎵 ©");
         assert_eq!(sanitize_playlist_description("  \n\t "), "");
+    }
+
+    #[test]
+    fn playlist_description_sanitizers_preserve_malformed_and_nested_text() {
+        assert_eq!(
+            sanitize_playlist_description("<p>&amp;lt;b&amp;gt;</p>"),
+            "&lt;b&gt;"
+        );
+        assert_eq!(
+            sanitize_playlist_description("<p>before<!-- hidden > text -->after</p>"),
+            "before after"
+        );
+        assert_eq!(
+            sanitize_playlist_description("Keep this <unfinished description"),
+            "Keep this <unfinished description"
+        );
+        assert_eq!(
+            normalize_canonical_playlist_description("&lt;b&gt;"),
+            "&lt;b&gt;"
+        );
+        assert_eq!(
+            normalize_canonical_playlist_description("<p>Road&nbsp;music</p>"),
+            "Road music"
+        );
+        assert_eq!(
+            sanitize_playlist_description("&constructor; &000000000000000000000000000000000000;"),
+            "&constructor; &000000000000000000000000000000000000;"
+        );
     }
 
     #[test]

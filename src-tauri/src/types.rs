@@ -12,7 +12,8 @@ use spotify_playback_engine::protocol::{
     ArtistPickItem, ArtistRef, ArtistReleaseCounts, ArtistReleasePage, ArtistReleases,
     ArtistTopCity, CreditArtist, CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage,
     PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, TrackCredits,
-    TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform, sanitize_playlist_description,
+    TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform,
+    normalize_canonical_playlist_description,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -249,7 +250,7 @@ impl From<&PlaylistRef> for Playlist {
             id: reference.id.clone(),
             uri: reference.uri.clone(),
             name: reference.name.clone(),
-            description: sanitize_playlist_description(
+            description: normalize_canonical_playlist_description(
                 reference.description.as_deref().unwrap_or_default(),
             ),
             owner: if reference.owner_name.is_empty() {
@@ -348,7 +349,7 @@ impl From<PlaylistBrowse> for PlaylistDetail {
                 id: browse.id,
                 uri: browse.uri,
                 name: browse.name,
-                description: sanitize_playlist_description(
+                description: normalize_canonical_playlist_description(
                     browse.description.as_deref().unwrap_or_default(),
                 ),
                 owner: if browse.owner_name.is_empty() {
@@ -1097,6 +1098,21 @@ mod tests {
         let legacy: SearchResult =
             serde_json::from_str(r#"{"tracks":[],"albums":[],"artists":[]}"#).unwrap();
         assert!(legacy.playlists.is_empty());
+    }
+
+    #[test]
+    fn playlist_conversion_does_not_decode_canonical_entities_twice() {
+        let reference = PlaylistRef {
+            id: "p1".into(),
+            uri: "spotify:playlist:p1".into(),
+            name: "Literal tags".into(),
+            description: Some("&lt;b&gt;".into()),
+            owner_id: String::new(),
+            owner_name: String::new(),
+            cover_url: None,
+            track_count: None,
+        };
+        assert_eq!(Playlist::from(&reference).description, "&lt;b&gt;");
     }
 
     #[test]
