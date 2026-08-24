@@ -103,6 +103,24 @@ pub struct RestoreSnapshot {
 }
 
 impl RestoreSnapshot {
+    /// Queue equality for restore completion: identity, order, and
+    /// playability. The engine owns several row fields across an install —
+    /// `effective_edit` re-resolves against the live edit store, `context`
+    /// is refilled, metadata may have drifted server-side since the plan was
+    /// captured — so equality stops at the stable identity of each row.
+    /// Comparing anything the engine rewrites would hang the restore forever:
+    /// every state suppressed as "not yet restored", an empty player bar over
+    /// working audio.
+    fn rows_match(a: &[Track], b: &[Track]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.id == y.id
+                    && x.uri == y.uri
+                    && x.duration_ms == y.duration_ms
+                    && x.unavailable == y.unavailable
+            })
+    }
+
     fn from_playback(state: &PlaybackState, resume_playing: bool) -> Self {
         Self {
             queue: state.queue.clone(),
@@ -132,6 +150,12 @@ impl RestoreSnapshot {
     }
 
     fn normalized(mut self) -> Self {
+        // Download marks never survive the trip into a plan: they are
+        // session-live truth, and this is the one boundary where disk claims
+        // become engine instructions.
+        for track in &mut self.queue {
+            track.cached = false;
+        }
         let requested = self.current_index.unwrap_or(0);
         self.current_index = if self.queue.is_empty() {
             None
@@ -155,7 +179,7 @@ impl RestoreSnapshot {
             state.position_ms == self.position_ms
         };
         state.auth_state == "ready"
-            && state.queue == self.queue
+            && Self::rows_match(&state.queue, &self.queue)
             && state.current_index == self.current_index
             && state.volume == self.volume
             && state.shuffle == self.shuffle
@@ -1484,6 +1508,67 @@ mod tests {
         assert!(RestoreSnapshot::from_playback(&state, state.playing).resume_playing);
         state.playing = false;
         assert!(!RestoreSnapshot::from_playback(&state, state.playing).resume_playing);
+    }
+
+    #[test]
+    fn restore_plans_never_carry_download_marks() {
+        let mut state = PlaybackState::default();
+        state.queue = vec![Track {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            cached: true,
+            ..Track::default()
+        }];
+        state.current_index = Some(0);
+
+        // Both constructors funnel through `normalized`: a live crash-recovery
+        // state and an on-disk snapshot written by an older build alike.
+        assert!(!RestoreSnapshot::from_playback(&state, false).queue[0].cached);
+        let durable = RestoreSnapshot::from_playback(&state, false).durable();
+        assert!(!durable.queue[0].cached);
+        assert!(!RestoreSnapshot::from_durable(durable).queue[0].cached);
+    }
+
+    #[test]
+    fn restore_matches_ignores_fields_the_engine_rewrites_on_install() {
+        // The snapshot as saved: marks, an edit, and a context from a past
+        // session. The engine's restored queue legitimately differs in all
+        // three — cached is dropped on install, edits re-resolve against the
+        // store, context is refilled — and none of that may hang the restore.
+        let mut snapshot_state = PlaybackState::default();
+        snapshot_state.auth_state = "ready".to_owned();
+        snapshot_state.queue = vec![Track {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            cached: true,
+            effective_edit: None,
+            context: "playlist:abc".to_owned(),
+            ..Track::default()
+        }];
+        snapshot_state.current_index = Some(0);
+        let restore = RestoreSnapshot::from_playback(&snapshot_state, false);
+
+        let mut restored = PlaybackState::default();
+        restored.auth_state = "ready".to_owned();
+        restored.queue = vec![Track {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            cached: false,
+            ..Track::default()
+        }];
+        restored.current_index = Some(0);
+
+        assert!(
+            restore.matches(&restored),
+            "volatile row fields must not keep the restore pending forever"
+        );
+
+        // Identity still matters: a different queue is not "restored".
+        restored.queue[0].id = "zzzzzzzzzzzzzzzzzzzzzz".to_owned();
+        assert!(!restore.matches(&restored));
     }
 
     /// Finds a built engine binary: `SPOTIFY_ENGINE_PATH`, the workspace

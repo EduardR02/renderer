@@ -72,9 +72,17 @@ pub struct PlaybackSnapshot {
 
 impl PlaybackSnapshot {
     pub fn from_playback(state: &PlaybackState) -> Self {
+        let mut queue = state.queue.clone();
+        // Download marks are session-live truth, derived from the audio cache
+        // by the heartbeat and by browses. A persisted snapshot must not carry
+        // them: the cache prunes on its own schedule, so a stored mark is a
+        // claim about the past — exactly the ghost-icon bug this avoids.
+        for track in &mut queue {
+            track.cached = false;
+        }
         Self {
             version: PLAYBACK_STATE_VERSION,
-            queue: state.queue.clone(),
+            queue,
             current_index: state.current_index,
             position_ms: state.position_ms,
             volume: state.volume,
