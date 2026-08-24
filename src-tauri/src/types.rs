@@ -12,7 +12,7 @@ use spotify_playback_engine::protocol::{
     ArtistPickItem, ArtistRef, ArtistReleaseCounts, ArtistReleasePage, ArtistReleases,
     ArtistTopCity, CreditArtist, CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage,
     PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, TrackCredits,
-    TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform,
+    TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform, sanitize_playlist_description,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
@@ -206,6 +206,7 @@ pub struct Playlist {
     pub id: String,
     pub uri: String,
     pub name: String,
+    /// Rich-text markup is removed at the engine/Tauri boundary.
     pub description: String,
     /// Display name of the owning user (falls back to the username).
     pub owner: String,
@@ -248,7 +249,9 @@ impl From<&PlaylistRef> for Playlist {
             id: reference.id.clone(),
             uri: reference.uri.clone(),
             name: reference.name.clone(),
-            description: reference.description.clone().unwrap_or_default(),
+            description: sanitize_playlist_description(
+                reference.description.as_deref().unwrap_or_default(),
+            ),
             owner: if reference.owner_name.is_empty() {
                 reference.owner_id.clone()
             } else {
@@ -345,7 +348,9 @@ impl From<PlaylistBrowse> for PlaylistDetail {
                 id: browse.id,
                 uri: browse.uri,
                 name: browse.name,
-                description: String::new(),
+                description: sanitize_playlist_description(
+                    browse.description.as_deref().unwrap_or_default(),
+                ),
                 owner: if browse.owner_name.is_empty() {
                     browse.owner_id.clone()
                 } else {
@@ -928,6 +933,7 @@ mod tests {
             id: "p1".to_owned(),
             uri: "spotify:playlist:p1".to_owned(),
             name: "Mixtape".to_owned(),
+            description: Some("<p>Road&nbsp;music</p>".to_owned()),
             revision: Some(revision.to_owned()),
             owner_id: "me".to_owned(),
             owner_name: String::new(),
@@ -984,6 +990,7 @@ mod tests {
     #[test]
     fn browsing_derives_the_candidates_alongside_the_revision() {
         let detail = PlaylistDetail::from(browse("rev-a", &["a", "b"]));
+        assert_eq!(detail.playlist.description, "Road music");
         assert_eq!(detail.playlist.cover_urls, vec!["a", "b"]);
         assert_eq!(detail.playlist.snapshot_id, "rev-a");
         assert_eq!(detail.playlist.tracks_total, 2);

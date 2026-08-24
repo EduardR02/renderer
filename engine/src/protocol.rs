@@ -439,15 +439,138 @@ pub struct Response<'a> {
     pub error: Option<&'a str>,
 }
 
-/// Playlist reference inside browse responses. `owner_id` is the owning
-/// user's Spotify username; `owner_name` is their display name when the
-/// source carries it (the rootlist only exposes usernames, so it is empty
-/// there).
+fn decode_html_entity(value: &str) -> Option<String> {
+    let named = match value.to_ascii_lowercase().as_str() {
+        "amp" => Some("&"),
+        "apos" => Some("'"),
+        "gt" => Some(">"),
+        "lt" => Some("<"),
+        "nbsp" => Some(" "),
+        "quot" => Some("\""),
+        "copy" => Some("©"),
+        "reg" => Some("®"),
+        "trade" => Some("™"),
+        "hellip" => Some("…"),
+        "ndash" => Some("–"),
+        "mdash" => Some("—"),
+        "lsquo" => Some("‘"),
+        "rsquo" => Some("’"),
+        "ldquo" => Some("“"),
+        "rdquo" => Some("”"),
+        "bull" => Some("•"),
+        "middot" => Some("·"),
+        "laquo" => Some("«"),
+        "raquo" => Some("»"),
+        "cent" => Some("¢"),
+        "pound" => Some("£"),
+        "yen" => Some("¥"),
+        "euro" => Some("€"),
+        "sect" => Some("§"),
+        "para" => Some("¶"),
+        "plusmn" => Some("±"),
+        "times" => Some("×"),
+        "divide" => Some("÷"),
+        "micro" => Some("µ"),
+        "deg" => Some("°"),
+        _ => None,
+    };
+    if let Some(named) = named {
+        return Some(named.to_owned());
+    }
+
+    let code = value
+        .strip_prefix("#x")
+        .or_else(|| value.strip_prefix("#X"))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .or_else(|| {
+            value
+                .strip_prefix('#')
+                .and_then(|decimal| decimal.parse().ok())
+        });
+    code.and_then(char::from_u32)
+        .filter(|character| *character != '\0')
+        .map(|character| character.to_string())
+}
+
+fn decode_html_entities(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+    while cursor < value.len() {
+        let Some(relative_ampersand) = value[cursor..].find('&') else {
+            decoded.push_str(&value[cursor..]);
+            break;
+        };
+        let ampersand = cursor + relative_ampersand;
+        decoded.push_str(&value[cursor..ampersand]);
+        let Some(relative_semicolon) = value[ampersand + 1..].find(';') else {
+            decoded.push_str(&value[ampersand..]);
+            break;
+        };
+        let semicolon = ampersand + 1 + relative_semicolon;
+        let entity = &value[ampersand + 1..semicolon];
+        let valid = !entity.is_empty()
+            && entity.len() <= 32
+            && entity.chars().all(|character| {
+                !character.is_whitespace() && !matches!(character, '&' | '<' | '>')
+            });
+        if valid {
+            if let Some(replacement) = decode_html_entity(entity) {
+                decoded.push_str(&replacement);
+            } else {
+                decoded.push_str(&value[ampersand..=semicolon]);
+            }
+        } else {
+            decoded.push_str(&value[ampersand..=semicolon]);
+        }
+        cursor = semicolon + 1;
+    }
+    decoded
+}
+
+/// Removes markup from playlist descriptions before they cross the engine
+/// boundary. Spotify stores descriptions as rich text (usually a short HTML
+/// fragment); cards render them as plain text, never as `{@html}`. Keeping the
+/// normalisation here also means cached/Tauri payloads have one stable shape.
+pub fn sanitize_playlist_description(value: &str) -> String {
+    let mut text = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for character in value.chars() {
+        if in_tag {
+            if character == '>' {
+                in_tag = false;
+                text.push(' ');
+            }
+        } else if character == '<' {
+            in_tag = true;
+            text.push(' ');
+        } else {
+            text.push(character);
+        }
+    }
+    let text = decode_html_entities(&text);
+    let mut normalized = String::with_capacity(text.len());
+    for (index, word) in text.split_whitespace().enumerate() {
+        let starts_with_punctuation = word
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(*byte, b',' | b'.' | b';' | b':' | b'!' | b'?'));
+        if index > 0 && !starts_with_punctuation {
+            normalized.push(' ');
+        }
+        normalized.push_str(word);
+    }
+    normalized
+}
+
+/// Playlist reference inside browse responses. `owner_id` is the owning user's
+/// Spotify username; `owner_name` is their display name when the source carries
+/// it (the rootlist only exposes usernames, so it is empty there).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlaylistRef {
     pub id: String,
     pub uri: String,
     pub name: String,
+    /// Plain-text description from search/playlist metadata, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub owner_id: String,
@@ -466,6 +589,9 @@ pub struct PlaylistBrowse {
     pub id: String,
     pub uri: String,
     pub name: String,
+    /// Plain-text playlist description from playlist metadata, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
     pub owner_id: String,
@@ -841,7 +967,7 @@ mod tests {
     use super::{
         ArtistRef, AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations,
         PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
-        StateEvent, TrackRef,
+        StateEvent, TrackRef, sanitize_playlist_description,
     };
 
     #[test]
@@ -1269,6 +1395,22 @@ mod tests {
             Command::BrowseLikedSongs { ref cursor }
                 if cursor.as_deref() == Some("hm://context-page/collection?offset=50")
         ));
+    }
+
+    #[test]
+    fn playlist_descriptions_are_reduced_to_plain_text() {
+        assert_eq!(
+            sanitize_playlist_description("<p>Focus&nbsp;&amp; flow <a href='#'>today</a></p>"),
+            "Focus & flow today"
+        );
+        assert_eq!(
+            sanitize_playlist_description(
+                "<p>The essential <b>tracks</b>, all in <a href='#'>one playlist</a>.</p>",
+            ),
+            "The essential tracks, all in one playlist."
+        );
+        assert_eq!(sanitize_playlist_description("&#x1F3B5; &#169;"), "🎵 ©");
+        assert_eq!(sanitize_playlist_description("  \n\t "), "");
     }
 
     #[test]

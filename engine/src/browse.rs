@@ -66,7 +66,7 @@ use serde::Deserialize;
 use spotify_playback_engine::protocol::{
     AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity, Canvas,
     CreditArtist, CreditRole, PlaylistRecommendations, PlaylistRef, RadioBrowse, TrackCredits,
-    TrackRef,
+    TrackRef, sanitize_playlist_description,
 };
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
@@ -138,6 +138,11 @@ fn id_of(uri: &SpotifyUri) -> String {
 
 fn uri_of(uri: &SpotifyUri) -> String {
     uri.to_uri().unwrap_or_default()
+}
+
+fn playlist_description(value: &str) -> Option<String> {
+    let description = sanitize_playlist_description(value);
+    (!description.is_empty()).then_some(description)
 }
 
 /// Logs, once per run, which audio formats Spotify actually offers this
@@ -1197,7 +1202,8 @@ fn playlist_ref_from_rootlist(
         uri: raw_uri.to_owned(),
         name: attributes.and_then(|a| a.name.clone()).unwrap_or_default(),
         owner_id: meta.owner_username.clone().or(user).unwrap_or_default(),
-        // The rootlist carries owner usernames but no display names.
+        // The rootlist carries owner usernames but no display names or
+        // descriptions; descriptions arrive from playlist metadata/search.
         description: None,
         owner_name: String::new(),
         cover_url: attributes.and_then(rootlist_cover),
@@ -1346,6 +1352,7 @@ pub async fn playlist_browse(
         name: playlist.name().to_owned(),
         revision: Some(hex(&playlist.revision)),
         owner_id,
+        description: playlist_description(&playlist.attributes.description),
         owner_name,
         cover_url: playlist_attributes_cover(&playlist.attributes),
         tracks,
@@ -3319,12 +3326,7 @@ fn playlist_ref_from_hit(hit: &SearchPlaylistHitJson) -> PlaylistRef {
         id: hit_id(hit.uri.as_deref()),
         uri: hit.uri.clone().unwrap_or_default(),
         name: hit.name.clone().unwrap_or_default(),
-        description: hit
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|description| !description.is_empty())
-            .map(str::to_owned),
+        description: hit.description.as_deref().and_then(playlist_description),
         owner_id,
         owner_name: owner
             .and_then(|owner| owner.name.clone())
@@ -4777,6 +4779,9 @@ mod tests {
             refs[0].uri,
             "spotify:user:alice:playlist:0123456789ABCDEFGHIJKL"
         );
+        // Rootlist attributes carry name/picture/length only; description is
+        // intentionally absent until a playlist metadata/search payload.
+        assert_eq!(refs[0].description, None);
         assert_eq!(refs[0].name, "Road Trip");
         assert_eq!(refs[0].owner_id, "alice");
         assert_eq!(refs[0].owner_name, "");
@@ -5030,7 +5035,7 @@ mod tests {
                             {"data": {
                                 "uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
                                 "name": "Public Mix",
-                                "description": "The essential tracks, all in one playlist.",
+                                "description": "<p>The essential <b>tracks</b>, all in <a href='https://example.invalid'>one playlist</a>.</p>",
                                 "ownerV2": {"data": {
                                     "name": "Alice Example",
                                     "username": "alice",

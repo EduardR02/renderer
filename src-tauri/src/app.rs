@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use spotify_playback_engine::protocol::sanitize_playlist_description;
 
 use crate::types::{
-    align_artist_ids, cover_urls_from_tracks, forget_cached_audio, CacheStats, CacheUsage,
-    PlaybackState, Playlist, PlaylistDetail, Track,
+    CacheStats, CacheUsage, PlaybackState, Playlist, PlaylistDetail, Track, align_artist_ids,
+    cover_urls_from_tracks, forget_cached_audio,
 };
 
 /// Number of playlists requested from the engine's rootlist browse.
@@ -277,7 +278,11 @@ pub struct PlaylistListCache {
 
 pub fn load_playlist_list(dir: &Path) -> Option<PlaylistListCache> {
     let bytes = std::fs::read(dir.join("playlist_list.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let mut cache: PlaylistListCache = serde_json::from_slice(&bytes).ok()?;
+    for playlist in &mut cache.playlists {
+        playlist.description = sanitize_playlist_description(&playlist.description);
+    }
+    Some(cache)
 }
 
 pub fn save_playlist_list(dir: &Path, cache: &PlaylistListCache) {
@@ -361,6 +366,7 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: PlaylistTracksEntry) 
         uri: format!("spotify:playlist:{}", entry.id),
         ..Playlist::default()
     });
+    playlist.description = sanitize_playlist_description(&playlist.description);
     playlist.tracks_total = entry.tracks.len() as u32;
     playlist.snapshot_id = entry.revision;
     // These tracks are what the detail page renders, so its candidates come
@@ -375,26 +381,29 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: PlaylistTracksEntry) 
 
 /// Upserts a playlist into the in-memory library list.
 ///
-/// A browsed playlist knows nothing about when it was last played or used in
-/// the library, so incoming `None`s never overwrite stored timestamps: the
-/// background refresh that follows every browse would otherwise erase a stamp
-/// written moments earlier.
+/// A browsed playlist has no local activity timestamps and may have an empty
+/// description when Spotify omits it; incoming empty values never overwrite
+/// those fields from the existing library snapshot.
 pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
+    playlist.description = sanitize_playlist_description(&playlist.description);
     if let Some(existing) = playlists.iter_mut().find(|entry| entry.id == playlist.id) {
         playlist.last_played = playlist.last_played.or(existing.last_played);
         playlist.last_activity = playlist.last_activity.or(existing.last_activity);
+        if playlist.description.is_empty() {
+            playlist.description = sanitize_playlist_description(&existing.description);
+        }
         *existing = playlist;
     } else {
         playlists.push(playlist);
     }
 }
 
-/// Copies the fields the rootlist cannot produce — the revision, the derived
-/// cover candidates, and the local activity timestamps — from the previous
+/// Copies the fields the rootlist cannot produce — the description, revision,
+/// derived cover candidates, and local activity timestamps — from the previous
 /// library snapshot onto a freshly fetched one.
 ///
 /// The rootlist carries none of them, so a plain replacement would blank all
-/// four local fields on every library refresh. For the candidates that is not
+/// five fields on every library refresh. For the candidates that is not
 /// cosmetic: they are derived from a browse of the playlist itself, so a wipe
 /// would drop the sidebar and home-grid mosaics back to monogram tiles until
 /// each playlist happens to be browsed again. The timestamps likewise must
@@ -402,11 +411,15 @@ pub fn upsert_playlist(playlists: &mut Vec<Playlist>, mut playlist: Playlist) {
 /// Home does not lose its listening history.
 pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
     for playlist in fresh.iter_mut() {
+        playlist.description = sanitize_playlist_description(&playlist.description);
         if let Some(old) = previous.iter().find(|entry| entry.id == playlist.id) {
             playlist.cover_urls = old.cover_urls.clone();
             playlist.snapshot_id = old.snapshot_id.clone();
             playlist.last_played = old.last_played;
             playlist.last_activity = old.last_activity;
+            if playlist.description.is_empty() {
+                playlist.description = sanitize_playlist_description(&old.description);
+            }
         }
     }
 }
@@ -699,9 +712,11 @@ mod tests {
         snapshot.position_ms = 84_000;
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
         assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot));
-        assert!(!playback_state_path(&dir)
-            .with_extension("json.tmp")
-            .exists());
+        assert!(
+            !playback_state_path(&dir)
+                .with_extension("json.tmp")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -829,6 +844,7 @@ mod tests {
         // drop every browsed playlist's mosaic back to a monogram tile until
         // it is browsed again. Both timestamps are local-only as well.
         let previous = vec![Playlist {
+            description: "<p>Road&nbsp;music</p>".into(),
             cover_urls: vec!["cover-a".into(), "cover-b".into()],
             snapshot_id: "rev-a".into(),
             last_played: Some(1_000),
@@ -837,6 +853,7 @@ mod tests {
         }];
         let mut fresh = vec![playlist("p1"), playlist("p2")];
         carry_local_fields(&previous, &mut fresh);
+        assert_eq!(fresh[0].description, "Road music");
         assert_eq!(fresh[0].cover_urls, vec!["cover-a", "cover-b"]);
         assert_eq!(fresh[0].snapshot_id, "rev-a");
         assert_eq!(fresh[0].last_played, Some(1_000));
@@ -928,6 +945,7 @@ mod tests {
         // timestamp; without the guard in upsert_playlist that would undo the
         // stamps written moments earlier by touch commands.
         let mut playlists = vec![Playlist {
+            description: "<p>Saved before browse</p>".into(),
             last_played: Some(900),
             last_activity: Some(950),
             ..playlist("p1")
@@ -942,6 +960,7 @@ mod tests {
         assert_eq!(playlists[0].last_played, Some(900));
         assert_eq!(playlists[0].last_activity, Some(950));
         assert_eq!(playlists[0].snapshot_id, "rev-b");
+        assert_eq!(playlists[0].description, "Saved before browse");
 
         // Explicit newer timestamps still win independently.
         upsert_playlist(
