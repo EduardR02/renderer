@@ -12,6 +12,7 @@
     selected = $bindable(null),
     cursorMs = $bindable(0),
     previewActive = false,
+    previewPositionMs = null,
     onsave = null,
     oncommit = null,
     onundo = null,
@@ -26,10 +27,11 @@
   let mainStage = $state(null);
   let overviewStage = $state(null);
   let mainCanvas = $state(null);
+  let playheadCursor = $state(null);
+  let previewPlayhead = $state(null);
   let overviewCanvas = $state(null);
   let hoverCursor = $state(null);
   let hoverLabel = $state(null);
-  let playheadCursor = $state(null);
   let viewStart = $state(0);
   let viewEnd = $state(1);
   let viewportDuration = 0;
@@ -81,7 +83,9 @@
   function editKey(edit) {
     return JSON.stringify({
       cuts: (edit?.cuts ?? []).map(({ start_ms, end_ms }) => [start_ms, end_ms]),
-      loop: edit?.loopRange ? [edit.loopRange.start_ms, edit.loopRange.end_ms] : null,
+      loop: edit?.loopRange
+        ? [edit.loopRange.start_ms, edit.loopRange.end_ms, edit.loopRange.play_count ?? null]
+        : null,
     });
   }
 
@@ -153,6 +157,7 @@
       _key: newKey(type),
       start_ms: Math.round(center - span / 2),
       end_ms: Math.round(center + span / 2),
+      ...(type === "loop" ? { play_count: 2 } : {}),
     };
     if (range.end_ms <= range.start_ms) range.end_ms = range.start_ms + 1;
     if (type === "loop") loopRange = range;
@@ -214,7 +219,7 @@
     const threshold = (viewSpan / mainSize.width) * SNAP_PX;
     let best = ms;
     let distance = threshold + 1;
-    const candidates = [0, duration];
+    const candidates = [0, duration, cursorValue];
     for (const range of occupied(type, key)) candidates.push(range.start, range.end);
     for (const candidate of candidates) {
       const nextDistance = Math.abs(ms - candidate);
@@ -241,6 +246,11 @@
   function updateCursorDom(ms, visible = true) {
     cursorValue = clamp(Math.round(Number(ms) || 0), 0, duration);
     updateMarker(playheadCursor, cursorValue, visible);
+  }
+
+  function updatePreviewDom(ms) {
+    const visible = ms !== null && ms !== undefined && Number.isFinite(Number(ms));
+    updateMarker(previewPlayhead, ms, visible);
   }
 
   function applyHover() {
@@ -361,7 +371,11 @@
     }
     if (active.kind === "create-intent") {
       if (!active.moved || !active.gap) return;
-      const start = clamp(Math.round(active.anchorMs), active.gap.start, active.gap.end - 1);
+      const start = clamp(
+        Math.round(snap(active.anchorMs, "cut", null, point.altKey)),
+        active.gap.start,
+        active.gap.end - 1,
+      );
       const regionKey = newKey("cut");
       const created = { _key: regionKey, start_ms: start, end_ms: start + 1 };
       cuts = sortCuts([...cuts, created]);
@@ -382,8 +396,9 @@
     if (active.kind === "create") {
       let end = snap(current, active.type, active.key, point.altKey);
       end = clamp(end, gap.start, gap.end);
-      const start = clamp(Math.min(active.anchorMs, end), gap.start, gap.end - 1);
-      end = clamp(Math.max(active.anchorMs, end), start + 1, gap.end);
+      const anchor = snap(active.anchorMs, active.type, active.key, point.altKey);
+      const start = clamp(Math.min(anchor, end), gap.start, gap.end - 1);
+      end = clamp(Math.max(anchor, end), start + 1, gap.end);
       replaceRegion(active.type, active.key, start, end);
       return;
     }
@@ -567,7 +582,7 @@
     const styles = getComputedStyle(canvas);
     const center = size.height / 2;
     const peaks = waveform?.peaks;
-    const interval = Math.max(1, Number(waveform?.interval_ms) || 10);
+    const interval = Math.max(1, Number(waveform?.interval_ms) || 1);
     const binCount = Math.min(Number(waveform?.bin_count) || 0, peaks ? peaks.length / 2 : 0);
     context.lineWidth = 1;
     context.strokeStyle = styles.getPropertyValue(quiet ? "--wave-quiet" : "--wave-main").trim() || "#9ccfd8";
@@ -619,21 +634,12 @@
   });
 
   $effect(() => {
-    const rangeValue = selectedRange;
-    if (!rangeValue || drag) return;
-    const span = viewSpan;
-    // A range wider than the user-selected viewport cannot fit. Panning to
-    // alternating edges would make this effect oscillate forever.
-    if (rangeValue.end_ms - rangeValue.start_ms >= span) return;
-    if (rangeValue.start_ms < viewStart) setViewport(rangeValue.start_ms, rangeValue.start_ms + span);
-    else if (rangeValue.end_ms > viewEnd) setViewport(rangeValue.end_ms - span, rangeValue.end_ms);
-  });
-
-  $effect(() => {
     waveform; viewStart; viewEnd; duration;
     scheduleDraw();
     updateCursorDom(cursorMs, true);
+    updatePreviewDom(previewPositionMs);
   });
+
 
   $effect(() => {
     const main = mainCanvas;
@@ -681,13 +687,14 @@
   </div>
 
   <div class="main-stage" class:panning={drag?.kind === "pan"} bind:this={mainStage}
-    role="region" aria-label="Track waveform. Shift-drag empty space to add a cut."
+    role="region" title="Hold Alt while dragging to bypass snapping." aria-label="Track waveform. Shift-drag empty space to add a cut. Hold Alt while dragging to bypass snapping."
     onwheel={onWheel} onpointerdown={(event) => beginPointer(event, "create")}
     onpointermove={onPointerMove} onpointerleave={() => { if (!drag) hideHover(); }}
     onpointerup={(event) => finishPointer(event)} onpointercancel={(event) => finishPointer(event, true)}
     oncontextmenu={(event) => event.preventDefault()}>
     <canvas bind:this={mainCanvas} aria-hidden="true"></canvas>
     <span class="playhead-cursor" bind:this={playheadCursor} hidden aria-hidden="true"></span>
+    <span class="preview-playhead" bind:this={previewPlayhead} hidden aria-hidden="true"></span>
     <span class="hover-cursor" bind:this={hoverCursor} hidden aria-hidden="true"></span>
     <span class="hover-time tnum" bind:this={hoverLabel} hidden aria-hidden="true"></span>
     {#if waveformState === "loading"}<span class="wave-status">Reading waveform…</span>
@@ -720,7 +727,7 @@
     <canvas bind:this={overviewCanvas} aria-hidden="true"></canvas>
     <span class="overview-window" style={overviewWindowStyle()} aria-hidden="true"></span>
   </div>
-  <p class="wave-hint">Shift-drag empty space creates a cut · middle-drag pans · Shift + wheel pans · Ctrl + wheel zooms · Alt bypasses snap</p>
+  <p class="wave-hint">Shift-drag empty space creates a cut · middle-drag pans · Shift + wheel pans · Ctrl + wheel zooms · Hold Alt while dragging to bypass snapping.</p>
 </div>
 
 <style>
@@ -745,9 +752,12 @@
   canvas { display: block; width: 100%; height: 100%; }
   .wave-status { position: absolute; z-index: 8; top: var(--s3); left: 50%; max-width: calc(100% - 32px); padding: 4px 9px; transform: translateX(-50%); border: 1px solid var(--line); border-radius: var(--rf); background: color-mix(in srgb, var(--bg-1) 88%, transparent); color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11); pointer-events: none; white-space: nowrap; }
   .wave-status.error { color: var(--rose); }
-  .playhead-cursor,.hover-cursor { position: absolute; top: 0; bottom: 0; width: 1px; pointer-events: none; }
-  .playhead-cursor { z-index: 3; background: var(--accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent); }
-  .hover-cursor { z-index: 6; background: color-mix(in srgb, var(--fg) 76%, transparent); }
+  .playhead-cursor,.preview-playhead,.hover-cursor { position: absolute; top: 0; bottom: 0; width: 2px; pointer-events: none; }
+  .playhead-cursor { z-index: 5; width: 3px; background: var(--bg-0); box-shadow: 0 0 0 1px var(--accent), 0 0 9px color-mix(in srgb, var(--accent) 72%, transparent); }
+  .playhead-cursor::before { content: ""; position: absolute; top: 0; left: 50%; width: 9px; height: 9px; transform: translate(-50%, -1px) rotate(45deg); border: 2px solid var(--bg-0); border-radius: 2px; background: var(--accent); }
+  .preview-playhead { z-index: 4; width: 0; border-left: 2px dashed var(--gold); opacity: 0.95; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--bg-0) 88%, transparent)); }
+  .preview-playhead::after { content: ""; position: absolute; bottom: 0; left: 50%; width: 8px; height: 8px; transform: translate(-50%, 1px); border: 2px solid var(--gold); border-radius: 50%; background: var(--bg-1); }
+  .hover-cursor { z-index: 6; width: 1px; background: color-mix(in srgb, var(--fg) 76%, transparent); }
   .hover-time { position: absolute; z-index: 7; top: 8px; transform: translateX(-50%); padding: 3px 6px; border: 1px solid var(--line-2); border-radius: var(--rf); background: color-mix(in srgb, var(--bg-1) 92%, transparent); color: var(--fg); font-size: 10px; pointer-events: none; white-space: nowrap; }
   .region-layer { position: absolute; z-index: 2; inset: 0; overflow: hidden; pointer-events: none; }
   .edit-region { position: absolute; top: 0; bottom: 0; min-width: 1px; border-inline: 1px solid currentColor; color: var(--rose-ink); background: color-mix(in srgb, var(--rose-ink) 16%, transparent); pointer-events: auto; }

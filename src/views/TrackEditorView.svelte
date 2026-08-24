@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { api, route, playback, getTrackEditorTrack, goBack, setNavigationGuard } from "../lib/state.svelte.js";
+  import { api, route, playback, positionMs as projectedPlaybackPositionMs, getTrackEditorTrack, goBack, setNavigationGuard } from "../lib/state.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import TrackEditWaveform from "../components/TrackEditWaveform.svelte";
@@ -21,16 +21,35 @@
   let previewRequest = $state(null), previewQueueAwaiting = $state(null), previewQueueIdentity = $state("");
 
   function keyed(range, prefix) {
-    return { _key: range?._key || `${prefix}-${++keySequence}`, start_ms: Math.round(Number(range?.start_ms) || 0), end_ms: Math.round(Number(range?.end_ms) || 0) };
+    return {
+      _key: range?._key || `${prefix}-${++keySequence}`,
+      start_ms: Math.round(Number(range?.start_ms) || 0),
+      end_ms: Math.round(Number(range?.end_ms) || 0),
+    };
+  }
+  function keyedLoop(range) {
+    const playCount = range?.play_count;
+    return {
+      ...keyed(range, "loop"),
+      play_count: playCount === undefined ? undefined : Number(playCount),
+    };
   }
   function hydrateCuts(value) {
     return (value ?? []).map((range) => keyed(range, "cut")).sort((a, b) => a.start_ms - b.start_ms || a.end_ms - b.end_ms);
+  }
+  function hydrateLoop(value) {
+    return value == null ? null : keyedLoop(value);
   }
   function canonicalCuts(value = cuts) {
     return value.map(({ start_ms, end_ms }) => ({ start_ms: Math.round(start_ms), end_ms: Math.round(end_ms) })).sort((a, b) => a.start_ms - b.start_ms || a.end_ms - b.end_ms);
   }
   function canonicalLoop(value = loopRange) {
-    return value ? { start_ms: Math.round(value.start_ms), end_ms: Math.round(value.end_ms) } : null;
+    if (!value) return null;
+    return {
+      start_ms: Math.round(value.start_ms),
+      end_ms: Math.round(value.end_ms),
+      play_count: value.play_count === undefined ? undefined : Number(value.play_count),
+    };
   }
   function snapshot(editCuts = cuts, editLoop = loopRange) {
     return JSON.stringify({ cuts: canonicalCuts(editCuts), loop_range: canonicalLoop(editLoop) });
@@ -47,7 +66,9 @@
   function editKey(edit) {
     return JSON.stringify({
       cuts: (edit?.cuts ?? []).map(({ start_ms, end_ms }) => [start_ms, end_ms]),
-      loop: edit?.loopRange ? [edit.loopRange.start_ms, edit.loopRange.end_ms] : null,
+      loop: edit?.loopRange
+        ? [edit.loopRange.start_ms, edit.loopRange.end_ms, edit.loopRange.play_count ?? null]
+        : null,
     });
   }
   function commitHistory(before, after = copyEdit()) {
@@ -94,9 +115,13 @@
       else if (index && range.start_ms < cuts[index - 1].end_ms) cutErrors[index] = "Cuts must be ordered and cannot overlap.";
     });
     if (loopRange) {
-      if (loopRange.start_ms < 0 || loopRange.start_ms >= loopRange.end_ms) loopError = "The loop start must be before the end.";
-      else if (loopRange.end_ms > duration) loopError = "The loop extends past the track.";
-      else {
+      if (!Number.isInteger(loopRange.play_count) || loopRange.play_count < 2 || loopRange.play_count > 32) {
+        loopError = "Plays must be a whole number from 2 to 32 (total passes).";
+      } else if (loopRange.start_ms < 0 || loopRange.start_ms >= loopRange.end_ms) {
+        loopError = "The loop start must be before the end.";
+      } else if (loopRange.end_ms > duration) {
+        loopError = "The loop extends past the track.";
+      } else {
         const overlap = cuts.findIndex((cut) => cut.start_ms < loopRange.end_ms && loopRange.start_ms < cut.end_ms);
         if (overlap >= 0) {
           loopError = `The loop overlaps cut ${overlap + 1}.`;
@@ -122,6 +147,19 @@
     if (type === "loop") loopRange = { ...current, [field]: next };
     else cuts = cuts.map((range) => range._key === key ? { ...range, [field]: next } : range).sort((a, b) => a.start_ms - b.start_ms || a.end_ms - b.end_ms);
     selected = { type, key };
+    actionError = "";
+    commitHistory(before);
+  }
+
+  function setPlayCount(key, value) {
+    if (!ready || saving || !loopRange || loopRange._key !== key) return;
+    const before = copyEdit();
+    const numeric = Number(value);
+    loopRange = {
+      ...loopRange,
+      play_count: Number.isFinite(numeric) ? numeric : 0,
+    };
+    selected = { type: "loop", key };
     actionError = "";
     commitHistory(before);
   }
@@ -170,8 +208,7 @@
     try {
       const definition = await api.saveTrackEdit(id, duration, nextCuts, nextLoop);
       if (!active(id, sourcePlaylist)) return;
-      cuts = hydrateCuts(definition?.cuts ?? nextCuts);
-      loopRange = definition?.loop_range ? keyed(definition.loop_range, "loop") : null;
+      loopRange = hydrateLoop(definition?.loop_range);
       baseline = snapshot();
       definitionExists = true;
       selected = null;
@@ -236,11 +273,14 @@
     queueEditSignature,
   ].join("|"));
   const draftSignature = $derived(snapshot());
-  const previewQueueMatches = $derived(
+  const previewQueueEditMatches = $derived(
     editorTrackCurrent &&
       !!previewSignature &&
       !!currentQueueTrack?.effective_edit &&
-      queueEditSignature === previewSignature &&
+      queueEditSignature === previewSignature,
+  );
+  const previewQueueMatches = $derived(
+    previewQueueEditMatches &&
       (!previewQueueIdentity || queueIdentity === previewQueueIdentity),
   );
   const previewQueueActive = $derived(
@@ -387,6 +427,20 @@
     return playback.duration_ms > 0 ? Math.min(compiled, playback.duration_ms) : compiled;
   }
 
+  function compiledToSource(position, editCuts = []) {
+    const transportDuration = playback.duration_ms > 0
+      ? playback.duration_ms
+      : Math.max(0, duration - editCuts.reduce((total, cut) => total + (cut.end_ms - cut.start_ms), 0));
+    const compiled = Math.max(0, Math.min(transportDuration, Math.round(Number(position) || 0)));
+    let removed = 0;
+    for (const cut of canonicalCuts(editCuts)) {
+      const seam = cut.start_ms - removed;
+      if (compiled < seam) break;
+      removed += cut.end_ms - cut.start_ms;
+    }
+    return Math.min(duration, compiled + removed);
+  }
+
   function seekPreview(position) {
     if (!previewIsCurrent || !editorTrackCurrent) return;
     const generation = previewGeneration, id = track?.id, sourcePlaylist = playlistId;
@@ -402,6 +456,14 @@
       draftSignature === previewSignature &&
       (previewState === "playing" || previewState === "paused"),
   );
+
+  const previewPositionMs = $derived.by(() => {
+    if (!previewIsCurrent || !editorTrackCurrent || !currentQueueTrack?.effective_edit) return null;
+    return compiledToSource(
+      projectedPlaybackPositionMs(),
+      currentQueueTrack.effective_edit.cuts ?? [],
+    );
+  });
 
   $effect(() => {
     const queueKey = queueIdentity;
@@ -419,7 +481,7 @@
     }
     if (!previewSignature) return;
     if (awaiting?.generation === previewGeneration) {
-      if (!previewQueueMatches) {
+      if (!previewQueueEditMatches) {
         if (queueKey === awaiting.baselineQueue) return;
         resetPreviewLifecycle();
         return;
@@ -473,7 +535,7 @@
     untrack(() => api.getTrackEdit(id, sourcePlaylist).then((status) => {
       if (!active(id, sourcePlaylist, generation)) return;
       cuts = hydrateCuts(status?.definition?.cuts);
-      loopRange = status?.definition?.loop_range ? keyed(status.definition.loop_range, "loop") : null;
+      loopRange = hydrateLoop(status?.definition?.loop_range);
       definitionExists = !!status?.definition;
       enabled = !!status?.enabled;
       baseline = snapshot();
@@ -483,6 +545,7 @@
       if (active(id, sourcePlaylist, generation)) loading = false;
     }));
   });
+
   $effect(() => {
     const id = track?.id, generation = ++waveformGeneration;
     waveform = null;
@@ -560,6 +623,7 @@
         bind:selected
         bind:cursorMs
         previewActive={previewIsCurrent}
+        previewPositionMs={previewPositionMs}
         onsave={save}
         oncommit={commitHistory}
         onundo={undo}
@@ -588,14 +652,15 @@
       </section>
 
       <section class="range-section">
-        <div class="range-heading"><div><h3>Loop</h3><p>Optionally repeat one clean section.</p></div><span class="loop-chip">{loopRange ? "Set" : "Off"}</span></div>
+        <div class="range-heading"><div><h3>Loop</h3><p>Optionally repeat one clean section. Plays is total passes, including the first.</p></div><span class="loop-chip">{loopRange ? "Set" : "Off"}</span></div>
         {#if loopRange}
           <div class="exact-row loop-row" class:selected={selected?.type === "loop"}>
             <button class="region-index" onclick={() => (selected = { type: "loop", key: loopRange._key })} aria-label="Select loop"><span></span>LP</button>
             <label>Start<input class="time-input tnum" disabled={!ready || saving} value={formatExactTime(loopRange.start_ms)} inputmode="decimal" aria-label="Loop start time" onkeydown={(event) => nudgeTime(event, "loop", loopRange._key, "start_ms")} onchange={(event) => commitTime(event, "loop", loopRange._key, "start_ms")} /></label>
             <span class="arrow">→</span>
             <label>End<input class="time-input tnum" disabled={!ready || saving} value={formatExactTime(loopRange.end_ms)} inputmode="decimal" aria-label="Loop end time" onkeydown={(event) => nudgeTime(event, "loop", loopRange._key, "end_ms")} onchange={(event) => commitTime(event, "loop", loopRange._key, "end_ms")} /></label>
-            <span class="range-duration tnum">{formatExactTime(loopRange.end_ms - loopRange.start_ms)}</span>
+            <label class="play-count-field">Plays<input class="time-input tnum" type="number" min="2" max="32" step="1" disabled={!ready || saving} value={loopRange.play_count ?? ""} aria-label="Total loop passes" onchange={(event) => setPlayCount(loopRange._key, event.currentTarget.value)} /></label>
+            <span class="range-duration tnum">{Number.isInteger(loopRange.play_count) ? `${loopRange.play_count} total` : "Invalid"}</span>
             <button class="remove-region" disabled={!ready || saving} title="Remove loop" onclick={removeLoop}><Icon name="x" size={12} /></button>
             {#if validation.loopError}<p class="range-error" role="alert">{validation.loopError}</p>{/if}
           </div>
@@ -652,7 +717,7 @@
   .range-count,.loop-chip { padding: 3px 8px; border: 1px solid var(--line); border-radius: var(--rf); color: var(--fg-2); font-size: var(--t-11); }
   .loop-chip { color: var(--gold); }
   .range-list { display: grid; gap: 5px; }
-  .exact-row { display: grid; grid-template-columns: 48px minmax(128px,174px) 18px minmax(128px,174px) minmax(104px,1fr) 44px; align-items: end; min-height: 64px; padding: 8px 4px 8px 0; border: 1px solid transparent; border-radius: var(--r2); background: color-mix(in srgb, var(--bg-1) 62%, transparent); }
+  .exact-row { display: grid; grid-template-columns: 48px minmax(110px,150px) 18px minmax(110px,150px) minmax(74px,90px) minmax(104px,1fr) 44px; align-items: end; min-height: 64px; padding: 8px 4px 8px 0; border: 1px solid transparent; border-radius: var(--r2); background: color-mix(in srgb, var(--bg-1) 62%, transparent); }
   .exact-row.selected { border-color: color-mix(in srgb, var(--rose-ink) 35%, var(--line)); }
   .loop-row.selected { border-color: color-mix(in srgb, var(--gold) 35%, var(--line)); }
   .region-index { align-self: stretch; display: flex; align-items: center; gap: 7px; padding-left: 10px; color: var(--fg-2); font: 10px var(--font-mono); }
@@ -680,7 +745,7 @@
     .preview-strip { margin-inline: var(--s4); }
     :global(.repair-sheet>.waveform-editor) { padding-inline: var(--s4); }
     .range-section { padding: var(--s4); }
-    .exact-row { grid-template-columns: 40px 1fr 18px 1fr 44px; }
+    .exact-row { grid-template-columns: 40px 1fr 18px 1fr 90px 1fr 44px; }
     .range-duration { display: none; }
     .edit-footer { padding-inline: var(--s4); }
   }
@@ -690,6 +755,7 @@
     .exact-row { grid-template-columns: 38px 1fr 44px; row-gap: 6px; }
     .exact-row label:first-of-type { grid-column: 2; }.exact-row label:nth-of-type(2) { grid-column: 2; grid-row: 2; }
     .region-index { grid-row: 1/3; }.arrow { display: none; }.remove-region { grid-column: 3; grid-row: 1/3; }
+    .loop-row .play-count-field { grid-column: 2; grid-row: 3; }.loop-row .region-index,.loop-row .remove-region { grid-row: 1/4; }
     .edit-footer { align-items: flex-start; flex-direction: column; }.edit-footer>div:last-child { width: 100%; justify-content: flex-end; }
   }
   @media(max-width:420px) { .edit-head :global(.art) { display: none; }.edit-head { margin-bottom: var(--s4); } }

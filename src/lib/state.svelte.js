@@ -1376,7 +1376,7 @@ function decodeTrackWaveform(payload) {
   const binCount = Number(payload.bin_count);
   const interval = Number(payload.interval_ms);
   const duration = Number(payload.duration_ms);
-  if (!Number.isInteger(binCount) || binCount < 0 || interval !== 10 ||
+  if (!Number.isInteger(binCount) || binCount < 0 || interval !== 1 ||
       !Number.isInteger(duration) || duration < 0 || typeof payload.peaks_base64 !== "string") {
     throw new Error("The waveform response was invalid.");
   }
@@ -1694,9 +1694,12 @@ export async function initEvents() {
   bootstrapped = true;
 
   listen("state", (e) => applyPlayback(e.payload)).catch(() => {});
-  // Heartbeats that only moved the playhead: a bare number, no queue.
+  // Heartbeats carry only the projected compiled position as a scalar; the
+  // full state event remains authoritative for duration and queue metadata.
   listen("position", (e) => {
-    playback.position_ms = e.payload ?? 0;
+    const position = Number(e.payload);
+    if (!Number.isFinite(position)) return;
+    playback.position_ms = Math.max(0, Math.round(position));
     anchorPlayhead(playback.position_ms);
   }).catch(() => {});
   /**
