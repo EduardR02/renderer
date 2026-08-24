@@ -178,10 +178,20 @@ impl RestoreSnapshot {
     }
 
     pub fn matches(&self, state: &PlaybackState) -> bool {
-        let position_matches = if self.resume_playing {
-            state.position_ms.abs_diff(self.position_ms) <= 2_500
+        // Restore positions are compiled-timeline values. Resolving the live
+        // edit store can shorten that timeline after the snapshot was written;
+        // RestoreQueue then clamps the request to the new compiled duration.
+        // Match the same canonical value or the restore gate would suppress
+        // every ready state forever.
+        let expected_position = if state.duration_ms == 0 {
+            self.position_ms
         } else {
-            state.position_ms == self.position_ms
+            self.position_ms.min(state.duration_ms)
+        };
+        let position_matches = if self.resume_playing {
+            state.position_ms.abs_diff(expected_position) <= 2_500
+        } else {
+            state.position_ms == expected_position
         };
         state.auth_state == "ready"
             && Self::rows_match(&state.queue, &self.queue)
@@ -316,6 +326,10 @@ pub struct EngineClient {
     state_tx: tokio::sync::broadcast::Sender<StateLine>,
     exit_tx: watch::Sender<bool>,
     last_state: Mutex<Option<PlaybackState>>,
+    /// The latest full engine state is a draft preview. Scalar heartbeats carry
+    /// no mode bit, so this keeps them from advancing the retained real queue
+    /// snapshot while a preview is live.
+    preview_active: AtomicBool,
     restore_pending: Mutex<Option<RestorePlan>>,
     persist_tx: SyncSender<PersistCommand>,
     persist_generation: AtomicU64,
@@ -343,6 +357,7 @@ impl EngineClient {
             state_tx,
             exit_tx,
             last_state: Mutex::new(None),
+            preview_active: AtomicBool::new(false),
             restore_pending: Mutex::new(restore_pending),
             persist_tx,
             persist_generation: AtomicU64::new(0),
@@ -1123,6 +1138,7 @@ impl EngineClient {
     // ------------------------------------------------------------------
 
     fn on_state(&self, state: &PlaybackState) {
+        self.preview_active.store(state.preview, Ordering::Release);
         let mut pending = self.restore_pending.lock();
         let matched = pending
             .as_ref()
@@ -1130,7 +1146,7 @@ impl EngineClient {
         if matched {
             *pending = None;
         }
-        let suppress_snapshot = pending.is_some() && state.auth_state == "ready";
+        let suppress_snapshot = state.preview || (pending.is_some() && state.auth_state == "ready");
         drop(pending);
         if !suppress_snapshot {
             *self.last_state.lock() = Some(state.clone());
@@ -1139,9 +1155,13 @@ impl EngineClient {
         let _ = self.state_tx.send(StateLine::State(state.clone()));
     }
 
-    /// Applies a scalar position heartbeat to the heartbeat-fresh last state.
+    /// Applies a scalar position heartbeat to the heartbeat-fresh last real
+    /// state. Preview heartbeats still reach the window, but cannot mutate the
+    /// queue snapshot used for persistence and child-crash recovery.
     fn on_position(&self, heartbeat: PositionHeartbeat) {
-        let changed = if let Some(last) = self.last_state.lock().as_mut() {
+        let changed = if self.preview_active.load(Ordering::Acquire) {
+            false
+        } else if let Some(last) = self.last_state.lock().as_mut() {
             last.position_ms = heartbeat.position_ms;
             last.duration_ms = heartbeat.duration_ms;
             true
@@ -1488,6 +1508,7 @@ mod tests {
             state_tx,
             exit_tx,
             last_state: Mutex::new(Some(state)),
+            preview_active: AtomicBool::new(false),
             restore_pending: Mutex::new(None),
             persist_tx,
             persist_generation: AtomicU64::new(0),
@@ -1846,6 +1867,45 @@ mod tests {
     }
 
     #[test]
+    fn preview_states_and_heartbeats_keep_the_real_crash_restore_snapshot() {
+        let mut normal = PlaybackState::default();
+        normal.ready = true;
+        normal.auth_state = "ready".to_owned();
+        normal.playing = true;
+        normal.position_ms = 12_000;
+        normal.duration_ms = 240_000;
+        normal.current_index = Some(0);
+        normal.queue = vec![Track {
+            id: "real-track".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        let client = client_with_last_state(normal.clone());
+
+        let mut preview = normal.clone();
+        preview.preview = true;
+        preview.position_ms = 80_000;
+        preview.queue[0].id = "draft-track".to_owned();
+        client.on_state(&preview);
+        client.on_position(PositionHeartbeat {
+            position_ms: 90_000,
+            duration_ms: 180_000,
+        });
+
+        let retained = client.last_state.lock().clone().unwrap();
+        assert_eq!(retained.queue[0].id, "real-track");
+        assert_eq!(retained.position_ms, 12_000);
+
+        client.on_eof();
+        let restore = client.restore_pending.lock();
+        let restore = &restore.as_ref().expect("real queue retained").snapshot;
+        assert_eq!(restore.queue[0].id, "real-track");
+        assert_eq!(restore.position_ms, 12_000);
+        assert!(restore.resume_playing);
+    }
+
+    #[test]
     fn blank_ready_state_is_suppressed_until_restored_state_matches() {
         let mut previous = PlaybackState::default();
         previous.auth_state = "ready".to_owned();
@@ -1964,6 +2024,30 @@ mod tests {
         // Identity still matters: a different queue is not "restored".
         restored.queue[0].id = "zzzzzzzzzzzzzzzzzzzzzz".to_owned();
         assert!(!restore.matches(&restored));
+    }
+
+    #[test]
+    fn restore_matches_a_position_clamped_by_a_new_shorter_compiled_timeline() {
+        let mut snapshot_state = PlaybackState::default();
+        snapshot_state.auth_state = "ready".to_owned();
+        snapshot_state.queue = vec![Track {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        snapshot_state.current_index = Some(0);
+        snapshot_state.position_ms = 200_000;
+        let restore = RestoreSnapshot::from_playback(&snapshot_state, false);
+
+        let mut restored = snapshot_state;
+        restored.position_ms = 150_000;
+        restored.duration_ms = 150_000;
+
+        assert!(
+            restore.matches(&restored),
+            "a newly enabled cut may clamp an old compiled snapshot to the new duration"
+        );
     }
 
     /// Finds a built engine binary: `SPOTIFY_ENGINE_PATH`, the workspace

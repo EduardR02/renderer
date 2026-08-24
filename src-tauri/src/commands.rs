@@ -258,8 +258,10 @@ pub async fn browse_playlists(
     result
 }
 
-/// Opens a playlist: serves the disk cache instantly when present and
-/// refreshes it in the background; otherwise fetches from the engine.
+/// Opens a followed playlist from the disk cache instantly and refreshes it in
+/// the background; otherwise fetches from the engine. Public playlist entries
+/// deliberately carry tracks only in the bounded cache, not library metadata,
+/// so serving one as a followed-cache hit would blank its name/owner/cover.
 #[tauri::command]
 pub async fn browse_playlist(
     app: AppHandle,
@@ -269,11 +271,15 @@ pub async fn browse_playlist(
 ) -> Result<PlaylistDetail, String> {
     let cached = {
         let guard = state.lock();
-        guard
-            .tracks_cache
-            .iter()
-            .find(|entry| entry.id == id)
-            .cloned()
+        is_followed_playlist(&guard.playlists, &id)
+            .then(|| {
+                guard
+                    .tracks_cache
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .cloned()
+            })
+            .flatten()
             .map(|entry| playlist_detail_from_cache(&guard, entry))
     };
     if let Some(detail) = cached {
@@ -433,10 +439,28 @@ pub async fn delete_playlist(
 ) -> Result<(), String> {
     client.delete_playlist(&id).await?;
     {
-        let guard = app.state::<Mutex<AppState>>();
-        let mut guard = guard.lock();
-        guard.playlists.retain(|playlist| playlist.id != id);
-        guard.tracks_cache.retain(|entry| entry.id != id);
+        let state = app.state::<Mutex<AppState>>();
+        let persistence = state.lock().playlist_persistence.clone();
+        let _serialize = persistence.lock();
+        let (dir, list_cache, tracks_cache) = {
+            let mut guard = state.lock();
+            guard.playlists.retain(|playlist| playlist.id != id);
+            guard.tracks_cache.retain(|entry| entry.id != id);
+            (
+                guard.data_dir.clone(),
+                PlaylistListCache {
+                    version: 1,
+                    fetched_at: guard.playlists_fetched_at,
+                    me_id: guard.me_id.clone(),
+                    playlists: guard.playlists.clone(),
+                },
+                guard.tracks_cache.clone(),
+            )
+        };
+        // A successful unfollow must reach disk before a concurrent older
+        // refresh can persist, or the removed row reappears on next startup.
+        save_playlist_list(&dir, &list_cache);
+        save_tracks_cache(&dir, &tracks_cache);
     }
     spawn_refresh_library(app);
     Ok(())
@@ -545,6 +569,8 @@ pub async fn get_cover(url: String) -> Result<String, String> {
 /// Browsing or editing a playlist deliberately does not count as playback.
 #[tauri::command]
 pub async fn touch_playlist(state: State<'_, Mutex<AppState>>, id: String) -> Result<(), String> {
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
     let (dir, cache) = {
         let mut guard = state.lock();
         if !touch_playlist_played(&mut guard.playlists, &id, now_secs()) {
@@ -576,6 +602,8 @@ pub async fn touch_playlist_activity(
     state: State<'_, Mutex<AppState>>,
     id: String,
 ) -> Result<(), String> {
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
     let (dir, cache) = {
         let mut guard = state.lock();
         if !stamp_playlist_activity(&mut guard.playlists, &id, now_secs()) {
@@ -1069,28 +1097,28 @@ async fn fetch_library(
     let references = client.browse_playlists(LIBRARY_LENGTH).await?;
     let mut playlists: Vec<Playlist> = references.iter().map(Playlist::from).collect();
     let fetched_at = now_secs();
-    let (dir, me_id) = {
-        let guard = state.lock();
-        carry_local_fields(&guard.playlists, &mut playlists);
-        (guard.data_dir.clone(), guard.me_id.clone())
-    };
-    // Rootlist order is only the tiebreaker; the fetch arrives in it, so the
-    // activity sort has to happen after local timestamps are carried over.
-    order_by_last_activity(&mut playlists);
-    save_playlist_list(
-        &dir,
-        &PlaylistListCache {
-            version: 1,
-            fetched_at: Some(fetched_at),
-            me_id,
-            playlists: playlists.clone(),
-        },
-    );
-    {
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    let (dir, cache) = {
         let mut guard = state.lock();
+        // A detail refresh may have enriched the current row while the
+        // rootlist request was in flight. Carry and install in the same
+        // serialized completion so sparse metadata cannot overwrite it.
+        carry_local_fields(&guard.playlists, &mut playlists);
+        order_by_last_activity(&mut playlists);
         guard.playlists = playlists.clone();
         guard.playlists_fetched_at = Some(fetched_at);
-    }
+        (
+            guard.data_dir.clone(),
+            PlaylistListCache {
+                version: 1,
+                fetched_at: Some(fetched_at),
+                me_id: guard.me_id.clone(),
+                playlists: playlists.clone(),
+            },
+        )
+    };
+    save_playlist_list(&dir, &cache);
     Ok(playlists)
 }
 
@@ -1104,29 +1132,34 @@ async fn fetch_playlist(
 ) -> Result<PlaylistDetail, String> {
     let detail = PlaylistDetail::from(client.browse_playlist(id).await?);
     let fetched_at = now_secs();
-    let mut guard = state.lock();
-    upsert_tracks_cache(
-        &mut guard.tracks_cache,
-        PlaylistTracksEntry {
-            id: detail.playlist.id.clone(),
-            fetched_at: Some(fetched_at),
-            revision: detail.playlist.snapshot_id.clone(),
-            tracks: detail.tracks.clone(),
-        },
-    );
-    let should_persist_library = is_followed_playlist(&guard.playlists, id);
-    if should_persist_library {
-        upsert_playlist(&mut guard.playlists, detail.playlist.clone());
-    }
-    let dir = guard.data_dir.clone();
-    let list_cache = should_persist_library.then(|| PlaylistListCache {
-        version: 1,
-        fetched_at: guard.playlists_fetched_at,
-        me_id: guard.me_id.clone(),
-        playlists: guard.playlists.clone(),
-    });
-    let tracks_cache = guard.tracks_cache.clone();
-    drop(guard);
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    let (dir, list_cache, tracks_cache) = {
+        let mut guard = state.lock();
+        upsert_tracks_cache(
+            &mut guard.tracks_cache,
+            PlaylistTracksEntry {
+                id: detail.playlist.id.clone(),
+                fetched_at: Some(fetched_at),
+                revision: detail.playlist.snapshot_id.clone(),
+                tracks: detail.tracks.clone(),
+            },
+        );
+        let should_persist_library = is_followed_playlist(&guard.playlists, id);
+        if should_persist_library {
+            upsert_playlist(&mut guard.playlists, detail.playlist.clone());
+        }
+        (
+            guard.data_dir.clone(),
+            should_persist_library.then(|| PlaylistListCache {
+                version: 1,
+                fetched_at: guard.playlists_fetched_at,
+                me_id: guard.me_id.clone(),
+                playlists: guard.playlists.clone(),
+            }),
+            guard.tracks_cache.clone(),
+        )
+    };
     save_tracks_cache(&dir, &tracks_cache);
     if let Some(list_cache) = list_cache {
         save_playlist_list(&dir, &list_cache);

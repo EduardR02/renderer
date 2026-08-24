@@ -329,6 +329,7 @@ impl Engine {
             auth_state: self.state.auth_state,
             auth_url: self.state.auth_url.as_deref(),
             playing: self.state.playing,
+            preview: self.preview_mode,
             username: self.session.as_ref().map(|session| session.username()),
             position_ms,
             duration_ms,
@@ -494,6 +495,10 @@ impl Engine {
             self.resume_after_reconnect = self.state.playing;
             self.state.ready = false;
             self.state.playing = false;
+            // The active history timer is wall-clock based. Stop it at the
+            // first observed disconnect so reconnect backoff is not counted as
+            // audible listening before shutdown_playback finalizes the row.
+            self.pause_listening();
             self.state.error = Some("the Spotify connection dropped; reconnecting".to_owned());
             eprintln!("Spotify session went invalid; reconnecting");
             return true;
@@ -1098,6 +1103,7 @@ impl Engine {
                     self.state.ready = false;
                     self.state.auth_state = AuthState::Error;
                     self.state.playing = false;
+                    self.finalize_listening(false);
                     self.state.error = Some(
                         "the local audio player stopped unexpectedly; request status to retry"
                             .to_owned(),
@@ -2084,7 +2090,14 @@ impl Engine {
             } if self.is_current_event(play_request_id, &track_id) => {
                 self.loading_failed = false;
                 self.clear_unavailable_burst();
+                let was_playing = self.state.playing;
                 self.state.playing = false;
+                if was_playing {
+                    // Command-driven pause already stopped and persisted the
+                    // timer optimistically. This path is for an unsolicited
+                    // player/audio-device pause.
+                    self.pause_listening();
+                }
                 self.update_position(position_ms);
                 true
             }
@@ -2183,6 +2196,7 @@ impl Engine {
                 track_id,
             } if self.is_current_event(play_request_id, &track_id) => {
                 self.state.playing = false;
+                self.finalize_listening(false);
                 true
             }
             _ => false,
@@ -2674,6 +2688,48 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].row.track_id, "0123456789ABCDEFGHIJKL");
         assert_eq!(rows[0].row.context, "library");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unexpected_player_pause_stops_listening_history_wall_clock() {
+        let (mut engine, root) = history_playing_engine();
+        let uri = track_uri();
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: 5_000,
+        }));
+        assert!(engine.on_player_event(PlayerEvent::Paused {
+            play_request_id: 7,
+            track_id: uri,
+            position_ms: 5_000,
+        }));
+        let paused_ms = engine.history().unwrap()[0].row.ms_played;
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            engine.history().unwrap()[0].row.ms_played,
+            paused_ms,
+            "audio-device or player pauses must not accrue silent wall time"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unexpected_player_close_finalizes_the_active_history_row() {
+        let (mut engine, root) = history_playing_engine();
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: track_uri(),
+            position_ms: 5_000,
+        }));
+        assert!(engine.on_player_signal(PlayerSignal::Closed { generation: 0 }));
+
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("listening_history.json")).unwrap())
+                .unwrap();
+        assert!(stored["active"].is_null());
+        assert_eq!(stored["finalized"].as_array().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

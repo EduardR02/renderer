@@ -574,6 +574,30 @@ fn strip_playlist_markup(value: &str) -> String {
     text
 }
 
+fn contains_complete_playlist_markup(value: &str) -> bool {
+    let mut cursor = 0usize;
+    while let Some(relative_open) = value[cursor..].find('<') {
+        let open = cursor + relative_open;
+        let after_open = &value[open + 1..];
+        if after_open
+            .strip_prefix("!--")
+            .is_some_and(|comment| comment.contains("-->"))
+        {
+            return true;
+        }
+
+        let candidate = after_open.strip_prefix('/').unwrap_or(after_open);
+        let Some(first) = candidate.chars().next() else {
+            return false;
+        };
+        if first.is_ascii_alphabetic() && candidate.find('>').is_some() {
+            return true;
+        }
+        cursor = open + 1;
+    }
+    false
+}
+
 /// Removes markup from playlist descriptions before they cross the engine
 /// boundary. Spotify stores descriptions as rich text (usually a short HTML
 /// fragment); cards render them as plain text, never as `{@html}`. Keeping the
@@ -587,11 +611,12 @@ pub fn sanitize_playlist_description(value: &str) -> String {
 ///
 /// Engine payloads are canonical plain text, so decoding entities again would
 /// turn a literal `&lt;tag&gt;` into markup and can erase it on a later card
-/// render. Tauri/cache callers still need to accept older raw fragments, for
-/// which the presence of a complete tag is an unambiguous signal to run the
-/// full sanitizer. Entity-only canonical text is intentionally left alone.
+/// render. Tauri/cache callers still need to accept older raw fragments. Only
+/// a syntactically plausible complete tag or comment selects the full
+/// sanitizer: ordinary comparison text such as `under < 3 min > classics`
+/// remains canonical plain text.
 pub fn normalize_canonical_playlist_description(value: &str) -> String {
-    if value.contains('<') && value.contains('>') {
+    if contains_complete_playlist_markup(value) {
         sanitize_playlist_description(value)
     } else {
         normalize_plain_text(value)
@@ -968,6 +993,10 @@ pub struct StateEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     pub playing: bool,
+    /// Draft editor previews are live transport state but never durable queue
+    /// state. The Tauri supervisor uses this bit to keep crash/quit restore
+    /// snapshots on the last real queue.
+    pub preview: bool,
     /// Position and duration in the compiled transport timeline. Queue row
     /// durations and edit ranges remain in original-source coordinates.
     pub position_ms: u32,
@@ -1129,6 +1158,7 @@ mod tests {
             auth_url: None,
             username: Some("alice".to_owned()),
             playing: true,
+            preview: false,
             position_ms: 7_500,
             duration_ms: 123_456,
             volume: 42,
@@ -1163,6 +1193,7 @@ mod tests {
             auth_url: Some("https://accounts.spotify.com/authorize?state=abc"),
             username: None,
             playing: false,
+            preview: false,
             position_ms: 0,
             duration_ms: 0,
             volume: 50,
@@ -1479,6 +1510,18 @@ mod tests {
     }
 
     #[test]
+    fn canonical_playlist_description_preserves_literal_comparison_brackets() {
+        assert_eq!(
+            normalize_canonical_playlist_description("Songs under < 3 min > classics"),
+            "Songs under < 3 min > classics"
+        );
+        assert_eq!(
+            normalize_canonical_playlist_description("Keep <unfinished > text"),
+            "Keep text"
+        );
+    }
+
+    #[test]
     fn browse_response_serializes_the_data_envelope() {
         let playlists = vec![PlaylistRef {
             id: "0123456789ABCDEFGHIJKL".to_owned(),
@@ -1608,6 +1651,7 @@ mod tests {
             auth_url: None,
             username: Some("alice".to_owned()),
             playing: false,
+            preview: false,
             position_ms: 0,
             duration_ms: 0,
             volume: 50,
@@ -1628,6 +1672,7 @@ mod tests {
             auth_url: None,
             username: None,
             playing: false,
+            preview: false,
             position_ms: 0,
             duration_ms: 0,
             volume: 50,

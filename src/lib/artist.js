@@ -127,6 +127,10 @@ function normalizePlainText(value) {
     .trim();
 }
 
+function containsCompletePlaylistMarkup(value) {
+  return /<!--[\s\S]*?-->|<\/?[A-Za-z][^>]*>/u.test(value);
+}
+
 export function sanitizePlaylistDescription(value) {
   const raw = String(value ?? "");
   if (!raw) return "";
@@ -137,12 +141,14 @@ export function sanitizePlaylistDescription(value) {
  * Normalises a description that has already crossed the engine boundary.
  * Entity decoding is deliberately not repeated: `&amp;lt;` is canonicalised
  * once by the engine to `&lt;`, and decoding it again would turn user text into
- * markup before a later sanitizer could erase it.
+ * markup before a later sanitizer could erase it. A pair of comparison
+ * brackets is ordinary text unless the enclosed spelling can actually start
+ * an HTML tag.
  */
 export function normalizeCanonicalPlaylistDescription(value) {
   const raw = String(value ?? "");
   if (!raw) return "";
-  return raw.includes("<") && raw.includes(">")
+  return containsCompletePlaylistMarkup(raw)
     ? sanitizePlaylistDescription(raw)
     : normalizePlainText(raw);
 }

@@ -7,8 +7,10 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use spotify_playback_engine::protocol::normalize_canonical_playlist_description;
@@ -135,6 +137,12 @@ pub struct AppState {
     /// This is process-local bookkeeping and is deliberately not serialized.
     #[serde(skip)]
     playlist_refreshing: HashSet<String>,
+    /// Serializes playlist state mutation with its bounded atomic cache write.
+    /// Async fetches may finish out of order; holding this outside the
+    /// AppState lock lets disk I/O proceed without blocking state readers while
+    /// still making memory and disk observe one completion order.
+    #[serde(skip)]
+    pub(crate) playlist_persistence: Arc<Mutex<()>>,
     /// True while a background library refresh (with retries) is running.
     #[serde(skip)]
     pub library_fetching: bool,
@@ -159,6 +167,7 @@ impl AppState {
             tracks_cache: Vec::new(),
             data_dir,
             playlist_refreshing: HashSet::new(),
+            playlist_persistence: Arc::new(Mutex::new(())),
             library_fetching: false,
             library_refresh_queued: false,
             cache_stats: None,
@@ -609,21 +618,17 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Writes via a temp file + rename so a crash mid-write cannot corrupt the
-/// cache.
+/// Writes via the same platform-correct temp-file replacement as durable
+/// playback state. In particular, Windows `rename` does not replace an
+/// existing destination; using it directly made every playlist cache save
+/// after the first one a silent no-op.
 fn write_json_atomic<T: Serialize>(path: PathBuf, value: &T) {
-    let bytes = match serde_json::to_vec(value) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("SpotifyRenderer: could not serialize cache {path:?}: {error}");
-            return;
-        }
-    };
-    let temp = path.with_extension("json.tmp");
-    if std::fs::write(&temp, &bytes).is_err() {
-        return;
+    if let Err(error) = write_json_atomic_result(path.clone(), value) {
+        eprintln!(
+            "SpotifyRenderer: could not write cache {}: {error}",
+            path.display()
+        );
     }
-    let _ = std::fs::rename(&temp, &path);
 }
 
 fn write_json_atomic_result<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
@@ -1110,6 +1115,35 @@ mod tests {
         assert_eq!(cache.playlists[0].last_activity, Some(1_800));
         assert_eq!(cache.playlists[1].last_played, None);
         assert_eq!(cache.playlists[1].last_activity, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn playlist_cache_save_replaces_an_existing_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotify-renderer-cache-replace-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["first", "second"] {
+            save_playlist_list(
+                &dir,
+                &PlaylistListCache {
+                    version: 1,
+                    fetched_at: Some(42),
+                    me_id: "me".to_owned(),
+                    playlists: vec![Playlist {
+                        name: name.to_owned(),
+                        ..playlist("p1")
+                    }],
+                },
+            );
+        }
+        assert_eq!(
+            load_playlist_list(&dir).unwrap().playlists[0].name,
+            "second"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

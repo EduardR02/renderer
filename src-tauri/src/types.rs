@@ -849,6 +849,9 @@ pub struct PlaybackState {
     #[serde(deserialize_with = "string_or_default")]
     pub auth_url: String,
     pub playing: bool,
+    /// True only while the engine queue is an editor draft preview. Preview
+    /// state is forwarded to the window but excluded from durable restore.
+    pub preview: bool,
     #[serde(deserialize_with = "string_or_default")]
     pub username: String,
     pub position_ms: u32,
@@ -873,6 +876,7 @@ impl Default for PlaybackState {
             auth_state: "needs_login".to_owned(),
             auth_url: String::new(),
             playing: false,
+            preview: false,
             username: String::new(),
             position_ms: 0,
             duration_ms: 0,
@@ -1113,6 +1117,24 @@ mod tests {
             track_count: None,
         };
         assert_eq!(Playlist::from(&reference).description, "&lt;b&gt;");
+    }
+
+    #[test]
+    fn playlist_conversion_preserves_canonical_comparison_brackets() {
+        let reference = PlaylistRef {
+            id: "p1".into(),
+            uri: "spotify:playlist:p1".into(),
+            name: "Short songs".into(),
+            description: Some("Songs under < 3 min > classics".into()),
+            owner_id: String::new(),
+            owner_name: String::new(),
+            cover_url: None,
+            track_count: None,
+        };
+        assert_eq!(
+            Playlist::from(&reference).description,
+            "Songs under < 3 min > classics"
+        );
     }
 
     #[test]
