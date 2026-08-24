@@ -15,7 +15,7 @@
   import Cover from "../components/Cover.svelte";
   import LikedMark from "../components/LikedMark.svelte";
   import Icon from "../components/Icon.svelte";
-
+  import { playlistSubtitle } from "../lib/artist.js";
   const greeting = $derived.by(() => {
     const h = new Date().getHours();
     if (h < 5) return "Good night";
@@ -177,9 +177,7 @@
     </div>
     <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
       <span class="card-name">{pl.name}</span>
-      <span class="card-sub">
-        {pl.tracks_total ? `${pl.tracks_total} songs` : "Playlist"}
-      </span>
+      <span class="card-sub">{playlistSubtitle(pl)}</span>
     </button>
   </div>
 {/snippet}

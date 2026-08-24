@@ -5,6 +5,7 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { sanitizePlaylistDescription } from "./artist.js";
 
 /* ---------------- Navigation ---------------- */
 
@@ -368,7 +369,13 @@ function anchorPlayhead(ms) {
 
 /** The playhead in ms, projected forward from the last engine sync. */
 export function positionMs() {
-  const elapsed = playback.playing ? Math.max(0, playhead.now - playhead.at) : 0;
+  // Keep the 250 ms ticker as a reactive invalidation source for ordinary
+  // progress UI, but use the monotonic clock directly for callers that sample
+  // the projection at display refresh cadence (the editor preview marker).
+  const now = Math.max(playhead.now, performance.now());
+  const speed = Number(playback.playback_speed);
+  const playbackSpeed = Number.isFinite(speed) && speed > 0 ? speed : 1;
+  const elapsed = playback.playing ? Math.max(0, now - playhead.at) * playbackSpeed : 0;
   const projected = playhead.base_ms + elapsed;
   return playback.duration_ms > 0
     ? Math.min(projected, playback.duration_ms)
@@ -1084,6 +1091,7 @@ function normalizeSearchPlaylist(value) {
     id,
     uri: ownerValue(value.uri) || `spotify:playlist:${id}`,
     name,
+    description: sanitizePlaylistDescription(value.description),
     owner,
     owner_id: ownerId,
     cover_url: coverUrl,
@@ -1111,10 +1119,13 @@ function dedupePlaylists(playlists) {
 }
 
 function mergePlaylistMetadata(primary, supplement) {
+  const primaryDescription = sanitizePlaylistDescription(primary?.description);
+  const supplementDescription = sanitizePlaylistDescription(supplement?.description);
   return {
     ...supplement,
     ...primary,
     uri: primary.uri || supplement.uri,
+    description: primaryDescription || supplementDescription,
     owner: primary.owner || supplement.owner,
     owner_id: primary.owner_id || supplement.owner_id,
     cover_url: primary.cover_url || supplement.cover_url,

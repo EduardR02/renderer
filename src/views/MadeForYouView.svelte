@@ -4,7 +4,7 @@
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
-
+  import { playlistSubtitle } from "../lib/artist.js";
   const playlists = $derived(mergePersonalizedPlaylists(library));
   const tone = $derived.by(() => {
     const playlist = playlists[0];
@@ -53,9 +53,7 @@
     </div>
     <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
       <span class="card-name">{pl.name}</span>
-      <span class="card-sub">
-        {pl.owner ? `By ${pl.owner}` : pl.tracks_total ? `${pl.tracks_total} songs` : "Playlist"}
-      </span>
+      <span class="card-sub">{playlistSubtitle(pl)}</span>
     </button>
   </div>
 {/snippet}

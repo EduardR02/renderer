@@ -12,7 +12,9 @@
     selected = $bindable(null),
     cursorMs = $bindable(0),
     previewActive = false,
+    previewPlaying = false,
     previewPositionMs = null,
+    previewPositionReader = null,
     onsave = null,
     oncommit = null,
     onundo = null,
@@ -39,6 +41,7 @@
   let drawFrame = 0;
   let pointerFrame = 0;
   let hoverFrame = 0;
+  let previewFrame = 0;
   let pendingPointer = null;
   let pendingHover = null;
   let mainSize = { width: 0, height: 0 };
@@ -116,12 +119,23 @@
     return freeGaps(type, key).find((gap) => ms >= gap.start && ms <= gap.end) ?? null;
   }
 
-  function bestGap(type, key) {
-    const center = (viewStart + viewEnd) / 2;
-    const gaps = freeGaps(type, key).filter((gap) => gap.end - gap.start >= 1);
-    return gaps.find((gap) => center >= gap.start && center <= gap.end)
-      ?? gaps.sort((a, b) => (b.end - b.start) - (a.end - a.start))[0]
-      ?? null;
+  function nearestGap(ms, type, key) {
+    let nearest = null;
+    let nearestDistance = Infinity;
+    for (const gap of freeGaps(type, key)) {
+      if (gap.end - gap.start < 1) continue;
+      const distance = ms < gap.start ? gap.start - ms : ms > gap.end ? ms - gap.end : 0;
+      if (distance < nearestDistance) {
+        nearest = gap;
+        nearestDistance = distance;
+      }
+    }
+    return nearest;
+  }
+
+  function sensibleSpan(gap) {
+    const desired = Math.min(10_000, Math.max(1_000, Math.round(duration / 10)));
+    return Math.max(1, Math.min(desired, gap.end - gap.start));
   }
 
   function emitCommit(before) {
@@ -147,19 +161,18 @@
       if (loopRange && type === "loop") selected = { type: "loop", key: loopRange._key };
       return;
     }
-    const gap = bestGap(type, null);
+    const gap = nearestGap(cursorValue, type, null);
     if (!gap) return;
     const before = copyEdit();
-    const desired = Math.min(10_000, Math.max(1_000, Math.round(duration / 10)));
-    const span = Math.max(1, Math.min(desired, gap.end - gap.start));
-    const center = clamp((viewStart + viewEnd) / 2, gap.start + span / 2, gap.end - span / 2);
+    const span = sensibleSpan(gap);
+    const anchor = clamp(cursorValue, gap.start, gap.end);
+    const start = Math.round(clamp(anchor - span / 2, gap.start, gap.end - span));
     const range = {
       _key: newKey(type),
-      start_ms: Math.round(center - span / 2),
-      end_ms: Math.round(center + span / 2),
+      start_ms: start,
+      end_ms: start + span,
       ...(type === "loop" ? { play_count: 2 } : {}),
     };
-    if (range.end_ms <= range.start_ms) range.end_ms = range.start_ms + 1;
     if (type === "loop") loopRange = range;
     else cuts = sortCuts([...cuts, range]);
     selected = { type, key: range._key };
@@ -247,10 +260,37 @@
     cursorValue = clamp(Math.round(Number(ms) || 0), 0, duration);
     updateMarker(playheadCursor, cursorValue, visible);
   }
-
   function updatePreviewDom(ms) {
-    const visible = ms !== null && ms !== undefined && Number.isFinite(Number(ms));
-    updateMarker(previewPlayhead, ms, visible);
+    const value = Number(ms);
+    const visible = ms !== null && ms !== undefined && Number.isFinite(value);
+    updateMarker(previewPlayhead, visible ? value : 0, visible);
+  }
+
+  function stopPreviewAnimation() {
+    if (!previewFrame) return;
+    cancelAnimationFrame(previewFrame);
+    previewFrame = 0;
+  }
+
+  function previewAnimationRunning() {
+    return previewActive && previewPlaying && typeof previewPositionReader === "function";
+  }
+
+  function applyPreviewFrame() {
+    previewFrame = 0;
+    if (!previewAnimationRunning() || document.hidden) return;
+    updatePreviewDom(previewPositionReader());
+    previewFrame = requestAnimationFrame(applyPreviewFrame);
+  }
+
+  function startPreviewAnimation() {
+    if (!previewAnimationRunning() || document.hidden || previewFrame) return;
+    updatePreviewDom(previewPositionReader());
+    previewFrame = requestAnimationFrame(applyPreviewFrame);
+  }
+
+  function updatePreviewFallback() {
+    if (!previewAnimationRunning()) updatePreviewDom(previewPositionMs);
   }
 
   function applyHover() {
@@ -637,9 +677,27 @@
     waveform; viewStart; viewEnd; duration;
     scheduleDraw();
     updateCursorDom(cursorMs, true);
-    updatePreviewDom(previewPositionMs);
+    updatePreviewFallback();
   });
 
+  $effect(() => {
+    const running = previewAnimationRunning();
+    const onVisibilityChange = () => {
+      if (document.hidden) stopPreviewAnimation();
+      else if (running) startPreviewAnimation();
+      else updatePreviewDom(previewPositionMs);
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    if (running && !document.hidden) startPreviewAnimation();
+    else {
+      stopPreviewAnimation();
+      updatePreviewDom(previewPositionMs);
+    }
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stopPreviewAnimation();
+    };
+  });
 
   $effect(() => {
     const main = mainCanvas;
@@ -667,15 +725,18 @@
       if (drawFrame) cancelAnimationFrame(drawFrame);
       if (pointerFrame) cancelAnimationFrame(pointerFrame);
       if (hoverFrame) cancelAnimationFrame(hoverFrame);
+      stopPreviewAnimation();
     };
   });
+
+
 </script>
 
 <div class="waveform-editor" class:dragging={!!drag}>
   <div class="wave-tools" role="toolbar" aria-label="Waveform edit tools">
     <div class="tool-group regions">
       <button class="tool-button cut-tool" disabled={disabled} onclick={() => addRegion("cut")} title="Add cut (C)">Add cut</button>
-      <button class="tool-button loop-tool" disabled={disabled} onclick={() => addRegion("loop")} title="Add or select loop (L)">{loopRange ? "Select loop" : "Add loop"}</button>
+      <button class="tool-button loop-tool" disabled={disabled} onclick={() => addRegion("loop")} title="Add loop at cursor (L)">{loopRange ? "Select loop" : "Add loop at cursor"}</button>
     </div>
     <output class="selection-readout tnum" aria-live="polite">{selectedReadout} <span>·</span> {cursorReadout}</output>
     <div class="tool-group zoom" aria-label="Zoom controls">
@@ -732,54 +793,113 @@
 
 <style>
   .waveform-editor { --wave-main: var(--foam); --wave-quiet: var(--fg-2); min-width: 0; }
-  .wave-tools { display: grid; grid-template-columns: auto minmax(160px, 1fr) auto; align-items: center; gap: var(--s3); min-height: 44px; margin-bottom: var(--s2); }
-  .tool-group { display: flex; align-items: center; gap: var(--s1); }
-  .tool-button,.fit-button,.zoom-button { height: 32px; border: 1px solid var(--line-2); color: var(--fg-1); background: color-mix(in srgb, var(--bg-2) 76%, transparent); }
-  .tool-button { padding: 0 var(--s3); border-radius: var(--r2); font-size: var(--t-12); }
-  .tool-button:hover:not(:disabled),.fit-button:hover,.zoom-button:hover { color: var(--fg); border-color: color-mix(in srgb, var(--fg) 22%, transparent); background: var(--bg-3); }
-  .cut-tool::before,.loop-tool::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 1px; background: var(--rose-ink); }
+  .wave-tools {
+    display: grid; grid-template-columns: auto minmax(180px, 1fr) auto;
+    align-items: center; gap: var(--s3); min-height: 42px; margin-bottom: 8px;
+  }
+  .tool-group { display: flex; align-items: center; gap: 6px; }
+  .tool-button, .fit-button, .zoom-button {
+    display: inline-flex; align-items: center; justify-content: center;
+    height: 34px; border: 1px solid var(--line-2); color: var(--fg-1);
+    background: color-mix(in srgb, var(--bg-2) 76%, transparent); font-family: var(--font-small);
+  }
+  .tool-button { min-width: 92px; padding: 0 var(--s3); border-radius: var(--r2); font-size: var(--t-12); }
+  .tool-button:hover:not(:disabled), .fit-button:hover, .zoom-button:hover {
+    color: var(--fg); border-color: color-mix(in srgb, var(--fg) 22%, transparent); background: var(--bg-3);
+  }
+  .cut-tool { border-color: color-mix(in srgb, var(--rose-ink) 30%, var(--line-2)); }
+  .loop-tool { border-color: color-mix(in srgb, var(--gold) 30%, var(--line-2)); }
+  .cut-tool::before, .loop-tool::before {
+    content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px;
+    border-radius: 1px; background: var(--rose-ink);
+  }
   .loop-tool::before { background: var(--gold); }
-  .selection-readout { min-width: 0; overflow: hidden; color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-12); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
-  .selection-readout span { color: var(--fg-3); }
+  .selection-readout {
+    display: inline-flex; align-items: center; justify-content: center; min-width: 0;
+    height: 30px; padding: 0 var(--s3); overflow: hidden; border: 1px solid var(--line);
+    border-radius: var(--rf); background: color-mix(in srgb, var(--bg-1) 52%, transparent);
+    color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-12);
+    text-align: center; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .selection-readout span { margin-inline: 6px; color: var(--fg-3); }
   .zoom { justify-content: flex-end; }
-  .zoom-button { width: 32px; border-radius: var(--r2); font-size: 18px; line-height: 1; }
-  .fit-button { padding: 0 10px; border-radius: var(--r2); font-size: var(--t-12); }
-  .zoom-level { width: 38px; color: var(--fg-2); font-size: var(--t-11); text-align: center; }
-  .main-stage,.overview-stage { position: relative; overflow: hidden; border: 1px solid var(--line-2); background: var(--bg-1); user-select: none; touch-action: pan-y; }
-  .main-stage { height: 230px; border-radius: var(--r2) var(--r2) 0 0; cursor: crosshair; }
-  .main-stage::after { content: ""; position: absolute; z-index: 1; top: 50%; right: 0; left: 0; height: 1px; background: var(--line); pointer-events: none; }
-  .main-stage.panning,.dragging .overview-window { cursor: grabbing; }
+  .zoom-button { width: 34px; border-radius: var(--r2); font-size: 18px; line-height: 1; }
+  .fit-button { min-width: 50px; padding: 0 10px; border-radius: var(--r2); font-size: var(--t-12); }
+  .zoom-level { width: 38px; color: var(--fg-2); font: var(--t-11) var(--font-mono); text-align: center; }
+  .main-stage, .overview-stage {
+    position: relative; overflow: hidden; border: 1px solid var(--line-2);
+    background: var(--bg-1); user-select: none; touch-action: pan-y;
+  }
+  .main-stage { height: 238px; border-radius: var(--r2) var(--r2) 0 0; cursor: crosshair; }
+  .main-stage::after {
+    content: ""; position: absolute; z-index: 1; top: 50%; right: 0; left: 0;
+    height: 1px; background: var(--line); pointer-events: none;
+  }
+  .main-stage.panning, .dragging .overview-window { cursor: grabbing; }
   canvas { display: block; width: 100%; height: 100%; }
-  .wave-status { position: absolute; z-index: 8; top: var(--s3); left: 50%; max-width: calc(100% - 32px); padding: 4px 9px; transform: translateX(-50%); border: 1px solid var(--line); border-radius: var(--rf); background: color-mix(in srgb, var(--bg-1) 88%, transparent); color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11); pointer-events: none; white-space: nowrap; }
+  .wave-status {
+    position: absolute; z-index: 8; top: var(--s3); left: 50%; max-width: calc(100% - 32px);
+    padding: 4px 9px; transform: translateX(-50%); border: 1px solid var(--line);
+    border-radius: var(--rf); background: color-mix(in srgb, var(--bg-1) 88%, transparent);
+    color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11);
+    pointer-events: none; white-space: nowrap;
+  }
   .wave-status.error { color: var(--rose); }
-  .playhead-cursor,.preview-playhead,.hover-cursor { position: absolute; top: 0; bottom: 0; width: 2px; pointer-events: none; }
+  .playhead-cursor, .preview-playhead, .hover-cursor { position: absolute; top: 0; bottom: 0; width: 2px; pointer-events: none; }
   .playhead-cursor { z-index: 5; width: 3px; background: var(--bg-0); box-shadow: 0 0 0 1px var(--accent), 0 0 9px color-mix(in srgb, var(--accent) 72%, transparent); }
-  .playhead-cursor::before { content: ""; position: absolute; top: 0; left: 50%; width: 9px; height: 9px; transform: translate(-50%, -1px) rotate(45deg); border: 2px solid var(--bg-0); border-radius: 2px; background: var(--accent); }
-  .preview-playhead { z-index: 4; width: 0; border-left: 2px dashed var(--gold); opacity: 0.95; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--bg-0) 88%, transparent)); }
-  .preview-playhead::after { content: ""; position: absolute; bottom: 0; left: 50%; width: 8px; height: 8px; transform: translate(-50%, 1px); border: 2px solid var(--gold); border-radius: 50%; background: var(--bg-1); }
+  .playhead-cursor::before {
+    content: ""; position: absolute; top: 0; left: 50%; width: 9px; height: 9px;
+    transform: translate(-50%, -1px) rotate(45deg); border: 2px solid var(--bg-0);
+    border-radius: 2px; background: var(--accent);
+  }
+  .preview-playhead {
+    z-index: 4; width: 0; border-left: 2px dashed var(--gold); opacity: .95;
+    filter: drop-shadow(0 0 3px color-mix(in srgb, var(--bg-0) 88%, transparent));
+    will-change: left;
+  }
+  .preview-playhead::after {
+    content: ""; position: absolute; bottom: 0; left: 50%; width: 8px; height: 8px;
+    transform: translate(-50%, 1px); border: 2px solid var(--gold);
+    border-radius: 50%; background: var(--bg-1);
+  }
   .hover-cursor { z-index: 6; width: 1px; background: color-mix(in srgb, var(--fg) 76%, transparent); }
-  .hover-time { position: absolute; z-index: 7; top: 8px; transform: translateX(-50%); padding: 3px 6px; border: 1px solid var(--line-2); border-radius: var(--rf); background: color-mix(in srgb, var(--bg-1) 92%, transparent); color: var(--fg); font-size: 10px; pointer-events: none; white-space: nowrap; }
+  .hover-time {
+    position: absolute; z-index: 7; top: 8px; transform: translateX(-50%); padding: 3px 6px;
+    border: 1px solid var(--line-2); border-radius: var(--rf);
+    background: color-mix(in srgb, var(--bg-1) 92%, transparent); color: var(--fg);
+    font-size: 10px; pointer-events: none; white-space: nowrap;
+  }
   .region-layer { position: absolute; z-index: 2; inset: 0; overflow: hidden; pointer-events: none; }
-  .edit-region { position: absolute; top: 0; bottom: 0; min-width: 1px; border-inline: 1px solid currentColor; color: var(--rose-ink); background: color-mix(in srgb, var(--rose-ink) 16%, transparent); pointer-events: auto; }
+  .edit-region {
+    position: absolute; top: 0; bottom: 0; min-width: 1px; border-inline: 1px solid currentColor;
+    color: var(--rose-ink); background: color-mix(in srgb, var(--rose-ink) 16%, transparent); pointer-events: auto;
+  }
   .edit-region.loop-region { color: var(--gold); background: color-mix(in srgb, var(--gold) 12%, transparent); }
   .edit-region.selected { box-shadow: inset 0 0 0 1px currentColor; }
   .region-body { position: absolute; inset: 0; width: 100%; cursor: grab; }
   .region-body:active { cursor: grabbing; }
   .region-handle { position: absolute; z-index: 3; top: 50%; width: 44px; height: 44px; transform: translateY(-50%); cursor: ew-resize; }
   .region-handle.start { left: -22px; }.region-handle.end { right: -22px; }
-  .region-handle::after { content: ""; position: absolute; top: 8px; bottom: 8px; left: 20px; width: 3px; border-radius: var(--rf); background: currentColor; box-shadow: 0 0 0 1px color-mix(in srgb, var(--bg-0) 76%, transparent); }
+  .region-handle::after {
+    content: ""; position: absolute; top: 8px; bottom: 8px; left: 20px; width: 3px;
+    border-radius: var(--rf); background: currentColor; box-shadow: 0 0 0 1px color-mix(in srgb, var(--bg-0) 76%, transparent);
+  }
   .time-mark { position: absolute; z-index: 4; bottom: 7px; color: var(--fg-2); font-family: var(--font-mono); font-size: 10px; pointer-events: none; }
   .time-mark.start { left: 9px; }.time-mark.end { right: 9px; }
-  .overview-stage { height: 46px; margin-top: 6px; border-radius: 0 0 var(--r2) var(--r2); cursor: crosshair; }
-  .overview-window { position: absolute; top: 0; bottom: 0; min-width: 4px; border: 1px solid var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bg-0) 50%, transparent); cursor: grab; }
-  .wave-hint { margin-top: 7px; color: var(--fg-3); font-family: var(--font-small); font-size: var(--t-11); text-align: right; }
+  .overview-stage { height: 46px; margin-top: 4px; border-top: 0; border-radius: 0 0 var(--r2) var(--r2); cursor: crosshair; }
+  .overview-window {
+    position: absolute; top: 0; bottom: 0; min-width: 4px; border: 1px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bg-0) 50%, transparent); cursor: grab;
+  }
+  .wave-hint { margin: 8px 2px 0; color: var(--fg-3); font-family: var(--font-small); font-size: var(--t-11); text-align: left; }
   @media (max-width: 760px) {
     .wave-tools { grid-template-columns: minmax(0, 1fr) auto; }
-    .selection-readout { grid-column: 1 / -1; grid-row: 2; text-align: left; }
-    .main-stage { height: 206px; }.wave-hint { text-align: left; }
+    .selection-readout { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; padding-inline: 0; border: 0; background: transparent; text-align: left; }
+    .main-stage { height: 212px; }.wave-hint { text-align: left; }
   }
   @media (max-width: 500px) {
     .wave-tools { grid-template-columns: 1fr; }.zoom { justify-content: flex-start; }
-    .selection-readout { grid-column: 1; grid-row: auto; }.main-stage { height: 186px; }
+    .selection-readout { grid-column: 1; grid-row: auto; }.main-stage { height: 190px; }
   }
 </style>

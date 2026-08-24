@@ -23,13 +23,92 @@ export function artistPlaylistCollections(overview) {
   };
 }
 
-export function artistPlaylistSubtitle(playlist) {
-  const description = String(playlist?.description ?? "")
-    .replace(/<[^>]*>/g, " ")
+const HTML_ENTITIES = Object.freeze({
+  amp: "&",
+  apos: "'",
+  gt: ">",
+  lt: "<",
+  nbsp: " ",
+  quot: '"',
+  copy: "©",
+  reg: "®",
+  trade: "™",
+  hellip: "…",
+  ndash: "–",
+  mdash: "—",
+  lsquo: "‘",
+  rsquo: "’",
+  ldquo: "“",
+  rdquo: "”",
+  bull: "•",
+  middot: "·",
+  laquo: "«",
+  raquo: "»",
+  cent: "¢",
+  pound: "£",
+  yen: "¥",
+  euro: "€",
+  sect: "§",
+  para: "¶",
+  plusmn: "±",
+  times: "×",
+  divide: "÷",
+  micro: "µ",
+  deg: "°",
+});
+
+function decodeHtmlEntities(value) {
+  return value.replace(
+    /&(#(?:x[0-9a-f]+|\d+)|[a-z][a-z0-9]+);/gi,
+    (match, body) => {
+      const named = HTML_ENTITIES[String(body).toLowerCase()];
+      if (named !== undefined) return named;
+      const raw = String(body);
+      const code = raw.toLowerCase().startsWith("#x")
+        ? Number.parseInt(raw.slice(2), 16)
+        : raw.startsWith("#")
+          ? Number.parseInt(raw.slice(1), 10)
+          : NaN;
+      if (
+        Number.isInteger(code) &&
+        code > 0 &&
+        code <= 0x10ffff &&
+        (code < 0xd800 || code > 0xdfff)
+      ) {
+        return String.fromCodePoint(code);
+      }
+      return match;
+    },
+  );
+}
+
+export function sanitizePlaylistDescription(value) {
+  return decodeHtmlEntities(
+    String(value ?? "").replace(/<!--[\s\S]*?-->|<[^>]*>/g, " "),
+  )
     .replace(/\s+/g, " ")
+    .replace(/\s+([,.;:!?])/g, "$1")
     .trim();
+}
+
+function meaningfulOwner(playlist) {
+  const isGeneric = (owner) =>
+    !owner ||
+    /^(?:spotify(?:\b|[_-]).*|user(?:\b|[_-]).*|unknown|owner|me|you)$/i.test(owner);
+  return [playlist?.owner, playlist?.owner_name, playlist?.owner_id]
+    .map((value) => String(value ?? "").replace(/\s+/g, " ").trim())
+    .find((owner) => !isGeneric(owner)) ?? "";
+}
+/** Shared plain-text subtitle for every playlist card surface. */
+
+export function playlistSubtitle(playlist) {
+  const description = sanitizePlaylistDescription(playlist?.description);
   if (description) return description;
-  if (playlist?.owner) return `By ${playlist.owner}`;
-  if (playlist?.tracks_total) return `${playlist.tracks_total} songs`;
+
+  const owner = meaningfulOwner(playlist);
+  if (owner) return `By ${owner}`;
+
+  const count = Number(playlist?.tracks_total ?? playlist?.track_count);
+  if (Number.isFinite(count) && count > 0) return `${Math.round(count)} songs`;
   return "Playlist";
 }

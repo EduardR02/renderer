@@ -6,7 +6,7 @@
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
-
+  import { playlistSubtitle } from "../lib/artist.js";
   /* The query field lives in the topbar; this view only renders results. */
 
   /* Five, because five is what the loaded page shows (`visibleTracks`). A
@@ -332,14 +332,7 @@
               </div>
               <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
                 <span class="card-name">{pl.name}</span>
-                <span class="card-sub"
-                  >{[
-                    pl.tracks_total ? `${pl.tracks_total} songs` : null,
-                    pl.owner ? `By ${pl.owner}` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ") || "Playlist"}</span
-                >
+                <span class="card-sub">{playlistSubtitle(pl)}</span>
               </button>
             </div>
           {/each}

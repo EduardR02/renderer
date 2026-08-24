@@ -199,66 +199,104 @@
 
 <section class="view page history-page">
   <header class="history-head">
-    <div>
+    <div class="history-head-copy">
       <span class="tag">Local</span>
       <h1 class="page-title">Listening history</h1>
       <p>Your latest plays, stored only on this computer.</p>
     </div>
-    <button class="btn-ghost danger" disabled={!loaded || loading || !history.length} onclick={() => (confirmClear = true)}>
-      Clear history
-    </button>
   </header>
 
   <div class="history-tools-sentinel" bind:this={toolsSentinel} aria-hidden="true"></div>
   <div class="history-tools" class:stuck={toolsStuck}>
-    <div class="history-filter">
-      <Icon name="search" size={13} />
-      <input
-        bind:value={query}
-        aria-label="Filter listening history"
-        placeholder="Filter by song or artist"
-        spellcheck="false"
-        disabled={!loaded || !!error}
-        onkeydown={(event) => event.key === "Escape" && (query = "")}
-      />
-      {#if query}
-        <button class="history-filter-clear" title="Clear filter" onclick={() => (query = "")}>
-          <Icon name="x" size={11} />
-        </button>
-      {/if}
+    <div class="history-summary" aria-live="polite">
+      <span class="history-summary-icon"><Icon name="clock" size={13} /></span>
+      <span class="history-summary-copy">
+        {#if loaded && !error}
+          <span class="history-summary-kicker">{filtering ? "Showing" : "Recorded"}</span>
+          <span class="history-summary-value">
+            <strong class="tnum">{countFormatter.format(filtered.length)}</strong>
+            {filtered.length === 1 ? "play" : "plays"}
+            {#if filtering}<span class="history-summary-total">of <span class="tnum">{countFormatter.format(history.length)}</span></span>{/if}
+          </span>
+        {:else if error}
+          <span class="history-summary-kicker">History</span>
+          <span class="history-summary-value">Unavailable</span>
+        {:else}
+          <span class="history-summary-kicker">History</span>
+          <span class="history-summary-value">Loading…</span>
+        {/if}
+      </span>
     </div>
-    <span class="history-count">
-      {#if loaded && !error}
-        <span class="tnum">{countFormatter.format(filtered.length)}</span>
-        {filtered.length === 1 ? "play" : "plays"}
-        {#if filtering}<span> of {countFormatter.format(history.length)}</span>{/if}
-      {/if}
-    </span>
-    <Select
-      label="Sort listening history"
-      options={SORTS}
-      value={sort}
-      disabled={!loaded || !!error}
-      onchange={(value) => (sort = value)}
-    />
+    <span class="history-tools-divider" aria-hidden="true"></span>
+    <div class="history-control history-filter-control">
+      <span class="history-control-label"><Icon name="search" size={12} />Filter</span>
+      <span class="history-filter">
+        <input
+          bind:value={query}
+          aria-label="Filter listening history"
+          placeholder="Song or artist"
+          spellcheck="false"
+          disabled={!loaded || !!error}
+          onkeydown={(event) => event.key === "Escape" && (query = "")}
+        />
+        {#if query}
+          <button class="history-filter-clear" type="button" aria-label="Clear filter" title="Clear filter" onclick={() => (query = "")}>
+            <Icon name="x" size={11} />
+          </button>
+        {/if}
+      </span>
+    </div>
+    <div class="history-control history-sort-control">
+      <span class="history-control-label"><Icon name="clock" size={12} />Sort</span>
+      <Select
+        label="Sort listening history"
+        options={SORTS}
+        value={sort}
+        disabled={!loaded || !!error}
+        onchange={(value) => (sort = value)}
+      />
+    </div>
+    <span class="history-tools-divider" aria-hidden="true"></span>
+    <button
+      class="btn-ghost history-clear"
+      type="button"
+      aria-label="Clear listening history"
+      disabled={!loaded || loading || !history.length}
+      onclick={() => (confirmClear = true)}
+    >
+      <Icon name="x" size={13} /> Clear history
+    </button>
   </div>
 
   {#if error}
-    <div class="empty failed">
+    <div class="empty history-empty failed">
       <p class="h">History unavailable</p>
       <p class="why">{error}</p>
       <div class="actions"><button class="btn-ghost" disabled={loading} onclick={loadHistory}>{loading ? "Loading…" : "Try again"}</button></div>
     </div>
   {:else if loaded && !filtered.length}
-    <div class="empty">
+    <div class="empty history-empty">
       <p class="h">{filtering ? "No plays match that" : "Nothing played yet"}</p>
       <p>
         {filtering
           ? "Try another song title or artist."
           : "Your first completed or skipped play will appear here."}
       </p>
+      {#if filtering}
+        <div class="actions">
+          <button class="btn-ghost" type="button" onclick={() => (query = "")}>
+            <Icon name="x" size={13} /> Clear filter
+          </button>
+        </div>
+      {/if}
     </div>
   {:else}
+    <div class="history-list-head" aria-hidden="true">
+      <span>Track</span>
+      <span>Source</span>
+      <span>Played</span>
+      <span>When</span>
+    </div>
     <div
       class="history-list"
       bind:this={bodyEl}
@@ -330,23 +368,29 @@
 
 
 <style>
-  .history-page { max-width: 1020px; margin: 0 auto; }
-  .history-head {
-    display: flex; align-items: flex-end; justify-content: space-between; gap: var(--s6);
-    margin-bottom: var(--s5);
+  .history-page { max-width: 1020px; margin: 0 auto; padding-top: var(--s5); }
+  .history-head { padding: var(--s2) 0 var(--s6); }
+  .history-head-copy { min-width: 0; }
+  .history-head .page-title { margin-top: var(--s2); }
+  .history-head p {
+    max-width: 520px; margin-top: var(--s2);
+    color: var(--fg-2); font-size: var(--t-13); line-height: 1.45;
   }
-  .history-head p { margin: 0; color: var(--fg-2); font-size: var(--t-13); }
-  .danger { color: var(--rose-ink); }
+  .history-clear { height: 34px; margin-left: auto; padding: 0 var(--s3); color: var(--fg-2); }
+  .history-clear:hover:not(:disabled) {
+    color: var(--love); background: var(--danger-wash);
+    border-color: color-mix(in srgb, var(--love) 45%, transparent);
+  }
 
-  /* Sticky under the topbar, and — like every other sticky bar here — type on
-     the page until rows start passing beneath it. */
+  /* The metadata and both controls are one instrument panel. When it sticks,
+     only the surface changes; sizes and alignment stay fixed. */
   .history-tools-sentinel { height: 0; pointer-events: none; }
   .history-tools {
     position: sticky; top: var(--topbar-h); z-index: 20;
-    display: flex; align-items: center; gap: var(--s3);
-    height: 46px; margin-bottom: var(--s1);
+    display: flex; align-items: center; gap: var(--s4);
+    min-height: 58px; padding: var(--s2) 0;
     background: transparent;
-    box-shadow: inset 0 -1px 0 var(--line);
+    box-shadow: inset 0 1px 0 var(--line), inset 0 -1px 0 var(--line);
     transition: background-color var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
   }
   .history-tools.stuck {
@@ -359,25 +403,68 @@
     .history-tools.stuck { background: var(--bg-1); }
   }
 
-  .history-filter {
-    display: flex; align-items: center; gap: var(--s2);
-    flex: 0 1 300px; min-width: 0; height: 30px; padding: 0 var(--s2);
-    border: 1px solid var(--line); border-radius: var(--r2);
-    color: var(--fg-3);
+  .history-summary {
+    display: flex; align-items: center; gap: var(--s3);
+    flex: 0 0 146px; min-width: 0;
   }
-  .history-filter:focus-within { border-color: color-mix(in srgb, var(--accent) 58%, transparent); }
+  .history-summary-icon {
+    display: grid; place-items: center; flex: none;
+    width: 28px; height: 28px; border-radius: var(--rf);
+    background: var(--accent-wash); color: var(--accent);
+  }
+  .history-summary-copy { display: grid; gap: 1px; min-width: 0; }
+  .history-summary-kicker, .history-control-label {
+    display: inline-flex; align-items: center; gap: 5px;
+    color: var(--fg-3); font-family: var(--font-small);
+    font-size: 9px; font-weight: var(--w-semi); letter-spacing: 0.11em; text-transform: uppercase;
+  }
+  .history-summary-value {
+    color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11);
+    white-space: nowrap;
+  }
+  .history-summary-value strong { color: var(--fg); font-weight: var(--w-semi); }
+  .history-summary-total { color: var(--fg-3); }
+  .history-tools-divider { align-self: stretch; width: 1px; margin: var(--s1) 0; background: var(--line); }
+
+  .history-control { display: grid; align-content: center; gap: 4px; min-width: 0; }
+  .history-control-label { height: 12px; }
+  .history-filter-control { flex: 1 1 310px; max-width: 420px; }
+  .history-filter {
+    display: flex; align-items: center;
+    min-width: 0; height: 34px; padding: 0 var(--s2) 0 var(--s3);
+    border: 1px solid var(--line-2); border-radius: var(--r2);
+    background: var(--bg-2); color: var(--fg-3);
+    transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+  }
+  .history-filter:focus-within {
+    border-color: color-mix(in srgb, var(--accent) 58%, transparent);
+    background: var(--bg-3);
+  }
   .history-filter input {
-    flex: 1; min-width: 0; color: var(--fg); font-size: var(--t-12);
+    flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0;
+    background: transparent; color: var(--fg); font-size: var(--t-12);
   }
   .history-filter input::placeholder { color: var(--fg-3); }
+  .history-filter input:disabled { opacity: 0.45; }
   .history-filter-clear {
     flex: none; display: grid; place-items: center;
-    width: 18px; height: 18px; border-radius: 50%; color: var(--fg-3);
+    width: 20px; height: 20px; border-radius: 50%; color: var(--fg-3);
   }
   .history-filter-clear:hover { color: var(--fg); background: rgba(255, 255, 255, 0.08); }
-  .history-count {
-    margin-right: auto; color: var(--fg-2);
-    font-family: var(--font-small); font-size: var(--t-11);
+  .history-sort-control { flex: none; }
+  .history-sort-control :global(.sel-btn) { height: 34px; min-width: 146px; background: var(--bg-2); }
+
+  .history-list-head {
+    display: grid; grid-template-columns: minmax(220px, 1fr) 104px 92px 96px;
+    align-items: center; gap: var(--s4);
+    height: 30px; padding: 0 var(--s2);
+    border-bottom: 1px solid var(--line);
+    color: var(--fg-3); font-family: var(--font-small);
+    font-size: 9px; font-weight: var(--w-semi); letter-spacing: 0.11em; text-transform: uppercase;
+  }
+  .history-list-head span:last-child { text-align: right; }
+  .history-empty {
+    max-width: none; min-height: 132px; margin: 0; padding: var(--s6) var(--s2);
   }
 
   /* One template for every row, because every row is the same height — that
@@ -416,8 +503,17 @@
   .hi-when { text-align: right; }
 
   @media (max-width: 760px) {
-    .history-head { flex-direction: column; align-items: flex-start; gap: var(--s3); }
-    .hi-row { grid-template-columns: minmax(0, 1fr) 92px; }
+    .history-tools { flex-wrap: wrap; gap: var(--s3); padding: var(--s3) 0; }
+    .history-summary { flex: 1 0 calc(100% - var(--s4)); }
+    .history-tools-divider { display: none; }
+    .history-filter-control { flex: 1 1 220px; max-width: none; }
+    .history-list-head, .hi-row { grid-template-columns: minmax(0, 1fr) 92px; }
+    .history-list-head span:nth-child(2), .history-list-head span:nth-child(3),
     .hi-context, .hi-played { display: none; }
+  }
+
+  @media (max-width: 520px) {
+    .history-filter-control { flex-basis: 100%; }
+    .history-sort-control, .history-sort-control :global(.sel), .history-sort-control :global(.sel-btn) { width: 100%; }
   }
 </style>
