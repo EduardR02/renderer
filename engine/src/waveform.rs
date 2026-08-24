@@ -19,10 +19,9 @@ use tokio::sync::{Semaphore, mpsc};
 
 const SAMPLE_RATE: u64 = 44_100;
 const CHANNELS: usize = 2;
-const FRAMES_PER_BIN: u64 = 441;
-pub const INTERVAL_MS: u16 = 10;
+pub const INTERVAL_MS: u16 = 1;
 const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
-const WAVEFORM_CACHE_VERSION: u16 = 1;
+const WAVEFORM_CACHE_VERSION: u16 = 2;
 const WAVEFORM_HEADER_LEN: usize = 28;
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -377,6 +376,9 @@ struct Envelope {
     peaks: Vec<Peak>,
     target_frames: u64,
     frames: u64,
+    bin_index: usize,
+    bin_phase: u64,
+    bin_phase_step: u64,
 }
 
 impl Envelope {
@@ -385,9 +387,13 @@ impl Envelope {
         let payload_len = bin_count
             .checked_mul(4)
             .ok_or_else(|| "waveform is too large".to_owned())?;
-        if payload_len + WAVEFORM_HEADER_LEN > MAX_ARTIFACT_BYTES as usize {
+        let artifact_len = WAVEFORM_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or_else(|| "waveform artifact length overflowed".to_owned())?;
+        if u64::try_from(artifact_len).map_or(true, |length| length > MAX_ARTIFACT_BYTES) {
             return Err("waveform exceeds the 16 MiB artifact limit".to_owned());
         }
+        let bin_phase_step = u64::from(INTERVAL_MS).saturating_mul(1_000);
         Ok(Self {
             peaks: vec![
                 Peak {
@@ -399,6 +405,9 @@ impl Envelope {
             ],
             target_frames: u64::from(duration_ms).saturating_mul(SAMPLE_RATE) / 1_000,
             frames: 0,
+            bin_index: 0,
+            bin_phase: 0,
+            bin_phase_step,
         })
     }
 
@@ -410,7 +419,7 @@ impl Envelope {
             if self.is_full() {
                 break;
             }
-            let bin = (self.frames / FRAMES_PER_BIN) as usize;
+            let bin = self.bin_index.min(self.peaks.len().saturating_sub(1));
             let low = quantize(frame[0].min(frame[1]));
             let high = quantize(frame[0].max(frame[1]));
             let peak = &mut self.peaks[bin];
@@ -423,6 +432,11 @@ impl Envelope {
                 peak.occupied = true;
             }
             self.frames += 1;
+            self.bin_phase += self.bin_phase_step;
+            if self.bin_phase >= SAMPLE_RATE {
+                self.bin_phase -= SAMPLE_RATE;
+                self.bin_index = self.bin_index.saturating_add(1);
+            }
         }
         Ok(())
     }
@@ -459,6 +473,12 @@ fn quantize(sample: f64) -> i16 {
 
 fn bin_count(duration_ms: u32) -> usize {
     usize::try_from(u64::from(duration_ms).div_ceil(u64::from(INTERVAL_MS))).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+fn bin_for_frame(frame: u64) -> usize {
+    usize::try_from(frame.saturating_mul(1_000) / (SAMPLE_RATE * u64::from(INTERVAL_MS)))
+        .unwrap_or(usize::MAX)
 }
 
 fn waveform_response(
@@ -514,7 +534,9 @@ fn read_artifact(path: &Path, expected_duration_ms: u32) -> Result<Option<Vec<u8
     }
     let bytes =
         fs::read(path).map_err(|error| format!("could not read waveform cache: {error}"))?;
-    if bytes.len() < WAVEFORM_HEADER_LEN || bytes.len() > MAX_ARTIFACT_BYTES as usize {
+    if u64::try_from(bytes.len()).map_or(true, |length| length > MAX_ARTIFACT_BYTES)
+        || bytes.len() < WAVEFORM_HEADER_LEN
+    {
         return Err("waveform cache artifact changed size while being read".to_owned());
     }
     if &bytes[0..4] != b"WFM1" {
@@ -528,15 +550,21 @@ fn read_artifact(path: &Path, expected_duration_ms: u32) -> Result<Option<Vec<u8
     let duration_ms = le_u32(&bytes[8..12]);
     let interval_ms = le_u16(&bytes[12..14]);
     let reserved = le_u16(&bytes[14..16]);
-    let stored_bins = le_u32(&bytes[16..20]) as usize;
-    let payload_len = le_u32(&bytes[20..24]) as usize;
+    let stored_bins = usize::try_from(le_u32(&bytes[16..20]))
+        .map_err(|_| "waveform cache bin count is too large".to_owned())?;
+    let payload_len = usize::try_from(le_u32(&bytes[20..24]))
+        .map_err(|_| "waveform cache payload length is too large".to_owned())?;
     let checksum = le_u32(&bytes[24..28]);
     if duration_ms != expected_duration_ms || interval_ms != INTERVAL_MS || reserved != 0 {
         return Err("waveform cache metadata does not match the track".to_owned());
     }
-    if payload_len != stored_bins.saturating_mul(4)
-        || WAVEFORM_HEADER_LEN.saturating_add(payload_len) != bytes.len()
-    {
+    let expected_payload_len = stored_bins
+        .checked_mul(4)
+        .ok_or_else(|| "waveform cache payload length overflowed".to_owned())?;
+    let expected_artifact_len = WAVEFORM_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or_else(|| "waveform cache artifact length overflowed".to_owned())?;
+    if payload_len != expected_payload_len || expected_artifact_len != bytes.len() {
         return Err("waveform cache length is invalid".to_owned());
     }
     let payload = bytes[WAVEFORM_HEADER_LEN..].to_vec();
@@ -552,9 +580,13 @@ fn write_artifact_atomic(path: &Path, duration_ms: u32, payload: &[u8]) -> Resul
     let total_len = WAVEFORM_HEADER_LEN
         .checked_add(payload.len())
         .ok_or_else(|| "waveform artifact length overflowed".to_owned())?;
-    if total_len > MAX_ARTIFACT_BYTES as usize {
+    if u64::try_from(total_len).map_or(true, |length| length > MAX_ARTIFACT_BYTES) {
         return Err("waveform exceeds the 16 MiB artifact limit".to_owned());
     }
+    let stored_bins = u32::try_from(payload.len() / 4)
+        .map_err(|_| "waveform contains too many bins".to_owned())?;
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| "waveform payload is too large".to_owned())?;
     let parent = path
         .parent()
         .ok_or_else(|| "waveform cache path has no parent".to_owned())?;
@@ -574,8 +606,8 @@ fn write_artifact_atomic(path: &Path, duration_ms: u32, payload: &[u8]) -> Resul
             .and_then(|_| file.write_all(&duration_ms.to_le_bytes()))
             .and_then(|_| file.write_all(&INTERVAL_MS.to_le_bytes()))
             .and_then(|_| file.write_all(&0u16.to_le_bytes()))
-            .and_then(|_| file.write_all(&(payload.len() as u32 / 4).to_le_bytes()))
-            .and_then(|_| file.write_all(&(payload.len() as u32).to_le_bytes()))
+            .and_then(|_| file.write_all(&stored_bins.to_le_bytes()))
+            .and_then(|_| file.write_all(&payload_len.to_le_bytes()))
             .and_then(|_| file.write_all(&crc32(payload).to_le_bytes()))
             .and_then(|_| file.write_all(payload))
             .and_then(|_| file.sync_all())
@@ -594,8 +626,11 @@ fn validate_payload(duration_ms: u32, payload: &[u8]) -> Result<(), String> {
     let expected = bin_count(duration_ms)
         .checked_mul(4)
         .ok_or_else(|| "waveform payload length overflowed".to_owned())?;
+    let total_len = WAVEFORM_HEADER_LEN
+        .checked_add(payload.len())
+        .ok_or_else(|| "waveform artifact length overflowed".to_owned())?;
     if payload.len() != expected
-        || payload.len() + WAVEFORM_HEADER_LEN > MAX_ARTIFACT_BYTES as usize
+        || u64::try_from(total_len).map_or(true, |length| length > MAX_ARTIFACT_BYTES)
     {
         return Err("waveform payload length does not match its duration".to_owned());
     }
@@ -770,26 +805,31 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_quantization_and_partial_bins_are_exact() {
-        let mut envelope = Envelope::new(15).unwrap();
-        let mut first = vec![0.0; FRAMES_PER_BIN as usize * 2];
+    fn aggregation_quantization_and_one_millisecond_bins_are_exact() {
+        let mut envelope = Envelope::new(3).unwrap();
+        let mut first = vec![0.0; 45 * 2];
         first[0] = -1.0;
         first[1] = 1.0;
         first[2] = -0.5;
         first[3] = 0.25;
         envelope.push_interleaved_stereo(&first).unwrap();
-        envelope.push_interleaved_stereo(&vec![0.5; 1_000]).unwrap();
+        envelope
+            .push_interleaved_stereo(&vec![0.5; 44 * 2])
+            .unwrap();
         let payload = envelope.finish();
-        assert_eq!(payload.len(), 8);
+        assert_eq!(payload.len(), 12);
         assert_eq!(peak(&payload, 0), (i16::MIN, i16::MAX));
         assert_eq!(peak(&payload, 1), (16_384, 16_384));
+        assert_eq!(peak(&payload, 2), (0, 0));
+        assert_eq!(bin_for_frame(44), 0);
+        assert_eq!(bin_for_frame(45), 1);
         assert_eq!(quantize(f64::NAN), 0);
         assert_eq!(quantize(-0.5), -16_384);
     }
 
     #[test]
     fn short_decode_is_zero_filled_without_stretching() {
-        let mut envelope = Envelope::new(25).unwrap();
+        let mut envelope = Envelope::new(3).unwrap();
         envelope.push_interleaved_stereo(&[-0.25, 0.25]).unwrap();
         let payload = envelope.finish();
         assert_eq!(payload.len(), 12);
@@ -837,6 +877,14 @@ mod tests {
         let payload = envelope.finish();
         write_artifact_atomic(&path, 20, &payload).unwrap();
         assert_eq!(read_artifact(&path, 20).unwrap().unwrap(), payload);
+        let mut coarse = fs::read(&path).unwrap();
+        coarse[4..6].copy_from_slice(&1u16.to_le_bytes());
+        coarse[12..14].copy_from_slice(&10u16.to_le_bytes());
+        fs::write(&path, coarse).unwrap();
+        assert!(read_artifact(&path, 20).is_err());
+        assert!(read_or_invalidate_artifact(&path, 20).unwrap().is_none());
+        assert!(!path.exists(), "coarse cache artifacts are invalidated");
+        write_artifact_atomic(&path, 20, &payload).unwrap();
         let mut corrupt = fs::read(&path).unwrap();
         *corrupt.last_mut().unwrap() ^= 1;
         fs::write(&path, corrupt).unwrap();
