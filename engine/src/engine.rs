@@ -93,6 +93,10 @@ pub struct Engine {
     /// The queue/playhead is installed but no librespot load exists. This is
     /// set by restore and by session teardown, and consumed by the next Play.
     current_needs_load: bool,
+    /// Whether the installed queue is a draft editor preview. Preview player
+    /// events still update transport state, but never create listening-history
+    /// rows.
+    preview_mode: bool,
     /// Playback intent captured when an authenticated session dies. A normal
     /// app startup restore never sets this; only an unexpected reconnect may
     /// resume automatically.
@@ -241,6 +245,7 @@ impl Engine {
             play_request_id: None,
             loading_failed: false,
             current_needs_load: false,
+            preview_mode: false,
             resume_after_reconnect: false,
             position_anchor: None,
             last_track_change: None,
@@ -571,6 +576,7 @@ impl Engine {
         self.state.current_index = None;
         self.state.queue.clear();
         self.current_needs_load = false;
+        self.preview_mode = false;
         self.resume_after_reconnect = false;
         self.shuffle_pool.clear();
         self.history.clear();
@@ -1242,7 +1248,33 @@ impl Engine {
     }
 
     fn finalize_listening(&mut self, completed: bool) {
+        if self.preview_mode {
+            return;
+        }
         let _ = self.listening_history.finalize(completed);
+    }
+
+    fn pause_listening(&mut self) {
+        if !self.preview_mode {
+            self.listening_history.pause();
+        }
+    }
+
+    fn start_listening(&mut self, track: &TrackRef) {
+        if !self.preview_mode {
+            self.listening_history.start_or_resume(track);
+        }
+    }
+    fn enter_preview_mode(&mut self) {
+        if !self.preview_mode {
+            self.finalize_listening(false);
+        }
+        self.preview_mode = true;
+    }
+
+    fn leave_preview_mode(&mut self) {
+        self.preview_mode = false;
+        self.finalize_listening(false);
     }
     fn validate_queue(queue: &[TrackRef], index: usize) -> Result<(), String> {
         if queue.is_empty() {
@@ -1290,7 +1322,7 @@ impl Engine {
     ) -> Result<bool, String> {
         fill_queue_context(&mut queue, &context);
         self.resolve_queue_edits(&mut queue);
-        self.play_resolved_queue(queue, index, position_ms, PositionSpace::Transport)
+        self.play_resolved_queue(queue, index, position_ms, PositionSpace::Transport, false)
     }
 
     fn preview_track_edit(
@@ -1301,7 +1333,7 @@ impl Engine {
         position_ms: u32,
     ) -> Result<bool, String> {
         let track = with_preview_edit(track, cuts, loop_range)?;
-        self.play_resolved_queue(vec![track], 0, position_ms, PositionSpace::Source)
+        self.play_resolved_queue(vec![track], 0, position_ms, PositionSpace::Source, true)
     }
 
     /// Installs queue rows whose `effective_edit` values are already final.
@@ -1313,12 +1345,27 @@ impl Engine {
         index: usize,
         position_ms: u32,
         position_space: PositionSpace,
+        preview: bool,
     ) -> Result<bool, String> {
         Self::validate_queue(&queue, index)?;
         let Some(playable_index) = first_available_from(&queue, index) else {
+            // Do not tear down an installed preview queue when a replacement
+            // cannot stop the current player.
+            if preview || self.preview_mode {
+                self.player()?;
+            }
+            if preview {
+                self.enter_preview_mode();
+            } else {
+                self.leave_preview_mode();
+            }
             return self.install_empty_or_unavailable_queue(queue);
         };
-        self.finalize_listening(false);
+        if preview {
+            self.enter_preview_mode();
+        } else {
+            self.leave_preview_mode();
+        }
 
         self.state.queue = queue;
         self.state.current_index = Some(playable_index);
@@ -1360,7 +1407,7 @@ impl Engine {
         // restart replays an edit the store no longer holds.
         self.resolve_queue_edits(&mut queue);
         Self::validate_queue(&queue, index)?;
-        self.finalize_listening(false);
+        self.leave_preview_mode();
         if let Some(player) = &self.player {
             player.stop();
         }
@@ -1412,7 +1459,7 @@ impl Engine {
         if let Some(reason) = unavailable_reason {
             return Err(reason);
         }
-        self.finalize_listening(false);
+        self.leave_preview_mode();
         if let Some(current) = self.state.current_index {
             if current != index {
                 self.history.push(current);
@@ -1472,7 +1519,7 @@ impl Engine {
         }
         self.state.playing = false;
         self.update_position(self.state.position_ms);
-        self.listening_history.pause();
+        self.pause_listening();
         self.state.error = None;
         Ok(true)
     }
@@ -1545,7 +1592,7 @@ impl Engine {
             .current_index
             .ok_or_else(|| "the queue has no current track".to_owned())?;
         if let Some(index) = self.previous_index() {
-            self.finalize_listening(false);
+            self.leave_preview_mode();
             if self.state.shuffle && !self.shuffle_pool.contains(&current) {
                 self.shuffle_pool.push(current);
             }
@@ -1607,8 +1654,11 @@ impl Engine {
             .state
             .current_index
             .ok_or_else(|| "the queue has no current track".to_owned())?;
-        self.finalize_listening(at_end);
         let next = self.take_next_index(at_end);
+        if self.preview_mode && next.is_some_and(|index| index != current) {
+            self.leave_preview_mode();
+        }
+        self.finalize_listening(at_end);
         match next {
             Some(index) => {
                 if index != current {
@@ -1739,7 +1789,7 @@ impl Engine {
         let current = self.state.current_index;
         let was_playing = self.state.playing;
         if self.state.current_index == Some(index) {
-            self.finalize_listening(false);
+            self.leave_preview_mode();
         }
         self.state.queue.remove(index);
         self.history.clear();
@@ -1982,7 +2032,7 @@ impl Engine {
                 if !suppress_playing {
                     if let Some(index) = self.state.current_index {
                         if let Some(track) = self.state.queue.get(index).cloned() {
-                            self.listening_history.start_or_resume(&track);
+                            self.start_listening(&track);
                         }
                     }
                 }
@@ -2355,6 +2405,24 @@ mod tests {
         engine.play_request_id = Some(7);
         engine
     }
+    fn preview_history_root() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "spotify-renderer-engine-preview-history-{}-{ordinal}",
+            std::process::id()
+        ))
+    }
+
+    fn history_playing_engine() -> (Engine, PathBuf) {
+        let root = preview_history_root();
+        let (mut engine, _) = test_engine_in(root.clone());
+        engine.state = playback_state(240_000);
+        engine.state.queue[0].id = "0123456789ABCDEFGHIJKL".to_owned();
+        engine.state.queue[0].duration_ms = 240_000;
+        engine.play_request_id = Some(7);
+        (engine, root)
+    }
 
     fn unavailable_track(id: &str) -> TrackRef {
         TrackRef {
@@ -2456,6 +2524,129 @@ mod tests {
             .is_err(),
             "preview must use the same sorted/non-overlapping validation as persistence"
         );
+    }
+
+    #[test]
+    fn normal_playback_is_finalized_before_preview_and_preview_events_are_ignored() {
+        let (mut engine, root) = history_playing_engine();
+        let uri = track_uri();
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: 5_000,
+        }));
+        assert_eq!(engine.history().unwrap().len(), 1);
+
+        let track = engine.state.queue[0].clone();
+        assert!(
+            engine
+                .preview_track_edit(track, vec![range(1_000, 2_000)], None, 5_000)
+                .is_err(),
+            "the capture engine has no player"
+        );
+        assert!(engine.preview_mode);
+        let rows = engine.history().unwrap();
+        assert_eq!(rows.len(), 1, "the real row is finalized, not discarded");
+        assert_eq!(rows[0].row.track_id, "0123456789ABCDEFGHIJKL");
+        assert!(!rows[0].row.completed);
+
+        engine.play_request_id = Some(8);
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 8,
+            track_id: uri,
+            position_ms: 5_000,
+        }));
+        assert_eq!(
+            engine.history().unwrap().len(),
+            1,
+            "a preview Playing event cannot append a draft row"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_preview_updates_keep_history_empty_through_pause_and_eof() {
+        let (mut engine, root) = history_playing_engine();
+        let track = engine.state.queue[0].clone();
+        assert!(
+            engine
+                .preview_track_edit(track.clone(), vec![range(1_000, 2_000)], None, 5_000)
+                .is_err()
+        );
+        assert!(engine.preview_mode);
+
+        engine.play_request_id = Some(8);
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 8,
+            track_id: track_uri(),
+            position_ms: 5_000,
+        }));
+        engine.current_needs_load = true;
+        assert_eq!(engine.pause(), Ok(true));
+        engine.play_request_id = Some(8);
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 8,
+            track_id: track_uri(),
+            position_ms: 6_000,
+        }));
+
+        assert!(
+            engine
+                .preview_track_edit(track, vec![range(3_000, 4_000)], None, 7_000)
+                .is_err()
+        );
+        assert!(engine.preview_mode);
+        engine.play_request_id = Some(9);
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 9,
+            track_id: track_uri(),
+            position_ms: 7_000,
+        }));
+        assert!(engine.on_player_event(PlayerEvent::EndOfTrack {
+            play_request_id: 9,
+            track_id: track_uri(),
+        }));
+        assert!(engine.history().unwrap().is_empty());
+        engine.shutdown();
+        assert!(engine.history().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normal_queue_replacement_leaves_preview_without_persisting_it() {
+        let (mut engine, root) = history_playing_engine();
+        let preview_track = engine.state.queue[0].clone();
+        assert!(
+            engine
+                .preview_track_edit(preview_track, vec![range(1_000, 2_000)], None, 5_000)
+                .is_err()
+        );
+        assert!(engine.preview_mode);
+
+        let normal_track = TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..TrackRef::default()
+        };
+        assert!(
+            engine
+                .play_queue(vec![normal_track], 0, 0, "library".to_owned())
+                .is_err(),
+            "the capture engine has no player"
+        );
+        assert!(!engine.preview_mode);
+        engine.play_request_id = Some(10);
+        assert!(engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 10,
+            track_id: track_uri(),
+            position_ms: 0,
+        }));
+        let rows = engine.history().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row.track_id, "0123456789ABCDEFGHIJKL");
+        assert_eq!(rows[0].row.context, "library");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
