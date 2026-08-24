@@ -85,6 +85,12 @@ const METADATA_BATCH_SIZE: usize = 40;
 /// are skipped only once the retries are exhausted.
 const METADATA_RETRY_ATTEMPTS: usize = 3;
 
+/// Upper bound on substitute payloads one browse may fetch to index the
+/// recordings librespot plays in place of region-locked tracks. A playlist
+/// that is mostly region-locked pays the cost across its first few opens
+/// instead of in one; everything indexed stays indexed for the session.
+const SUBSTITUTE_INDEX_CAP: usize = 64;
+
 /// Capped exponential backoff between batch attempts, starting at this many
 /// milliseconds and doubling up to [`METADATA_BACKOFF_MAX_MS`].
 const METADATA_BACKOFF_BASE_MS: u64 = 250;
@@ -294,11 +300,13 @@ pub fn track_ref(track: &Track) -> TrackRef {
 /// caches something, and the staleness window is exactly when someone is
 /// looking at the mark.
 ///
-/// One known gap: a region-replaced track plays from an `alternative`, whose
-/// file ids are not on the track itself, so such a track reads as uncached even
-/// when its substitute is on disk. Resolving alternatives here would mean a
-/// metadata fetch per track, which is the cost this whole approach exists to
-/// avoid.
+/// Region-locked tracks carry no files of their own: librespot plays one of
+/// their `alternatives` instead, so the audio lands on disk under the
+/// substitute's ids. [`track_is_cached`] therefore answers false for them at
+/// parse time — and [`fetch_tracks`] follows up by indexing those
+/// substitutes ([`pending_substitutes`]) and re-marking such rows through
+/// [`resolve_cached`], which chases one level of alternatives. After that
+/// pass a played region-locked track reads as cached exactly like any other.
 fn track_is_cached(track: &Track, cache: Option<&Cache>) -> bool {
     let Some(cache) = cache else {
         return false;
@@ -454,6 +462,37 @@ pub fn cached_track_ids(ids: &[String], cache: Option<&Cache>) -> Vec<String> {
         .filter(|id| resolve_cached(id, &index, cache, true) == Some(true))
         .cloned()
         .collect()
+}
+
+/// Works out what a finished track batch still needs for region-locked rows.
+///
+/// A row parsed with no files of its own but with alternatives is the shape
+/// librespot substitutes at play time: the audio will land on disk under one
+/// of those substitute ids, so they are the only way to answer "is this
+/// cached" honestly. Returns the substitute ids worth fetching (not indexed
+/// yet, first-appearance order) and the row ids whose cached mark should be
+/// recomputed once that fetch lands. Pure so the selection is unit-testable.
+fn pending_substitutes(
+    track_ids: &[String],
+    index: &HashMap<String, TrackFiles>,
+) -> (Vec<String>, Vec<String>) {
+    let mut fetch: Vec<String> = Vec::new();
+    let mut remark: Vec<String> = Vec::new();
+    for id in track_ids {
+        let Some(entry) = index.get(id) else {
+            continue;
+        };
+        if !entry.files.is_empty() || entry.alternatives.is_empty() {
+            continue;
+        }
+        remark.push(id.clone());
+        for alternative in &entry.alternatives {
+            if !index.contains_key(alternative) && !fetch.contains(alternative) {
+                fetch.push(alternative.clone());
+            }
+        }
+    }
+    (fetch, remark)
 }
 
 /// Release year of an album, or `None` when the metadata carries no date.
@@ -736,16 +775,79 @@ fn parse_album_payload(entity_uri: &str, payload: &[u8]) -> Option<AlbumRef> {
 /// in ~40-URI batches in first-appearance order, and items that fail to
 /// resolve (episodes, local files, removed tracks) are skipped. No per-item
 /// network calls: one POST per batch.
+///
+/// Region-locked tracks get one follow-up pass: their substitutes are indexed
+/// and their download marks recomputed through the alternative chase, so a
+/// played region-locked row reads as cached like any other. See
+/// [`index_region_substitutes`].
 pub async fn fetch_tracks<'a>(
     session: &Session,
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
 ) -> Result<Vec<TrackRef>, String> {
     let policy = AvailabilityPolicy::for_session(session);
     let cache = session.cache().cloned();
-    fetch_extended(session, uris, ExtensionKind::TRACK_V4, |entity_uri, payload| {
+    let mut tracks = fetch_extended(session, uris, ExtensionKind::TRACK_V4, |entity_uri, payload| {
         parse_track_payload(entity_uri, payload, &policy, cache.as_deref())
     })
-    .await
+    .await?;
+    index_region_substitutes(session, &policy, cache.as_deref(), &mut tracks).await;
+    Ok(tracks)
+}
+
+/// Indexes the substitutes of region-locked tracks and re-marks those rows.
+///
+/// Parse time leaves such rows marked uncached: [`track_is_cached`] only sees
+/// their own (empty) file list, while the audio actually lands on disk under
+/// a substitute's ids — the recordings librespot quietly swaps in when the
+/// playlist's version has no playable files for the session's country. This
+/// pass fetches the not-yet-indexed substitutes (one batched round trip,
+/// capped), which [`remember_track_files`] indexes as a side effect, and then
+/// recomputes the affected rows' marks through [`resolve_cached`]'s one-level
+/// alternative chase. A substitute that fails to resolve is logged and skipped:
+/// the row stays uncached-marked, which is what every earlier session showed.
+async fn index_region_substitutes(
+    session: &Session,
+    policy: &AvailabilityPolicy,
+    cache: Option<&Cache>,
+    tracks: &mut [TrackRef],
+) {
+    let track_ids: Vec<String> = tracks.iter().map(|track| track.id.clone()).collect();
+    let (to_fetch, to_remark) = {
+        let Ok(index) = FILE_IDS.read() else {
+            return;
+        };
+        pending_substitutes(&track_ids, &index)
+    };
+    if !to_fetch.is_empty() {
+        let uris: Vec<SpotifyUri> = to_fetch
+            .iter()
+            .take(SUBSTITUTE_INDEX_CAP)
+            .filter_map(|id| SpotifyUri::from_uri(&format!("spotify:track:{id}")).ok())
+            .collect();
+        let result = fetch_extended(session, &uris, ExtensionKind::TRACK_V4, |entity_uri, payload| {
+            parse_track_payload(entity_uri, payload, policy, cache)
+        })
+        .await;
+        if let Err(error) = result {
+            eprintln!(
+                "substitute metadata unavailable for {} region-locked track(s): {error}",
+                to_fetch.len()
+            );
+        }
+    }
+    if to_remark.is_empty() {
+        return;
+    }
+    let now_cached: std::collections::HashSet<String> =
+        cached_track_ids(&to_remark, cache).into_iter().collect();
+    if now_cached.is_empty() {
+        return;
+    }
+    for track in tracks.iter_mut() {
+        if !track.cached && now_cached.contains(&track.id) {
+            track.cached = true;
+        }
+    }
 }
 
 /// Playlist item attributes carry the only trustworthy "added" timestamp.
@@ -6388,5 +6490,72 @@ mod file_index_tests {
     fn without_a_cache_nothing_is_reported_as_cached() {
         let ids = vec!["1indexDDDDDDDDDDDDDDDD".to_owned()];
         assert!(cached_track_ids(&ids, None).is_empty());
+    }
+
+    /// Builds an index entry directly, without going through a metadata
+    /// payload: `pending_substitutes` only reads the map's shape.
+    fn entry(files: usize, alternatives: &[&str]) -> TrackFiles {
+        TrackFiles {
+            files: (0..files).map(|_| FileId::from_raw(&[0u8; 20])).collect(),
+            alternatives: alternatives.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn substitutes_are_planned_only_for_fileless_rows_with_unindexed_alternatives() {
+        let index: HashMap<String, TrackFiles> = HashMap::from([
+            ("1subAAAAAAAAAAAAAAAA".to_owned(), entry(2, &[])),
+            (
+                "1subBBBBBBBBBBBBBBBB".to_owned(),
+                entry(0, &["1subEEEEEEEEEEEEEEEE"]),
+            ),
+            (
+                "1subCCCCCCCCCCCCCCCC".to_owned(),
+                entry(0, &["1subAAAAAAAAAAAAAAAA", "1subFFFFFFFFFFFFFFFF"]),
+            ),
+            ("1subDDDDDDDDDDDDDDDD".to_owned(), entry(0, &[])),
+        ]);
+        let track_ids: Vec<String> = vec![
+            "1subAAAAAAAAAAAAAAAA".to_owned(),
+            "1subBBBBBBBBBBBBBBBB".to_owned(),
+            "1subCCCCCCCCCCCCCCCC".to_owned(),
+            "1subDDDDDDDDDDDDDDDD".to_owned(),
+        ];
+
+        let (fetch, remark) = pending_substitutes(&track_ids, &index);
+
+        // Only the file-less rows with alternatives are in scope; a row whose
+        // substitute is already indexed needs no fetch, just a re-mark. A row
+        // with neither files nor alternatives is simply unavailable — there is
+        // nothing to chase, so its mark cannot change.
+        assert_eq!(
+            fetch,
+            vec!["1subEEEEEEEEEEEEEEEE".to_owned(), "1subFFFFFFFFFFFFFFFF".to_owned()]
+        );
+        assert_eq!(
+            remark,
+            vec![
+                "1subBBBBBBBBBBBBBBBB".to_owned(),
+                "1subCCCCCCCCCCCCCCCC".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_rows_and_duplicate_alternatives_are_handled() {
+        let mut index: HashMap<String, TrackFiles> = HashMap::new();
+        index.insert(
+            "1subGGGGGGGGGGGGGGGG".to_owned(),
+            entry(0, &["1subHHHHHHHHHHHHHHHH", "1subHHHHHHHHHHHHHHHH"]),
+        );
+
+        let track_ids = vec![
+            "1subGGGGGGGGGGGGGGGG".to_owned(),
+            "1subNeverParsed0000000".to_owned(),
+        ];
+        let (fetch, remark) = pending_substitutes(&track_ids, &index);
+
+        assert_eq!(fetch, vec!["1subHHHHHHHHHHHHHHHH".to_owned()]);
+        assert_eq!(remark, vec!["1subGGGGGGGGGGGGGGGG".to_owned()]);
     }
 }
