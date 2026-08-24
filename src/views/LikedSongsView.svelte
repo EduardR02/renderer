@@ -20,14 +20,15 @@
   let nextCursor = $state(null);
   let loading = $state(false);
   let error = $state("");
-  let requestedInitial = false;
+  let loadGeneration = 0;
 
-  async function loadPage(cursor = null) {
+  async function loadPage(cursor = null, generation = loadGeneration) {
     if (loading) return;
     loading = true;
     error = "";
     try {
       const page = await api.browseLikedSongs(cursor);
+      if (generation !== loadGeneration) return;
       const seen = new Set(tracks.map((track) => track.uri));
       const additions = [];
       for (const track of page?.tracks ?? []) {
@@ -35,23 +36,28 @@
         seen.add(track.uri);
         additions.push(track);
       }
-      // Preserve the array identity so TrackList extends its virtual window
-      // instead of treating pagination as a new collection and scrolling up.
       tracks.push(...additions);
       nextCursor = page?.next_cursor ?? null;
     } catch (reason) {
-      error = String(reason || "Could not load Liked Songs.");
+      if (generation === loadGeneration) {
+        error = String(reason || "Could not load Liked Songs.");
+      }
     } finally {
-      loading = false;
+      if (generation === loadGeneration) loading = false;
     }
   }
 
-  /* Mounting this route is the lazy boundary. No library/bootstrap path calls
-     the endpoint, and later pages require an explicit Load more action. */
+  function reloadCollection() {
+    const generation = ++loadGeneration;
+    tracks = [];
+    nextCursor = null;
+    loading = false;
+    error = "";
+    loadPage(null, generation);
+  }
+
   $effect(() => {
-    if (requestedInitial) return;
-    requestedInitial = true;
-    untrack(() => loadPage());
+    untrack(reloadCollection);
   });
 
   function playFrom(index) {
@@ -92,12 +98,11 @@
     >
       <Icon name="play" size={19} />
     </button>
-    <span>Read-only Spotify collection</span>
   </div>
 
   {#if tracks.length}
     <div class="section liked-tracks">
-      <TrackList {tracks} {playFrom} showLike={false} queueContext="liked" />
+      <TrackList {tracks} {playFrom} queueContext="liked" />
     </div>
   {:else if loading}
     <div class="tl liked-loading" style="--cols:28px 36px minmax(0,1fr) 52px" aria-hidden="true">

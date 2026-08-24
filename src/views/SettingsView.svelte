@@ -25,9 +25,15 @@
   let clearing = $state(false);
   let clearError = $state("");
   let appSettings = $state(null);
-  let settingsBusy = $state(false);
-  let settingsError = $state("");
-  let startupError = $state("");
+  let settingBusy = $state("");
+  const settingErrors = $state({
+    load: "",
+    audioCacheLimit: "",
+    normalisation: "",
+    launchAtLogin: "",
+    startMinimized: "",
+    animatedCanvas: "",
+  });
 
   const CACHE_LIMITS = [
     { value: 1024, label: "1 GiB" },
@@ -87,68 +93,58 @@
       : null,
   );
 
-  async function updateAudioCacheLimit(mb) {
-    if (!Number.isFinite(mb) || settingsBusy) return;
-    settingsBusy = true;
-    settingsError = "";
-    try {
-      appSettings = await api.setAudioCacheLimit(mb);
-    } catch (error) {
-      settingsError = String(error || "Could not save the cache limit.");
-    } finally {
-      settingsBusy = false;
-    }
-  }
-
-  async function updateStartupSetting(update, fallbackMessage) {
-    if (!appSettings || settingsBusy) return;
-    settingsBusy = true;
-    startupError = "";
+  async function updateSetting(key, update, fallbackMessage) {
+    if (!appSettings || settingBusy) return;
+    settingBusy = key;
+    settingErrors[key] = "";
     try {
       appSettings = await update();
     } catch (error) {
-      startupError = String(error || fallbackMessage);
+      settingErrors[key] = String(error || fallbackMessage);
     } finally {
-      settingsBusy = false;
+      if (settingBusy === key) settingBusy = "";
     }
   }
 
+  function updateAudioCacheLimit(mb) {
+    if (!Number.isFinite(mb)) return;
+    return updateSetting(
+      "audioCacheLimit",
+      () => api.setAudioCacheLimit(mb),
+      "Could not save the cache limit.",
+    );
+  }
+
   function updateLaunchAtLogin(enabled) {
-    return updateStartupSetting(
+    return updateSetting(
+      "launchAtLogin",
       () => api.setLaunchAtLogin(enabled),
       "Could not update launch at login.",
     );
   }
 
   function updateStartMinimized(enabled) {
-    return updateStartupSetting(
+    return updateSetting(
+      "startMinimized",
       () => api.setStartMinimized(enabled),
       "Could not update start minimized.",
     );
   }
 
   function updateAnimatedCanvas(enabled) {
-    return updateStartupSetting(
+    return updateSetting(
+      "animatedCanvas",
       () => api.setAnimatedCanvas(enabled),
       "Could not update animated Canvas.",
     );
   }
 
-  let normalisationError = $state("");
-
-  /* Not a startup setting: the engine applies it live by rebuilding its
-     player, so it gets its own error slot and handler. */
-  async function updateNormalisation(enabled) {
-    if (!appSettings || settingsBusy) return;
-    settingsBusy = true;
-    normalisationError = "";
-    try {
-      appSettings = await api.setNormalisation(enabled);
-    } catch (error) {
-      normalisationError = String(error || "Could not update volume normalization.");
-    } finally {
-      settingsBusy = false;
-    }
+  function updateNormalisation(enabled) {
+    return updateSetting(
+      "normalisation",
+      () => api.setNormalisation(enabled),
+      "Could not update volume normalization.",
+    );
   }
 
   const pingLabel = $derived(
@@ -161,14 +157,20 @@
   $effect(() => {
     refreshCacheStats().catch(() => {});
     api.getAppSettings()
-      .then((value) => (appSettings = value))
-      .catch((error) => (settingsError = String(error || "Could not load app settings.")));
+      .then((value) => {
+        appSettings = value;
+        settingErrors.load = "";
+      })
+      .catch((error) => {
+        settingErrors.load = String(error || "Could not load app settings.");
+      });
   });
 </script>
 
 <section class="view page">
   <div class="settings-intro">
     <h1 class="page-title">Settings</h1>
+    {#if settingErrors.load}<p class="inline-error" role="alert">{settingErrors.load}</p>{/if}
   </div>
 
   <!-- Hairline-separated rows rather than boxed cards: [label + helper] on the
@@ -226,7 +228,7 @@
             similar volume. Constant per-track gain only — it can turn tracks down but never
             compresses or limits dynamics. Switching briefly reconnects playback.
           </div>
-          {#if normalisationError}<div class="inline-error">{normalisationError}</div>{/if}
+          {#if settingErrors.normalisation}<div class="inline-error" role="alert">{settingErrors.normalisation}</div>{/if}
         </div>
         <div class="set-ctl">
           <input
@@ -234,7 +236,7 @@
             type="checkbox"
             aria-label="Volume normalization"
             checked={appSettings?.normalisation ?? false}
-            disabled={!appSettings || settingsBusy}
+            disabled={!appSettings || !!settingBusy}
             onchange={(event) => updateNormalisation(event.currentTarget.checked)}
           />
         </div>
@@ -243,7 +245,7 @@
         <div>
           <div class="k">Launch at login</div>
           <div class="d">Starts Spotify Renderer when you sign in to Windows.</div>
-          {#if startupError}<div class="inline-error">{startupError}</div>{/if}
+          {#if settingErrors.launchAtLogin}<div class="inline-error" role="alert">{settingErrors.launchAtLogin}</div>{/if}
         </div>
         <div class="set-ctl">
           <input
@@ -251,7 +253,7 @@
             type="checkbox"
             aria-label="Launch at login"
             checked={appSettings?.launch_at_login ?? false}
-            disabled={!appSettings || settingsBusy}
+            disabled={!appSettings || !!settingBusy}
             onchange={(event) => updateLaunchAtLogin(event.currentTarget.checked)}
           />
         </div>
@@ -260,6 +262,7 @@
         <div>
           <div class="k">Start minimized</div>
           <div class="d">Opens the normal window minimized to the taskbar; closing it still exits the app.</div>
+          {#if settingErrors.startMinimized}<div class="inline-error" role="alert">{settingErrors.startMinimized}</div>{/if}
         </div>
         <div class="set-ctl">
           <input
@@ -267,7 +270,7 @@
             type="checkbox"
             aria-label="Start minimized"
             checked={appSettings?.start_minimized ?? false}
-            disabled={!appSettings || settingsBusy}
+            disabled={!appSettings || !!settingBusy}
             onchange={(event) => updateStartMinimized(event.currentTarget.checked)}
           />
         </div>
@@ -281,6 +284,7 @@
             every client while that is off — so this switch can only turn Canvas off, never on.
             Enable video in Spotify's own settings first.
           </div>
+          {#if settingErrors.animatedCanvas}<div class="inline-error" role="alert">{settingErrors.animatedCanvas}</div>{/if}
         </div>
         <div class="set-ctl">
           <input
@@ -288,7 +292,7 @@
             type="checkbox"
             aria-label="Animated Canvas"
             checked={appSettings?.animated_canvas ?? false}
-            disabled={!appSettings || settingsBusy}
+            disabled={!appSettings || !!settingBusy}
             onchange={(event) => updateAnimatedCanvas(event.currentTarget.checked)}
           />
         </div>
@@ -331,14 +335,14 @@
         <div>
           <div class="k">Audio cache limit</div>
           <div class="d">Maximum downloaded audio kept on disk. Applies after the next restart.</div>
-          {#if settingsError}<div class="inline-error">{settingsError}</div>{/if}
+          {#if settingErrors.audioCacheLimit}<div class="inline-error" role="alert">{settingErrors.audioCacheLimit}</div>{/if}
         </div>
         <div class="set-ctl">
           <Select
             label="Audio cache limit"
             options={CACHE_LIMITS}
             value={cacheLimitMb}
-            disabled={!appSettings || settingsBusy}
+            disabled={!appSettings || !!settingBusy}
             onchange={updateAudioCacheLimit}
           />
         </div>

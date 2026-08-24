@@ -18,6 +18,24 @@ export const route = $state({ name: "library", id: null, param: null });
 const HISTORY_MAX = 50;
 const history = $state({ entries: [{ name: "library", id: null, param: null }], cursor: 0 });
 
+let navigationGuard = null;
+
+/**
+ * Installs the single synchronous route-leave guard used by transient editors.
+ * The returned cleanup only removes the guard it installed.
+ */
+export function setNavigationGuard(guard) {
+  navigationGuard = typeof guard === "function" ? guard : null;
+  const installed = navigationGuard;
+  return () => {
+    if (navigationGuard === installed) navigationGuard = null;
+  };
+}
+
+function navigationAllowed(entry, action) {
+  return !navigationGuard || navigationGuard(entry, action) !== false;
+}
+
 export function canGoBack() {
   return history.cursor > 0;
 }
@@ -74,6 +92,7 @@ function applyEntry(entry) {
 export function navigate(name, id = null, param = null) {
   const current = history.entries[history.cursor];
   if (current && current.name === name && current.id === id && current.param === param) return;
+  if (!navigationAllowed({ name, id, param }, "navigate")) return;
   // Navigating from the middle of the stack starts a new branch, so anything
   // ahead of the cursor is dropped.
   history.entries.splice(history.cursor + 1);
@@ -85,12 +104,14 @@ export function navigate(name, id = null, param = null) {
 
 export function goBack() {
   if (!canGoBack()) return;
+  if (!navigationAllowed(history.entries[history.cursor - 1], "back")) return;
   history.cursor -= 1;
   applyEntry(history.entries[history.cursor]);
 }
 
 export function goForward() {
   if (!canGoForward()) return;
+  if (!navigationAllowed(history.entries[history.cursor + 1], "forward")) return;
   history.cursor += 1;
   applyEntry(history.entries[history.cursor]);
 }
@@ -121,13 +142,30 @@ export const ui = $state({
 /** Live preference bits used by mounted surfaces without polling Settings. */
 export const appSettings = $state({ animated_canvas: false });
 
-export const trackEditor = $state({ track: null, playlistId: null });
+const trackEditor = $state({ tracks: {} });
+const trackEditorKeys = [];
+
+
+function trackEditorKey(trackId, playlistId) {
+  return JSON.stringify([String(trackId ?? ""), playlistId || null]);
+}
+
+export function getTrackEditorTrack(trackId, playlistId = null) {
+  return trackEditor.tracks[trackEditorKey(trackId, playlistId)] ?? null;
+}
 
 export function openTrackEditor(track, playlistId = null) {
   if (!track?.id) return;
-  trackEditor.track = { ...track };
-  trackEditor.playlistId = playlistId || null;
-  navigate("track-editor", track.id, playlistId || null);
+  const sourcePlaylist = playlistId || null;
+  const key = trackEditorKey(track.id, sourcePlaylist);
+  trackEditor.tracks[key] = { ...track };
+  const oldIndex = trackEditorKeys.indexOf(key);
+  if (oldIndex >= 0) trackEditorKeys.splice(oldIndex, 1);
+  trackEditorKeys.push(key);
+  while (trackEditorKeys.length > HISTORY_MAX) {
+    delete trackEditor.tracks[trackEditorKeys.shift()];
+  }
+  navigate("track-editor", track.id, sourcePlaylist);
 }
 
 function applyAppSettings(value) {
@@ -1232,19 +1270,7 @@ export function promotePlaylist(id, { played = false } = {}) {
   return true;
 }
 
-/* ---------------- Local likes (no-op backend) ---------------- */
-// Plain object: Svelte's state proxy only wraps objects/arrays (Sets are not reactive).
-export const liked = $state({});
-
-export function isTrackLiked(uri) {
-  return !!liked[uri];
-}
-
-export function toggleLiked(uri) {
-  if (liked[uri]) delete liked[uri];
-  else liked[uri] = true;
-}
-
+/* ---------------- Spotify saved tracks ---------------- */
 /* ---------------- Cover resolution ---------------- */
 
 const coverCache = new Map(); // remote url -> cover:// url
@@ -1343,6 +1369,34 @@ export async function resolveCoverUrl(url) {
 
 /* ---------------- Commands (exact contract names) ---------------- */
 
+let playbackSpeedRequestGeneration = 0;
+
+function decodeTrackWaveform(payload) {
+  if (!payload || typeof payload !== "object") throw new Error("The waveform response was empty.");
+  const binCount = Number(payload.bin_count);
+  const interval = Number(payload.interval_ms);
+  const duration = Number(payload.duration_ms);
+  if (!Number.isInteger(binCount) || binCount < 0 || interval !== 10 ||
+      !Number.isInteger(duration) || duration < 0 || typeof payload.peaks_base64 !== "string") {
+    throw new Error("The waveform response was invalid.");
+  }
+  const binary = atob(payload.peaks_base64);
+  if (binary.length !== binCount * 4) throw new Error("The waveform payload was truncated.");
+  const peaks = new Int16Array(binCount * 2);
+  for (let index = 0; index < peaks.length; index += 1) {
+    const offset = index * 2;
+    const unsigned = binary.charCodeAt(offset) | (binary.charCodeAt(offset + 1) << 8);
+    peaks[index] = unsigned & 0x8000 ? unsigned - 0x10000 : unsigned;
+  }
+  return {
+    track_id: payload.track_id,
+    duration_ms: duration,
+    interval_ms: interval,
+    bin_count: binCount,
+    peaks,
+  };
+}
+
 export const api = {
   play: () => invoke("play"),
   pause: () => invoke("pause"),
@@ -1383,14 +1437,14 @@ export const api = {
   setPlaybackSpeed: (speed) => {
     const target = Number(speed);
     const previous = playback.playback_speed;
-    // Optimistic for the same reason as `seek` and `setVolume`: the speed
-    // control drops its local draft when the command *reply* lands, but the
-    // state event carrying the new speed travels a different IPC path and can
-    // arrive later — without this, the control falls back to the old value
-    // for a few frames in between and flickers forward again.
+    const generation = ++playbackSpeedRequestGeneration;
+    // Only the newest command still represents the control's intent. An older
+    // rejection must not roll back a newer optimistic value.
     playback.playback_speed = target;
     return invoke("set_playback_speed", { speed: target }).catch((error) => {
-      playback.playback_speed = previous;
+      if (generation === playbackSpeedRequestGeneration) {
+        playback.playback_speed = previous;
+      }
       throw error;
     });
   },
@@ -1423,22 +1477,31 @@ export const api = {
     clearLazyQueue();
     return invoke("move_queue", { from, to });
   },
-  getHistory: (offset = 0, limit = 40, query = "", sort = "recent") =>
-    invoke("get_history", { offset, limit, query, sort }),
+  getHistory: () => invoke("get_history"),
   clearHistory: () => invoke("clear_history"),
   getTrackEdit: (trackId, playlistId = null) =>
     invoke("get_track_edit", { trackId, playlistId }),
+  getTrackWaveform: (trackId) =>
+    invoke("get_track_waveform", { trackId }).then(decodeTrackWaveform),
+  cancelTrackWaveform: (trackId) => invoke("cancel_track_waveform", { trackId }),
   saveTrackEdit: (trackId, durationMs, cuts, loopRange = null) =>
     invoke("save_track_edit", { trackId, durationMs, cuts, loopRange }),
   deleteTrackEdit: (trackId) => invoke("delete_track_edit", { trackId }),
+  previewTrackEdit: (track, cuts, loopRange = null, positionMs = 0) => {
+    clearLazyQueue();
+    return invoke("preview_track_edit", {
+      track,
+      cuts,
+      loopRange,
+      positionMs: Math.max(0, Math.round(Number(positionMs) || 0)),
+    });
+  },
   setPlaylistTrackEditEnabled: (playlistId, trackId, enabled) =>
     invoke("set_playlist_track_edit_enabled", {
       playlistId,
       trackId,
       enabled: !!enabled,
     }),
-  extractTrackWaveform: (trackId, points = 768) =>
-    invoke("extract_track_waveform", { trackId, points }),
   /**
    * `limit` applies to every section the server returns, not just the three we
    * parse, and it dominates search latency: measured medians are 743ms at 10

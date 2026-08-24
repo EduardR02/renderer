@@ -1,11 +1,10 @@
 <script>
+  import { untrack } from "svelte";
   import {
     api,
     navigate,
     playback,
     togglePlay,
-    toggleLiked,
-    isTrackLiked,
     library,
     promotePlaylist,
     openCredits,
@@ -33,8 +32,6 @@
     showAdded = false,
     /** Official desktop surfaces expose lifetime plays on albums/Popular. */
     showPlays = false,
-    /** Read-only collections can suppress the local-only heart affordance. */
-    showLike = true,
     /** Recommendation rows may forbid adding when the source playlist is read-only. */
     allowAddToPlaylist = true,
     /** Render every row and install no shared-pane windowing machinery. */
@@ -96,11 +93,9 @@
      column is a minmax(0, …) and every cell truncates.
      ===================================================================== */
   const COL = {
-    /* Widths, in the order the cells appear in the row. */
     idx: "28px",
     art: "36px",
     plays: "108px",
-    like: "32px",
     time: "52px",
     more: "28px",
   };
@@ -132,7 +127,7 @@
        share it can be squeezed out of. */
     if (colAdded) list.push("minmax(84px, 0.8fr)");
     if (colPlays) list.push(COL.plays);
-    list.push(COL.like, COL.time, rowActionLabel ? "56px" : COL.more);
+    list.push(COL.time, rowActionLabel ? "56px" : COL.more);
     return list.join(" ");
   });
 
@@ -191,6 +186,7 @@
   }
 
   function closeMenus() {
+    menu.generation += 1;
     menu.open = false;
     picker.open = false;
     artistPicker.open = false;
@@ -200,13 +196,24 @@
      `maxH` is part of the position, not decoration: see openRowMenu. */
   const menu = $state({
     open: false, x: 0, top: null, bottom: null, maxH: 0,
-    track: null, index: -1, copied: false,
-    editDefined: false, editEnabled: false, editLoading: false,
+    track: null, index: -1, copied: false, generation: 0,
+    editDefined: false, editEnabled: false, editLoading: false, editError: "",
   });
   const picker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, track: null });
   /* Same shape and same placement rules as the playlist picker — a second
+
      surface hanging off one row of the menu, rather than N rows inside it. */
   const artistPicker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, artists: [] });
+  let menuTracks;
+  let menuPlaylistId;
+  $effect(() => {
+    const nextTracks = tracks;
+    const nextPlaylistId = playlistId;
+    if (nextTracks === menuTracks && nextPlaylistId === menuPlaylistId) return;
+    menuTracks = nextTracks;
+    menuPlaylistId = nextPlaylistId;
+    if (menu.open || picker.open || artistPicker.open) untrack(closeMenus);
+  });
 
   /**
    * Which row is the playing one, as an index into `tracks`.
@@ -314,17 +321,25 @@
     };
   }
 
+  function menuTargetCurrent(generation, sourcePlaylist, track, index) {
+    return (
+      menu.open &&
+      menu.generation === generation &&
+      playlistId === sourcePlaylist &&
+      menu.track === track &&
+      menu.index === index &&
+      tracks[index] === track
+    );
+  }
+
   function openRowMenu(e, track, i) {
     e.stopPropagation();
-    /* The trigger is a TOGGLE. The dismiss handler below deliberately ignores
-       pointer-downs on the kebab — otherwise it would close the menu a moment
-       before this click reopened it, and the button would look dead — which
-       leaves closing on a second press to this line. Pressing a different row's
-       kebab still just moves the menu to that row. */
     if (menu.open && menu.index === i) {
       closeMenus();
       return;
     }
+    const generation = ++menu.generation;
+    const sourcePlaylist = playlistId;
     const r = e.currentTarget.getBoundingClientRect();
     const placed = placePopover(r, MENU_MAX_H);
     menu.open = true;
@@ -335,34 +350,53 @@
     menu.track = track;
     menu.index = i;
     menu.copied = false;
+    menu.editError = "";
     picker.open = false;
     artistPicker.open = false;
     menu.editDefined = false;
     menu.editEnabled = false;
-    menu.editLoading = !!playlistId;
-    if (playlistId && track?.id) {
-      api.getTrackEdit(track.id, playlistId)
+    menu.editLoading = !!sourcePlaylist;
+    if (sourcePlaylist && track?.id) {
+      api.getTrackEdit(track.id, sourcePlaylist)
         .then((status) => {
-          if (!menu.open || menu.track?.id !== track.id) return;
+          if (!menuTargetCurrent(generation, sourcePlaylist, track, i)) return;
           menu.editDefined = !!status?.definition;
           menu.editEnabled = !!status?.enabled;
         })
-        .catch(() => {})
+        .catch((reason) => {
+          if (!menuTargetCurrent(generation, sourcePlaylist, track, i)) return;
+          menu.editError = String(reason || "Could not load edit status.");
+        })
         .finally(() => {
-          if (menu.open && menu.track?.id === track.id) menu.editLoading = false;
+          if (menuTargetCurrent(generation, sourcePlaylist, track, i)) {
+            menu.editLoading = false;
+          }
         });
     }
   }
 
   async function toggleEditedVersion() {
     if (!playlistId || !menu.track?.id || !menu.editDefined || menu.editLoading) return;
+    const generation = menu.generation;
+    const sourcePlaylist = playlistId;
+    const track = menu.track;
+    const index = menu.index;
     const enabled = !menu.editEnabled;
     menu.editLoading = true;
+    menu.editError = "";
     try {
-      await api.setPlaylistTrackEditEnabled(playlistId, menu.track.id, enabled);
-      menu.editEnabled = enabled;
+      await api.setPlaylistTrackEditEnabled(sourcePlaylist, track.id, enabled);
+      if (menuTargetCurrent(generation, sourcePlaylist, track, index)) {
+        menu.editEnabled = enabled;
+      }
+    } catch (reason) {
+      if (menuTargetCurrent(generation, sourcePlaylist, track, index)) {
+        menu.editError = String(reason || "Could not update this playlist.");
+      }
     } finally {
-      menu.editLoading = false;
+      if (menuTargetCurrent(generation, sourcePlaylist, track, index)) {
+        menu.editLoading = false;
+      }
     }
   }
 
@@ -528,6 +562,7 @@
   let seenLength = -1;
 
   const visible = $derived(disableWindowing ? tracks : tracks.slice(firstRow, lastRow));
+
 
   function measure(scroller) {
     if (!bodyEl || !scroller) return;
@@ -741,19 +776,6 @@
         <span class="c-plays">{formatPlayCount(track.play_count)}</span>
       {/if}
 
-      {#if showLike}
-        <span class="c-like">
-          <button
-            class:liked={isTrackLiked(track.uri)}
-            title={isTrackLiked(track.uri) ? "Remove from Liked Songs" : "Save to Liked Songs"}
-            onclick={() => toggleLiked(track.uri)}
-          >
-            <Icon name={isTrackLiked(track.uri) ? "heart-filled" : "heart"} size={15} />
-          </button>
-        </span>
-      {:else}
-        <span aria-hidden="true"></span>
-      {/if}
 
       <span class="c-time">{formatTime(track.duration_ms)}</span>
 
@@ -836,7 +858,6 @@
         >Added {#if sortKey === "added"}<span class="tl-sort-indicator" aria-hidden="true">{sortDirection === "asc" ? "↑" : "↓"}</span>{/if}</button>
       {/if}
       {#if colPlays}<span class="tl-plays-head">Plays</span>{/if}
-      <span></span>
       <button
         class="tl-sort-btn tl-sort-duration"
         class:active={sortKey === "duration"}
@@ -919,8 +940,11 @@
         disabled={menu.editLoading}
         onclick={toggleEditedVersion}
       >
-        {menu.editEnabled ? "✓ Use edited version" : "Use edited version"}
+        <span>Use edited version</span>{#if menu.editEnabled}<span class="edit-check"><Icon name="check" size={14} /></span>{/if}
       </button>
+    {/if}
+    {#if menu.editError}
+      <p class="menu-error" role="alert">{menu.editError}</p>
     {/if}
     {#if menu.track?.id}
       <button class="menu-item" onclick={() => { menu.open = false; navigate("radio", menu.track.id); }}>
@@ -1006,6 +1030,14 @@
     margin: 0;
     overflow-y: auto;
   }
+  .menu-error {
+    max-width: 216px;
+    margin: 4px 10px 7px;
+    color: var(--rose-ink);
+    font-size: var(--t-11);
+    line-height: 1.35;
+  }
   .menu-item.done { color: var(--accent); }
   .menu-item.done :global(.icon) { color: var(--accent); }
+  .edit-check { margin-left: auto; color: var(--accent); }
 </style>

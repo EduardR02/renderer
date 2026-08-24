@@ -22,14 +22,36 @@
      `--h` here was dead — it set a variable the wash rule never read, so every
      album page washed the same default foam.) */
   const tone = $derived(coverTone(album?.cover_url ?? "", album?.id ?? ""));
+  let shuffleBusy = $state(false);
+  let actionError = $state("");
+  $effect(() => {
+    album?.id;
+    actionError = "";
+    shuffleBusy = false;
+  });
+
+
 
   function playFrom(i) {
     if (tracks.length) api.playQueue(tracks, i, `album:${album?.id ?? ""}`).catch(() => {});
   }
 
-  function shufflePlay() {
-    if (!tracks.length) return;
-    api.playQueue(tracks, 0, `album:${album?.id ?? ""}`).catch(() => {});
+  async function shufflePlay() {
+    if (!tracks.length || shuffleBusy) return;
+    const id = album?.id ?? "";
+    const queue = [...tracks];
+    shuffleBusy = true;
+    actionError = "";
+    try {
+      await api.setShuffle(true);
+      await api.playQueue(queue, 0, `album:${id}`);
+    } catch (reason) {
+      if (album?.id === id) {
+        actionError = String(reason || "Could not shuffle this album.");
+      }
+    } finally {
+      if (album?.id === id) shuffleBusy = false;
+    }
   }
 </script>
 
@@ -110,9 +132,10 @@
           <button class="play-lg" title="Play" onclick={() => playFrom(0)} disabled={!tracks.length}>
             <Icon name="play" size={19} />
           </button>
-          <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
-            <Icon name="shuffle" size={14} />Shuffle
+          <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length || shuffleBusy}>
+            <Icon name="shuffle" size={14} />{shuffleBusy ? "Starting…" : "Shuffle"}
           </button>
+          {#if actionError}<span class="inline-error" role="alert">{actionError}</span>{/if}
         </div>
       </div>
     </header>

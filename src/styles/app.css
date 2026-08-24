@@ -1362,19 +1362,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-med);
   color: var(--fg-1); text-align: right;
 }
-.c-like, .c-more { display: grid; place-items: center; }
-.c-like button, .c-more button {
+.c-more { display: grid; place-items: center; }
+.c-more button {
   display: grid; place-items: center; width: 28px; height: 28px; flex: none;
   border-radius: var(--rf); color: var(--fg-2); opacity: 0;
   transition: color var(--d1) var(--ease), opacity var(--d1) var(--ease);
 }
-.tl-row:hover .c-like button, .tl-row:hover .c-more button { opacity: 1; }
-.c-like button:focus-visible, .c-more button:focus-visible { opacity: 1; }
-/* ROSE = saved, in its ink weight — see `.btn-icon.saved`. This is the mark
-   that appears most often in the app and on the smallest surface. */
-.c-like button.liked { opacity: 1; color: var(--rose-ink); }
-.c-like button.liked:hover { color: color-mix(in srgb, var(--rose-ink) 55%, var(--fg)); }
-.c-like button:hover, .c-more button:hover { color: var(--fg); }
+.tl-row:hover .c-more button { opacity: 1; }
+.c-more button:focus-visible { opacity: 1; }
+.c-more button:hover { color: var(--fg); }
 
 /* Queue row trailing cluster — same reveal-on-hover rule as .c-more. */
 .q-actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }

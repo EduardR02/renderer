@@ -1,10 +1,9 @@
 <script>
+  import { untrack } from "svelte";
   import {
     playback,
     api,
     togglePlay,
-    toggleLiked,
-    isTrackLiked,
     navigate,
     route,
     positionMs,
@@ -18,12 +17,141 @@
 
   let dragPos = $state(null);
 
+  function numberMs(value) {
+    const ms = Number(value);
+    return Number.isFinite(ms) ? Math.max(0, ms) : 0;
+  }
+
+  /**
+   * Queue edit ranges stay in source coordinates. The player rail, however,
+   * is the engine's compiled one-pass timeline: each cut collapses to one
+   * seam and everything after it shifts left by the removed duration.
+   */
+  function makeEditTimeline(edit, originalValue, wireValue) {
+    const originalDuration = numberMs(originalValue);
+    const cuts = (edit?.cuts ?? [])
+      .map((range) => ({
+        start: Number(range?.start_ms),
+        end: Number(range?.end_ms),
+      }))
+      .filter((range) => (
+        Number.isFinite(range.start)
+        && Number.isFinite(range.end)
+        && range.start >= 0
+        && range.end > range.start
+        && range.end <= originalDuration
+      ))
+      .sort((left, right) => left.start - right.start || left.end - right.end)
+      .reduce((valid, range) => {
+        const previous = valid[valid.length - 1];
+        if (!previous || range.start >= previous.end) valid.push(range);
+        return valid;
+      }, []);
+    const removedDuration = cuts.reduce((total, cut) => total + cut.end - cut.start, 0);
+    const onePassDuration = Math.max(0, originalDuration - removedDuration);
+    const wireDuration = numberMs(wireValue);
+    const compiledDuration = edit && wireDuration > 0 ? wireDuration : onePassDuration;
+
+    const sourceToCompiled = (sourceValue) => {
+      const source = Math.min(originalDuration, Math.max(0, numberMs(sourceValue)));
+      let removedBefore = 0;
+      for (const cut of cuts) {
+        if (source <= cut.start) break;
+        if (source < cut.end) return cut.start - removedBefore;
+        removedBefore += cut.end - cut.start;
+      }
+      return source - removedBefore;
+    };
+    const percent = (value) => compiledDuration > 0
+      ? Math.min(100, Math.max(0, (value / compiledDuration) * 100))
+      : 0;
+
+    const seamByPosition = new Map();
+    for (const cut of cuts) {
+      const position = sourceToCompiled(cut.start);
+      const existing = seamByPosition.get(position);
+      const sourceText = `${formatTime(cut.start)}–${formatTime(cut.end)}`;
+      if (existing) {
+        existing.sourceText += `, ${sourceText}`;
+      } else {
+        seamByPosition.set(position, {
+          position,
+          percent: percent(position),
+          sourceText,
+        });
+      }
+    }
+    const seams = [...seamByPosition.values()].map((seam) => ({
+      ...seam,
+      title: `Cut seam at compiled ${formatTime(seam.position)}; removed source range ${seam.sourceText}.`,
+    }));
+
+    const rawLoop = edit?.loop_range;
+    const loopStart = Number(rawLoop?.start_ms);
+    const loopEnd = Number(rawLoop?.end_ms);
+    const loopValid = (
+      Number.isFinite(loopStart)
+      && Number.isFinite(loopEnd)
+      && loopStart >= 0
+      && loopEnd > loopStart
+      && loopEnd <= originalDuration
+      && cuts.every((cut) => cut.end <= loopStart || loopEnd <= cut.start)
+    );
+    const loop = loopValid ? {
+      start: sourceToCompiled(loopStart),
+      end: sourceToCompiled(loopEnd),
+      sourceStart: loopStart,
+      sourceEnd: loopEnd,
+    } : null;
+    if (loop) {
+      loop.startPercent = percent(loop.start);
+      loop.endPercent = percent(loop.end);
+      loop.widthPercent = Math.max(0, loop.endPercent - loop.startPercent);
+      loop.title = `Loop span mapped to compiled ${formatTime(loop.start)}–${formatTime(
+        loop.end,
+      )}; source ${formatTime(loop.sourceStart)}–${formatTime(loop.sourceEnd)}.`;
+    }
+
+    const durationTitle = `Edited playback · compiled one-pass duration ${formatTime(
+      compiledDuration,
+    )}; original duration ${formatTime(originalDuration)}.`;
+    const markerTitle = [
+      durationTitle,
+      seams.length
+        ? `Cut seams at compiled ${seams.map((seam) => `${formatTime(seam.position)} (source ${seam.sourceText})`).join(", ")}.`
+        : "",
+      loop?.title ?? "",
+    ].filter(Boolean).join(" ");
+
+    return {
+      originalDuration,
+      onePassDuration,
+      compiledDuration,
+      seams,
+      loop,
+      markerTitle,
+    };
+  }
+
   const current = $derived(
     playback.current_index >= 0 ? (playback.queue[playback.current_index] ?? null) : null
   );
-  const pos = $derived(dragPos !== null ? dragPos : positionMs());
-  const isLiked = $derived(current ? isTrackLiked(current.uri) : false);
 
+  const effectiveEdit = $derived(current?.effective_edit ?? null);
+  const editTimeline = $derived.by(() => makeEditTimeline(
+    effectiveEdit,
+    current?.duration_ms,
+    playback.duration_ms,
+  ));
+  const editIndicator = $derived.by(() => {
+    if (!effectiveEdit) return null;
+    return {
+      label: "Edited",
+      title: editTimeline.markerTitle,
+    };
+  });
+
+  const pos = $derived(dragPos !== null ? dragPos : positionMs());
   // `track` is the engine's name for repeat-one; anything outside
   // off/context/track is rejected outright by the Rust command layer.
   function cycleRepeat() {
@@ -58,6 +186,10 @@
   let speedMenu = $state(null);
   let speedAnchor = $state({ left: 0, bottom: 0 });
   let speedTimer = null;
+  let pendingSpeed = null;
+  let speedRequestActive = false;
+  let speedIntent = 0;
+
 
   const speedPercent = $derived(
     speedDraft ?? Math.round((playback.playback_speed || 1) * 100)
@@ -69,25 +201,42 @@
   }
 
   /**
-   * Held briefly rather than sent per notch. A wheel sweep across 1x would
-   * otherwise arm and disarm the engine's pipeline repeatedly, and each of
-   * those transitions legitimately discards the queued audio - so an
-   * un-debounced sweep would stutter the output on the way past 1x.
+   * Wheel and slider input is first collapsed into one settled intent. If a
+   * command is already in flight, only the newest settled value waits behind
+   * it; no two speed commands overlap and intermediate values are discarded.
    */
+  async function flushSpeed() {
+    if (speedRequestActive) return;
+    speedRequestActive = true;
+    while (pendingSpeed) {
+      const request = pendingSpeed;
+      pendingSpeed = null;
+      try {
+        await api.setPlaybackSpeed(request.percent / 100);
+      } catch {
+        // The API wrapper rolls back only if this is still the active command.
+      } finally {
+        if (request.intent === speedIntent && speedDraft === request.percent) {
+          speedDraft = null;
+        }
+      }
+    }
+    speedRequestActive = false;
+  }
+
   function commitSpeed(percent) {
     const snapped = Math.round(percent / SPEED_STEP) * SPEED_STEP;
     const next = Math.min(SPEED_MAX, Math.max(SPEED_MIN, snapped));
+    const intent = ++speedIntent;
     speedDraft = next;
     clearTimeout(speedTimer);
     speedTimer = setTimeout(() => {
-      api
-        .setPlaybackSpeed(next / 100)
-        .catch(() => {})
-        .finally(() => {
-          if (speedDraft === next) speedDraft = null;
-        });
+      pendingSpeed = { percent: next, intent };
+      flushSpeed();
     }, 120);
   }
+
+  $effect(() => () => clearTimeout(speedTimer));
 
   function placeSpeedMenu() {
     const rect = speedButton?.getBoundingClientRect();
@@ -153,15 +302,27 @@
         />
       </button>
       <span class="p-meta">
-        {#if current.album_id}
-          <button
-            class="p-title"
-            title="Go to album"
-            onclick={() => navigate("album", current.album_id)}
-          >{current.name}</button>
-        {:else}
-          <span class="p-title">{current.name}</span>
-        {/if}
+        <span class="p-title-line">
+          {#if current.album_id}
+            <button
+              class="p-title"
+              title="Go to album"
+              onclick={() => navigate("album", current.album_id)}
+            >{current.name}</button>
+          {:else}
+            <span class="p-title">{current.name}</span>
+          {/if}
+          {#if editIndicator}
+            <span
+              class="p-edit-indicator"
+              title={editIndicator.title}
+              aria-label={editIndicator.title}
+            >
+              <span class="p-edit-mark" aria-hidden="true"></span>
+              {editIndicator.label}
+            </span>
+          {/if}
+        </span>
         <ArtistLinks
           class="p-artists"
           names={current.artist_names}
@@ -169,14 +330,6 @@
           id={current.artist_id}
         />
       </span>
-      <button
-        class="btn-icon"
-        class:saved={isLiked}
-        title={isLiked ? "Remove from Liked Songs" : "Save to Liked Songs"}
-        onclick={() => toggleLiked(current.uri)}
-      >
-        <Icon name={isLiked ? "heart-filled" : "heart"} size={16} />
-      </button>
     {:else}
       <!-- Idle holds the same 48px slot, so the bar does not jump the moment
            the first track lands. -->
@@ -219,20 +372,44 @@
 
     <div class="p-seek">
       <span class="p-time l">{formatTime(pos)}</span>
-      <Slider
-        min={0}
-        max={playback.duration_ms || 0}
-        value={positionMs()}
-        label="Seek"
-        step={5000}
-        formatValue={formatTime}
-        onCommit={(v) => {
-          dragPos = null;
-          api.seek(v).catch(() => {});
-        }}
-        onDragStart={(v) => (dragPos = v)}
-        onDragChange={(v) => (dragPos = v)}
-      />
+      <div
+        class="p-seek-slider"
+        title={effectiveEdit ? editTimeline.markerTitle : undefined}
+      >
+        <Slider
+          min={0}
+          max={playback.duration_ms || 0}
+          value={positionMs()}
+          label="Seek"
+          step={5000}
+          formatValue={formatTime}
+          onCommit={(v) => {
+            dragPos = null;
+            api.seek(v).catch(() => {});
+          }}
+          onDragStart={(v) => (dragPos = v)}
+          onDragChange={(v) => (dragPos = v)}
+        />
+        {#if effectiveEdit}
+          <span class="p-seek-markers" aria-hidden="true">
+            {#if editTimeline.loop && editTimeline.loop.widthPercent > 0}
+              <span
+                class="p-loop-band"
+                style:left="{editTimeline.loop.startPercent}%"
+                style:width="{editTimeline.loop.widthPercent}%"
+                title={editTimeline.loop.title}
+              ></span>
+            {/if}
+            {#each editTimeline.seams as seam (seam.percent)}
+              <span
+                class="p-cut-seam"
+                style:left="{seam.percent}%"
+                title={seam.title}
+              ></span>
+            {/each}
+          </span>
+        {/if}
+      </div>
       <span class="p-time r">{formatTime(playback.duration_ms)}</span>
     </div>
   </div>
@@ -356,6 +533,72 @@
     background: var(--bg-2);
     box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85), 0 2px 6px rgba(0, 0, 0, 0.5);
     color: var(--fg-1);
+  }
+  .p-title-line {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s2);
+    min-width: 0;
+  }
+  .p-title-line .p-title {
+    min-width: 0;
+    flex: 1;
+  }
+  .p-edit-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+    padding: 2px 5px;
+    border: 1px solid color-mix(in srgb, var(--gold) 34%, transparent);
+    border-radius: var(--rf);
+    background: color-mix(in srgb, var(--gold) 7%, transparent);
+    color: color-mix(in srgb, var(--gold) 78%, var(--fg-1));
+    font-family: var(--font-small);
+    font-size: 10px;
+    font-weight: var(--w-semi);
+    letter-spacing: 0.04em;
+    line-height: 1.15;
+    white-space: nowrap;
+  }
+  .p-edit-mark {
+    width: 5px;
+    height: 5px;
+    flex: none;
+    border: 1px solid currentColor;
+    border-radius: 50%;
+  }
+  .p-seek-slider {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1;
+    min-width: 0;
+    height: 12px;
+  }
+  .p-seek-markers {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+  }
+  .p-loop-band {
+    position: absolute;
+    top: 50%;
+    height: 8px;
+    transform: translateY(-50%);
+    border: 1px solid color-mix(in srgb, var(--gold) 48%, transparent);
+    border-radius: var(--rf);
+    background: color-mix(in srgb, var(--gold) 20%, transparent);
+  }
+  .p-cut-seam {
+    position: absolute;
+    top: 50%;
+    width: 1px;
+    height: 12px;
+    transform: translate(-50%, -50%);
+    background: color-mix(in srgb, var(--gold) 82%, var(--fg));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--bg-0) 75%, transparent);
   }
   .speed-menu:not(:popover-open) {
     display: none;

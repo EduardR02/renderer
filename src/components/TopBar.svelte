@@ -14,6 +14,7 @@
     goForward,
     canGoBack,
     canGoForward,
+    getTrackEditorTrack,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
 
@@ -78,7 +79,9 @@
                   ? (detail.artist ? `${detail.artist.name} / Fans also like` : "")
                   : route.name === "appears-on"
                     ? (detail.artist ? `${detail.artist.name} / Appears On` : "")
-                    : ""
+                    : route.name === "track-editor"
+                      ? (getTrackEditorTrack(route.id, route.param)?.name ?? "Song repair")
+                      : ""
   );
 
   /**

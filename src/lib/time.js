@@ -9,6 +9,43 @@ export function formatTime(ms) {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 
+/** Exact editor time with millisecond precision. */
+export function formatExactTime(ms) {
+  const value = Math.max(0, Math.round(Number(ms) || 0));
+  const totalSeconds = Math.floor(value / 1000);
+  const milliseconds = String(value % 1000).padStart(3, "0");
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${seconds}.${milliseconds}`
+    : `${minutes}:${seconds}.${milliseconds}`;
+}
+
+/**
+ * Parses decimal seconds, m:ss.mmm, or h:mm:ss.mmm into integer milliseconds.
+ * Returns null for partial, negative, or out-of-radix values.
+ */
+export function parseExactTime(value) {
+  const source = String(value ?? "").trim();
+  if (!source) return null;
+  if (!source.includes(":")) {
+    if (!/^(?:\d+\.?\d*|\.\d+)$/.test(source)) return null;
+    const seconds = Number(source);
+    return Number.isFinite(seconds) ? Math.round(seconds * 1000) : null;
+  }
+  const parts = source.split(":");
+  if (parts.length !== 2 && parts.length !== 3) return null;
+  if (!parts.every((part) => /^\d+(?:\.\d+)?$/.test(part))) return null;
+  const seconds = Number(parts.at(-1));
+  const minutes = Number(parts.at(-2));
+  if (!Number.isFinite(seconds) || !Number.isInteger(minutes) || seconds >= 60) return null;
+  if (parts.length === 2) return Math.round((minutes * 60 + seconds) * 1000);
+  const hours = Number(parts[0]);
+  if (!Number.isInteger(hours) || minutes >= 60) return null;
+  return Math.round((hours * 3600 + minutes * 60 + seconds) * 1000);
+}
+
 /**
  * "1 hr 12 min" style duration for collection footers.
  *
