@@ -80,16 +80,16 @@
   const engaged = $derived(trackDrag.active && !!zoneEl && trackDrag.listEl === zoneEl);
 
   /**
-   * Neighbour shift for row `i`. The gap is an insertion point in ORIGINAL
-   * coordinates; rows between it and the source slide one slot toward the
-   * source, which is what makes the marked gap read as reserved space.
+   * Neighbour shift for row `i`. `slot` is the FINAL landing index: rows
+   * between the source and it slide one slot toward the source, which is
+   * what opens the visible hole the insertion bar marks.
    */
   function rowDragTransform(i) {
-    if (!engaged || !canReorder || trackDrag.gap < 0) return null;
+    if (!engaged || !canReorder || trackDrag.slot < 0) return null;
     const from = trackDrag.sourceIndex;
     if (i === from) return null;
-    if (i > from && i <= trackDrag.gap) return "translateY(calc(var(--row-h) * -1))";
-    if (i < from && i >= trackDrag.gap) return "translateY(var(--row-h))";
+    if (i > from && i <= trackDrag.slot) return "translateY(calc(var(--row-h) * -1))";
+    if (i < from && i >= trackDrag.slot) return "translateY(var(--row-h))";
     return null;
   }
 
@@ -97,13 +97,12 @@
     return engaged && canReorder && trackDrag.sourceIndex === i;
   }
 
-  /** Where the insertion bar renders inside this body, in px. */
+  /** Where the insertion bar renders inside this body, in px: the top edge
+      of the hole at the FINAL landing slot. No-op slots show nothing. */
   const insertion = $derived.by(() => {
-    if (!engaged || !canReorder || trackDrag.gap < 0) return null;
-    const from = trackDrag.sourceIndex;
-    const to = trackDrag.gap <= from ? trackDrag.gap : trackDrag.gap - 1;
-    if (to === from) return null;
-    return trackDrag.gap * ROW_H;
+    if (!engaged || !canReorder || trackDrag.slot < 0) return null;
+    if (trackDrag.slot === trackDrag.sourceIndex) return null;
+    return trackDrag.slot * ROW_H;
   });
 
   $effect(() => {

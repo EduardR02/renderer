@@ -652,16 +652,20 @@
     width: 16px;
     height: 16px;
     border-radius: var(--rf);
-    color: var(--rose-ink);
-    background: color-mix(in srgb, var(--rose-ink) 14%, transparent);
+    /* A SOLID rose disc with the mark punched out in ground, not a tinted
+       ghost of one: a 12px glyph on a 14% wash read as a smudge. Filled is
+       how the app already says "yours" at small scale (the liked heart),
+       and the dark punch-out keeps it crisp instead of muddy. */
+    color: var(--bg-0);
+    background: var(--rose-ink);
     transition:
       background var(--d1) var(--ease),
       box-shadow var(--d1) var(--ease);
   }
   .p-saved:hover .p-saved-mark,
   .p-saved:focus-visible .p-saved-mark {
-    background: color-mix(in srgb, var(--rose-ink) 24%, transparent);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--rose-ink) 12%, transparent);
+    background: color-mix(in srgb, var(--rose-ink) 82%, #ffffff);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--rose-ink) 22%, transparent);
   }
   .p-saved-panel {
     position: absolute;

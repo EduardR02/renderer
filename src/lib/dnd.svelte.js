@@ -2,20 +2,17 @@
  * Track drag-and-drop: the one gesture controller behind "grab a song and
  * move it".
  *
- * Two drops mean something:
- *   - inside an owned playlist's own table -> reorder (playlist4 MOV,
- *     Web-API insert-before semantics)
- *   - onto a sidebar playlist row          -> move there (add, then remove
- *     from the source) or, from any other list, plain add
+ *   - onto a sidebar playlist row          -> COPY there (add only; the
+ *     source keeps the track — dropping on any other list adds too)
  *
  * Everything spatial runs in ONE requestAnimationFrame loop that exists only
- * while a drag is live: hit-testing, the insertion gap, autoscroll of the two
+ * while a drag is live: hit-testing, the landing slot, autoscroll of the two
  * scrollable regions (the content pane and the library rail), and the ghost's
  * position. `pointermove` only records coordinates; it never reads layout.
  * When no drag runs, this module's steady-state cost is exactly zero.
  *
  * Reactivity contract: `trackDrag` is the reactive projection components read
- * (TrackList draws the insertion bar and parts its rows around the gap;
+ * (TrackList draws the insertion bar and parts its rows around the slot;
  * Sidebar lights up its drop targets). The DOM ghost is deliberately outside
  * Svelte — moving one transform per frame must not re-render anything.
  */
@@ -27,21 +24,23 @@ export const trackDrag = $state({
   /** The grabbed row's track object and uri. */
   track: null,
   uri: "",
-  /** Set only when the source list is an owned playlist (move semantics). */
+  /**
+   * The playlist the row was dragged FROM, when it is an owned playlist.
+   * Dropping back on it is a cancel, never a self-copy.
+   */
   sourcePlaylistId: null,
   sourceIndex: -1,
-  /**
-   * True when dropping onto another playlist should also remove the track
-   * from the source playlist. Dropping back on the source itself cancels.
-   */
-  move: false,
   /** Latest pointer position, window coordinates. */
   x: 0,
   y: 0,
   /** Wrapper element of the hovered reorder zone, or null. */
   listEl: null,
-  /** Insertion gap in ORIGINAL list coordinates (0..length); -1 when none. */
-  gap: -1,
+  /**
+   * FINAL landing index (0..length-1); -1 when no reorder target is under
+   * the pointer. The insertion bar, the parting preview and the reorder
+   * call all read this one number, so they cannot disagree.
+   */
+  slot: -1,
 });
 
 /* ------------------------------------------------------------------ */
@@ -173,9 +172,8 @@ function activate() {
   d.uri = ctx.track.uri;
   d.sourcePlaylistId = ctx.playlistId ?? null;
   d.sourceIndex = ctx.index;
-  d.move = !!ctx.playlistId;
   d.listEl = null;
-  d.gap = -1;
+  d.slot = -1;
 
   scrollers = [];
   const paneScroller = press.rowEl.closest(".scroll");
@@ -273,25 +271,41 @@ function bandPenetration(distance) {
  */
 function hitTest(x, y) {
   let zoneEl = null;
-  let gap = -1;
+  let slot = -1;
   for (const z of zones) {
     if (!z.el.isConnected) continue;
     const r = z.el.getBoundingClientRect();
     if (x < r.left || x > r.right || y < r.top || y >= r.bottom) continue;
     const meta = z.meta();
     if (meta.canReorder && meta.length > 0) {
-      gap = Math.max(0, Math.min(meta.length, Math.round((y - r.top) / ROW_H)));
+      const from = trackDrag.sourceIndex;
+      const last = meta.length - 1;
+      const raw = Math.round((y - r.top) / ROW_H);
+      if (raw <= from) {
+        /* Upward and at-origin: every original boundary is a real slot. */
+        slot = Math.max(0, Math.min(last, raw));
+      } else if (raw === from + 1) {
+        /* The WHOLE immediate next row means "land right after me". The
+           boundary between the dragged row and this one decodes to a
+           no-op, so it must never be offered — offering it is what made
+           one-slot-down drags feel impossible. */
+        slot = Math.min(last, from + 1);
+      } else {
+        /* Deeper pointers are judged by midpoint WITHOUT the dragged row
+           present — which is exactly the final landing index. */
+        slot = Math.max(0, Math.min(last, raw - 1));
+      }
       zoneEl = z.el;
     }
     break; // at most one zone contains the point; stop at the first overlap
   }
   const dropRow =
     zoneEl ? null : (document.elementFromPoint(x, y)?.closest?.(".lib-row[data-pid]") ?? null);
-  return { zoneEl, gap, dropRow };
+  return { zoneEl, slot, dropRow };
 }
 
 /**
- * One layout pass per frame while dragging: hover state, insertion gap,
+ * One layout pass per frame while dragging: hover state, landing slot,
  * autoscroll, ghost position. Every write to reactive state is guarded by an
  * equality check, so idling the pointer notifies nobody.
  */
@@ -314,10 +328,10 @@ function frame(now) {
     }
   }
 
-  const { zoneEl, gap, dropRow } = hitTest(d.x, d.y);
+  const { zoneEl, slot, dropRow } = hitTest(d.x, d.y);
 
   if (d.listEl !== zoneEl) d.listEl = zoneEl;
-  if (d.gap !== gap) d.gap = gap;
+  if (d.slot !== slot) d.slot = slot;
   press.dropRow = dropRow;
 
   positionGhost();
@@ -339,10 +353,10 @@ function endDrag(commit) {
        run — a flick-release over the rail, or a machine under load. No frame
        loop pass has resolved a target then; do it synchronously from the
        final pointer position so the drop doesn't degrade into a cancel. */
-    if (d.listEl === null && d.gap < 0 && p.dropRow === null) {
+    if (d.listEl === null && d.slot < 0 && p.dropRow === null) {
       const hit = hitTest(d.x, d.y);
       d.listEl = hit.zoneEl;
-      d.gap = hit.gap;
+      d.slot = hit.slot;
       p.dropRow = hit.dropRow;
     }
     let matched = null;
@@ -354,17 +368,17 @@ function endDrag(commit) {
     if (matched) {
       const meta = matched.meta();
       const from = d.sourceIndex;
-      /* Gap g is an insertion point in original coordinates; the final index
-         loses one when the track came from above the gap. Equal => no-op. */
-      const to = d.gap <= from ? d.gap : d.gap - 1;
-      if (to !== from) {
+      /* `slot` is already the FINAL index — bar, parting preview and this
+         call all derive from it; no coordinate conversion left. */
+      const to = d.slot;
+      if (to !== from && to >= 0) {
         meta.run(from, to);
         outcome = "reorder";
       }
     } else if (p.dropRow) {
       const pid = p.dropRow.dataset.pid;
-      if (!(d.move && pid === d.sourcePlaylistId)) {
-        commitToPlaylist(pid, d.uri, d.sourcePlaylistId, d.move);
+      if (pid !== d.sourcePlaylistId) {
+        commitToPlaylist(pid, d.uri);
         pulse(p.dropRow);
         outcome = "playlist";
       }
@@ -377,7 +391,7 @@ function endDrag(commit) {
   d.sourcePlaylistId = null;
   d.sourceIndex = -1;
   d.listEl = null;
-  d.gap = -1;
+  d.slot = -1;
 
   if (wasActive) {
     document.documentElement.classList.remove("dragging-track");
@@ -416,20 +430,17 @@ function suppressReleaseClick() {
 }
 
 /**
- * Move-or-add onto a sidebar playlist. Add first: until the remove confirms,
- * the worst case is the track living in both playlists, never in neither.
- * Failures stay silent like every other fire-and-forget playlist edit — the
- * next reconciliation paints the server's truth.
+ * Copy onto a sidebar playlist. Deliberately an ADD, never a move: dragging
+ * out of a playlist leaves the original in place. Failures stay silent like
+ * every other fire-and-forget playlist edit — the next reconciliation paints
+ * the server's truth.
  */
-function commitToPlaylist(pid, uri, sourcePid, move) {
+function commitToPlaylist(pid, uri) {
   const target = library.find((p) => p.id === pid);
   api.addPlaylistTracks(pid, [uri])
     .then(() => {
       if (target) promotePlaylist(target.id);
       api.touchPlaylistActivity(pid).catch(() => {});
-      if (move && sourcePid && sourcePid !== pid) {
-        api.removePlaylistTracks(sourcePid, [uri]).catch(() => {});
-      }
     })
     .catch(() => {});
 }

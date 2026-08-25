@@ -203,7 +203,7 @@
           class="lib-row"
           class:active={route.name === "playlist" && route.id === pl.id}
           class:playing={playingId === pl.id}
-          class:no-drop={trackDrag.active && trackDrag.move && trackDrag.sourcePlaylistId === pl.id}
+          class:no-drop={trackDrag.active && trackDrag.sourcePlaylistId === pl.id}
           data-pid={pl.id}
           onclick={() => navigate("playlist", pl.id)}
         >
