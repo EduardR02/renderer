@@ -356,34 +356,6 @@
           {:else}
             <span class="p-title">{current.name}</span>
           {/if}
-          {#if savedIn.length}
-            <span class="p-saved">
-              <span class="p-saved-mark"><Icon name="check" size={12} /></span>
-              <!-- Keyboard path: tabbing into a row button opens the panel
-                   through :focus-within, so the wrapper stays non-focusable
-                   and every interactive target remains a real button. -->
-              <span class="p-saved-panel" role="group" aria-label={savedLabel}>
-                <span class="p-saved-head">Saved in</span>
-                {#each savedIn as ref (ref.id)}
-                  <button
-                    class="p-saved-row"
-                    title="Open {ref.name}"
-                    onclick={() => openSaved(ref.id)}
-                  >{ref.name}</button>
-                {/each}
-              </span>
-            </span>
-          {/if}
-          {#if editIndicator}
-            <span
-              class="p-edit-indicator"
-              title={editIndicator.title}
-              aria-label={editIndicator.title}
-            >
-              <span class="p-edit-mark" aria-hidden="true"></span>
-              {editIndicator.label}
-            </span>
-          {/if}
         </span>
         <ArtistLinks
           class="p-artists"
@@ -392,6 +364,37 @@
           id={current.artist_id}
         />
       </span>
+      {#if savedIn.length}
+        <!-- Marks live BESIDE the two-line text block, not inside its first
+             line: .p-now centres its children, so the check faces the whole
+             title+artists stack instead of hanging off the song name. -->
+        <span class="p-saved">
+          <span class="p-saved-mark"><Icon name="check" size={12} /></span>
+          <!-- Keyboard path: tabbing into a row button opens the panel
+               through :focus-within, so the wrapper stays non-focusable
+               and every interactive target remains a real button. -->
+          <span class="p-saved-panel" role="group" aria-label={savedLabel}>
+            <span class="p-saved-head">Saved in</span>
+            {#each savedIn as ref (ref.id)}
+              <button
+                class="p-saved-row"
+                title="Open {ref.name}"
+                onclick={() => openSaved(ref.id)}
+              >{ref.name}</button>
+            {/each}
+          </span>
+        </span>
+      {/if}
+      {#if editIndicator}
+        <span
+          class="p-edit-indicator"
+          title={editIndicator.title}
+          aria-label={editIndicator.title}
+        >
+          <span class="p-edit-mark" aria-hidden="true"></span>
+          {editIndicator.label}
+        </span>
+      {/if}
     {:else}
       <!-- Idle holds the same 48px slot, so the bar does not jump the moment
            the first track lands. -->
