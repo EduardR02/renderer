@@ -21,7 +21,8 @@ use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use spotify_playback_engine::protocol::{
     AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistReleasePage, Canvas, Command,
-    LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, Response,
+    LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
+    RadioBrowse, Response,
     SearchBrowse, TrackCredits, TrackWaveform,
 };
 use tokio::sync::mpsc;
@@ -70,6 +71,10 @@ enum BrowseOutcome {
     LikedSongs {
         request_id: String,
         result: Result<LikedSongsPage, String>,
+    },
+    LikedUris {
+        request_id: String,
+        result: Result<LikedUrisPage, String>,
     },
     TrackCredits {
         request_id: String,
@@ -489,6 +494,30 @@ async fn run(
                                     }
                                 }
                             }
+                            Command::BrowseLikedUris { cursor } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::liked_song_uris_browse(
+                                                &session,
+                                                cursor.as_deref(),
+                                            )
+                                            .await;
+                                            let _ = sender.send(BrowseOutcome::LikedUris {
+                                                request_id,
+                                                result,
+                                            });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::LikedUris {
+                                            request_id,
+                                            result: Err(error),
+                                        });
+                                    }
+                                }
+                            }
                             Command::BrowseTrackCredits { id } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -696,6 +725,9 @@ async fn run(
                         }
                         BrowseOutcome::LikedSongs { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_liked_songs", &result)?;
+                        }
+                        BrowseOutcome::LikedUris { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_liked_uris", &result)?;
                         }
                         BrowseOutcome::TrackCredits { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_track_credits", &result)?;

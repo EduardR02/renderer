@@ -155,6 +155,18 @@ pub struct AppState {
     /// [`CACHE_STATS_TTL_SECS`].
     #[serde(skip)]
     pub cache_stats: Option<(i64, CacheStats)>,
+    /// Reverse lookup index answering "which of my containers hold this
+    /// track": owned playlists plus the Liked Songs collection. Backs the
+    /// player bar's saved mark without any network round trip at play time.
+    #[serde(skip)]
+    pub memberships: Vec<MembershipEntry>,
+    /// True while a background membership reconciliation chain is running.
+    #[serde(skip)]
+    pub membership_fetching: bool,
+    /// Set when a trigger arrives mid-chain, mirroring
+    /// [`library_refresh_queued`](AppState::library_refresh_queued).
+    #[serde(skip)]
+    pub membership_refresh_queued: bool,
 }
 
 impl AppState {
@@ -171,6 +183,9 @@ impl AppState {
             library_fetching: false,
             library_refresh_queued: false,
             cache_stats: None,
+            memberships: Vec::new(),
+            membership_fetching: false,
+            membership_refresh_queued: false,
         }
     }
 
@@ -372,6 +387,102 @@ pub fn upsert_tracks_cache(entries: &mut Vec<PlaylistTracksEntry>, entry: Playli
     entries.retain(|existing| existing.id != entry.id);
     entries.insert(0, entry);
     entries.truncate(TRACKS_CACHE_MAX);
+}
+
+// ---------------------------------------------------------------------------
+// playlist_membership.json
+// ---------------------------------------------------------------------------
+
+/// Membership sentinel for the user's Liked Songs collection: not a rootlist
+/// playlist, but it must light the same saved mark the playlists do.
+pub const LIKED_MEMBERSHIP_ID: &str = "liked";
+
+/// One indexed container's track URIs. Playlists also carry their Playlist4
+/// revision so reconciliation can skip an unchanged fetch; Liked Songs has no
+/// revision and permanently carries an empty one.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MembershipEntry {
+    pub id: String,
+    pub revision: String,
+    /// Track URIs (`spotify:track:<id>`), deduplicated.
+    pub uris: HashSet<String>,
+}
+
+impl MembershipEntry {
+    pub fn contains(&self, uri: &str) -> bool {
+        self.uris.contains(uri)
+    }
+
+    /// Whether a refetch is due given the container's current revision.
+    /// An empty stored revision means "never fetched" (or "has no revision",
+    /// like Liked Songs), and both cases always refetch; Liked Songs is small
+    /// enough that re-walking it on every reconciliation pass is the cheapest
+    /// honest way to see external likes and unlikes.
+    pub fn stale(&self, snapshot_id: &str) -> bool {
+        self.revision.is_empty()
+            || (!snapshot_id.is_empty() && snapshot_id != self.revision)
+    }
+}
+
+/// On-disk shape of `playlist_membership.json`. The URI sets serialize as
+/// plain arrays, so the file stays diffable and hand-editable.
+#[derive(Serialize, Deserialize)]
+struct MembershipCache {
+    version: u32,
+    saved_at: Option<i64>,
+    entries: Vec<MembershipEntry>,
+}
+
+pub fn load_membership(dir: &Path) -> Vec<MembershipEntry> {
+    let bytes = match std::fs::read(dir.join("playlist_membership.json")) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_slice::<MembershipCache>(&bytes)
+        .map(|cache| cache.entries)
+        .unwrap_or_default()
+}
+
+pub fn save_membership(dir: &Path, entries: &[MembershipEntry]) {
+    let cache = MembershipCache {
+        version: 1,
+        saved_at: Some(now_secs()),
+        entries: entries.to_vec(),
+    };
+    write_json_atomic(dir.join("playlist_membership.json"), &cache);
+}
+
+/// Inserts or replaces one container's membership. Returns whether anything
+/// changed, so callers can skip pointless persistence and UI events when a
+/// browse confirmed what the index already knew.
+pub fn upsert_membership(entries: &mut Vec<MembershipEntry>, entry: MembershipEntry) -> bool {
+    match entries.iter_mut().find(|existing| existing.id == entry.id) {
+        Some(existing) => {
+            let changed = existing.revision != entry.revision || existing.uris != entry.uris;
+            if changed {
+                *existing = entry;
+            }
+            changed
+        }
+        None => {
+            entries.push(entry);
+            true
+        }
+    }
+}
+
+pub fn remove_membership(entries: &mut Vec<MembershipEntry>, id: &str) -> bool {
+    let before = entries.len();
+    entries.retain(|existing| existing.id != id);
+    entries.len() != before
+}
+
+/// Whether a library playlist counts for the saved mark. Deliberately strict:
+/// only containers the user created themselves qualify — followed playlists
+/// are someone else's curation, and editorial (Made For You, The DJ) rows are
+/// Spotify's, so none of them belong in either the index or the hover list.
+pub fn playlist_qualifies(playlist: &Playlist, me_id: &str) -> bool {
+    !me_id.is_empty() && playlist.owner_id == me_id
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +822,84 @@ mod tests {
         assert!(round_trip.launch_at_login);
         assert!(round_trip.start_minimized);
         assert!(round_trip.normalisation);
+    }
+
+    fn membership(id: &str, revision: &str, uris: &[&str]) -> MembershipEntry {
+        MembershipEntry {
+            id: id.to_owned(),
+            revision: revision.to_owned(),
+            uris: uris.iter().map(|uri| uri.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn membership_upsert_reports_changes_and_skips_identical_writes() {
+        let mut entries = Vec::new();
+        assert!(upsert_membership(
+            &mut entries,
+            membership("p1", "rev1", &["spotify:track:a", "spotify:track:a", "spotify:track:b"]),
+        ));
+        // Same id, same content: no change to report.
+        assert!(!upsert_membership(
+            &mut entries,
+            membership("p1", "rev1", &["spotify:track:b", "spotify:track:a"]),
+        ));
+        assert!(upsert_membership(
+            &mut entries,
+            membership("p1", "rev2", &["spotify:track:b"]),
+        ));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].revision, "rev2");
+        assert!(entries[0].contains("spotify:track:b"));
+        assert!(!entries[0].contains("spotify:track:a"));
+    }
+
+    #[test]
+    fn membership_staleness_tracks_revisions_and_liked_always_refreshes() {
+        let playlist = membership("p1", "rev1", &["spotify:track:a"]);
+        assert!(!playlist.stale("rev1"), "unchanged revision must not refetch");
+        assert!(playlist.stale("rev2"), "moved revision must refetch");
+        // A rootlist row with no revision carries no signal of change; the
+        // indexed data stands until a revision shows up and differs.
+        assert!(!playlist.stale(""));
+
+        // Liked Songs permanently carries an empty revision and is re-walked
+        // every pass — that is how external likes become visible.
+        let liked = membership(LIKED_MEMBERSHIP_ID, "", &[]);
+        assert!(liked.stale(""));
+    }
+
+    #[test]
+    fn membership_round_trips_through_the_disk_format() {
+        let dir = std::env::temp_dir().join(format!("spotify-renderer-membership-{}", now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries = vec![
+            membership("p1", "rev1", &["spotify:track:a", "spotify:track:b"]),
+            membership(LIKED_MEMBERSHIP_ID, "", &["spotify:track:c"]),
+        ];
+        save_membership(&dir, &entries);
+        let loaded = load_membership(&dir);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, "p1");
+        assert_eq!(loaded[0].revision, "rev1");
+        assert_eq!(loaded[0].uris.len(), 2);
+        assert!(loaded[1].contains("spotify:track:c"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_owned_playlists_qualify_for_the_saved_mark() {
+        let mut mine = Playlist::default();
+        mine.owner_id = "user-1".into();
+        assert!(playlist_qualifies(&mine, "user-1"));
+        assert!(
+            !playlist_qualifies(&mine, ""),
+            "no identity yet means nothing qualifies"
+        );
+
+        let mut followed = Playlist::default();
+        followed.owner_id = "someone-else".into();
+        assert!(!playlist_qualifies(&followed, "user-1"));
     }
 
     fn track(id: &str) -> Track {

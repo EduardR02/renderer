@@ -1,15 +1,19 @@
 //! Tauri command layer: frontend-facing commands plus the background tasks
 //! that keep `AppState`, the disk caches, and the frontend events in sync.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+
 use crate::app::{
-    AppSettings, AppState, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH, PlaylistListCache,
-    PlaylistTracksEntry, carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir,
-    engine_state_dir, is_followed_playlist, load_app_settings, load_playlist_list, now_secs,
-    order_by_last_activity, playlist_detail_from_cache, save_app_settings, save_playlist_list,
-    save_tracks_cache, touch_playlist_activity as stamp_playlist_activity, touch_playlist_played,
+    AppSettings, AppState, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH, LIKED_MEMBERSHIP_ID,
+    MembershipEntry, PlaylistListCache, PlaylistTracksEntry, carry_local_fields,
+    clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir, is_followed_playlist,
+    load_app_settings, load_playlist_list, now_secs, order_by_last_activity,
+    playlist_detail_from_cache, playlist_qualifies, remove_membership, save_app_settings,
+    save_membership, save_playlist_list, save_tracks_cache,
+    touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, upsert_membership,
     upsert_playlist, upsert_tracks_cache,
 };
 use crate::covers;
@@ -20,7 +24,7 @@ use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
     ArtistReleasePageDetail, CacheStats, HistoryEntry, LikedSongsDetail, Playlist, PlaylistDetail,
     PlaylistRecommendationsDetail, RadioDetail, SearchResult, Track, TrackCreditsDetail,
-    TrackWaveform,
+    TrackPlaylistRef, TrackWaveform,
 };
 use parking_lot::Mutex;
 use serde_json::json;
@@ -286,7 +290,7 @@ pub async fn browse_playlist(
         spawn_refresh_playlist(app, id);
         return Ok(detail);
     }
-    fetch_playlist(&state, &client, &id).await
+    fetch_playlist(&app, &state, &client, &id).await
 }
 
 #[tauri::command]
@@ -442,10 +446,15 @@ pub async fn delete_playlist(
         let state = app.state::<Mutex<AppState>>();
         let persistence = state.lock().playlist_persistence.clone();
         let _serialize = persistence.lock();
-        let (dir, list_cache, tracks_cache) = {
+        let (dir, list_cache, tracks_cache, membership) = {
             let mut guard = state.lock();
             guard.playlists.retain(|playlist| playlist.id != id);
             guard.tracks_cache.retain(|entry| entry.id != id);
+            // The index must forget the container in the same critical
+            // section, or the next lookup could still light the mark for a
+            // playlist that no longer exists.
+            let removed = remove_membership(&mut guard.memberships, &id);
+            let membership = removed.then(|| guard.memberships.clone());
             (
                 guard.data_dir.clone(),
                 PlaylistListCache {
@@ -455,12 +464,16 @@ pub async fn delete_playlist(
                     playlists: guard.playlists.clone(),
                 },
                 guard.tracks_cache.clone(),
+                membership,
             )
         };
         // A successful unfollow must reach disk before a concurrent older
         // refresh can persist, or the removed row reappears on next startup.
         save_playlist_list(&dir, &list_cache);
         save_tracks_cache(&dir, &tracks_cache);
+        if let Some(entries) = membership {
+            save_membership(&dir, &entries);
+        }
     }
     spawn_refresh_library(app);
     Ok(())
@@ -621,6 +634,51 @@ pub async fn touch_playlist_activity(
     };
     save_playlist_list(&dir, &cache);
     Ok(())
+}
+
+/// Which of the user's own containers hold `uri` — the data behind the
+/// player bar's saved mark. Pure in-memory lookup: the index is maintained
+/// by [`fetch_playlist`] and the reconciliation chain, so a track change
+/// costs one IPC round trip and no network. Liked Songs leads the list;
+/// playlists follow in current library order with names resolved live from
+/// that library, so a rename is reflected without touching the index.
+#[tauri::command]
+pub fn get_track_playlists(
+    state: State<'_, Mutex<AppState>>,
+    uri: String,
+) -> Result<Vec<TrackPlaylistRef>, String> {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return Ok(Vec::new());
+    }
+    let guard = state.lock();
+    let mut refs = Vec::new();
+    if guard
+        .memberships
+        .iter()
+        .any(|entry| entry.id == LIKED_MEMBERSHIP_ID && entry.contains(uri))
+    {
+        refs.push(TrackPlaylistRef {
+            id: LIKED_MEMBERSHIP_ID.to_owned(),
+            name: "Liked Songs".to_owned(),
+        });
+    }
+    for playlist in &guard.playlists {
+        let Some(entry) = guard
+            .memberships
+            .iter()
+            .find(|entry| entry.id == playlist.id)
+        else {
+            continue;
+        };
+        if entry.contains(uri) {
+            refs.push(TrackPlaylistRef {
+                id: playlist.id.clone(),
+                name: playlist.name.clone(),
+            });
+        }
+    }
+    Ok(refs)
 }
 
 #[tauri::command]
@@ -1033,6 +1091,10 @@ async fn refresh_library_with_retry(
         match fetch_library(state, client).await {
             Ok(playlists) => {
                 let _ = app.emit("library", &playlists);
+                // A fresh rootlist is the reconciliation trigger: new owned
+                // playlists, deleted ones, and moved revisions are all
+                // visible only here.
+                spawn_membership_reconcile(app.clone());
                 return Ok(());
             }
             Err(error) => {
@@ -1051,6 +1113,146 @@ async fn refresh_library_with_retry(
     Err(last_error)
 }
 
+/// Pause between sequential reconciliation fetches. The chain runs after the
+/// user-facing library refresh has finished; pacing keeps it background
+/// traffic even for a large owned library.
+const MEMBERSHIP_RECONCILE_GAP: Duration = Duration::from_millis(300);
+
+/// One background membership-reconciliation chain, mirroring the library
+/// chain's coalescing shape: triggers arriving mid-pass re-run once instead
+/// of being dropped.
+fn spawn_membership_reconcile(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let client = app.state::<Arc<EngineClient>>();
+        let state = app.state::<Mutex<AppState>>();
+        {
+            let mut guard = state.lock();
+            if guard.membership_fetching {
+                guard.membership_refresh_queued = true;
+                return;
+            }
+            guard.membership_fetching = true;
+        }
+        loop {
+            reconcile_memberships(&app, &state, &client).await;
+            let mut guard = state.lock();
+            if !std::mem::take(&mut guard.membership_refresh_queued) {
+                guard.membership_fetching = false;
+                return;
+            }
+        }
+    });
+}
+
+/// Brings the membership index in line with the current library: drops
+/// containers that no longer qualify (deleted, unfollowed, or no longer
+/// owned), refetches stale ones sequentially, and re-walks Liked Songs —
+/// which has no revision and must always be re-asked to see external
+/// likes and unlikes. Failures keep the previous entry rather than
+/// corrupting a good index with an empty one.
+async fn reconcile_memberships(
+    app: &AppHandle,
+    state: &Mutex<AppState>,
+    client: &EngineClient,
+) {
+    // Snapshot the work list first so fetches run without holding the lock.
+    let (dir, work) = {
+        let mut guard = state.lock();
+        let qualifying: Vec<(String, String)> = guard
+            .playlists
+            .iter()
+            .filter(|playlist| playlist_qualifies(playlist, &guard.me_id))
+            .map(|playlist| (playlist.id.clone(), playlist.snapshot_id.clone()))
+            .collect();
+        guard.memberships.retain(|entry| {
+            entry.id == LIKED_MEMBERSHIP_ID || qualifying.iter().any(|(id, _)| *id == entry.id)
+        });
+        let work: Vec<String> = qualifying
+            .iter()
+            .filter(|(id, revision)| {
+                guard
+                    .memberships
+                    .iter()
+                    .find(|entry| entry.id == *id)
+                    .is_none_or(|entry| entry.stale(revision))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        (guard.data_dir.clone(), work)
+    };
+
+    for id in &work {
+        match client.browse_playlist(id).await {
+            Ok(browse) => {
+                let detail = PlaylistDetail::from(browse);
+                let persistence = state.lock().playlist_persistence.clone();
+                let _serialize = persistence.lock();
+                let changed = {
+                    let mut guard = state.lock();
+                    upsert_membership(
+                        &mut guard.memberships,
+                        MembershipEntry {
+                            id: detail.playlist.id.clone(),
+                            revision: detail.playlist.snapshot_id.clone(),
+                            uris: detail.tracks.iter().map(|track| track.uri.clone()).collect(),
+                        },
+                    )
+                };
+                if changed {
+                    let entries = state.lock().memberships.clone();
+                    save_membership(&dir, &entries);
+                    let _ = app.emit("memberships_changed", ());
+                }
+            }
+            Err(error) => log::warn(&format!(
+                "membership reconcile of playlist {id} failed: {error}"
+            )),
+        }
+        tokio::time::sleep(MEMBERSHIP_RECONCILE_GAP).await;
+    }
+    // Liked Songs: one context walk per pass. A page failure mid-walk keeps
+    // the previously indexed set — a partial liked list would silently
+    // unmark tracks that are still saved.
+    match browse_all_liked_uris(client).await {
+        Ok(uris) => {
+            let persistence = state.lock().playlist_persistence.clone();
+            let _serialize = persistence.lock();
+            let changed = {
+                let mut guard = state.lock();
+                upsert_membership(
+                    &mut guard.memberships,
+                    MembershipEntry {
+                        id: LIKED_MEMBERSHIP_ID.to_owned(),
+                        revision: String::new(),
+                        uris,
+                    },
+                )
+            };
+            if changed {
+                let entries = state.lock().memberships.clone();
+                save_membership(&dir, &entries);
+                let _ = app.emit("memberships_changed", ());
+            }
+        }
+        Err(error) => log::warn(&format!("membership reconcile of liked songs failed: {error}")),
+    }
+}
+
+/// Walks every Saved Tracks page into one deduplicated URI set. Pages are
+/// bare URI payloads; only a truncated context needs more than one request.
+async fn browse_all_liked_uris(client: &EngineClient) -> Result<HashSet<String>, String> {
+    let mut all = HashSet::new();
+    let mut cursor = None;
+    loop {
+        let page = client.browse_liked_uris(cursor.as_deref()).await?;
+        all.extend(page.uris.into_iter().filter(|uri| uri.starts_with("spotify:track:")));
+        match page.next_cursor.filter(|next| !next.is_empty()) {
+            Some(next) => cursor = Some(next),
+            None => return Ok(all),
+        }
+    }
+}
+
 fn spawn_refresh_playlist(app: AppHandle, id: String) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<Arc<EngineClient>>();
@@ -1062,7 +1264,7 @@ fn spawn_refresh_playlist(app: AppHandle, id: String) {
             }
         }
 
-        let result = fetch_playlist(&state, &client, &id).await;
+        let result = fetch_playlist(&app, &state, &client, &id).await;
         {
             let mut guard = state.lock();
             guard.finish_playlist_refresh(&id);
@@ -1123,9 +1325,11 @@ async fn fetch_library(
 }
 
 /// Engine round-trip for one playlist; always updates the bounded tracks
-/// cache. Only a playlist already present in the rootlist-backed library also
-/// updates and persists the library entry.
+/// cache, and — for a playlist the user created — the membership index the
+/// saved mark reads. Only a playlist already present in the rootlist-backed
+/// library also updates and persists the library entry.
 async fn fetch_playlist(
+    app: &AppHandle,
     state: &Mutex<AppState>,
     client: &EngineClient,
     id: &str,
@@ -1134,7 +1338,7 @@ async fn fetch_playlist(
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
-    let (dir, list_cache, tracks_cache) = {
+    let (dir, list_cache, tracks_cache, membership) = {
         let mut guard = state.lock();
         upsert_tracks_cache(
             &mut guard.tracks_cache,
@@ -1149,6 +1353,23 @@ async fn fetch_playlist(
         if should_persist_library {
             upsert_playlist(&mut guard.playlists, detail.playlist.clone());
         }
+        // Every fresh track listing of an owned playlist is authoritative
+        // membership data, whichever path fetched it — an explicit browse, an
+        // edit refresh, or the reconciliation chain. The index is updated
+        // here and only here for playlists.
+        let membership = if playlist_qualifies(&detail.playlist, &guard.me_id) {
+            upsert_membership(
+                &mut guard.memberships,
+                MembershipEntry {
+                    id: detail.playlist.id.clone(),
+                    revision: detail.playlist.snapshot_id.clone(),
+                    uris: detail.tracks.iter().map(|track| track.uri.clone()).collect(),
+                },
+            )
+            .then(|| guard.memberships.clone())
+        } else {
+            None
+        };
         (
             guard.data_dir.clone(),
             should_persist_library.then(|| PlaylistListCache {
@@ -1158,11 +1379,18 @@ async fn fetch_playlist(
                 playlists: guard.playlists.clone(),
             }),
             guard.tracks_cache.clone(),
+            membership,
         )
     };
     save_tracks_cache(&dir, &tracks_cache);
     if let Some(list_cache) = list_cache {
         save_playlist_list(&dir, &list_cache);
+    }
+    if let Some(entries) = membership {
+        save_membership(&dir, &entries);
+        // Hovering the mark must not wait for the next track change: an add
+        // to the playing playlist lights it up within one event round trip.
+        let _ = app.emit("memberships_changed", ());
     }
     Ok(detail)
 }

@@ -935,6 +935,7 @@ impl Engine {
             | Command::BrowseArtistReleases { .. }
             | Command::BrowseArtistCatalogue { .. }
             | Command::BrowseLikedSongs { .. }
+            | Command::BrowseLikedUris { .. }
             | Command::BrowseSearch { .. }
             | Command::BrowseTrackCredits { .. }
             | Command::BrowseCanvas { .. }

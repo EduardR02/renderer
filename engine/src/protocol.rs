@@ -308,6 +308,12 @@ pub enum Command {
         #[serde(default)]
         cursor: Option<String>,
     },
+    /// The user's Saved Tracks as bare URIs, one page per response. Responded
+    /// to with a `browse_liked_uris` message.
+    BrowseLikedUris {
+        #[serde(default)]
+        cursor: Option<String>,
+    },
     /// Search via the spclient searchview endpoint. Responded to with a
     /// `browse_search` message.
     BrowseSearch {
@@ -890,6 +896,17 @@ pub struct ArtistBrowse {
 #[serde(default)]
 pub struct LikedSongsPage {
     pub tracks: Vec<TrackRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// The user's Saved Tracks as bare URIs, for callers that need membership
+/// rather than playable rows. One context round trip per page; unlike
+/// [`LikedSongsPage`] it never pays for per-track metadata batches.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LikedUrisPage {
+    pub uris: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }

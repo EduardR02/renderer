@@ -177,6 +177,37 @@
     writeSort(route.id, sortState.key, sortState.direction);
   }
 
+  /**
+   * Manual reorder is meaningful only against the playlist's own order. A
+   * sorted projection is a view, not storage: dragging inside it would move
+   * rows the server never placed there. So while any sort is engaged the
+   * table keeps its drag-out (add/move elsewhere) but takes no drops.
+   */
+  const naturalOrder = $derived(
+    sortState.key === null || (sortState.key === "order" && sortState.direction === "asc"),
+  );
+
+  /**
+   * Applies the landed position immediately — the row must be where the drop
+   * put it the moment the ghost dissolves — then lets the backend confirm.
+   * The `playlist` refresh that follows replaces `tracks` wholesale anyway,
+   * because its row order differs; the revert below only covers the window
+   * where Spotify refused the MOV and no refresh has landed yet.
+   */
+  async function reorderTracks(from, to) {
+    const list = detail.playlist?.tracks;
+    if (!Array.isArray(list) || from === to || from < 0 || to < 0) return;
+    if (from >= list.length || to >= list.length) return;
+    const [moved] = list.splice(from, 1);
+    list.splice(to, 0, moved);
+    try {
+      await api.reorderPlaylistTracks(pl.id, from, to);
+    } catch {
+      const [taken] = list.splice(to, 1);
+      list.splice(from, 0, taken);
+    }
+  }
+
   /* Fallback for a playlist the backend has not swept yet: derive the mosaic
      candidates from the tracks we already have on screen. */
   const artPool = $derived.by(() => {
@@ -692,6 +723,7 @@
           sortKey={sortState.key}
           sortDirection={sortState.direction}
           onSort={toggleSort}
+          onReorder={editable && naturalOrder ? reorderTracks : null}
         />
       </div>
     {:else}

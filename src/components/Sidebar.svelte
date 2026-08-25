@@ -1,5 +1,6 @@
 <script>
   import { route, navigate, library, libraryState, api, playback } from "../lib/state.svelte.js";
+  import { trackDrag } from "../lib/dnd.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import LikedMark from "./LikedMark.svelte";
@@ -186,7 +187,7 @@
       </form>
     {/if}
 
-    <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} bind:this={libList}>
+    <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} class:droppable={trackDrag.active} bind:this={libList}>
       <button
         class="lib-row liked-row"
         class:active={route.name === "liked"}
@@ -202,11 +203,21 @@
           class="lib-row"
           class:active={route.name === "playlist" && route.id === pl.id}
           class:playing={playingId === pl.id}
+          class:no-drop={trackDrag.active && trackDrag.move && trackDrag.sourcePlaylistId === pl.id}
+          data-pid={pl.id}
           onclick={() => navigate("playlist", pl.id)}
         >
           <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} size={32} />
           <span class="lib-name">{pl.name}</span>
-          {#if pl.tracks_total}<span class="lib-count">{pl.tracks_total}</span>{/if}
+          {#if trackDrag.active}
+            <!-- While a song is in flight the count cedes its slot to the
+                 affordance: every user playlist is a valid destination (the
+                 source itself wears .no-drop), and "+" says what a drop does
+                 without a word of prose. -->
+            <span class="lib-drop-hint" aria-hidden="true">+</span>
+          {:else if pl.tracks_total}
+            <span class="lib-count">{pl.tracks_total}</span>
+          {/if}
         </button>
       {/each}
       {#if !libraryState.loaded && !library.length}

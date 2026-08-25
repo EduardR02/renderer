@@ -2649,6 +2649,53 @@ pub async fn liked_songs_browse(
     })
 }
 
+/// The Saved Tracks collection as bare URIs — the same spclient context
+/// resolver [`liked_songs_browse`] walks, minus the per-track metadata
+/// batches. Membership checks need identity, not playable rows, so a whole
+/// collection costs one round trip per page instead of one metadata batch
+/// per hundred tracks. Pagination mirrors the parent: following
+/// `next_cursor` is the only thing that fetches another page.
+pub async fn liked_song_uris_browse(
+    session: &Session,
+    cursor: Option<&str>,
+) -> Result<spotify_playback_engine::protocol::LikedUrisPage, String> {
+    let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+        let payload = session
+            .spclient()
+            .get_next_page(cursor)
+            .await
+            .map_err(|error| format!("liked song uris page request failed: {error}"))?;
+        let json = std::str::from_utf8(&payload)
+            .map_err(|error| format!("liked song uris page was not utf-8: {error}"))?;
+        let page = protobuf_json_mapping::parse_from_str::<
+            librespot_protocol::context_page::ContextPage,
+        >(json)
+        .map_err(|error| format!("unparseable liked song uris page: {error}"))?;
+        (
+            context_page_track_uris(&page),
+            context_page_next_cursor(&page),
+        )
+    } else {
+        let context_uri = format!("spotify:user:{}:collection", session.username());
+        let context = session
+            .spclient()
+            .get_context(&context_uri)
+            .await
+            .map_err(|error| format!("liked song uris request failed: {error}"))?;
+        let uris = context
+            .pages
+            .iter()
+            .flat_map(context_page_track_uris)
+            .collect();
+        let next_cursor = context.pages.iter().find_map(context_page_next_cursor);
+        (uris, next_cursor)
+    };
+    Ok(spotify_playback_engine::protocol::LikedUrisPage {
+        uris: uris.iter().map(uri_of).collect(),
+        next_cursor,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // track credits (queryTrackCreditsGroupedModal)
 // ---------------------------------------------------------------------------

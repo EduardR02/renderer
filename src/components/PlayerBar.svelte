@@ -14,6 +14,7 @@
   import ArtistLinks from "./ArtistLinks.svelte";
   import Slider from "./Slider.svelte";
   import { formatTime } from "../lib/time.js";
+  import { listen } from "@tauri-apps/api/event";
 
   let dragPos = $state(null);
 
@@ -150,6 +151,49 @@
       title: editTimeline.markerTitle,
     };
   });
+
+  /**
+   * Which of the user's own containers hold the playing track. One in-memory
+   * IPC per track change — the index lives in the Rust side and is kept
+   * fresh there by playlist fetches and a background reconciliation, so the
+   * bar never polls and never blocks on the network.
+   */
+  let savedIn = $state([]);
+  let savedSeq = 0;
+
+  async function lookupSavedIn(uri) {
+    const seq = ++savedSeq;
+    if (!uri?.startsWith("spotify:track:")) {
+      savedIn = [];
+      return;
+    }
+    try {
+      const refs = await api.getTrackPlaylists(uri);
+      if (seq === savedSeq) savedIn = refs ?? [];
+    } catch {
+      // Backend not ready or gone: no mark is safer than a wrong mark.
+      if (seq === savedSeq) savedIn = [];
+    }
+  }
+
+  /* Track changes re-ask; index changes (an add while this track plays,
+     an external like picked up by reconciliation) arrive as one event. */
+  $effect(() => {
+    lookupSavedIn(current?.uri);
+  });
+  $effect(() => {
+    const event = listen("memberships_changed", () => lookupSavedIn(current?.uri));
+    return () => event.then((off) => off()).catch(() => {});
+  });
+
+  /* Screen readers get the real container names, not a count. */
+  const savedLabel = $derived(`Saved in ${savedIn.map((ref) => ref.name).join(", ")}`);
+
+  function openSaved(id) {
+    if (id === "liked") navigate("liked");
+    else navigate("playlist", id);
+  }
+
 
   const pos = $derived(dragPos !== null ? dragPos : positionMs());
   // `track` is the engine's name for repeat-one; anything outside
@@ -311,6 +355,24 @@
             >{current.name}</button>
           {:else}
             <span class="p-title">{current.name}</span>
+          {/if}
+          {#if savedIn.length}
+            <span class="p-saved">
+              <span class="p-saved-mark"><Icon name="check" size={12} /></span>
+              <!-- Keyboard path: tabbing into a row button opens the panel
+                   through :focus-within, so the wrapper stays non-focusable
+                   and every interactive target remains a real button. -->
+              <span class="p-saved-panel" role="group" aria-label={savedLabel}>
+                <span class="p-saved-head">Saved in</span>
+                {#each savedIn as ref (ref.id)}
+                  <button
+                    class="p-saved-row"
+                    title="Open {ref.name}"
+                    onclick={() => openSaved(ref.id)}
+                  >{ref.name}</button>
+                {/each}
+              </span>
+            </span>
           {/if}
           {#if editIndicator}
             <span
@@ -567,6 +629,112 @@
     flex: none;
     border: 1px solid currentColor;
     border-radius: 50%;
+  }
+
+  /* Saved-in mark: a quiet foam check that opens the list of the user's
+     containers holding this track. The panel borrows the speed-menu's
+     raised surface; hover or keyboard focus opens it, no JS positioning. */
+  .p-saved {
+    position: relative;
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    align-self: center;
+    cursor: default;
+    outline: none;
+  }
+  .p-saved-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: var(--rf);
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    transition:
+      background var(--d1) var(--ease),
+      box-shadow var(--d1) var(--ease);
+  }
+  .p-saved:hover .p-saved-mark,
+  .p-saved:focus-visible .p-saved-mark {
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .p-saved-panel {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: -8px;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 200px;
+    max-width: 280px;
+    max-height: 232px;
+    overflow-y: auto;
+    padding: var(--s3);
+    border: 1px solid var(--line-2);
+    border-radius: var(--r2);
+    background: var(--bg-2);
+    box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85), 0 2px 6px rgba(0, 0, 0, 0.5);
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(4px);
+    pointer-events: none;
+    transition:
+      opacity var(--d1) var(--ease),
+      transform var(--d1) var(--ease),
+      visibility var(--d1) var(--ease);
+  }
+  /* Invisible bridge across the gap, so the pointer can travel from the
+     mark into the panel without the hover chain breaking mid-way. */
+  .p-saved-panel::before {
+    content: "";
+    position: absolute;
+    top: -8px;
+    left: 0;
+    right: 0;
+    height: 8px;
+  }
+  .p-saved:hover .p-saved-panel,
+  .p-saved:focus-within .p-saved-panel,
+  .p-saved:focus-visible .p-saved-panel {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+  .p-saved-head {
+    margin-bottom: var(--s2);
+    color: var(--fg-3);
+    font-family: var(--font-small);
+    font-size: 10px;
+    font-weight: var(--w-semi);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .p-saved-row {
+    overflow: hidden;
+    padding: 3px 6px;
+    margin: 0 -6px;
+    border: 0;
+    border-radius: var(--r1);
+    background: none;
+    color: var(--fg-1);
+    font: inherit;
+    font-size: var(--t-12);
+    line-height: 1.35;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      color var(--d1) var(--ease),
+      background var(--d1) var(--ease);
+  }
+  .p-saved-row:hover {
+    background: var(--bg-3);
   }
   .p-seek-slider {
     position: relative;

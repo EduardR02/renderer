@@ -17,6 +17,7 @@
   import { formatTime } from "../lib/time.js";
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
+  import { pressTrack, justDragged, registerReorderZone, trackDrag } from "../lib/dnd.svelte.js";
 
   let {
     tracks = [],
@@ -44,11 +45,92 @@
     onRowAction = null,
     /** Optional per-row guard for an always-visible trailing action. */
     rowActionDisabled = null,
+    /** Optimistic in-place reorder for owned playlists; null disables drops into this table. */
+    onReorder = null,
   } = $props();
 
   const queueSource = $derived(
     String(queueContext || (playlistId ? `playlist:${playlistId}` : "")).trim(),
   );
+
+  /* =====================================================================
+     DRAG SOURCE / REORDER TARGET
+
+     A row press becomes a drag only after 6px of travel; `pressTrack` keeps
+     a plain press-and-release byte-identical to the old click behaviour.
+     Two independent capabilities decide what a drag can do:
+
+       draggable out   allowAddToPlaylist — every surface whose row menu
+                       offers "Add to playlist…" honours the same guard here,
+                       including the recommendation footer that turns it off.
+       reorder inside  onReorder — passed only by PlaylistView, and only
+                       while the table shows the playlist's own order; a
+                       sorted projection cannot accept manual positions.
+
+     While a drag from THIS table is live, the rows part around the pointer:
+     neighbours translate one slot and the source row fades, so the bar sits
+     visibly in the hole the row will fill. Pure transforms — no measurement
+     beyond the one rect the drag loop already reads per frame.
+     ===================================================================== */
+  const canReorder = $derived(!!onReorder);
+  const dragEnabled = $derived(allowAddToPlaylist || !!onReorder);
+  /* This table's body element — the reorder zone registered below. */
+  const zoneEl = $derived(disableWindowing ? flatBody : bodyEl);
+  const engaged = $derived(trackDrag.active && !!zoneEl && trackDrag.listEl === zoneEl);
+
+  /**
+   * Neighbour shift for row `i`. The gap is an insertion point in ORIGINAL
+   * coordinates; rows between it and the source slide one slot toward the
+   * source, which is what makes the marked gap read as reserved space.
+   */
+  function rowDragTransform(i) {
+    if (!engaged || !canReorder || trackDrag.gap < 0) return null;
+    const from = trackDrag.sourceIndex;
+    if (i === from) return null;
+    if (i > from && i <= trackDrag.gap) return "translateY(calc(var(--row-h) * -1))";
+    if (i < from && i >= trackDrag.gap) return "translateY(var(--row-h))";
+    return null;
+  }
+
+  function rowIsSource(i) {
+    return engaged && canReorder && trackDrag.sourceIndex === i;
+  }
+
+  /** Where the insertion bar renders inside this body, in px. */
+  const insertion = $derived.by(() => {
+    if (!engaged || !canReorder || trackDrag.gap < 0) return null;
+    const from = trackDrag.sourceIndex;
+    const to = trackDrag.gap <= from ? trackDrag.gap : trackDrag.gap - 1;
+    if (to === from) return null;
+    return trackDrag.gap * ROW_H;
+  });
+
+  $effect(() => {
+    if (!zoneEl || !onReorder) return;
+    // `meta` reads live props at drag time, so lengths and handlers stay
+    // fresh without re-registering on every tracks mutation.
+    return registerReorderZone(zoneEl, () => ({
+      length: tracks.length,
+      canReorder: true,
+      run: onReorder,
+    }));
+  });
+
+  /** Row presses start here, delegated so windowing can recycle rows freely. */
+  function onBodyPointerDown(event) {
+    if (!dragEnabled) return;
+    if (event.target.closest("button, a, input, textarea")) return;
+    const row = event.target.closest(".tl-row");
+    if (!row) return;
+    const index = Number(row.dataset.i);
+    pressTrack({
+      event,
+      rowEl: row,
+      index,
+      track: tracks[index],
+      playlistId: playlistId ?? null,
+    });
+  }
 
   /* =====================================================================
      COLUMNS — one source of truth, in the component that renders the cells.
@@ -235,6 +317,7 @@
   });
 
   function onRowDblClick(i) {
+    if (justDragged()) return; // the release click of a drag is not play intent
     if (tracks[i]?.unavailable) return;
     if (i === currentRow && playback.playing) togglePlay();
     else playFrom(i);
@@ -548,6 +631,7 @@
 
   let rootEl = $state(null);
   let bodyEl = $state(null);
+  let flatBody = $state(null);
   let firstRow = $state(0);
   let lastRow = $state(0);
   /* Plain mirrors of the two above: measure() must not *read* reactive state,
@@ -704,6 +788,9 @@
       class="tl-row"
       class:current={i === currentRow}
       class:unavailable={track.unavailable}
+      class:drag-source={rowIsSource(i)}
+      data-i={i}
+      style:transform={rowDragTransform(i)}
       role="button"
       aria-disabled={track.unavailable ? "true" : undefined}
       title={track.unavailable ? (track.unavailable_reason || "Unavailable") : undefined}
@@ -800,6 +887,7 @@
 <div
   class="tl"
   class:dense
+  class:reordering={engaged}
   bind:this={rootEl}
   style="overflow-anchor: none"
   style:--cols={cols}
@@ -870,14 +958,22 @@
   {/if}
 
   {#if disableWindowing}
-    <div style="overflow-anchor: none">
+    <div
+      bind:this={flatBody}
+      role="presentation"
+      style="overflow-anchor: none; position: relative"
+      onpointerdown={onBodyPointerDown}
+    >
       {@render trackRows(visible, 0)}
+      {#if insertion !== null}<div class="tl-insert" style:top="{insertion}px"></div>{/if}
     </div>
   {:else}
     <div
       bind:this={bodyEl}
+      role="presentation"
       style="overflow-anchor: none; position: relative"
       style:height="{tracks.length * ROW_H}px"
+      onpointerdown={onBodyPointerDown}
     >
       <div
         style="position: absolute; inset: 0 0 auto"
@@ -885,6 +981,7 @@
       >
         {@render trackRows(visible, firstRow)}
       </div>
+      {#if insertion !== null}<div class="tl-insert" style:top="{insertion}px"></div>{/if}
     </div>
   {/if}
 </div>

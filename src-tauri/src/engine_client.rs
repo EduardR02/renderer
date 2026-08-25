@@ -918,6 +918,18 @@ impl EngineClient {
         parse_data(reply, "browse_liked_songs")
     }
 
+    /// Saved Tracks as bare URIs — the membership lookup the saved mark
+    /// reconciles with. Never fetches track metadata.
+    pub async fn browse_liked_uris(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<spotify_playback_engine::protocol::LikedUrisPage, String> {
+        let reply = self
+            .request("browse_liked_uris", json!({"cursor": cursor}))
+            .await?;
+        parse_data(reply, "browse_liked_uris")
+    }
+
     pub async fn browse_track_credits(
         &self,
         id: &str,

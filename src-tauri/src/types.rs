@@ -340,6 +340,15 @@ pub struct PlaylistDetail {
     pub tracks: Vec<Track>,
 }
 
+/// One container holding a track, as answered by `get_track_playlists`.
+/// The Liked Songs collection reports the sentinel id `"liked"`; the
+/// frontend maps it to the collection route.
+#[derive(Clone, Debug, Serialize)]
+pub struct TrackPlaylistRef {
+    pub id: String,
+    pub name: String,
+}
+
 impl From<PlaylistBrowse> for PlaylistDetail {
     fn from(browse: PlaylistBrowse) -> Self {
         let revision = browse.revision.unwrap_or_default();

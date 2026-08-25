@@ -11,7 +11,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tauri::Manager;
 
-use app::{data_dir, load_app_settings, load_tracks_cache, save_app_settings, AppState};
+use app::{
+    data_dir, load_app_settings, load_membership, load_tracks_cache, save_app_settings, AppState,
+};
 use engine_client::EngineClient;
 
 fn restore_main_window(app: &tauri::AppHandle) {
@@ -126,6 +128,7 @@ pub fn run() {
             commands::set_animated_canvas,
             commands::touch_playlist,
             commands::touch_playlist_activity,
+            commands::get_track_playlists,
         ])
         .setup(|app| {
             let mut startup_settings = load_app_settings();
@@ -150,6 +153,10 @@ pub fn run() {
             let state = Mutex::new(AppState::new(data_dir()));
             let dir = state.lock().data_dir.clone();
             state.lock().tracks_cache = load_tracks_cache(&dir);
+            // The saved-mark index hydrates from disk so a returning user's
+            // very first track change already resolves without any fetch; the
+            // ready-transition reconciliation supersedes stale rows.
+            state.lock().memberships = load_membership(&dir);
             app.manage(state);
 
             // Spawn the playback engine and keep it alive across crashes.

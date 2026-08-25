@@ -2424,3 +2424,115 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
             backdrop-filter: none;
   }
 }
+
+/* =====================================================================
+   TRACK DRAG-AND-DROP
+
+   The gesture has three painted parts, and each is styled here rather than
+   in a component because the ghost lives outside Svelte entirely (see
+   src/lib/dnd.svelte.js): it must follow the pointer without re-rendering
+   anything.
+
+     1. #drag-layer + .tl-drag-ghost — the grabbed row. A faithful clone of
+        the real row (same markup, same --cols template copied from its
+        table), lifted: raised surface, hairline edge, deep shadow, a 1.028
+        scale. Lifted enough to read as "in hand", never tilted — tilt reads
+        as playful, and this app is not.
+
+     2. .tl-insert — the insertion bar. Foam, 2px, rounded, with a soft glow
+        borrowed from the seek rail's language: this too is a position you
+        are choosing precisely.
+
+     3. Row choreography — neighbours part by one --row-h around the gap
+        (transform only, compositor work), and the source row fades to a
+        quarter while its ghost carries the content.
+
+   While ANY track drag is live the rows' hover affordances go quiet: the
+   pointer is holding a row, so play glyphs and kebabs lighting up underneath
+   it would be noise about surfaces nobody can act on.
+   ===================================================================== */
+#drag-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 90; /* above chrome (30) and sticky heads (20); popovers stay on top */
+  pointer-events: none;
+}
+.tl-drag-ghost {
+  position: absolute;
+  left: 0;
+  top: 0;
+  will-change: transform;
+}
+.tl-drag-ghost .tl-row {
+  background: var(--bg-2);
+  box-shadow:
+    inset 0 0 0 1px var(--line-2),
+    0 14px 32px -10px rgba(0, 0, 0, 0.8),
+    0 3px 10px rgba(0, 0, 0, 0.5);
+}
+html.dragging-track,
+html.dragging-track body {
+  cursor: grabbing;
+}
+html.dragging-track * {
+  cursor: inherit;
+}
+/* Every element under a held row reads the grab: buttons, volume rails and
+   links carry their own `cursor` declarations, which beat inheritance, so
+   they must be re-pointed. `inherit` rather than a hard `grabbing` lets a
+   refused target override its whole subtree at once — .lib-row.no-drop's
+   not-allowed (0-2-0) outranks this (0-1-1) and its children follow it. */
+/* Under a held row the table stops advertising itself: no hover wash, no
+   play glyph, no kebab. The current row's identity wash stays — knowing
+   what is playing is never noise. */
+html.dragging-track .tl-row:hover:not(.current) { background: transparent; }
+html.dragging-track .tl-row:hover .n { display: inline; }
+html.dragging-track .tl-row:hover .go { display: none; }
+html.dragging-track .tl-row:hover .c-more button { opacity: 0; }
+
+.tl.reordering .tl-row {
+  transition:
+    background-color var(--d1) var(--ease),
+    transform var(--d2) var(--ease),
+    opacity var(--d1) var(--ease);
+}
+.tl-row.drag-source { opacity: 0.25; }
+.tl-row.drag-source:hover { background: transparent; }
+
+.tl-insert {
+  position: absolute;
+  left: var(--s3);
+  right: var(--s3);
+  height: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 55%, transparent);
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* --- Sidebar: playlists as destinations ----------------------------
+   Nothing changes at rest; a rail that lights up "because dragging might
+   happen" spends attention on nothing. The affordance appears with the
+   gesture: the count cedes its slot to a foam "+" (markup in Sidebar),
+   hover lifts the row under an accent hairline, and the source playlist of
+   a MOVE dims and refuses the cursor — dropping a song back where it came
+   from is not an action, and the UI should say so before the release. --- */
+.lib-list.droppable .lib-row[data-pid]:hover {
+  background: var(--bg-3);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.lib-list.droppable .lib-row[data-pid]:hover .lib-name { color: var(--accent); }
+.lib-drop-hint {
+  font-family: var(--font-number);
+  font-size: var(--t-13);
+  font-weight: var(--w-semi);
+  color: var(--accent);
+}
+.lib-row.no-drop { opacity: 0.45; cursor: not-allowed; }
+.lib-row.no-drop:hover { background: transparent; box-shadow: none; }
+.lib-row.no-drop .lib-drop-hint { color: var(--fg-3); }
+
+@media (prefers-reduced-motion: reduce) {
+  .tl.reordering .tl-row { transition: background-color var(--d1) var(--ease), opacity var(--d1) var(--ease); }
+}

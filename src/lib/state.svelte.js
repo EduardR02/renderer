@@ -1533,6 +1533,8 @@ export const api = {
     invoke("browse_artist_catalogue", { id, releaseTypes, offset, limit }),
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
   touchPlaylistActivity: (id) => invoke("touch_playlist_activity", { id }),
+  /** Containers of the user that hold `uri` — the saved mark's data. */
+  getTrackPlaylists: (uri) => invoke("get_track_playlists", { uri }),
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
   browseCanvas: (id) => invoke("browse_canvas", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
