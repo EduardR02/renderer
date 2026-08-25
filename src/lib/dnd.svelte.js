@@ -78,9 +78,20 @@ const PRESS_THRESHOLD = 6; // px of travel before a press becomes a drag
 const EDGE_BAND = 64; // px autoscroll band inside a scroller
 const MAX_SCROLL_SPEED = 1100; // px/s at full band penetration
 const ROW_H = 48; // must track --row-h
+/* Compact-pill ghost geometry. The pointer carries the settled pill by a
+   fixed handle — 18px in from its left edge, vertically centred — and the
+   whole thing stays under a 260px cap however long the title is. */
+const PILL_MAX_WIDTH = 260;
+const PILL_ANCHOR_X = 18;
+const PILL_ANCHOR_Y = ROW_H / 2;
+/* The lift scale, applied with transform-origin 0 0 (see positionGhost and
+   the #drag-layer CSS). The pill's sliding margins are expressed in
+   pre-scale coordinates, so both files need the number. */
+const GHOST_SCALE = 1.028;
 
 let press = null; // pending press before the threshold, then live drag state
-let ghostWrap = null; // positioned .tl clone holding the row clone
+let ghostWrap = null; // positioned wrap holding the pill ghost
+let pillEl = null; // the pill inside ghostWrap; its margins carry the anchor
 let originRect = null; // where the ghost came from (fly-back target)
 let layer = null; // #drag-layer, created once per activation
 let rafId = 0;
@@ -154,9 +165,7 @@ function activate() {
   press.active = true;
 
   layer = ensureLayer();
-  ghostWrap = buildGhost(press.rowEl);
-  press.grabX = trackDrag.x - originRect.left;
-  press.grabY = trackDrag.y - originRect.top;
+  ghostWrap = buildGhost(press.rowEl); // also fixes press.grabX/grabY
 
   const d = trackDrag;
   d.active = true;
@@ -191,36 +200,62 @@ function ensureLayer() {
 }
 
 /**
- * Clones the pressed row into the fixed layer. The clone keeps the real row
- * markup (art, two-line title, columns) by copying `.tl`'s inline `--cols`
- * template and density class — everything visual about a row comes from
- * app.css through those classes, so the copy is faithful with no re-styling.
+ * Builds the ghost: the pressed row folded into a compact pill carrying its
+ * art tile and title block — cloned nodes, so Cover's fallback tiles keep
+ * working offline — styled entirely by the #drag-layer block in app.css.
+ *
+ * The gesture opens at the row's FULL geometry: the wrap starts as wide as
+ * the row, under the pointer exactly where it closed, then compresses over
+ * var(--d2)/var(--ease). Two CSS transitions share that one clock — the
+ * wrap's width eases down to the pill's natural width while the pill slides
+ * inside the wrap so the grab point travels to the pill's handle (18px in
+ * from its left edge, vertically centred). One continuous morph: frame()'s
+ * per-frame transform math is untouched by all of this, and reduced motion
+ * lands directly in pill form because the media query kills the transitions.
+ * Measuring the natural width costs one layout read per activation, never
+ * per frame.
  */
 function buildGhost(rowEl) {
-  const tl = rowEl.closest(".tl");
   const rect = rowEl.getBoundingClientRect();
   originRect = rect;
+  press.grabX = trackDrag.x - rect.left;
+  press.grabY = trackDrag.y - rect.top;
 
   const wrap = document.createElement("div");
-  wrap.className = "tl tl-drag-ghost";
-  if (tl?.classList.contains("dense")) wrap.classList.add("dense");
-  const cols = tl?.style.getPropertyValue("--cols");
-  if (cols) wrap.style.setProperty("--cols", cols);
-  wrap.style.width = `${rect.width}px`;
-
-  const row = rowEl.cloneNode(true);
-  row.classList.add("is-ghost");
-  row.classList.remove("current");
-  wrap.appendChild(row);
-
+  wrap.className = "tl-drag-ghost";
+  const pill = document.createElement("div");
+  pill.className = "tl-drag-pill";
+  const art = rowEl.querySelector(".c-art");
+  if (art) pill.appendChild(art.cloneNode(true));
+  const title = rowEl.querySelector(".c-title");
+  if (title) pill.appendChild(title.cloneNode(true));
+  wrap.appendChild(pill);
   layer.appendChild(wrap);
+  pillEl = pill;
+
+  /* Natural pill width clamped to the design cap, measured off an
+     unconstrained render that is corrected before any frame can paint it. */
+  wrap.style.width = "max-content";
+  const pillWidth = Math.min(pill.getBoundingClientRect().width, PILL_MAX_WIDTH);
+
+  /* Start geometry first — the row's own footprint, pill flush — committed
+     with a style flush so the transitions have something to ease FROM; then
+     the end state: fold to the pill, slide it under the pointer's handle. */
+  wrap.style.width = `${rect.width}px`;
+  pill.style.marginLeft = "0px";
+  pill.style.marginTop = "0px";
+  void wrap.offsetWidth;
+  wrap.style.width = `${pillWidth}px`;
+  pill.style.marginLeft = `${(press.grabX - PILL_ANCHOR_X) / GHOST_SCALE}px`;
+  pill.style.marginTop = `${(press.grabY - PILL_ANCHOR_Y) / GHOST_SCALE}px`;
+
   return wrap;
 }
 
 function positionGhost() {
   if (!ghostWrap) return;
   ghostWrap.style.transform =
-    `translate3d(${trackDrag.x - press.grabX}px, ${trackDrag.y - press.grabY}px, 0) scale(1.028)`;
+    `translate3d(${trackDrag.x - press.grabX}px, ${trackDrag.y - press.grabY}px, 0) scale(${GHOST_SCALE})`;
 }
 
 /** Ease-in weight for the autoscroll band: gentle at the edge, brisk deeper. */
@@ -348,7 +383,36 @@ function endDrag(commit) {
     document.documentElement.classList.remove("dragging-track");
     retireGhost(outcome === "cancel" ? "return" : "dissolve");
     gestureEndedAt = performance.now();
+    suppressReleaseClick();
   }
+}
+
+let releaseGuardTimer = 0;
+
+/**
+ * A drag that ends over what it started on leaves the browser primed to
+ * synthesize a click at the release point. Artist names are role="link"
+ * SPANS rather than buttons precisely so they can ellipsize (see
+ * ArtistLinks.svelte), which means that synthetic click passes TrackList's
+ * interactive-cell press guard and navigates. After a REAL drag, swallow
+ * the first click that follows within ~400ms — capture phase,
+ * preventDefault + stopPropagation, gone once it has fired. The timeout
+ * disarms the trap when no click comes, so a drag released into empty
+ * space can never eat the user's NEXT intentional click.
+ */
+function suppressReleaseClick() {
+  clearTimeout(releaseGuardTimer);
+  const swallow = (e) => {
+    disarm();
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  const disarm = () => {
+    document.removeEventListener("click", swallow, true);
+    clearTimeout(releaseGuardTimer);
+  };
+  document.addEventListener("click", swallow, true);
+  releaseGuardTimer = setTimeout(disarm, 400);
 }
 
 /**
@@ -376,7 +440,7 @@ function pulse(rowEl) {
   try {
     rowEl.animate(
       [
-        { background: "color-mix(in srgb, var(--accent) 22%, transparent)" },
+        { background: "color-mix(in srgb, var(--rose-ink) 22%, transparent)" },
         { background: "rgba(255,255,255,0)" },
       ],
       { duration: 550, easing: "ease-out" },
@@ -388,20 +452,34 @@ function pulse(rowEl) {
 
 /**
  * Ghost exit paths. Cancel flies the row home — the gesture undoes itself in
- * front of the user. A committed drop dissolves in place: the real row is
- * already where the ghost was, so flying it anywhere would be a lie.
+ * front of the user, and the pill unfolds back into the row's footprint on
+ * the way (same clock as the compression, run backwards). A committed drop
+ * dissolves in place: the real row is already where the ghost was, so
+ * flying it anywhere would be a lie.
  */
 function retireGhost(mode) {
   if (!ghostWrap) return;
   const wrap = ghostWrap;
+  const pill = pillEl;
   ghostWrap = null;
+  pillEl = null;
   clearTimeout(cleanupTimer);
 
   if (mode === "return" && originRect) {
+    /* The inline transition list must carry width itself: writing it replaces
+       the stylesheet's transition property wholesale. The pill re-declares
+       its own margins to match the flight rather than var(--d2). */
+    const flight = "220ms cubic-bezier(0.2, 0, 0, 1)";
     wrap.style.transition =
-      "transform 220ms cubic-bezier(0.2, 0, 0, 1), opacity 220ms linear";
+      `transform ${flight}, width ${flight}, opacity 220ms linear`;
     wrap.style.transform =
       `translate3d(${originRect.left}px, ${originRect.top}px, 0) scale(1)`;
+    wrap.style.width = `${originRect.width}px`;
+    if (pill) {
+      pill.style.transition = `margin-left ${flight}, margin-top ${flight}`;
+      pill.style.marginLeft = "0px";
+      pill.style.marginTop = "0px";
+    }
     wrap.style.opacity = "0.55";
     cleanupTimer = setTimeout(() => wrap.remove(), 240);
   } else {
@@ -410,3 +488,4 @@ function retireGhost(mode) {
     cleanupTimer = setTimeout(() => wrap.remove(), 150);
   }
 }
+

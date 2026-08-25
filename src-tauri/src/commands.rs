@@ -1257,36 +1257,51 @@ fn spawn_refresh_playlist(app: AppHandle, id: String) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
-        {
-            let mut guard = state.lock();
-            if !guard.start_playlist_refresh(&id) {
+        loop {
+            {
+                let mut guard = state.lock();
+                if !guard.start_playlist_refresh(&id) {
+                    return;
+                }
+            }
+
+            let result = fetch_playlist(&app, &state, &client, &id).await;
+            let again = {
+                let mut guard = state.lock();
+                guard.finish_playlist_refresh(&id);
+                guard.take_playlist_refresh_queued(&id)
+            };
+
+            match result {
+                /* Tell the window, do not just warm the cache.
+                This refresh used to update the caches and stop there, so the
+                fresh payload was only ever seen the NEXT time the playlist was
+                opened. Download marks made that obvious: `cached` is stripped
+                when the track cache is loaded from disk, deliberately, since a
+                pruned audio cache must not leave phantom marks behind — so a
+                cache-served open showed none, the refresh quietly learned the
+                real ones, and they appeared on the second open. Anything else
+                that changed server-side had the same one-open lag; the marks
+                were just the visible case. */
+                Ok(detail) => {
+                    // A trigger landed while this fetch was out, so what we
+                    // just read may predate the newest committed edit; the
+                    // queued pass below speaks instead of this payload.
+                    if !again {
+                        let _ = app.emit("playlist", &detail);
+                    }
+                }
+                Err(error) => log::error(&format!(
+                    "background refresh of playlist {id} failed: {error}"
+                )),
+            }
+
+            // An edit committed while this fetch was out queued one more
+            // pass above; running it keeps the emitted payload from standing
+            // stale until the next open.
+            if !again {
                 return;
             }
-        }
-
-        let result = fetch_playlist(&app, &state, &client, &id).await;
-        {
-            let mut guard = state.lock();
-            guard.finish_playlist_refresh(&id);
-        }
-
-        match result {
-            /* Tell the window, do not just warm the cache.
-            This refresh used to update the caches and stop there, so the
-            fresh payload was only ever seen the NEXT time the playlist was
-            opened. Download marks made that obvious: `cached` is stripped
-            when the track cache is loaded from disk, deliberately, since a
-            pruned audio cache must not leave phantom marks behind — so a
-            cache-served open showed none, the refresh quietly learned the
-            real ones, and they appeared on the second open. Anything else
-            that changed server-side had the same one-open lag; the marks
-            were just the visible case. */
-            Ok(detail) => {
-                let _ = app.emit("playlist", &detail);
-            }
-            Err(error) => log::error(&format!(
-                "background refresh of playlist {id} failed: {error}"
-            )),
         }
     });
 }

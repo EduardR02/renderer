@@ -178,33 +178,44 @@
   }
 
   /**
-   * Manual reorder is meaningful only against the playlist's own order. A
-   * sorted projection is a view, not storage: dragging inside it would move
-   * rows the server never placed there. So while any sort is engaged the
-   * table keeps its drag-out (add/move elsewhere) but takes no drops.
+   * Manual reorder is meaningful only against the playlist's own sequence,
+   * and BOTH "#" directions show it: ascending is storage order itself,
+   * descending the same sequence read backwards — reorderTracks translates
+   * view positions back to storage coordinates for it. Unsorted (key null)
+   * is storage order too. Any other projection is a view, not storage:
+   * dragging inside it would move rows the server never placed there, so
+   * the table keeps its drag-out (add/move elsewhere) but takes no drops.
    */
-  const naturalOrder = $derived(
-    sortState.key === null || (sortState.key === "order" && sortState.direction === "asc"),
-  );
+  const ownOrderShown = $derived(sortState.key === null || sortState.key === "order");
 
   /**
    * Applies the landed position immediately — the row must be where the drop
    * put it the moment the ghost dissolves — then lets the backend confirm.
-   * The `playlist` refresh that follows replaces `tracks` wholesale anyway,
-   * because its row order differs; the revert below only covers the window
-   * where Spotify refused the MOV and no refresh has landed yet.
+   *
+   * `from`/`to` are VIEW indices. Under "# descending" the view mirrors
+   * storage, so both ends translate (view v lives at n-1-v) before the
+   * splice and the backend MOV touch storage coordinates; a two-slot drag
+   * at the top of the view is then the same two-slot move, read from the
+   * other end. The `playlist` refresh that follows replaces `tracks`
+   * wholesale anyway, because its row order differs; the revert below only
+   * covers the window where Spotify refused the MOV and no refresh has
+   * landed yet.
    */
   async function reorderTracks(from, to) {
     const list = detail.playlist?.tracks;
     if (!Array.isArray(list) || from === to || from < 0 || to < 0) return;
     if (from >= list.length || to >= list.length) return;
-    const [moved] = list.splice(from, 1);
-    list.splice(to, 0, moved);
+    const mirrored = sortState.key === "order" && sortState.direction === "desc";
+    const last = list.length - 1;
+    const actualFrom = mirrored ? last - from : from;
+    const actualTo = mirrored ? last - to : to;
+    const [moved] = list.splice(actualFrom, 1);
+    list.splice(actualTo, 0, moved);
     try {
-      await api.reorderPlaylistTracks(pl.id, from, to);
+      await api.reorderPlaylistTracks(pl.id, actualFrom, actualTo);
     } catch {
-      const [taken] = list.splice(to, 1);
-      list.splice(from, 0, taken);
+      const [taken] = list.splice(actualTo, 1);
+      list.splice(actualFrom, 0, taken);
     }
   }
 
@@ -723,7 +734,7 @@
           sortKey={sortState.key}
           sortDirection={sortState.direction}
           onSort={toggleSort}
-          onReorder={editable && naturalOrder ? reorderTracks : null}
+          onReorder={editable && ownOrderShown ? reorderTracks : null}
         />
       </div>
     {:else}

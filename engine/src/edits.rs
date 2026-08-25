@@ -23,11 +23,16 @@
 //! from the server before each edit rather than trusting a caller-supplied
 //! snapshot, so a stale UI cannot fail the optimistic-concurrency check.
 //!
-//! Semantics flagged for live verification: MOV `to_index` uses the Web API
-//! "insert before" convention (the position in the pre-move list where the
-//! moved range is inserted); REM uses `items_as_key` (remove by URI) which
-//! mirrors the Web API remove-by-uri call, including its behavior on
-//! duplicate tracks.
+//! MOV semantics are settled against two independent references: the Web
+//! API documents `insert_before` in pre-move coordinates ("first item of a
+//! 10-item playlist to the last position" means insert_before=10), and the
+//! official web player builds index-based MOV ops the same way (before an
+//! item -> its current index; after it -> current index + 1; end ->
+//! length). So the server reads `to_index` as an insert-before position in
+//! the pre-move list, and `reorder_tracks` converts the caller's
+//! final-position target accordingly. REM uses `items_as_key` (remove by
+//! URI) which mirrors the Web API remove-by-uri call, including its
+//! behavior on duplicate tracks.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,17 +80,29 @@ fn remove_tracks_op(uris: &[String]) -> p4::Op {
     op
 }
 
-/// MOV op moving a single item from `from` to the position `to` (insert
-/// before `to`, Web API `insert_before` convention).
+/// MOV op moving the single item at `from` so that it lands at index `to`
+/// of the resulting list. Callers speak final positions; the wire's
+/// `to_index` is an insert-before slot in the pre-move list — "to reorder
+/// the first item to the last position in a playlist with 10 items, set
+/// range_start to 0, and insert_before to 10" (Web API reference) — so a
+/// downward move encodes one past the target, the end case landing on
+/// length ("append").
 fn move_op(from: usize, to: usize) -> p4::Op {
     let mut op = p4::Op::new();
     op.set_kind(p4::op::Kind::MOV);
     let mut mov = p4::Mov::new();
     mov.from_index = Some(clamp_index(from));
     mov.length = Some(1);
-    mov.to_index = Some(clamp_index(to));
+    mov.to_index = Some(clamp_index(insert_before_index(from, to)));
     op.mov = protobuf::MessageField::some(mov);
     op
+}
+
+/// Converts a final-position target (`to` indexes the resulting list) into
+/// the MOV wire's insert-before index over the pre-move list: moving down
+/// skips the slot the move itself vacates. Moving up needs no adjustment.
+fn insert_before_index(from: usize, to: usize) -> usize {
+    if to > from { to.saturating_add(1) } else { to }
 }
 
 /// UPDATE_LIST_ATTRIBUTES op setting the playlist name.
@@ -339,8 +356,11 @@ pub async fn remove_tracks(session: &Session, id: &str, uris: &[String]) -> Resu
     post_playlist_changes(session, id, vec![remove_tracks_op(uris)]).await
 }
 
-/// Moves one track to the position `to` (insert before `to`) via a MOV
-/// change.
+/// Moves one track so that it lands at index `to` of the resulting list.
+///
+/// Callers speak final positions — the same numbers the UI's optimistic
+/// splice produces — and [`move_op`] converts once into the wire's
+/// insert-before form, so no caller ever sees both coordinate systems.
 pub async fn reorder_tracks(
     session: &Session,
     id: &str,
@@ -405,12 +425,32 @@ mod tests {
 
     #[test]
     fn move_op_carries_web_api_insert_before_semantics() {
+        // Moving up passes the final index through untouched.
         let op = round_trip(&move_op(3, 1));
         assert_eq!(op.kind(), p4::op::Kind::MOV);
         let mov = op.mov.unwrap();
         assert_eq!(mov.from_index, Some(3));
         assert_eq!(mov.length, Some(1));
         assert_eq!(mov.to_index, Some(1));
+
+        // Moving down encodes one past the target: item 2 to final index 5
+        // inserts before pre-move index 6, skipping the vacated slot.
+        let down = round_trip(&move_op(2, 5));
+        let mov = down.mov.unwrap();
+        assert_eq!(mov.from_index, Some(2));
+        assert_eq!(mov.to_index, Some(6));
+    }
+
+    #[test]
+    fn downward_moves_convert_to_insert_before_positions() {
+        // [A,B,C] dragged to the end posts to_index 3 == length ("append").
+        assert_eq!(insert_before_index(0, 2), 3);
+        // Landing mid-list skips the vacated slot: A to final index 1 of
+        // [A,B,C] inserts before C.
+        assert_eq!(insert_before_index(0, 1), 2);
+        // Moving up passes through untouched.
+        assert_eq!(insert_before_index(3, 1), 1);
+        assert_eq!(insert_before_index(1, 0), 0);
     }
 
     #[test]

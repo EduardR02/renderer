@@ -2433,9 +2433,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    src/lib/dnd.svelte.js): it must follow the pointer without re-rendering
    anything.
 
-     1. #drag-layer + .tl-drag-ghost — the grabbed row. A faithful clone of
-        the real row (same markup, same --cols template copied from its
-        table), lifted: raised surface, hairline edge, deep shadow, a 1.028
+    1. #drag-layer + .tl-drag-ghost — the grabbed row folded into a compact
+        pill of cloned nodes (art tile + two-line title block). It opens at
+        the row's full geometry and compresses onto the pointer over
+        var(--d2): raised surface, hairline edge, deep shadow, a 1.028
         scale. Lifted enough to read as "in hand", never tilted — tilt reads
         as playful, and this app is not.
 
@@ -2462,13 +2463,38 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   left: 0;
   top: 0;
   will-change: transform;
+  /* Scale pivots on the wrap's own corner: any other origin would displace
+     the grab handle by a fraction of the pill's slide distance. */
+  transform-origin: 0 0;
+  /* dnd.svelte.js opens the wrap as wide as the pressed row, then eases this
+     width down to the pill's natural one. */
+  transition: width var(--d2) var(--ease);
 }
-.tl-drag-ghost .tl-row {
+.tl-drag-pill {
+  /* Explicit fill: an auto-width block would let the sliding margin eat its
+     own content box (margin-left participates in the auto-width resolve),
+     collapsing the pill to its padding. 100% ignores margins and overflows
+     the wrap to the right, which is exactly the slide we want. */
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--row-h);
+  padding: 8px 14px 8px 8px; /* art sits flush in the rounded corner */
+  border-radius: var(--r2);
   background: var(--bg-2);
   box-shadow:
     inset 0 0 0 1px var(--line-2),
     0 14px 32px -10px rgba(0, 0, 0, 0.8),
     0 3px 10px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  /* The pill slides inside the wrap while the width folds, so the grab
+     point travels from wherever the pointer closed on the row to the pill's
+     handle — 18px in from its left edge, vertically centred. Same clock as
+     the width above: one gesture, no jumps. */
+  transition:
+    margin-left var(--d2) var(--ease),
+    margin-top var(--d2) var(--ease);
 }
 html.dragging-track,
 html.dragging-track body {
@@ -2514,20 +2540,22 @@ html.dragging-track .tl-row:hover .c-more button { opacity: 0; }
 /* --- Sidebar: playlists as destinations ----------------------------
    Nothing changes at rest; a rail that lights up "because dragging might
    happen" spends attention on nothing. The affordance appears with the
-   gesture: the count cedes its slot to a foam "+" (markup in Sidebar),
-   hover lifts the row under an accent hairline, and the source playlist of
-   a MOVE dims and refuses the cursor — dropping a song back where it came
-   from is not an action, and the UI should say so before the release. --- */
+   gesture: the count cedes its slot to a rose "+" (markup in Sidebar) —
+   a song joining your playlist is membership, what is yours, so the cue
+   wears rose rather than the positional-insertion foam — hover lifts the
+   row under a rose hairline, and the source playlist of a MOVE dims and
+   refuses the cursor — dropping a song back where it came from is not an
+   action, and the UI should say so before the release. --- */
 .lib-list.droppable .lib-row[data-pid]:hover {
   background: var(--bg-3);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rose-ink) 45%, transparent);
 }
-.lib-list.droppable .lib-row[data-pid]:hover .lib-name { color: var(--accent); }
+.lib-list.droppable .lib-row[data-pid]:hover .lib-name { color: var(--rose-ink); }
 .lib-drop-hint {
   font-family: var(--font-number);
   font-size: var(--t-13);
   font-weight: var(--w-semi);
-  color: var(--accent);
+  color: var(--rose-ink);
 }
 .lib-row.no-drop { opacity: 0.45; cursor: not-allowed; }
 .lib-row.no-drop:hover { background: transparent; box-shadow: none; }
@@ -2535,4 +2563,6 @@ html.dragging-track .tl-row:hover .c-more button { opacity: 0; }
 
 @media (prefers-reduced-motion: reduce) {
   .tl.reordering .tl-row { transition: background-color var(--d1) var(--ease), opacity var(--d1) var(--ease); }
+  /* The pill compression is decoration: land in pill form immediately. */
+  .tl-drag-ghost, .tl-drag-pill { transition: none; }
 }

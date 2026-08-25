@@ -63,9 +63,10 @@
        draggable out   allowAddToPlaylist — every surface whose row menu
                        offers "Add to playlist…" honours the same guard here,
                        including the recommendation footer that turns it off.
-       reorder inside  onReorder — passed only by PlaylistView, and only
-                       while the table shows the playlist's own order; a
-                       sorted projection cannot accept manual positions.
+      reorder inside  onReorder — passed only by PlaylistView, and only
+                      while the table shows the playlist's own order
+                      (forwards or reversed); any other sorted projection
+                      cannot accept manual positions.
 
      While a drag from THIS table is live, the rows part around the pointer:
      neighbours translate one slot and the source row fades, so the bar sits

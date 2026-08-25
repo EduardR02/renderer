@@ -631,9 +631,11 @@
     border-radius: 50%;
   }
 
-  /* Saved-in mark: a quiet foam check that opens the list of the user's
-     containers holding this track. The panel borrows the speed-menu's
-     raised surface; hover or keyboard focus opens it, no JS positioning. */
+  /* Saved-in mark: a quiet rose check that opens the list of the user's
+     containers holding this track. Rose, not foam, because the mark is a
+     membership statement - "this song lives in your playlists" is what is
+     yours. The panel borrows the speed-menu's raised surface; hover or
+     keyboard focus opens it, no JS positioning. */
   .p-saved {
     position: relative;
     display: inline-flex;
@@ -650,16 +652,16 @@
     width: 16px;
     height: 16px;
     border-radius: var(--rf);
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--rose-ink);
+    background: color-mix(in srgb, var(--rose-ink) 14%, transparent);
     transition:
       background var(--d1) var(--ease),
       box-shadow var(--d1) var(--ease);
   }
   .p-saved:hover .p-saved-mark,
   .p-saved:focus-visible .p-saved-mark {
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+    background: color-mix(in srgb, var(--rose-ink) 24%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--rose-ink) 12%, transparent);
   }
   .p-saved-panel {
     position: absolute;

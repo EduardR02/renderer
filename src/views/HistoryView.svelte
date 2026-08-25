@@ -45,16 +45,23 @@
     return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
   }
 
-  function formatWhen(timestamp) {
+  /* The when-cell is a two-line stack: the day on top, the clock under it.
+     A bare "3:49" next to the Played column's "1:12" read as two durations;
+     a day word cannot be mistaken for one, and the column of days is what
+     makes the journal scannable. */
+  function whenDay(timestamp) {
     const date = new Date(timestamp);
     const today = startOfDay(new Date());
     const day = startOfDay(date);
-    const time = timeFormatter.format(date);
-    if (day === today) return time;
-    if (day === today - 86_400_000) return `Yest. ${time}`;
+    if (day === today) return "Today";
+    if (day === today - 86_400_000) return "Yest.";
     const now = new Date();
-    if (date.getFullYear() === now.getFullYear()) return `${dateFormatter.format(date)} ${time}`;
-    return `${yearFormatter.format(date)} ${time}`;
+    if (date.getFullYear() === now.getFullYear()) return dateFormatter.format(date);
+    return yearFormatter.format(date);
+  }
+
+  function whenClock(timestamp) {
+    return timeFormatter.format(new Date(timestamp));
   }
 
   function contextLabel(context) {
@@ -64,6 +71,24 @@
     if (context === "history") return "History";
     const [kind] = context.split(":", 1);
     return ({ playlist: "Playlist", album: "Album", artist: "Artist", radio: "Radio" })[kind] || "Queue";
+  }
+
+  /* A quiet glyph per kind of source, so the column scans by shape before
+     its text is read. Liked is the one warm mark — it is the "yours" hue. */
+  function contextIcon(context) {
+    if (!context) return null;
+    if (context === "liked") return "heart-f";
+    if (context === "search") return "search";
+    const [kind] = context.split(":", 1);
+    return ({ playlist: "queue", album: "note", artist: "note", radio: "shuffle" })[kind] || null;
+  }
+
+  /* How much of the song a skipped play actually got through — drawn as a
+     micro seek-rail so a partial reads as a shape, not as a bare duration. */
+  function playedPct(entry) {
+    const total = entry.track.duration_ms || 0;
+    if (total <= 0) return 0;
+    return Math.min(100, Math.max(3, Math.round((entry.ms_played / total) * 100)));
   }
 
   function titleOf(entry) {
@@ -214,30 +239,30 @@
   </header>
 
   <div class="history-tools-sentinel" bind:this={toolsSentinel} aria-hidden="true"></div>
+  <!-- One quiet instrument row: what is listed, the filter, the order, and the
+       one destructive action. The controls say what they are; the bar carries
+       no labels of its own and no chrome until it sticks. -->
   <div class="history-tools" class:stuck={toolsStuck}>
     <div class="history-summary" aria-live="polite">
-      <span class="history-summary-icon"><Icon name="clock" size={13} /></span>
-      <span class="history-summary-copy">
-        {#if loaded && !error}
-          <span class="history-summary-kicker">{filtering ? "Showing" : "Recorded"}</span>
-          <span class="history-summary-value">
-            <strong class="tnum">{countFormatter.format(filtered.length)}</strong>
-            {filtered.length === 1 ? "play" : "plays"}
-            {#if filtering}<span class="history-summary-total">of <span class="tnum">{countFormatter.format(history.length)}</span></span>{/if}
-          </span>
-        {:else if error}
-          <span class="history-summary-kicker">History</span>
-          <span class="history-summary-value">Unavailable</span>
-        {:else}
-          <span class="history-summary-kicker">History</span>
-          <span class="history-summary-value">Loading…</span>
-        {/if}
-      </span>
+      <Icon name="clock" size={15} />
+      {#if loaded && !error}
+        <span class="caps">{filtering ? "Showing" : "Recorded"}</span>
+        <span class="history-count">
+          <strong class="tnum">{countFormatter.format(filtered.length)}</strong>
+          {filtered.length === 1 ? "play" : "plays"}
+          {#if filtering}<span class="history-total">of <span class="tnum">{countFormatter.format(history.length)}</span></span>{/if}
+        </span>
+      {:else if error}
+        <span class="caps">History</span>
+        <span class="history-count">Unavailable</span>
+      {:else}
+        <span class="caps">History</span>
+        <span class="history-count">Loading…</span>
+      {/if}
     </div>
-    <span class="history-tools-divider" aria-hidden="true"></span>
     <div class="history-control history-filter-control">
-      <span class="history-control-label"><Icon name="search" size={12} />Filter</span>
       <span class="history-filter">
+        <Icon name="search" size={13} />
         <input
           bind:value={query}
           aria-label="Filter listening history"
@@ -254,7 +279,6 @@
       </span>
     </div>
     <div class="history-control history-sort-control">
-      <span class="history-control-label"><Icon name="clock" size={12} />Sort</span>
       <Select
         label="Sort listening history"
         options={SORTS}
@@ -263,7 +287,6 @@
         onchange={(value) => (sort = value)}
       />
     </div>
-    <span class="history-tools-divider" aria-hidden="true"></span>
     <button
       class="btn-ghost history-clear"
       type="button"
@@ -299,10 +322,10 @@
     </div>
   {:else}
     <div class="history-list-head" aria-hidden="true">
-      <span>Track</span>
-      <span>Source</span>
-      <span>Played</span>
-      <span>When</span>
+      <span class="caps">Track</span>
+      <span class="caps">Source</span>
+      <span class="caps">Played</span>
+      <span class="caps">When</span>
     </div>
     <div
       class="history-list"
@@ -326,33 +349,47 @@
         {:else}
           {#each visible as entry, index (firstRow + index)}
             <div class="hi-row">
-              <button
-                class="hi-main"
-                title={`Play ${entry.track.name}`}
-                onclick={() => replay(entry)}
-              >
-                <Cover
-                  src={entry.track.cover_url}
-                  id={entry.track.album_id || entry.track.uri}
-                  name={entry.track.name}
-                  size={40}
-                />
+              <!-- The whole row is the button: one tab stop, replay from
+                   anywhere on it, and the accessible name is the play itself. -->
+              <button class="hi-main" title={`Play ${entry.track.name}`} onclick={() => replay(entry)}>
+                <span class="hi-art">
+                  <Cover
+                    src={entry.track.cover_url}
+                    id={entry.track.album_id || entry.track.uri}
+                    name={entry.track.name}
+                    size={40}
+                  />
+                  <span class="hi-go" aria-hidden="true"><Icon name="play" size={13} /></span>
+                </span>
                 <span class="hi-copy">
                   <strong>{entry.track.name}</strong>
                   <span>{artistOf(entry)}</span>
                 </span>
+                <span class="hi-context" class:liked={entry.context === "liked"}>
+                  {#if contextIcon(entry.context)}<Icon name={contextIcon(entry.context)} size={11} />{/if}
+                  <span class="hi-context-text">{contextLabel(entry.context)}</span>
+                </span>
+                <span class="hi-played">
+                  {#if entry.completed}
+                    <!-- Foam, the app's "this is done" hue, and the only colour
+                         in the row besides a liked heart. -->
+                    <span class="hi-complete"><Icon name="check" size={12} />Played</span>
+                  {:else}
+                    <span
+                      class="hi-partial"
+                      title={`Skipped — ${formatTime(entry.ms_played)} of ${formatTime(entry.track.duration_ms)} heard`}
+                    >
+                      <span class="sr-only">Partial play, </span>
+                      <span class="tnum">{formatTime(entry.ms_played)}</span>
+                      <span class="hi-progress" aria-hidden="true"><i style:width="{playedPct(entry)}%"></i></span>
+                    </span>
+                  {/if}
+                </span>
+                <time class="hi-when tnum" datetime={new Date(entry.started_at).toISOString()}>
+                  <span class="hi-when-day">{whenDay(entry.started_at)}</span>
+                  <span class="hi-when-clock">{whenClock(entry.started_at)}</span>
+                </time>
               </button>
-              <span class="hi-context">{contextLabel(entry.context)}</span>
-              <span class="hi-played">
-                {#if entry.completed}
-                  <span class="hi-complete"><Icon name="check" size={12} />Played</span>
-                {:else}
-                  <span class="tnum">{formatTime(entry.ms_played)}</span>
-                {/if}
-              </span>
-              <time class="hi-when tnum" datetime={new Date(entry.started_at).toISOString()}>
-                {formatWhen(entry.started_at)}
-              </time>
             </div>
           {/each}
         {/if}
@@ -375,7 +412,13 @@
 
 
 <style>
-  .history-page { max-width: 1020px; margin: 0 auto; padding-top: var(--s5); }
+  .history-page {
+    max-width: 1020px; margin: 0 auto; padding-top: var(--s5);
+    /* The one column template, shared by the head and every row so a label
+       always sits over its column. The windowing only asks that a row is
+       56px tall; the columns may do this. */
+    --hi-cols: minmax(220px, 1fr) 104px 92px 96px;
+  }
   .history-head { padding: var(--s2) 0 var(--s6); }
   .history-head-copy { min-width: 0; }
   .history-head .page-title { margin-top: var(--s2); }
@@ -383,21 +426,29 @@
     max-width: 520px; margin-top: var(--s2);
     color: var(--fg-2); font-size: var(--t-13); line-height: 1.45;
   }
-  .history-clear { height: 34px; margin-left: auto; padding: 0 var(--s3); color: var(--fg-2); }
+  .history-clear { height: 32px; margin-left: auto; padding: 0 var(--s3); color: var(--fg-2); }
   .history-clear:hover:not(:disabled) {
     color: var(--love); background: var(--danger-wash);
     border-color: color-mix(in srgb, var(--love) 45%, transparent);
   }
-
-  /* The metadata and both controls are one instrument panel. When it sticks,
-     only the surface changes; sizes and alignment stay fixed. */
+  .history-page {
+    max-width: 1020px; margin: 0 auto; padding-top: var(--s5);
+    /* The one column template, shared by the head and every row so a label
+       always sits over its column: art, track, source, played, when. The
+       windowing only asks that a row is 56px tall; the columns may do this. */
+    --hi-cols: 40px minmax(220px, 1fr) 116px 92px 96px;
+  }
+  /* The instrument row sticks under the topbar. At rest it is nothing at
+     all — no fill, no rules; the controls float on the page like the
+     track-list head's do. When it sticks, only the surface changes: the
+     same glass the topbar and tl-head wear, and one hairline underneath to
+     hold the rows out of it. Sizes and alignment never move. */
   .history-tools-sentinel { height: 0; pointer-events: none; }
   .history-tools {
     position: sticky; top: var(--topbar-h); z-index: 20;
     display: flex; align-items: center; gap: var(--s4);
-    min-height: 58px; padding: var(--s2) 0;
+    min-height: 48px; padding: var(--s2) 0;
     background: transparent;
-    box-shadow: inset 0 1px 0 var(--line), inset 0 -1px 0 var(--line);
     transition: background-color var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
   }
   .history-tools.stuck {
@@ -411,47 +462,33 @@
   }
 
   .history-summary {
-    display: flex; align-items: center; gap: var(--s3);
-    flex: 0 0 146px; min-width: 0;
+    display: flex; align-items: center; gap: var(--s2);
+    flex: none; min-width: 0; color: var(--fg-3);
   }
-  .history-summary-icon {
-    display: grid; place-items: center; flex: none;
-    width: 28px; height: 28px; border-radius: var(--rf);
-    background: var(--accent-wash); color: var(--accent);
-  }
-  .history-summary-copy { display: grid; gap: 1px; min-width: 0; }
-  .history-summary-kicker, .history-control-label {
-    display: inline-flex; align-items: center; gap: 5px;
-    color: var(--fg-3); font-family: var(--font-small);
-    font-size: 9px; font-weight: var(--w-semi); letter-spacing: 0.11em; text-transform: uppercase;
-  }
-  .history-summary-value {
-    color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11);
+  .history-count {
+    display: inline-flex; align-items: baseline; gap: 5px; min-width: 0;
+    color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-12);
     white-space: nowrap;
   }
-  .history-summary-value strong { color: var(--fg); font-weight: var(--w-semi); }
-  .history-summary-total { color: var(--fg-3); }
-  .history-tools-divider { align-self: stretch; width: 1px; margin: var(--s1) 0; background: var(--line); }
+  .history-count strong { color: var(--fg); font-weight: var(--w-semi); font-size: var(--t-13); }
+  .history-total { color: var(--fg-3); }
 
-  .history-control { display: grid; align-content: center; gap: 4px; min-width: 0; }
-  .history-control-label { height: 12px; }
+  .history-control { display: flex; align-items: center; min-width: 0; }
   .history-filter-control { flex: 1 1 310px; max-width: 420px; }
   .history-filter {
-    display: flex; align-items: center;
-    min-width: 0; height: 34px; padding: 0 var(--s2) 0 var(--s3);
+    display: flex; align-items: center; gap: var(--s2);
+    min-width: 0; width: 100%; height: 32px; padding: 0 var(--s3);
     border: 1px solid var(--line-2); border-radius: var(--r2);
     background: var(--bg-2); color: var(--fg-3);
     transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
   }
-  .history-filter:focus-within {
-    border-color: color-mix(in srgb, var(--accent) 58%, transparent);
-    background: var(--bg-3);
-  }
+  .history-filter:focus-within { border-color: var(--foam); background: var(--bg-3); }
   .history-filter input {
     flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0;
     background: transparent; color: var(--fg); font-size: var(--t-12);
+    text-overflow: ellipsis;
   }
-  .history-filter input::placeholder { color: var(--fg-3); }
+  .history-filter input::placeholder { color: var(--fg-2); }
   .history-filter input:disabled { opacity: 0.45; }
   .history-filter-clear {
     flex: none; display: grid; place-items: center;
@@ -459,37 +496,50 @@
   }
   .history-filter-clear:hover { color: var(--fg); background: rgba(255, 255, 255, 0.08); }
   .history-sort-control { flex: none; }
-  .history-sort-control :global(.sel-btn) { height: 34px; min-width: 146px; background: var(--bg-2); }
+  .history-sort-control :global(.sel-btn) { height: 32px; min-width: 138px; }
 
   .history-list-head {
-    display: grid; grid-template-columns: minmax(220px, 1fr) 104px 92px 96px;
+    display: grid; grid-template-columns: var(--hi-cols);
     align-items: center; gap: var(--s4);
-    height: 30px; padding: 0 var(--s2);
-    border-bottom: 1px solid var(--line);
-    color: var(--fg-3); font-family: var(--font-small);
-    font-size: 9px; font-weight: var(--w-semi); letter-spacing: 0.11em; text-transform: uppercase;
+    height: 30px; padding: 0 var(--s3);
+    color: var(--fg-3);
   }
+  /* "Track" covers the art column too; the rest sit over their own. */
+  .history-list-head span:first-child { grid-column: 1 / 3; }
   .history-list-head span:last-child { text-align: right; }
   .history-empty {
-    max-width: none; min-height: 132px; margin: 0; padding: var(--s6) var(--s2);
+    max-width: none; min-height: 132px; margin: 0; padding: var(--s6) var(--s3);
   }
 
   /* One template for every row, because every row is the same height — that
-     is what the windowing above depends on. */
-  .hi-row {
-    display: grid;
-    grid-template-columns: minmax(220px, 1fr) 104px 92px 96px;
-    align-items: center; gap: var(--s4);
-    height: 56px; padding: 0 var(--s2);
-    border-radius: var(--r1);
-    box-shadow: inset 0 -1px 0 var(--line-2);
-  }
-  .hi-row:hover { background: rgba(255, 255, 255, 0.035); }
+     is what the windowing above depends on. The rows speak the track-list's
+     language: borderless rounded hover surfaces, no separators. The sticky
+     bar's hairline is the only structural line the list answers to. */
+  .hi-row { height: 56px; }
   .hi-main {
-    display: flex; align-items: center; gap: var(--s3);
-    min-width: 0; height: 100%; text-align: left;
+    display: grid; grid-template-columns: var(--hi-cols);
+    align-items: center; gap: var(--s4);
+    width: 100%; height: 56px; padding: 0 var(--s3);
+    border-radius: var(--r2); text-align: left;
+    transition: background-color var(--d1) var(--ease);
   }
-  .hi-main:disabled { opacity: 1; }
+  .hi-main:hover { background: rgba(255, 255, 255, 0.045); }
+
+  /* The replay affordance lives on the art: on hover (or keyboard focus) the
+     sleeve dims under a scrim and the play glyph surfaces. Opacity only —
+     nothing moves, so reduced motion has nothing to undo. */
+  .hi-art { position: relative; display: block; flex: none; width: 40px; height: 40px; }
+  .hi-go {
+    position: absolute; inset: 0; z-index: 1;
+    display: grid; place-items: center;
+    border-radius: var(--r1);
+    background: color-mix(in srgb, var(--bg-0) 55%, transparent);
+    color: var(--fg);
+    opacity: 0;
+    transition: opacity var(--d1) var(--ease);
+  }
+  .hi-main:hover .hi-go, .hi-main:focus-visible .hi-go { opacity: 1; }
+
   .hi-copy { display: grid; gap: 3px; min-width: 0; }
   .hi-copy strong {
     font-size: var(--t-13); font-weight: var(--w-med); color: var(--fg);
@@ -499,22 +549,45 @@
     font-size: var(--t-11); color: var(--fg-2);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .hi-row:hover .hi-copy strong { color: var(--fg); }
-  .hi-context, .hi-when {
-    font-size: var(--t-11); color: var(--fg-2);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .hi-played { font-size: var(--t-11); color: var(--fg-2); }
-  /* Foam, the app's "this is done" hue, and the only colour in the row. */
-  .hi-complete { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); }
-  .hi-when { text-align: right; }
+  .hi-main:hover .hi-copy > span { color: var(--fg-1); }
 
+  /* The source of a play, as the app's quiet chip: a hairline pill that
+     scans by its glyph before its word is read. Liked is the one warm mark. */
+  .hi-context {
+    display: inline-flex; align-items: center; gap: 5px;
+    justify-self: start; min-width: 0; max-width: 100%;
+    height: 20px; padding: 0 var(--s2);
+    border: 1px solid var(--line); border-radius: var(--rf);
+    color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11);
+    transition: color var(--d1) var(--ease), border-color var(--d1) var(--ease);
+  }
+  .hi-context-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hi-context :global(.icon) { color: var(--fg-3); }
+  .hi-context.liked :global(.icon) { color: var(--rose-ink); }
+  .hi-main:hover .hi-context { color: var(--fg-1); border-color: var(--line-2); }
+
+  .hi-played { display: flex; align-items: center; min-width: 0; font-size: var(--t-11); color: var(--fg-2); }
+  .hi-complete { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font-weight: var(--w-med); }
+  /* A skipped play shows how much of the song it got through as a micro
+     seek-rail — the cache-meter's object at row scale — so completed and
+     partial separate by shape before either is read. */
+  .hi-partial { display: grid; gap: 5px; justify-items: start; }
+  .hi-progress {
+    width: 44px; height: 3px; border-radius: var(--rf);
+    background: var(--bg-4); overflow: hidden;
+  }
+  .hi-progress i { display: block; height: 100%; border-radius: inherit; background: var(--accent-grad); }
+
+  /* Day over clock, right-aligned: the column reads as a run of days with
+     times hanging under them, which is how a journal is scanned. */
+  .hi-when { display: grid; gap: 1px; justify-items: end; min-width: 0; text-align: right; }
+  .hi-when-day { font-family: var(--font-small); font-size: var(--t-12); font-weight: var(--w-med); color: var(--fg-1); white-space: nowrap; }
+  .hi-when-clock { font-size: var(--t-11); color: var(--fg-3); white-space: nowrap; }
   @media (max-width: 760px) {
+    .history-page { --hi-cols: 40px minmax(0, 1fr) 92px; }
     .history-tools { flex-wrap: wrap; gap: var(--s3); padding: var(--s3) 0; }
     .history-summary { flex: 1 0 calc(100% - var(--s4)); }
-    .history-tools-divider { display: none; }
     .history-filter-control { flex: 1 1 220px; max-width: none; }
-    .history-list-head, .hi-row { grid-template-columns: minmax(0, 1fr) 92px; }
     .history-list-head span:nth-child(2), .history-list-head span:nth-child(3),
     .hi-context, .hi-played { display: none; }
   }

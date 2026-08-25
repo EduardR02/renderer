@@ -137,6 +137,12 @@ pub struct AppState {
     /// This is process-local bookkeeping and is deliberately not serialized.
     #[serde(skip)]
     playlist_refreshing: HashSet<String>,
+    /// Set when a refresh trigger arrives while another is out for the same
+    /// playlist; the running refresh re-runs once more instead of the trigger
+    /// being dropped (an edit committed mid-fetch would otherwise never be
+    /// seen until the next open).
+    #[serde(skip)]
+    playlist_refresh_queued: HashSet<String>,
     /// Serializes playlist state mutation with its bounded atomic cache write.
     /// Async fetches may finish out of order; holding this outside the
     /// AppState lock lets disk I/O proceed without blocking state readers while
@@ -180,6 +186,7 @@ impl AppState {
             data_dir,
             playlist_refreshing: HashSet::new(),
             playlist_persistence: Arc::new(Mutex::new(())),
+            playlist_refresh_queued: HashSet::new(),
             library_fetching: false,
             library_refresh_queued: false,
             cache_stats: None,
@@ -190,11 +197,22 @@ impl AppState {
     }
 
     pub(crate) fn start_playlist_refresh(&mut self, id: &str) -> bool {
-        self.playlist_refreshing.insert(id.to_owned())
+        if self.playlist_refreshing.insert(id.to_owned()) {
+            return true;
+        }
+        // Another fetch is out for this playlist; remember the trigger so
+        // its completion can run one more pass instead of dropping this one.
+        self.playlist_refresh_queued.insert(id.to_owned());
+        false
     }
 
     pub(crate) fn finish_playlist_refresh(&mut self, id: &str) {
         self.playlist_refreshing.remove(id);
+    }
+
+    /// Takes and clears a mid-flight refresh trigger for `id`.
+    pub(crate) fn take_playlist_refresh_queued(&mut self, id: &str) -> bool {
+        self.playlist_refresh_queued.remove(id)
     }
 }
 
@@ -994,10 +1012,15 @@ mod tests {
         let mut state = AppState::new(PathBuf::from("unused"));
 
         assert!(state.start_playlist_refresh("p1"));
+        // A second trigger while p1 is out is refused but queued for a
+        // single re-run, so an edit landing mid-fetch is never dropped.
         assert!(!state.start_playlist_refresh("p1"));
         assert!(state.start_playlist_refresh("p2"));
 
         state.finish_playlist_refresh("p1");
+        assert!(state.take_playlist_refresh_queued("p1"));
+        assert!(!state.take_playlist_refresh_queued("p1"));
+
         assert!(state.start_playlist_refresh("p1"));
         state.finish_playlist_refresh("p1");
         state.finish_playlist_refresh("p2");

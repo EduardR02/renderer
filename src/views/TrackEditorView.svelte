@@ -627,7 +627,7 @@
         </div>
         <div class="preview-copy">
           <strong>{previewStatus.label}</strong>
-          <span>{previewStatus.copy} · cursor {formatExactTime(cursorMs)}</span>
+          <span class="tnum">{previewStatus.copy} · cursor {formatExactTime(cursorMs)}</span>
         </div>
         <span class="preview-status" class:active={previewStatus.active} class:stale={previewState === "stale"}>{previewStatus.label}</span>
       </div>
@@ -688,7 +688,7 @@
         {:else}<p class="empty-range">No loop. Use Add loop or press L to create one.</p>{/if}
       </section>
 
-      {#if playlistId}<label class="enable-row"><input type="checkbox" checked={enabled} disabled={!ready || saving || !definitionExists} onchange={(event) => setEnabled(event.currentTarget.checked)} /><span><strong>Use repaired version in this playlist</strong><small>Off by default. Other playlists still play the intact track.</small></span></label>{/if}
+      {#if playlistId}<label class="enable-row"><input class="enable-check" type="checkbox" checked={enabled} disabled={!ready || saving || !definitionExists} onchange={(event) => setEnabled(event.currentTarget.checked)} /><span><strong>Use repaired version in this playlist</strong><small>Off by default. Other playlists still play the intact track.</small></span></label>{/if}
       {#if actionError}<p class="edit-error" role="alert">{actionError}</p>{/if}
       {#if validation.firstError}<p class="edit-error" role="alert">Fix the highlighted range before saving.</p>{/if}
       <footer class="edit-footer">
@@ -708,10 +708,20 @@
 <style>
 .edit-page { max-width: 1240px; margin-inline: auto; }
 .edit-back {
-  display: inline-flex; align-items: center; gap: 7px; min-height: 30px;
-  margin-bottom: var(--s3); color: var(--fg-2);
+  display: inline-flex; align-items: center; gap: 7px; min-height: 32px;
+  margin-bottom: var(--s3); padding: 0 var(--s3) 0 var(--s2);
+  border-radius: var(--r2); color: var(--fg-2); font-size: var(--t-12);
+  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.edit-back:hover { color: var(--fg); }
+.edit-back:hover { color: var(--fg); background: rgba(255, 255, 255, 0.05); }
+/* Same left-aligned quiet column as every other empty state — centring it
+   would dress a missing track up as a modal event. */
+.empty-state { max-width: 560px; padding: var(--s7) 0; color: var(--fg-2); font-size: var(--t-13); }
+.empty-state h1 {
+  margin-bottom: var(--s2); color: var(--fg);
+  font: var(--w-bold) var(--t-20) var(--font-display); letter-spacing: -.015em;
+}
+.edit-head p { font-size: var(--t-12); }
 .edit-head { display: flex; align-items: center; gap: var(--s4); margin-bottom: var(--s5); }
 .edit-head :global(.art) { flex: none; }
 .edit-title { min-width: 0; }
@@ -753,24 +763,34 @@
 }
 .preview-button {
   padding: 0 var(--s3); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  background: var(--accent); color: var(--accent-ink); font-weight: var(--w-med);
+  background: var(--accent); color: var(--accent-ink);
+  font-size: var(--t-12); font-weight: var(--w-semi);
+  transition: filter var(--d1) var(--ease), transform var(--d1) var(--ease);
 }
 .preview-pause {
   gap: 6px; padding: 0 10px; border: 1px solid var(--line-2);
   background: var(--bg-2); color: var(--fg-1); font-size: var(--t-11);
+  transition: color var(--d1) var(--ease), border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .preview-pause:hover { border-color: color-mix(in srgb, var(--fg) 22%, transparent); background: var(--bg-3); }
 .preview-button:hover:not(:disabled) { filter: brightness(1.08); }
+.preview-button:active:not(:disabled) { transform: scale(0.98); }
 .preview-copy { display: grid; min-width: 0; gap: 2px; color: var(--fg-2); font-size: var(--t-11); }
 .preview-copy strong { color: var(--fg-1); font-size: var(--t-12); }
 .preview-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .preview-status {
-  margin-left: auto; padding: 3px 7px; border: 1px solid var(--line);
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-left: auto; padding: 3px 9px; border: 1px solid var(--line);
   border-radius: var(--rf); color: var(--fg-3); font: var(--t-11) var(--font-small);
   white-space: nowrap;
 }
+/* A status lamp, not a second headline: the label already runs in the copy,
+   so the pill leads with the dot and lets colour carry the state. */
+.preview-status::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--fg-3); }
 .preview-status.active { border-color: color-mix(in srgb, var(--accent) 40%, transparent); color: var(--accent); }
+.preview-status.active::before { background: var(--accent); }
 .preview-status.stale { border-color: color-mix(in srgb, var(--gold) 40%, transparent); color: var(--gold); }
+.preview-status.stale::before { background: var(--gold); }
 :global(.repair-sheet>.waveform-editor) { padding: 0 var(--s6) var(--s4); }
 .definition-status, .definition-error {
   min-height: 42px; margin: 0 var(--s6); padding: 10px var(--s3);
@@ -786,14 +806,17 @@
 .range-heading p, .empty-range { font: var(--t-12) var(--font-small); }
 .range-count, .loop-chip {
   flex: none; padding: 3px 8px; border: 1px solid var(--line);
-  border-radius: var(--rf); color: var(--fg-2); font: var(--t-11) var(--font-small);
+  border-radius: var(--rf); font: var(--t-11) var(--font-small);
 }
+/* A quantity, so it wears the app's count colour like every other count. */
+.range-count { color: var(--count); }
 .loop-chip { border-color: color-mix(in srgb, var(--gold) 28%, var(--line)); color: var(--gold); }
 .range-list { display: grid; gap: 6px; }
 .exact-row {
   display: grid; align-items: end; column-gap: var(--s2); row-gap: 5px;
   min-height: 62px; padding: 7px 8px 7px 0; border: 1px solid transparent;
   border-radius: var(--r2); background: color-mix(in srgb, var(--bg-1) 62%, transparent);
+  transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .exact-row.cut-row {
   grid-template-columns: 44px minmax(120px, 1.1fr) 18px minmax(120px, 1.1fr) minmax(100px, .8fr) 38px;
@@ -801,11 +824,22 @@
 .exact-row.loop-row {
   grid-template-columns: 44px minmax(120px, 1.1fr) 18px minmax(120px, 1.1fr) minmax(84px, .6fr) minmax(100px, .8fr) 38px;
 }
-.exact-row.selected { border-color: color-mix(in srgb, var(--rose-ink) 35%, var(--line)); }
-.loop-row.selected { border-color: color-mix(in srgb, var(--gold) 35%, var(--line)); }
+.exact-row:hover:not(.selected) { border-color: var(--line-2); }
+/* Selection is the region's hue as a wash under the row, matching the
+   tint the region paints on the waveform above — one fact, two surfaces. */
+.exact-row.cut-row.selected {
+  border-color: color-mix(in srgb, var(--rose-ink) 38%, var(--line));
+  background: color-mix(in srgb, var(--rose-ink) 7%, color-mix(in srgb, var(--bg-1) 62%, transparent));
+}
+.loop-row.selected {
+  border-color: color-mix(in srgb, var(--gold) 38%, var(--line));
+  background: color-mix(in srgb, var(--gold) 7%, color-mix(in srgb, var(--bg-1) 62%, transparent));
+}
 .region-index {
   align-self: stretch; display: flex; align-items: center; gap: 7px; padding-left: 10px;
-  border: 0; color: var(--fg-2); background: transparent; font: 10px var(--font-mono);
+  border: 0; color: var(--fg-2); background: transparent;
+  font: var(--t-11) var(--font-mono);
+  transition: color var(--d1) var(--ease);
 }
 .region-index:hover { color: var(--fg); }
 .region-index span { width: 3px; height: 22px; border-radius: var(--rf); background: var(--rose-ink); }
@@ -814,14 +848,18 @@
 .time-input {
   width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--line-2);
   border-radius: var(--r1); outline: 0; background: var(--bg-2); color: var(--fg); font: var(--t-12) var(--font-mono);
+  transition: border-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease), opacity var(--d1) var(--ease);
 }
+.time-input:hover:not(:disabled):not(:focus) { border-color: color-mix(in srgb, var(--fg) 18%, var(--line-2)); }
 .time-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent); }
+.time-input:disabled { opacity: .45; }
 .arrow, .range-duration, .remove-region { align-self: center; margin-top: 16px; }
 .arrow { color: var(--fg-3); text-align: center; }
 .range-duration { padding: 0 var(--s2); color: var(--fg-2); font: var(--t-11) var(--font-mono); white-space: nowrap; }
 .remove-region {
   display: grid; place-items: center; width: 34px; height: 34px; margin-inline: auto;
   border: 1px solid transparent; border-radius: var(--r1); color: var(--fg-2); background: transparent;
+  transition: color var(--d1) var(--ease), border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .remove-region:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--rose-ink) 34%, transparent); color: var(--rose-ink);
@@ -829,11 +867,24 @@
 }
 .range-error { grid-column: 2/-1; color: var(--rose-ink); font-size: var(--t-11); }
 .enable-row {
-  display: flex; gap: var(--s3); margin: 0 var(--s6) var(--s5); padding: var(--s4);
+  display: flex; align-items: flex-start; gap: var(--s3); margin: 0 var(--s6) var(--s5); padding: var(--s4);
   border: 1px solid var(--line-2); border-radius: var(--r2); background: color-mix(in srgb, var(--bg-1) 36%, transparent);
+  transition: border-color var(--d1) var(--ease), opacity var(--d1) var(--ease);
 }
-.enable-row span { display: grid; gap: 2px; }.enable-row small { color: var(--fg-2); }
-.edit-error { margin: 0 var(--s6) var(--s3); color: var(--rose-ink); }
+.enable-row:hover:not(:has(.enable-check:disabled)) { border-color: color-mix(in srgb, var(--fg) 18%, var(--line-2)); }
+.enable-row:focus-within { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+/* The commit is gated on a saved definition existing; while it is gated the
+   whole row steps back rather than leaving an active-looking control dead. */
+.enable-row:has(.enable-check:disabled) { opacity: .55; }
+.enable-row span { display: grid; gap: 2px; }
+.enable-row strong { font-weight: var(--w-semi); }
+.enable-row small { color: var(--fg-2); font-size: var(--t-11); }
+.enable-check {
+  width: 16px; height: 16px; margin: 2px 0 0; flex: none;
+  accent-color: var(--accent); cursor: pointer;
+}
+.enable-check:disabled { cursor: default; }
+.edit-error { margin: 0 var(--s6) var(--s3); color: var(--rose-ink); font-size: var(--t-12); }
 .edit-footer {
   position: sticky; z-index: 8; bottom: 0; display: flex; align-items: center;
   justify-content: space-between; min-height: 64px; padding: var(--s3) var(--s6);

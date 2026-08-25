@@ -51,6 +51,42 @@ fixtures.playlistDetail = {
   tracks: makeTracks(12),
 };
 
+/* History fixture: a believable listening day. */
+const now = Date.now();
+const H = 3600_000;
+fixtures.history = makeTracks(14).map((track, i) => ({
+  track_id: track.id,
+  started_at: now - i * (37 * 60_000) - H / 3,
+  ms_played: i % 5 === 0 ? Math.floor(track.duration_ms * 0.4) : track.duration_ms,
+  completed: i % 5 !== 0,
+  context: ["playlist:p1", "album:al1", "search", "liked", "radio:r1"][i % 5],
+  track,
+}));
+
+/* Waveform fixture: packed little-endian (min,max) i16 pairs at 10ms bins —
+   the exact contract decodeTrackWaveform validates. A smooth pseudo-song so
+   the canvas has structure to draw. */
+fixtures.waveformFor = (trackId, durationMs) => {
+  const bins = Math.floor(durationMs / 10);
+  const pairs = new Int16Array(bins * 2);
+  for (let b = 0; b < bins; b += 1) {
+    const t = b / bins;
+    const amp = (Math.sin(t * 61) * 0.3 + Math.sin(t * 17.3) * 0.45 + 0.55) * 30000;
+    const lo = -Math.round(amp * (0.55 + 0.4 * Math.abs(Math.sin(t * 7))));
+    pairs[b * 2] = lo;
+    pairs[b * 2 + 1] = Math.round(amp);
+  }
+  const bytes = new Uint8Array(pairs.buffer);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+  return { track_id: trackId, duration_ms: durationMs, interval_ms: 1, bin_count: bins, peaks_base64: btoa(bin) };
+};
+
+
+/* Queue entries carry the source context the player bar and history read. */
+function contextTracks(tracks) {
+  return tracks.map((t) => ({ ...t, context: "playlist:p1" }));
+}
 window.__fixtures = fixtures;
 
 window.__TAURI_INTERNALS__ = {
@@ -70,23 +106,40 @@ window.__TAURI_INTERNALS__ = {
           ready: true,
           auth_state: "ready",
           username: "eduard",
-          playing: false,
-          position_ms: 0,
+          playing: true,
+          position_ms: 45000,
+          duration_ms: fixtures.playlistDetail.tracks[0].duration_ms,
           volume: 70,
           shuffle: false,
           repeat: "off",
           playback_speed: 1,
-          queue: [],
+          current_index: 0,
+          current_uri: fixtures.playlistDetail.tracks[0].uri,
+          queue: contextTracks(fixtures.playlistDetail.tracks),
           playlists: fixtures.playlists,
         };
-      case "browse_playlists":
-        return JSON.parse(JSON.stringify(fixtures.playlists));
+      case "get_track_playlists":
+        return [
+          { id: "liked", name: "Liked Songs" },
+          { id: "p1", name: "Road Trip" },
+        ];
       case "browse_playlist":
         return JSON.parse(JSON.stringify(fixtures.playlistDetail));
       case "get_app_settings":
         return { animated_canvas: false };
-      default:
-        return null; // every edit command "succeeds"
+      case "get_history":
+        return JSON.parse(JSON.stringify(fixtures.history));
+      case "get_track_waveform":
+        return fixtures.waveformFor(args.trackId, 214000);
+      case "get_track_edit":
+        return { definition: null, enabled: false };
+      case "save_track_edit":
+        return {
+          track_id: args.trackId,
+          duration_ms: args.durationMs,
+          cuts: args.cuts ?? [],
+          loop_range: args.loopRange ?? null,
+        };
     }
   },
 };

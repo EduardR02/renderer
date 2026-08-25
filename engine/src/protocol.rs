@@ -362,9 +362,10 @@ pub enum Command {
         id: String,
         uris: Vec<String>,
     },
-    /// Moves one track to the position `to` (insert before `to`, Web API
-    /// reorder semantics) via a playlist4 MOV change. Responded to with an
-    /// `edit_reorder_playlist_tracks` message.
+    /// Moves one track so that it lands at index `to` of the resulting list
+    /// (the engine converts the final position into the playlist4 MOV wire's
+    /// insert-before form). Responded to with an `edit_reorder_playlist_tracks`
+    /// message.
     EditReorderPlaylistTracks {
         id: String,
         from: usize,
