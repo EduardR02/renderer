@@ -10,7 +10,7 @@
     ensurePersonalizedDiscovery,
     mergePersonalizedPlaylists,
   } from "../lib/state.svelte.js";
-  import { playPlaylistById, playLikedSongs } from "../lib/play.js";
+  import { playPlaylistById, playLikedSongs, cardPlay } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import LikedMark from "../components/LikedMark.svelte";
@@ -113,34 +113,19 @@
     ),
   );
 
-  let busy = $state("");
+  const busy = $state({ id: "" });
   let error = $state("");
 
   async function play(id) {
-    if (busy) return;
-    busy = id;
     error = "";
-    try {
-      await playPlaylistById(id);
-    } catch (reason) {
-      error = String(reason || "Could not play this playlist.");
-    } finally {
-      busy = "";
-    }
+    error = await cardPlay(busy, id, () => playPlaylistById(id), "Could not play this playlist.");
   }
 
   async function playLiked() {
-    if (busy) return;
-    busy = "liked";
     error = "";
-    try {
-      await playLikedSongs();
-    } catch (reason) {
-      error = String(reason || "Could not play Liked Songs.");
-    } finally {
-      busy = "";
-    }
+    error = await cardPlay(busy, "liked", playLikedSongs, "Could not play Liked Songs.");
   }
+
 </script>
 
 {#snippet likedCard(canPlay)}
@@ -154,10 +139,10 @@
           class="card-play saved"
           aria-label="Play Liked Songs"
           title="Play Liked Songs"
-          disabled={!!busy}
+          disabled={!!busy.id}
           onclick={playLiked}
         >
-          <Icon name={busy === "liked" ? "more" : "play"} size={15} />
+          <Icon name={busy.id === "liked" ? "more" : "play"} size={15} />
         </button>
       {/if}
     </div>
@@ -182,10 +167,10 @@
         class="card-play"
         aria-label={`Play ${pl.name}`}
         title={`Play ${pl.name}`}
-        disabled={!!busy}
+        disabled={!!busy.id}
         onclick={() => play(pl.id)}
       >
-        <Icon name={busy === pl.id ? "more" : "play"} size={15} />
+        <Icon name={busy.id === pl.id ? "more" : "play"} size={15} />
       </button>
     </div>
     <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
@@ -331,8 +316,14 @@
   .grid.home-shelf {
     grid-template-columns: repeat(var(--shelf-columns), minmax(0, 1fr));
   }
-
-
+  /* Equal columns turn a thin shelf — Recently played with a single entry —
+     into one balloon at half the pane. The card keeps the shelf's own scale
+     instead; the unasked-for track simply stays empty. Skeleton shelves share
+     the class and sit at cardsPerRow columns, far under the cap, so the
+     skeleton→fresh swap keeps its geometry. */
+  .grid.home-shelf > .card {
+    max-width: 300px;
+  }
   .home-first { margin-top: 0; }
   @media (max-width: 620px) {
     .home-shelf { gap: var(--s4); }

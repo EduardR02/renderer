@@ -46,3 +46,32 @@ export async function playPlaylistById(id) {
   promotePlaylist(id, { played: true });
   api.touchPlaylist(id).catch(() => {});
 }
+
+/**
+ * The one busy-guard behind every card's play button.
+ *
+ * A card play is two awaits (browse, then queue) during which the button must
+ * look busy, further clicks must be refused, and exactly one failure message
+ * must survive. Every grid view had its own copy of that choreography; this
+ * is the single one.
+ *
+ * `busy` is the caller's own `$state({ id: "" })` slot: runes cannot live in a
+ * plain `.js` module, so the view owns the reactive object and hands over the
+ * proxy — mutations here stay reactive in the view's template. `load` is a
+ * thunk so callers with arguments close over them. Returns the message to
+ * display ("" on success or when `stillCurrent` says the caller has moved on),
+ * so the view keeps one `error = await cardPlay(...)` line.
+ */
+export async function cardPlay(busy, id, load, failure, stillCurrent = null) {
+  if (busy.id) return "";
+  busy.id = id;
+  try {
+    await load();
+    return "";
+  } catch (reason) {
+    if (stillCurrent && !stillCurrent()) return "";
+    return String(reason || failure);
+  } finally {
+    busy.id = "";
+  }
+}

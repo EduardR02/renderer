@@ -412,13 +412,6 @@
 
 
 <style>
-  .history-page {
-    max-width: 1020px; margin: 0 auto; padding-top: var(--s5);
-    /* The one column template, shared by the head and every row so a label
-       always sits over its column. The windowing only asks that a row is
-       56px tall; the columns may do this. */
-    --hi-cols: minmax(220px, 1fr) 104px 92px 96px;
-  }
   .history-head { padding: var(--s2) 0 var(--s6); }
   .history-head-copy { min-width: 0; }
   .history-head .page-title { margin-top: var(--s2); }

@@ -1,7 +1,7 @@
 <script>
   import { untrack } from "svelte";
-  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch } from "../lib/state.svelte.js";
-  import { playAlbumById, playPlaylistById } from "../lib/play.js";
+  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch, playback } from "../lib/state.svelte.js";
+  import { playAlbumById, playPlaylistById, cardPlay } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
@@ -41,23 +41,31 @@
     if (tracks.length) api.playQueue(tracks, i, "search").catch(() => {});
   }
 
-  let busy = $state("");
+  const busy = $state({ id: "" });
   let playError = $state("");
 
   /* The card opens; only this button plays. A result card knows an id and
      nothing else, so playing it costs one browse first. */
   async function play(id, load, failure) {
-    if (busy) return;
-    busy = id;
     playError = "";
-    try {
-      await load(id);
-    } catch (reason) {
-      playError = String(reason || failure);
-    } finally {
-      busy = "";
-    }
+    playError = await cardPlay(busy, id, () => load(id), failure);
   }
+
+  /* The body under the failure heading carries only what the heading and the
+     retry button do not already say. When a failure has no cause of its own,
+     state.svelte.js answers with SEARCH_FAILURE_MESSAGE — "Search could not
+     load. Try again." — which restates both, so the line is dropped instead
+     of saying the same thing three times. While Spotify is still connecting
+     the waiting notice is the actual cause, and the view says it in its own
+     words; afterwards any remaining text IS the underlying cause. */
+  const searchCause = $derived.by(() => {
+    const raw = search.error;
+    if (!raw) return "";
+    if (!(playback.ready === true && playback.auth_state === "ready")) {
+      return "Spotify hasn't finished connecting.";
+    }
+    return raw === "Search could not load. Try again." ? "" : raw;
+  });
 
   /* ---- Recent searches ------------------------------------------------
      Eight, newest first, in localStorage. Reading is wrapped because a
@@ -158,7 +166,9 @@
   {:else if search.error && !search.results}
     <div class="empty failed" role="alert">
       <p class="h">Search couldn't load.</p>
-      <p class="why">{search.error}</p>
+      <!-- One fact per line: the heading names the failure, the cause line
+           (when there is one) says why, the button owns the retry. -->
+      {#if searchCause}<p class="why">{searchCause}</p>{/if}
       <div class="actions">
         <button class="btn-ghost" onclick={retrySearch}>Try again</button>
       </div>
@@ -192,7 +202,7 @@
       </div>
       <div>
         <div class="section-head"><h2 class="section-title">Songs</h2></div>
-        <div class="tl" style="--cols:28px 36px minmax(0,1fr) 52px">
+        <div class="tl" style="--cols:28px 36px minmax(0,1fr) 52px 28px">
           {#each SKELETON_ROWS as _, i (i)}
             <div class="sk-row">
               <span class="sk" style="width:12px"></span>
@@ -202,6 +212,7 @@
                 <span class="sk b" style="width:{34 - ((i * 5) % 12)}%"></span>
               </span>
               <span class="sk" style="width:28px;justify-self:end"></span>
+              <span></span>
             </div>
           {/each}
         </div>
@@ -324,10 +335,10 @@
                   class="card-play"
                   aria-label={`Play ${pl.name}`}
                   title={`Play ${pl.name}`}
-                  disabled={!!busy}
+                  disabled={!!busy.id}
                   onclick={() => play(pl.id, playPlaylistById, "Could not play this playlist.")}
                 >
-                  <Icon name={busy === pl.id ? "more" : "play"} size={15} />
+                  <Icon name={busy.id === pl.id ? "more" : "play"} size={15} />
                 </button>
               </div>
               <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>
@@ -358,10 +369,10 @@
                   class="card-play"
                   aria-label={`Play ${al.name}`}
                   title={`Play ${al.name}`}
-                  disabled={!!busy}
+                  disabled={!!busy.id}
                   onclick={() => play(al.id, playAlbumById, "Could not play this release.")}
                 >
-                  <Icon name={busy === al.id ? "more" : "play"} size={15} />
+                  <Icon name={busy.id === al.id ? "more" : "play"} size={15} />
                 </button>
               </div>
               <button class="card-copy" onclick={() => navigate("album", al.id)}>

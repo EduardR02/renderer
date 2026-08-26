@@ -427,15 +427,33 @@
 {/if}
 
 <style>
+  /* A native checkbox ignores the app's control language: at this size its
+     checked glyph lands gray-on-gray, outside the accent system every other
+     control here speaks. Drawn instead, in the .btn-accent vocabulary: an
+     unchecked box is a raised field with a hairline; a checked one is the
+     foam fill with the ink glyph. Disabled keeps the dimmed field the Select
+     and the filter input use; :focus-visible keeps the global outline. */
   .set-check {
-    width: 16px;
-    height: 16px;
-    margin: 0;
-    accent-color: var(--accent);
-    cursor: pointer;
+    appearance: none;
+    display: grid; place-items: center;
+    width: 16px; height: 16px; margin: 0;
+    border: 1px solid var(--line-2); border-radius: var(--r1);
+    background: var(--bg-2); cursor: pointer;
+    transition: background-color var(--d1) var(--ease), border-color var(--d1) var(--ease);
   }
-
+  .set-check:hover:enabled { border-color: var(--fg-3); }
+  .set-check:checked {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .set-check:checked::before {
+    content: "";
+    width: 10px; height: 10px;
+    background: var(--accent-ink);
+    clip-path: polygon(13% 50%, 0 63%, 37% 100%, 100% 16%, 87% 3%, 37% 72%);
+  }
   .set-check:disabled {
     cursor: default;
+    opacity: 0.45;
   }
 </style>

@@ -342,18 +342,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The nav dims and re-tints its icons for hover and for the selected row; the
    glyph punched out of the mark is neither — it belongs to the tile. */
 .nav-item .nav-mark svg { opacity: 1; color: var(--accent-ink); }
-/* the label ellipses; the shortcut chip is never pushed out of the rail */
-.nav-item > span:not(.kbd) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nav-item .kbd { margin-left: auto; flex: none; }
+/* The label ellipses rather than wrapping or widening the row. */
+.nav-item > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.kbd {
-  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.02em;
-  color: var(--fg-3); padding: 1px 4px; border: 1px solid var(--line);
-  border-radius: 3px;
-}
-/* The queue count used to borrow `.kbd`, which is the *keyboard keycap* style:
-   monospaced, 10px, boxed. It is a quantity, not a shortcut, so it belongs in
-   the interface font with the rest of the counts. */
+/* A quantity, not a shortcut: interface type with tabular figures, like every
+   other count in the app. */
 .nav-count {
   margin-left: auto; padding-left: var(--s2);
   font-size: var(--t-11); font-variant-numeric: tabular-nums;
@@ -445,8 +438,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The 32px tile that used to live here — a flat pale rose square with a dark
    heart punched out of it — was a SECOND drawing of the Liked Songs mark, and
    it did not match the one on the collection page. Both are now LikedMark. */
-
-.sidebar-foot { padding: var(--s2) 0 var(--s3); }
 
 /* ---------------------------------------------------------------- pane */
 .pane {
@@ -625,7 +616,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .np-album {
   display: grid; grid-template-columns: 34px minmax(0, 1fr) auto;
   align-items: center; gap: var(--s3);
-  width: calc(100% - var(--s6)); margin: var(--s5) var(--s3) 0;
+  /* Same plate geometry as `.np-next`: 8px past the text grid on both
+     sides, so the two hover plates in this column share one x-range and
+     the album row's copy lines up with every other block's copy. */
+  width: calc(100% - var(--s4)); margin: var(--s5) var(--s2) 0;
   padding: var(--s2); border-radius: var(--r2);
   color: var(--fg-1); text-align: left;
   transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
@@ -897,12 +891,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .tag.saved {
   background: var(--rose); color: var(--bg-0);
   backdrop-filter: none; -webkit-backdrop-filter: none; box-shadow: none;
-}
-/* A hairline that leads with the accent and fades into the ordinary line
-   colour. Structure, so it leads with foam. */
-.rule-accent {
-  flex: 1; min-width: var(--s7); height: 1px; border: 0; margin: 0;
-  background: var(--rule-accent);
 }
 .section { margin-top: var(--s8); }
 .section-head {
@@ -1781,11 +1769,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .menu-item.danger:hover:not(:disabled),
 .menu-item.danger:focus-visible { background: color-mix(in srgb, var(--love) 12%, var(--bg-4)); color: var(--love); }
 .menu-sep { height: 1px; margin: var(--s1) var(--s2); background: var(--line); }
-.menu-label {
-  padding: var(--s2) var(--s3) var(--s1);
-  font-family: var(--font-small); font-size: var(--t-caps); font-weight: var(--w-semi);
-  letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label);
-}
 
 .playlist-menu-wrap { position: relative; }
 .playlist-actions-menu {
@@ -2275,13 +2258,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .chip.on:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
 .chip[role="tab"] { padding: 0 var(--s3); }
-/* How many are behind the chip, so choosing a filter is an informed choice
-   rather than a guess. Quiet by default; inherits the chip's colour when on. */
-.chip-count {
-  flex: none; font-family: var(--font-number); font-size: var(--t-11);
-  font-weight: var(--w-med); color: var(--count);
-}
-.chip.on .chip-count { color: color-mix(in srgb, var(--foam) 62%, var(--fg)); }
 
 /* What KIND of record this is — Album, EP, Single. Gold, not foam: it is a
    fact about the record, not something you can do to it, and gold is the layer

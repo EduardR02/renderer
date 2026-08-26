@@ -152,7 +152,7 @@ fixtures.artist = {
     compilations: [],
     appears_on: [],
   },
-  release_counts: { albums: 2, singles: 0, compilations: 0, appears_on: 0 },
+  release_counts: { albums: 3, singles: 2, compilations: 1, appears_on: 7 },
   releases_next_offset: null,
   overview: {
     biography: "A fixture artist: enough prose to draw the About card, nothing more.",
@@ -174,6 +174,74 @@ fixtures.artist = {
   },
 };
 fixtures.songwriterPlaylist = clone(songwriterPlaylist);
+
+/** Track ids for catalogue releases start past every library fixture. */
+let catalogueTrackOffset = 200;
+
+/**
+ * One catalogue release for the paged artist surfaces: a summary plus its
+ * COMPLETE track list, exactly like an engine page — the discography reader
+ * renders every row under the record. Tracks credit Artist 1 (compilations
+ * and appears-on summaries spread the bill) and point back at this release.
+ */
+function catalogueRelease(kind, id, name, year, trackCount, artists = ["Artist 1"]) {
+  const offset = catalogueTrackOffset;
+  catalogueTrackOffset += trackCount + 4;
+  return {
+    id,
+    uri: `spotify:album:${id}`,
+    name,
+    artist_names: artists,
+    artist_ids: [],
+    cover_url: "",
+    year,
+    tracks: makeTracks(trackCount, offset).map((track) => ({
+      ...track,
+      album_name: name,
+      album_id: id,
+      artist_names: [artists[0]],
+      artist_ids: ["ar1"],
+      artist_id: "ar1",
+    })),
+  };
+}
+
+/**
+ * The virtual catalogue `browse_artist_catalogue` walks, pooled by release
+ * type: three albums, two singles, a compilation and seven appears-on
+ * summaries. Sized so a four-release page (six-item mixed walk) and a
+ * six-release page both land mid-pool and leave a genuine remainder behind.
+ */
+const cataloguePools = {
+  albums: [
+    catalogueRelease("albums", "al0", "Album 0", 2021, 8),
+    catalogueRelease("albums", "al1", "Album 1", 2018, 10),
+    catalogueRelease("albums", "al2", "Album 2", 2015, 9),
+  ],
+  singles: [
+    catalogueRelease("singles", "sg0", "Single 0", 2023, 2),
+    catalogueRelease("singles", "sg1", "Single 1", 2020, 1),
+  ],
+  compilations: [
+    catalogueRelease("compilations", "cp0", "Compilation 0", 2019, 12, ["Artist 1", "Artist 2"]),
+  ],
+  appears_on: [
+    catalogueRelease("appears_on", "ao0", "Appears On 0", 2022, 5),
+    catalogueRelease("appears_on", "ao1", "Appears On 1", 2021, 7),
+    catalogueRelease("appears_on", "ao2", "Appears On 2", 2020, 6),
+    catalogueRelease("appears_on", "ao3", "Appears On 3", 2019, 4),
+    catalogueRelease("appears_on", "ao4", "Appears On 4", 2017, 8, ["Artist 1", "Artist 3"]),
+    catalogueRelease("appears_on", "ao5", "Appears On 5", 2016, 6),
+    catalogueRelease("appears_on", "ao6", "Appears On 6", 2014, 5, ["Artist 1", "Artist 4"]),
+  ],
+};
+
+/**
+ * The album route's payload (AlbumDetail): the record plus its track list.
+ * It answers as Album 0 for whatever id is asked — enough for layout review,
+ * and consistent with the artist shelf whose first release shares the id.
+ */
+fixtures.album = catalogueRelease("albums", "al0", "Album 0", 2021, 8);
 
 /** The routes that read one cached artist payload — mirrors state.svelte.js. */
 const ARTIST_ROUTE_NAMES = [
@@ -477,6 +545,30 @@ function updateMemberships(args, add) {
   else removePlaylistTracks(id, uris);
 }
 
+/**
+ * Track credits, shaped exactly like the engine's `TrackCreditsDetail`:
+ * licensor-named groups, contributors with optional subroles and verbatim
+ * urls. Rich on purpose — the wide sheet, the filter field and the compact
+ * variant all need real data to be reviewed against.
+ */
+function trackCreditsPayload(id) {
+  const n = Number(String(id).replace(/\D/g, "")) || 0;
+  const performer = (name, subroles) => ({ id: `c${n}-${name}`, uri: `spotify:artist:${name}`, url: `https://artists.spotify.com/songwriter/${name}`, name, subroles });
+  return {
+    track_uri: `spotify:track:${id}`,
+    track_name: `Song ${n}`,
+    groups: [
+      { title: "Performer", contributors: [performer("Main Artist", ["Main Vocalist"]), performer("Featured Artist", ["Featured Vocalist"]), performer("Choir", ["Background Vocalist"])] },
+      { title: "Writer", contributors: [performer("Author One", ["Lyricist", "Composer"]), performer("Author Two", ["Composer"])] },
+      { title: "Producer", contributors: [performer("Producer One", ["Producer"]), performer("Co Producer", ["Co-Producer", "Programmer"])] },
+      { title: "Technical", contributors: [performer("Engineer One", ["Recording Engineer", "Mixing Engineer"]), performer("Mastering Engineer", ["Mastering Engineer"])] },
+      { title: "Source", contributors: [performer("Sample Source", [])] },
+    ],
+    source: "Universal Music Publishing Group",
+  };
+}
+
+
 window.__fixtures = fixtures;
 window.__TAURI_INTERNALS__ = {
   callbacks,
@@ -504,6 +596,35 @@ window.__TAURI_INTERNALS__ = {
         return clone(fixtures.artist);
       case "browse_artist_songwriter":
         return clone(fixtures.songwriterPlaylist);
+      case "browse_album":
+        return clone(fixtures.album);
+      case "browse_artist_catalogue": {
+        // The engine pages a stable round-robin walk across the selected
+        // release types; mirror that so page boundaries mix records the way
+        // production pages do instead of draining one pool at a time.
+        const wanted = Array.isArray(args.releaseTypes) && args.releaseTypes.length
+          ? args.releaseTypes
+          : ["albums", "singles", "compilations"];
+        const pools = wanted.map((type) => cataloguePools[type]).filter(Array.isArray);
+        const walk = [];
+        for (let round = 0; ; round += 1) {
+          let added = false;
+          for (const pool of pools) {
+            if (round < pool.length) {
+              walk.push(pool[round]);
+              added = true;
+            }
+          }
+          if (!added) break;
+        }
+        const offset = Math.max(0, Number(args.offset ?? 0));
+        const limit = Math.max(1, Number(args.limit ?? 4));
+        return {
+          releases: clone(walk.slice(offset, offset + limit)),
+          total: walk.length,
+          next_offset: offset + limit < walk.length ? offset + limit : null,
+        };
+      }
       case "browse_playlist":
         return clone(detailFor(args.id ?? args.playlistId));
       case "browse_canvas":
@@ -715,6 +836,10 @@ window.__TAURI_INTERNALS__ = {
         emit("session", { auth_state: "logged_out", username: "", error: "" });
         emitState();
         return null;
+      case "browse_track_credits":
+        return clone(trackCreditsPayload(args.id ?? args.trackId ?? "t0"));
+      case "get_cache_stats":
+        return { entries: 0, bytes: 0 };
       default:
         return null;
     }

@@ -1,6 +1,6 @@
 <script>
   import { detail, navigate, navigateArtist, route } from "../lib/state.svelte.js";
-  import { playPlaylistById } from "../lib/play.js";
+  import { playPlaylistById, cardPlay } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -17,38 +17,31 @@
   const title = $derived(discovered ? "Discovered on" : "Artist playlists");
   const playlists = $derived(discovered ? collections.discovered : collections.artist);
 
-  let busy = $state("");
+  let busy = $state({ id: "" });
   let error = $state("");
-  let playGeneration = 0;
   let loadedRoute = "";
 
   $effect(() => {
     const key = `${route.name}:${route.id ?? ""}`;
     if (key === loadedRoute) return;
     loadedRoute = key;
-    playGeneration += 1;
-    busy = "";
+    busy.id = "";
     error = "";
   });
 
   async function play(id) {
-    if (busy) return;
-    const generation = playGeneration;
+    if (busy.id) return;
     const key = `${route.name}:${route.id ?? ""}`;
-    busy = id;
     error = "";
-    try {
-      await playPlaylistById(id);
-    } catch (reason) {
-      if (generation === playGeneration && key === `${route.name}:${route.id ?? ""}`) {
-        error = String(reason || "Could not play this playlist.");
-      }
-    } finally {
-      if (generation === playGeneration && key === `${route.name}:${route.id ?? ""}`) {
-        busy = "";
-      }
-    }
+    error = await cardPlay(
+      busy,
+      id,
+      () => playPlaylistById(id),
+      "Could not play this playlist.",
+      () => key === `${route.name}:${route.id ?? ""}`,
+    );
   }
+
 </script>
 
 {#snippet playlistCard(playlist)}
@@ -72,10 +65,10 @@
         class="card-play"
         aria-label={`Play ${playlist.name}`}
         title={`Play ${playlist.name}`}
-        disabled={!!busy}
+        disabled={!!busy.id}
         onclick={() => play(playlist.id)}
       >
-        <Icon name={busy === playlist.id ? "more" : "play"} size={15} />
+        <Icon name={busy.id === playlist.id ? "more" : "play"} size={15} />
       </button>
     </div>
     <button class="card-copy" onclick={() => navigate("playlist", playlist.id)}>

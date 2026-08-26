@@ -3,9 +3,9 @@
     detail,
     navigate,
     navigateArtist,
-    loadCataloguePage,
   } from "../lib/state.svelte.js";
-  import { playAlbumById } from "../lib/play.js";
+  import { createCataloguePaging, sentinelLoader } from "../lib/discography.svelte.js";
+  import { playAlbumById, cardPlay } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -13,100 +13,53 @@
   const artist = $derived(detail.artist);
   const counts = $derived(artist?.release_counts ?? {});
   const appearsOnCount = $derived(counts.appears_on ?? 0);
-  const RELEASE_TYPES = ["appears_on"];
-  const PAGE_SIZE = 6;
+  const APPEARS_ON_TYPES = ["appears_on"];
 
-  let releases = $state([]);
-  let nextOffset = $state(0);
-  let total = $state(0);
-  let loading = $state(false);
-  let error = $state("");
-  let sentinel = $state(null);
-  let loadedArtist = "";
-  let loadGeneration = 0;
-  let busy = $state("");
+  let busy = $state({ id: "" });
   let playError = $state("");
+  let sentinel = $state(null);
 
-  async function loadNext(key = artist?.id ?? "", generation = loadGeneration) {
-    const id = artist?.id;
-    if (
-      !id ||
-      generation !== loadGeneration ||
-      id !== key ||
-      loading ||
-      nextOffset == null ||
-      !appearsOnCount
-    ) return;
-    const offset = nextOffset;
-    loading = true;
-    error = "";
-    try {
-      const page = await loadCataloguePage(id, RELEASE_TYPES, offset, PAGE_SIZE);
-      if (generation !== loadGeneration || artist?.id !== key) return;
-      const known = new Set(releases.map((release) => release.id));
-      for (const release of page?.releases ?? []) {
-        if (!release?.id || known.has(release.id)) continue;
-        releases.push(release);
-        known.add(release.id);
-      }
-      total = page?.total ?? appearsOnCount;
-      nextOffset = page?.next_offset ?? null;
-    } catch (reason) {
-      if (generation === loadGeneration) {
-        error = String(reason || "Could not load Appears On.");
-      }
-    } finally {
-      if (generation === loadGeneration) loading = false;
-    }
-  }
+  /**
+   * The paged catalogue reader shared with the discography (see src/lib/
+   * discography.svelte.js), fixed to the appears-on slice. The summary count
+   * gates it: a profile with no appears-on releases never spends a request.
+   */
+  const paging = createCataloguePaging({
+    getId: () => artist?.id ?? "",
+    releaseTypes: () => APPEARS_ON_TYPES,
+    pageSize: 6,
+    mayLoad: () => !!appearsOnCount,
+    seedTotal: () => appearsOnCount,
+    errorMessage: "Could not load Appears On.",
+  });
 
+  /* A new artist is another list: drop what arrived for the last one. */
+  $effect(() => paging.reset());
+
+  /* Play marks belong to one artist's payload; they die with it. */
   $effect(() => {
-    const id = artist?.id ?? "";
-    if (!id || id === loadedArtist) return;
-    loadedArtist = id;
-    loadGeneration += 1;
-    const generation = loadGeneration;
-    loading = false;
-    releases = [];
-    nextOffset = 0;
-    total = appearsOnCount;
-    error = "";
-    busy = "";
+    artist?.id;
+    busy.id = "";
     playError = "";
-    queueMicrotask(() => loadNext(id, generation));
   });
 
-  /* One bounded page opens the view. Further pages load only when a real
-     scroll reaches the footer; the button remains the keyboard fallback. */
-  $effect(() => {
-    const node = sentinel;
-    if (!node) return;
-    const scroller = node.closest(".scroll");
-    if (!scroller) return;
-    const onScroll = () => {
-      const remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-      if (remaining <= 400) loadNext();
-    };
-    scroller.addEventListener("scroll", onScroll, { passive: true });
-    return () => scroller.removeEventListener("scroll", onScroll);
-  });
-
+  /* Further pages load only when real scrolling reaches the footer; the
+     button remains the keyboard fallback. */
+  $effect(() => sentinelLoader(sentinel, () => paging.loadNext()));
   async function playRelease(id) {
-    if (busy) return;
-    const generation = loadGeneration;
+    if (busy.id) return;
     const artistId = artist?.id;
-    busy = id;
     playError = "";
-    try {
-      await playAlbumById(id);
-    } catch (reason) {
-      if (generation === loadGeneration && artist?.id === artistId) {
-        playError = String(reason || "Could not play this release.");
-      }
-    } finally {
-      if (generation === loadGeneration && artist?.id === artistId) busy = "";
-    }
+    playError = await cardPlay(
+      busy,
+      id,
+      () => playAlbumById(id),
+      "Could not play this release.",
+      () => artist?.id === artistId,
+    );
   }
+
+
 </script>
 
 <section class="view page aux-page appears-page">
@@ -121,9 +74,9 @@
       </div>
     </header>
 
-    {#if releases.length}
+    {#if paging.releases.length}
       <div class="grid appears-grid">
-        {#each releases as release (release.id)}
+        {#each paging.releases as release (release.id)}
           {@const tone = coverTone(release.cover_url, release.id)}
           <div class="card" style:--tone-glow={tone.glow}>
             <div class="card-art">
@@ -137,10 +90,10 @@
                 class="card-play"
                 aria-label={`Play ${release.name}`}
                 title={`Play ${release.name}`}
-                disabled={!!busy}
+                disabled={!!busy.id}
                 onclick={() => playRelease(release.id)}
               >
-                <Icon name={busy === release.id ? "more" : "play"} size={15} />
+                <Icon name={busy.id === release.id ? "more" : "play"} size={15} />
               </button>
             </div>
             <button class="card-copy" onclick={() => navigate("album", release.id)}>
@@ -150,7 +103,7 @@
           </div>
         {/each}
       </div>
-    {:else if loading}
+    {:else if paging.loading}
       <div class="grid appears-grid" aria-hidden="true">
         {#each Array.from({ length: 3 }) as _, i (i)}
           <div class="card">
@@ -162,7 +115,7 @@
           </div>
         {/each}
       </div>
-    {:else if !error}
+    {:else if !paging.error}
       <div class="empty">
         <p class="h">No Appears On releases are available.</p>
         <p class="sub">Spotify did not return release summaries for this artist.</p>
@@ -170,17 +123,17 @@
     {/if}
 
     <div class="aux-foot" bind:this={sentinel}>
-      {#if loading && releases.length}
+      {#if paging.loading && paging.releases.length}
         <span class="aux-status">Loading releases…</span>
-      {:else if error && nextOffset != null}
-        <button class="btn-ghost" onclick={() => loadNext()}>Try again</button>
-      {:else if nextOffset != null && releases.length}
-        <button class="btn-ghost" onclick={() => loadNext()}>Load more<Icon name="chevron-down" size={14} /></button>
-      {:else if releases.length}
-        <span class="aux-status"><span class="tnum">{releases.length}</span>{total && total !== releases.length ? ` of ${total}` : ""} releases</span>
+      {:else if paging.error && paging.nextOffset != null}
+        <button class="btn-ghost" onclick={() => paging.loadNext()}>Try again</button>
+      {:else if paging.nextOffset != null && paging.releases.length}
+        <button class="btn-ghost" onclick={() => paging.loadNext()}>Load more<Icon name="chevron-down" size={14} /></button>
+      {:else if paging.releases.length}
+        <span class="aux-status"><span class="tnum">{paging.releases.length}</span>{paging.total && paging.total !== paging.releases.length ? ` of ${paging.total}` : ""} releases</span>
       {/if}
     </div>
-    {#if error}<p class="inline-error" role="alert">{error}</p>{/if}
+    {#if paging.error}<p class="inline-error" role="alert">{paging.error}</p>{/if}
     {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
   {:else if detail.error}
     <header class="aux-head">

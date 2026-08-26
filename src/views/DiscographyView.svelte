@@ -12,7 +12,7 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import Select from "../components/Select.svelte";
-  import { GROUPS, releaseKind } from "../lib/discography.js";
+  import { GROUPS, releaseKind, createCataloguePaging, sentinelLoader } from "../lib/discography.svelte.js";
   import { observeStuck } from "../lib/sticky.js";
   import { formatTotal } from "../lib/time.js";
 
@@ -77,50 +77,19 @@
   ];
   let sort = $state("catalogue");
 
-  let releases = $state([]);
-  let nextOffset = $state(0);
-  let total = $state(0);
-  let loading = $state(false);
-  let error = $state("");
   let sentinel = $state(null);
-  /** Identity of the list currently loaded, so a group or artist change refills. */
-  let loadedKey = "";
-  let loadGeneration = 0;
 
-  async function loadNext(
-    key = `${artist?.id ?? ""}:${group}`,
-    generation = loadGeneration,
-  ) {
-    const id = artist?.id;
-    if (
-      !id ||
-      generation !== loadGeneration ||
-      `${id}:${group}` !== key ||
-      loading ||
-      nextOffset == null
-    ) return;
-    const offset = nextOffset;
-    loading = true;
-    error = "";
-    try {
-      const page = await loadCataloguePage(id, releaseTypes, offset, 4);
-      if (generation !== loadGeneration || `${artist?.id}:${group}` !== key) return;
-      const known = new Set(releases.map((release) => release.id));
-      for (const release of page?.releases ?? []) {
-        if (known.has(release.id)) continue;
-        releases.push(release);
-        known.add(release.id);
-      }
-      total = page?.total ?? total;
-      nextOffset = page?.next_offset ?? null;
-    } catch (reason) {
-      if (generation === loadGeneration) {
-        error = String(reason || "Could not load more of this catalogue.");
-      }
-    } finally {
-      if (generation === loadGeneration) loading = false;
-    }
-  }
+  /**
+   * The paged catalogue reader this view shares with Appears On (see
+   * src/lib/discography.svelte.js). This side contributes only its identity:
+   * whose catalogue, and which slice of it — picking a group asks the engine
+   * for that query again, it does not filter what already arrived.
+   */
+  const paging = createCataloguePaging({
+    getId: () => artist?.id ?? "",
+    releaseTypes: () => (GROUPS.find((g) => g.id === group)?.types ?? GROUPS[0].types),
+    pageSize: 4,
+  });
 
   /**
    * Display order is distinct from the playback context. Catalogue order is
@@ -129,7 +98,7 @@
    * Explicit sort choices order the releases currently loaded.
    */
   const ordered = $derived.by(() => {
-    const items = releases.map((release, index) => ({ release, index }));
+    const items = paging.releases.map((release, index) => ({ release, index }));
     if (sort === "catalogue") return items;
     if (sort === "az") {
       return items.sort((a, b) =>
@@ -151,40 +120,19 @@
   /** Flat index of a track across every release loaded so far. */
   function playFrom(releaseIndex, trackIndex) {
     let index = trackIndex;
-    for (let i = 0; i < releaseIndex; i++) index += releases[i].tracks.length;
-    playCatalogueContext(releases, artist.id, releaseTypes, nextOffset, index).catch(() => {});
+    for (let i = 0; i < releaseIndex; i++) index += paging.releases[i].tracks.length;
+    playCatalogueContext(paging.releases, artist.id, releaseTypes, paging.nextOffset, index).catch(() => {});
   }
 
   function playRelease(releaseIndex) {
     playFrom(releaseIndex, 0);
   }
 
-  $effect(() => {
-    const key = `${artist?.id ?? ""}:${group}`;
-    if (!artist?.id || key === loadedKey) return;
-    loadedKey = key;
-    loadGeneration += 1;
-    const generation = loadGeneration;
-    loading = false;
-    releases = [];
-    nextOffset = 0;
-    total = 0;
-    error = "";
-    queueMicrotask(() => loadNext(key, generation));
-  });
+  /* A new artist or group is another list: drop what is on screen and open
+     the first page of the new selection. */
+  $effect(() => paging.reset());
 
-  $effect(() => {
-    const node = sentinel;
-    if (!node) return;
-    const scroller = node.closest(".scroll");
-    if (!scroller) return;
-    const onScroll = () => {
-      const remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-      if (remaining <= 400) loadNext();
-    };
-    scroller.addEventListener("scroll", onScroll, { passive: true });
-    return () => scroller.removeEventListener("scroll", onScroll);
-  });
+  $effect(() => sentinelLoader(sentinel, () => paging.loadNext()));
 
   /* The control row is type on the page until releases pass under it. */
   let controlSentinel = $state(null);
@@ -302,7 +250,7 @@
       </article>
     {/each}
 
-    {#if !releases.length && loading}
+    {#if !paging.releases.length && paging.loading}
       <!-- The frame a release arrives into, drawn before it does: cover slot,
            title, meta, six rows. Nothing moves when the batch lands. -->
       {#each Array.from({ length: 2 }) as _, i (i)}
@@ -327,29 +275,29 @@
     {/if}
 
     <div class="dx-foot" bind:this={sentinel}>
-      {#if loading && releases.length}
+      {#if paging.loading && paging.releases.length}
         <span class="dx-status">Loading releases…</span>
-      {:else if error && nextOffset != null}
-        <button class="btn-ghost" onclick={() => loadNext()}>
+      {:else if paging.error && paging.nextOffset != null}
+        <button class="btn-ghost" onclick={() => paging.loadNext()}>
           Try again
         </button>
-      {:else if nextOffset != null && releases.length}
+      {:else if paging.nextOffset != null && paging.releases.length}
         <!-- Near-footer scrolling does this automatically; the button is the
              keyboard fallback and explicit retry affordance. -->
-        <button class="btn-ghost" onclick={() => loadNext()}>
+        <button class="btn-ghost" onclick={() => paging.loadNext()}>
           Load more<Icon name="chevron-down" size={14} />
         </button>
-      {:else if releases.length}
+      {:else if paging.releases.length}
         <span class="dx-status">
-          <span class="tnum">{releases.length}</span>{total && total !== releases.length
-            ? ` of ${total}`
+          <span class="tnum">{paging.releases.length}</span>{paging.total && paging.total !== paging.releases.length
+            ? ` of ${paging.total}`
             : ""} releases
         </span>
       {/if}
     </div>
-    {#if error}<p class="inline-error" role="alert">{error}</p>{/if}
+    {#if paging.error}<p class="inline-error" role="alert">{paging.error}</p>{/if}
 
-    {#if !loading && !releases.length && !error}
+    {#if !paging.loading && !paging.releases.length && !paging.error}
       <div class="empty">
         <p class="h">Nothing under this heading.</p>
         <p class="sub">Try another release type.</p>

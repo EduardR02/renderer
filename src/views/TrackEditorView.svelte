@@ -708,7 +708,7 @@
           <strong>{previewStatus.label}</strong>
           <span class="tnum">{previewStatus.copy} · cursor {formatExactTime(cursorMs)}</span>
         </div>
-        <span class="preview-status" class:active={previewStatus.active} class:stale={previewState === "stale"}>{previewStatus.label}</span>
+        <span class="preview-status" class:active={previewStatus.active} class:stale={previewState === "stale"} aria-hidden="true"></span>
       </div>
       <TrackEditWaveform
         durationMs={duration}

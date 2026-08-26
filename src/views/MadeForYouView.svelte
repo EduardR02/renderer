@@ -1,6 +1,6 @@
 <script>
   import { library, mergePersonalizedPlaylists, navigate } from "../lib/state.svelte.js";
-  import { playPlaylistById } from "../lib/play.js";
+  import { playPlaylistById, cardPlay } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -14,20 +14,12 @@
     );
   });
 
-  let busy = $state("");
+  const busy = $state({ id: "" });
   let error = $state("");
 
   async function play(id) {
-    if (busy) return;
-    busy = id;
     error = "";
-    try {
-      await playPlaylistById(id);
-    } catch (reason) {
-      error = String(reason || "Could not play this playlist.");
-    } finally {
-      busy = "";
-    }
+    error = await cardPlay(busy, id, () => playPlaylistById(id), "Could not play this playlist.");
   }
 </script>
 
@@ -45,10 +37,10 @@
         class="card-play"
         aria-label={`Play ${pl.name}`}
         title={`Play ${pl.name}`}
-        disabled={!!busy}
+        disabled={!!busy.id}
         onclick={() => play(pl.id)}
       >
-        <Icon name={busy === pl.id ? "more" : "play"} size={15} />
+        <Icon name={busy.id === pl.id ? "more" : "play"} size={15} />
       </button>
     </div>
     <button class="card-copy" onclick={() => navigate("playlist", pl.id)}>

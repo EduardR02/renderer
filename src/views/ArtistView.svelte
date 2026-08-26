@@ -16,7 +16,7 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import Biography from "../components/Biography.svelte";
-  import { GROUPS, RELEASE_KEYS } from "../lib/discography.js";
+  import { GROUPS, RELEASE_KEYS } from "../lib/discography.svelte.js";
   import { artistPlaylistCollections, playlistSubtitle } from "../lib/artist.js";
 
   /**
