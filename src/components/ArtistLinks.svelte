@@ -1,5 +1,5 @@
 <script>
-  import { navigate } from "../lib/state.svelte.js";
+  import { navigateArtist } from "../lib/state.svelte.js";
 
   /**
    * A track's artists, each navigable on its own.
@@ -16,11 +16,11 @@
     names.map((_, i) => (ids.length ? (ids[i] ?? "") : i === 0 ? id : ""))
   );
 
-  function activate(event, linkId) {
+  function activate(event, i) {
     if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
     event.stopPropagation();
-    navigate("artist", linkId);
+    navigateArtist(linkIds[i], names[i]);
   }
 </script>
 
@@ -49,8 +49,8 @@
         role="link"
         tabindex="0"
         title="Go to {name}"
-        onclick={(event) => activate(event, linkIds[i])}
-        onkeydown={(event) => activate(event, linkIds[i])}
+        onclick={(event) => activate(event, i)}
+        onkeydown={(event) => activate(event, i)}
       >{name}</span>
     {:else}
       <span>{name}</span>

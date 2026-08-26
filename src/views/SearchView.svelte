@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { search, api, navigate, focusSearch, queueSearch, retrySearch } from "../lib/state.svelte.js";
+  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -32,7 +32,7 @@
 
   function openTop() {
     if (!top) return;
-    if (top.kind === "Artist") navigate("artist", top.id);
+    if (top.kind === "Artist") navigateArtist(top.id, top.name);
     else if (top.kind === "Album") navigate("album", top.id);
     else api.playQueue(tracks, 0, "search").catch(() => {});
   }
@@ -390,7 +390,7 @@
             <!-- No play button here, and that is not an omission: an artist is
                  not a record. The whole card opens, which is the same rule the
                  others follow with the exception removed. -->
-            <button class="card" style:--tone-glow={tone.glow} onclick={() => navigate("artist", ar.id)}>
+            <button class="card" style:--tone-glow={tone.glow} onclick={() => navigateArtist(ar.id, ar.name)}>
               <span class="card-art">
                 <Cover src={ar.cover_url} id={ar.id} name={ar.name} fill circle />
               </span>

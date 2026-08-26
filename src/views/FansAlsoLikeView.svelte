@@ -1,5 +1,5 @@
 <script>
-  import { detail, navigate } from "../lib/state.svelte.js";
+  import { detail, navigateArtist } from "../lib/state.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -14,7 +14,7 @@
 <section class="view page aux-page">
   {#if artist}
     <header class="aux-head">
-      <button class="aux-back" onclick={() => navigate("artist", artist.id)}>
+      <button class="aux-back" onclick={() => navigateArtist(artist.id, artist.name)}>
         <Icon name="back" size={13} />{artist.name}
       </button>
       <div class="aux-title-row">
@@ -30,7 +30,7 @@
           <button
             class="card artist-card"
             style:--tone-glow={tone.glow}
-            onclick={() => navigate("artist", related.id)}
+            onclick={() => navigateArtist(related.id, related.name)}
           >
             <span class="card-art">
               <Cover

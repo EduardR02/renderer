@@ -3,6 +3,7 @@
   import {
     api,
     navigate,
+    navigateArtist,
     playback,
     togglePlay,
     library,
@@ -579,7 +580,7 @@
   function goToArtist(e) {
     if (menuArtists.length === 1) {
       menu.open = false;
-      navigate("artist", menuArtists[0].id);
+      navigateArtist(menuArtists[0].id, menuArtists[0].name);
       return;
     }
     const placed = placePopover(e.currentTarget.getBoundingClientRect(), 40 * menuArtists.length);
@@ -1214,7 +1215,7 @@
         onclick={() => {
           menu.open = false;
           artistPicker.open = false;
-          navigate("artist", artist.id);
+          navigateArtist(artist.id, artist.name);
         }}
       >{artist.name}</button>
     {/each}

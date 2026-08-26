@@ -118,6 +118,43 @@ export function goForward() {
 }
 
 /**
+ * The display names a navigation already knew, keyed by artist id.
+ *
+ * Every production entry into an artist page carries the Spotify-provided
+ * artist name at the click site, while the route itself records only the id —
+ * so anything needing the name has waited for the whole artist payload.
+ * Recording the name here lets ArtistView start songwriter discovery from the
+ * route alone. Deliberately not `$state`: entries are written synchronously
+ * before the navigation commits and read on mount, so reactivity would only
+ * be global noise. Bounded at HISTORY_MAX because its lifetime is one
+ * history stack's — a hint older than the oldest place back can never be
+ * read again.
+ */
+const artistNameHints = new Map();
+
+export function navigateArtist(id, name) {
+  const artistId = typeof id === "string" ? id.trim() : "";
+  if (!artistId) return;
+  const hint = typeof name === "string" ? name.trim() : "";
+  if (hint) {
+    /* Re-insert so iteration order stays most-recent-first and eviction takes
+       the stalest entry, not an arbitrarily old one. */
+    artistNameHints.delete(artistId);
+    artistNameHints.set(artistId, hint);
+    while (artistNameHints.size > HISTORY_MAX) {
+      artistNameHints.delete(artistNameHints.keys().next().value);
+    }
+  }
+  navigate("artist", artistId);
+}
+
+/** The recorded name for `id`, or "" when navigation knew none. Read-only. */
+export function artistNameHint(id) {
+  const key = typeof id === "string" ? id.trim() : "";
+  return (key && artistNameHints.get(key)) || "";
+}
+
+/**
  * `paneWidth` is the measured inner width of the content pane, published by
  * App.svelte from a ResizeObserver.
  *
@@ -173,6 +210,34 @@ function applyAppSettings(value) {
   if (value && typeof value === "object" && "animated_canvas" in value) {
     appSettings.animated_canvas = !!value.animated_canvas;
   }
+}
+
+/* A panel-mount read must never overwrite a newer Settings mutation. Reads
+   begun while a write is in flight are ignored as snapshots of an undefined
+   intermediate state; the mutation reply remains authoritative. */
+let appSettingsRevision = 0;
+let appSettingsMutations = 0;
+
+function readAppSettings() {
+  const revision = appSettingsRevision;
+  const stableAtStart = appSettingsMutations === 0;
+  return invoke("get_app_settings").then((value) => {
+    if (stableAtStart && revision === appSettingsRevision) applyAppSettings(value);
+    return value;
+  });
+}
+
+function mutateAppSettings(command, args) {
+  const revision = ++appSettingsRevision;
+  appSettingsMutations += 1;
+  return invoke(command, args)
+    .then((value) => {
+      if (revision === appSettingsRevision) applyAppSettings(value);
+      return value;
+    })
+    .finally(() => {
+      appSettingsMutations -= 1;
+    });
 }
 
 export function focusSearch() {
@@ -1648,24 +1713,14 @@ export const api = {
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
   browseCanvas: (id) => invoke("browse_canvas", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
-  getAppSettings: () =>
-    invoke("get_app_settings").then((value) => {
-      applyAppSettings(value);
-      return value;
-    }),
+  getAppSettings: readAppSettings,
   setAudioCacheLimit: (mb) => invoke("set_audio_cache_limit", { mb }),
   setNormalisation: (enabled) =>
-    invoke("set_normalisation", { enabled: !!enabled }).then((value) => {
-      applyAppSettings(value);
-      return value;
-    }),
+    mutateAppSettings("set_normalisation", { enabled: !!enabled }),
   setLaunchAtLogin: (enabled) => invoke("set_launch_at_login", { enabled: !!enabled }),
   setStartMinimized: (enabled) => invoke("set_start_minimized", { enabled: !!enabled }),
   setAnimatedCanvas: (enabled) =>
-    invoke("set_animated_canvas", { enabled: !!enabled }).then((value) => {
-      applyAppSettings(value);
-      return value;
-    }),
+    mutateAppSettings("set_animated_canvas", { enabled: !!enabled }),
   browsePlaylists: () => invoke("browse_playlists"),
   browseLikedSongs: (cursor = null) => invoke("browse_liked_songs", { cursor }),
   browsePlaylist: (id) => invoke("browse_playlist", { id }),

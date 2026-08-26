@@ -1,5 +1,15 @@
 <script>
-  import { detail, api, navigate, ui, retryDetail, loadCataloguePage } from "../lib/state.svelte.js";
+  import {
+    detail,
+    api,
+    navigate,
+    navigateArtist,
+    artistNameHint,
+    route,
+    ui,
+    retryDetail,
+    loadCataloguePage,
+  } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -389,19 +399,26 @@
 
   /* ------------------------------------------------------- written by
      The verified playlist is an optional enhancement, so it gets its own
-     request after BrowseArtist has painted the identity, Popular rows, and
-     shelves. The request key includes both canonical identity fields: an
-     answer for a previous artist can never populate this section after a
-     navigation race.
+     request, kept off the artist payload's critical path. The request
+     identity is the route id plus the name recorded at navigation time
+     (`navigateArtist`): a click that already knows the name starts this as
+     soon as the route commits, before BrowseArtist answers, and the section
+     stays hidden until data arrives. Only a navigation that knew no name
+     falls back to the loaded artist — and hint precedence then keeps the
+     overview's later arrival from re-issuing under the canonical name.
 
      The engine returns the playlist reference plus at most ten source-order
      tracks. A missing playlist or an empty track payload is intentionally
      indistinguishable from no section: there is nothing useful to render. */
-  const songwriterArtistKey = $derived.by(() => {
-    const id = artist?.id ?? "";
-    const name = artist?.name ?? "";
-    return id && name ? `${id}\u0000${name}` : "";
+  const songwriterRequest = $derived.by(() => {
+    const id = String(route.id ?? "").trim();
+    const hinted = id ? artistNameHint(id) : "";
+    const name = hinted || artist?.name || "";
+    return id && name ? { id, name } : null;
   });
+  const songwriterArtistKey = $derived(
+    songwriterRequest ? `${songwriterRequest.id}\u0000${songwriterRequest.name}` : "",
+  );
   let songwriterPayload = $state(null);
   let songwriterLoading = $state(false);
   let songwriterForArtist = $state("");
@@ -420,12 +437,9 @@
     songwriterLoading = false;
     if (!key) return;
 
-    const id = artist?.id;
-    const name = artist?.name;
-    if (!id || !name) return;
     songwriterLoading = true;
     api
-      .browseArtistSongwriter(id, name)
+      .browseArtistSongwriter(songwriterRequest.id, songwriterRequest.name)
       .then((value) => {
         if (generation !== songwriterRequestGeneration || songwriterArtistKey !== key) return;
         songwriterLoading = false;
@@ -1114,7 +1128,7 @@
             <button
               class="card"
               style:--tone-glow={tone.glow}
-              onclick={() => navigate("artist", related.id)}
+              onclick={() => navigateArtist(related.id, related.name)}
             >
               <span class="card-art">
                 <Cover

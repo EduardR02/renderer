@@ -1,5 +1,5 @@
 <script>
-  import { detail, navigate, route } from "../lib/state.svelte.js";
+  import { detail, navigate, navigateArtist, route } from "../lib/state.svelte.js";
   import { playPlaylistById } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
@@ -88,7 +88,7 @@
 <section class="view page aux-page">
   {#if artist}
     <header class="aux-head">
-      <button class="aux-back" onclick={() => navigate("artist", artist.id)}>
+      <button class="aux-back" onclick={() => navigateArtist(artist.id, artist.name)}>
         <Icon name="back" size={13} />{artist.name}
       </button>
       <div class="aux-title-row">

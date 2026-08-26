@@ -3,6 +3,7 @@
     detail,
     route,
     navigate,
+    navigateArtist,
     loadCataloguePage,
     playCatalogueContext,
     retryDetail,
@@ -199,7 +200,7 @@
 <section class="view page dx-page">
   {#if artist}
     <header class="dx-title-block">
-      <button class="dx-back" onclick={() => navigate("artist", artist.id)}>
+      <button class="dx-back" onclick={() => navigateArtist(artist.id, artist.name)}>
         <Icon name="back" size={13} />{artist.name}
       </button>
       <div class="dx-title-row">

@@ -763,6 +763,7 @@ Object.assign(window.__harness, {
   navigate: (name, id = null, param = null) => state.navigate(name, id, param),
   back: () => state.goBack(),
   forward: () => state.goForward(),
+  navigateArtist: (id, name = "") => state.navigateArtist(id, name),
   selectCanvasDemo: () => {
     const track = playback.queue[playback.current_index];
     if (track) {

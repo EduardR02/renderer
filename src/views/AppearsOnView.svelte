@@ -2,6 +2,7 @@
   import {
     detail,
     navigate,
+    navigateArtist,
     loadCataloguePage,
   } from "../lib/state.svelte.js";
   import { playAlbumById } from "../lib/play.js";
@@ -111,7 +112,7 @@
 <section class="view page aux-page appears-page">
   {#if artist}
     <header class="aux-head">
-      <button class="aux-back" onclick={() => navigate("artist", artist.id)}>
+      <button class="aux-back" onclick={() => navigateArtist(artist.id, artist.name)}>
         <Icon name="back" size={13} />{artist.name}
       </button>
       <div class="aux-title-row">
