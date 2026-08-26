@@ -25,7 +25,6 @@
   const playCountFormatter = new Intl.NumberFormat();
 
   const canvasTrackKey = $derived(current?.id || current?.uri || "");
-  let canvasTrack = $state("");
   let canvasUrl = $state("");
   let canvasReady = $state(false);
   let canvasStageRatio = $state(100);
@@ -63,18 +62,32 @@
     const key = canvasTrackKey;
     const shouldFetch = Boolean(key && appSettings.animated_canvas && pageVisible && !reducedMotion);
     const generation = ++canvasGeneration;
-    canvasTrack = key;
-    canvasUrl = "";
-    canvasReady = false;
-    canvasStageRatio = 100;
-    if (!shouldFetch) return;
+    /* Resource-policy changes are authoritative and clear immediately. A
+       track change is different: keep the current Canvas and its geometry
+       while the next request is in flight, then replace or collapse exactly
+       once when that request answers. */
+    if (!shouldFetch) {
+      canvasUrl = "";
+      canvasReady = false;
+      canvasStageRatio = 100;
+      return;
+    }
     api.browseCanvas(key)
       .then((canvas) => {
-        if (generation !== canvasGeneration || !canvas?.url) return;
+        if (generation !== canvasGeneration) return;
+        if (!canvas?.url) {
+          canvasUrl = "";
+          canvasReady = false;
+          canvasStageRatio = 100;
+          return;
+        }
         canvasUrl = canvas.url;
       })
       .catch(() => {
-        if (generation === canvasGeneration) canvasUrl = "";
+        if (generation !== canvasGeneration) return;
+        canvasUrl = "";
+        canvasReady = false;
+        canvasStageRatio = 100;
       });
   });
 
@@ -165,16 +178,9 @@
   </div>
 
   {#if current}
-    <!-- The artwork is the panel's subject, so it gets the full column width
-         and throws a blurred copy of itself behind the top of the panel. That
-         glow is the only place the interface takes colour from the music
-         rather than from the palette, and it costs one composited layer. When
-         the cover is missing, the generated tile supplies the same glow from
-         the Rose Pine accents, so the block never looks empty. -->
-    <!-- The stage opens as the square cover at full rail width. When the
-         Canvas reports readiness, --stage-open reshapes the box to the
-         frame's real ratio and one calm timeline breathes it open, recedes
-         the cover beneath, and pours the video down over it. -->
+    <!-- At rest this is the original inset square sleeve: rounded, raised and
+         lit by its own static cover glow. A ready Canvas extends that same
+         frame to the video's natural ratio; it never becomes rail chrome. -->
     <div
       class="np-stage"
       class:play={canvasReady}
@@ -189,8 +195,9 @@
           id={current.album_id || current.uri}
           name={current.album_name || current.name}
           fill
+          lg
         />
-        {#if canvasUrl && canvasTrack === canvasTrackKey}
+        {#if canvasUrl}
           <video
             class="np-canvas"
             bind:this={canvasEl}
