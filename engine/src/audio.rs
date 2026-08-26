@@ -746,17 +746,25 @@ pub struct RodioSink {
     _stream: rodio::OutputStream,
 }
 
-/// Maps a u16 volume (librespot's 0..=65535 scale) to rodio gain using the
-/// same curve librespot's default SoftMixer applies (Log, 60 dB range):
-/// `exp(ln(1000) * normalized) / 1000`. Mirrored here so the transport's
-/// audible volume curve is unchanged when volume moves from per-packet
-/// attenuation to the rodio sink.
+/// Maps a u16 volume (librespot's 0..=65535 scale) to the audible gain used
+/// by librespot's `Cubic(60)` volume control: `(0.1 + 0.9 * normalized)^3`.
+/// Keep both endpoints explicit: cubic's 0.1 floor is useful for control
+/// granularity, but transport zero must still be exact mute.
 fn volume_to_gain(volume: u16) -> f32 {
     if volume == 0 {
         return 0.0;
     }
+    if volume == u16::MAX {
+        return 1.0;
+    }
+
     let normalized = f64::from(volume) / f64::from(u16::MAX);
-    (f64::exp(f64::ln(1000.0) * normalized) / 1000.0) as f32
+    let gain = (0.1 + 0.9 * normalized).powi(3);
+    if gain.is_finite() {
+        gain.clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    }
 }
 
 /// Applies a transport volume change to the live rodio sink immediately.
@@ -1596,22 +1604,58 @@ mod tests {
         producer.join().unwrap();
     }
 
-    /// The rodio gain curve must mirror librespot's default SoftMixer
-    /// mapping (Log, 60 dB) so switching volume from per-packet attenuation
-    /// to the sink does not change the audible volume curve.
+    /// The rodio gain curve must mirror librespot's `Cubic(60)` volume
+    /// control so switching volume from per-packet attenuation to the sink
+    /// does not change the audible volume curve.
     #[test]
-    fn volume_to_gain_matches_the_softmixer_log_curve() {
-        // Log(60 dB): exp(ln(1000) * n) / 1000.
-        let expected = |n: f64| (f64::exp(f64::ln(1000.0) * n) / 1000.0) as f32;
+    fn volume_to_gain_matches_the_softmixer_cubic_curve() {
+        let expected = |volume: u16| {
+            let normalized = f64::from(volume) / f64::from(u16::MAX);
+            (0.1 + 0.9 * normalized).powi(3) as f32
+        };
         assert_eq!(volume_to_gain(0), 0.0, "mute is exactly zero");
         assert_eq!(volume_to_gain(u16::MAX), 1.0, "max volume is unity");
-        for percent in [1u32, 10, 25, 50, 75, 90] {
-            let volume = ((percent * u32::from(u16::MAX)) / 100) as u16;
-            let normalized = f64::from(volume) / f64::from(u16::MAX);
+
+        let table = [
+            (1u16, 0.0010004121),
+            (655u16, 0.0012948577),
+            (6553u16, 0.0068582564),
+            (16384u16, 0.034329213),
+            (32768u16, 0.16638123),
+            (49151u16, 0.46547818),
+            (58982u16, 0.7535881),
+        ];
+        for (volume, expected_gain) in table {
+            let actual = volume_to_gain(volume);
             assert!(
-                (volume_to_gain(volume) - expected(normalized)).abs() < 1e-6,
-                "mapping mismatch at {percent}%"
+                (actual - expected_gain).abs() <= 1e-6,
+                "mapping mismatch at raw volume {volume}: {actual} != {expected_gain}"
             );
+            assert!(
+                (actual - expected(volume)).abs() <= 1e-6,
+                "mapping formula mismatch at raw volume {volume}"
+            );
+        }
+    }
+
+    #[test]
+    fn volume_to_gain_is_monotonic_and_bounded() {
+        let mut previous = volume_to_gain(0);
+        for volume in 1u16..=u16::MAX {
+            let gain = volume_to_gain(volume);
+            assert!(
+                gain.is_finite(),
+                "gain at raw volume {volume} is not finite"
+            );
+            assert!(
+                (0.0..=1.0).contains(&gain),
+                "gain at raw volume {volume} escaped [0, 1]: {gain}"
+            );
+            assert!(
+                gain >= previous,
+                "gain decreased at raw volume {volume}: {gain} < {previous}"
+            );
+            previous = gain;
         }
     }
 }

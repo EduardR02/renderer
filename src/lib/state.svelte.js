@@ -199,6 +199,11 @@ export const playback = $state({
   queue: [],
   error: null,
 });
+let playingRequestGeneration = 0;
+let playingAuthorityGeneration = 0;
+let volumeRequestGeneration = 0;
+let volumeAuthorityGeneration = 0;
+
 
 const lazyQueue = $state({ generation: 0, source: null, cursor: null, loading: false, retryAfter: 0 });
 const QUEUE_BACKFILL_LOW_WATER = 8;
@@ -384,6 +389,8 @@ export function positionMs() {
 
 export function applyPlayback(payload) {
   if (!payload) return;
+  if ("playing" in payload) playingAuthorityGeneration += 1;
+  if ("volume" in payload) volumeAuthorityGeneration += 1;
   const loggedOut = observeSearchSession(payload);
   const wasPlaying = playback.playing;
   for (const key of Object.keys(playback)) {
@@ -442,7 +449,7 @@ export function applySession(payload) {
     session.username = payload.username;
     playback.username = payload.username;
   }
-  if (payload.error != null) session.error = payload.error;
+  if (Object.prototype.hasOwnProperty.call(payload, "error")) session.error = payload.error;
   maybeStartDeferredSearch();
 }
 
@@ -1289,6 +1296,31 @@ export function promotePlaylist(id, { played = false } = {}) {
   return true;
 }
 
+/**
+ * Patches the matching library row from an authoritative `playlist_summary`
+ * event, which the backend emits with the refreshed playlist after an applied
+ * fetch (add/remove/reorder land here). The row updates in place — keyed
+ * sidebar rows keep their element and repaint only the count — and the list
+ * is never reordered: an edit already promoted its row through its own
+ * command, so a bare count change must not shuffle the rail.
+ *
+ * `last_activity`/`last_played` are local-only ordering state. They serialize
+ * as `null` whenever the backend has no stamp of its own; `null` means "not
+ * supplied" and preserves ours. A concrete timestamp outranks it.
+ */
+export function applyPlaylistSummary(summary) {
+  const id = typeof summary?.id === "string" ? summary.id : "";
+  if (!id) return false;
+  const row = library.find((playlist) => playlist?.id === id);
+  if (!row) return false;
+  for (const key of Object.keys(summary)) {
+    const value = summary[key];
+    if ((key === "last_activity" || key === "last_played") && value == null) continue;
+    if (row[key] !== value) row[key] = value;
+  }
+  return true;
+}
+
 /* ---------------- Spotify saved tracks ---------------- */
 /* ---------------- Cover resolution ---------------- */
 
@@ -1388,6 +1420,16 @@ export async function resolveCoverUrl(url) {
 
 /* ---------------- Commands (exact contract names) ---------------- */
 
+let previewLeaseIdSequence = 0;
+
+export function allocatePreviewLeaseId() {
+  if (previewLeaseIdSequence >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("Preview lease ID exhausted.");
+  }
+  previewLeaseIdSequence += 1;
+  return previewLeaseIdSequence;
+}
+
 let playbackSpeedRequestGeneration = 0;
 
 function decodeTrackWaveform(payload) {
@@ -1415,10 +1457,43 @@ function decodeTrackWaveform(payload) {
     peaks,
   };
 }
+function requestPlaying(target) {
+  const previous = playback.playing;
+  const at = positionMs();
+  const generation = ++playingRequestGeneration;
+  const authority = playingAuthorityGeneration;
+  playback.playing = target;
+  anchorPlayhead(at);
+  syncPlayheadTicker(target);
+  return invoke(target ? "play" : "pause").catch((error) => {
+    if (generation === playingRequestGeneration && authority === playingAuthorityGeneration) {
+      const rollbackAt = positionMs();
+      playback.playing = previous;
+      anchorPlayhead(rollbackAt);
+      syncPlayheadTicker(previous);
+    }
+    throw error;
+  });
+}
+
+function requestVolume(percent) {
+  const target = Math.min(100, Math.max(0, Math.round(percent)));
+  const previous = playback.volume;
+  const generation = ++volumeRequestGeneration;
+  const authority = volumeAuthorityGeneration;
+  playback.volume = target;
+  return invoke("set_volume", { percent: target }).catch((error) => {
+    if (generation === volumeRequestGeneration && authority === volumeAuthorityGeneration) {
+      playback.volume = previous;
+    }
+    throw error;
+  });
+}
+
 
 export const api = {
-  play: () => invoke("play"),
-  pause: () => invoke("pause"),
+  play: () => requestPlaying(true),
+  pause: () => requestPlaying(false),
   next: async () => {
     if (lazyQueue.source && playback.current_index >= playback.queue.length - 1) {
       await backfillLazyQueue(true);
@@ -1444,12 +1519,10 @@ export const api = {
     });
   },
   setVolume: (percent) => {
-    const target = Math.min(100, Math.max(0, Math.round(percent)));
     // Optimistic for the same reason as `seek`: the volume slider is driven by
     // `playback.volume`, so between releasing the drag and the engine's next
     // state event it would fall back to the pre-drag value and flick forward.
-    playback.volume = target;
-    return invoke("set_volume", { percent: target });
+    return requestVolume(percent);
   },
   setShuffle: (enabled) => invoke("set_shuffle", { enabled: !!enabled }),
   setRepeat: (mode) => invoke("set_repeat", { mode }),
@@ -1506,15 +1579,17 @@ export const api = {
   saveTrackEdit: (trackId, durationMs, cuts, loopRange = null) =>
     invoke("save_track_edit", { trackId, durationMs, cuts, loopRange }),
   deleteTrackEdit: (trackId) => invoke("delete_track_edit", { trackId }),
-  previewTrackEdit: (track, cuts, loopRange = null, positionMs = 0) => {
+  previewTrackEdit: (track, cuts, loopRange = null, positionMs = 0, previewLeaseId) => {
     clearLazyQueue();
     return invoke("preview_track_edit", {
       track,
       cuts,
       loopRange,
       positionMs: Math.max(0, Math.round(Number(positionMs) || 0)),
+      previewLeaseId,
     });
   },
+  restorePreview: (previewLeaseId) => invoke("restore_preview", { previewLeaseId }),
   setPlaylistTrackEditEnabled: (playlistId, trackId, enabled) =>
     invoke("set_playlist_track_edit_enabled", {
       playlistId,
@@ -1693,13 +1768,7 @@ export function removePlaylistRecommendation(id, revision = "", uri) {
 export function togglePlay() {
   if (!playback.queue.length) return;
   if (playback.current_index < 0 || playback.queue[playback.current_index]?.unavailable) return;
-  // Capture where the playhead actually is before the flip, so resuming
-  // projects from there rather than from the last engine sync.
-  const at = positionMs();
-  playback.playing = !playback.playing;
-  anchorPlayhead(at);
-  syncPlayheadTicker(playback.playing);
-  invoke(playback.playing ? "play" : "pause").catch(() => {});
+  requestPlaying(!playback.playing).catch(() => {});
 }
 
 export function openAuthUrl() {
@@ -1782,6 +1851,9 @@ export async function initEvents() {
   }).catch(() => {});
   listen("session", (e) => applySession(e.payload)).catch(() => {});
   listen("library", (e) => setLibrary(e.payload)).catch(() => {});
+  // A mutation's refreshed summary patches the one library row it names;
+  // full rootlist answers still arrive as `library`.
+  listen("playlist_summary", (e) => applyPlaylistSummary(e.payload)).catch(() => {});
 
   // Pull initial state. The engine may not be ready yet, so the cached
   // library snapshot (hydrated by the Rust side at startup) is applied here
@@ -1790,7 +1862,7 @@ export async function initEvents() {
   api
     .getState()
     .then((payload) => {
-      applyPlayback(payload);
+      applyPlayback(payload?.playback ?? payload);
       if (payload && Array.isArray(payload.playlists)) setLibrary(payload.playlists);
     })
     .catch(() => {});

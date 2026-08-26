@@ -124,14 +124,14 @@ export function pressTrack(ctx) {
   };
   window.addEventListener("pointermove", onPressMove);
   window.addEventListener("pointerup", onPressUp);
-  window.addEventListener("pointercancel", onPressUp);
+  window.addEventListener("pointercancel", onPressCancel);
   window.addEventListener("keydown", onPressKey, true);
 }
 
 function releaseListeners() {
   window.removeEventListener("pointermove", onPressMove);
   window.removeEventListener("pointerup", onPressUp);
-  window.removeEventListener("pointercancel", onPressUp);
+  window.removeEventListener("pointercancel", onPressCancel);
   window.removeEventListener("keydown", onPressKey, true);
 }
 
@@ -157,6 +157,11 @@ function onPressUp() {
   if (!press) return;
   const commit = press.active;
   endDrag(commit);
+}
+
+function onPressCancel() {
+  if (!press) return;
+  endDrag(false);
 }
 
 function activate() {

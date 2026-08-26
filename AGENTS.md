@@ -32,6 +32,7 @@ bun tauri build
 - Read the relevant code before changing it. The repository is the source of truth.
 - Preserve a high bar for interface quality. For UI work, follow the frontend design skill and inspect the real surface when possible.
 - Verify significant changes with observable evidence. Never claim a result that was not actually checked.
+- Bounded delegation keeps file details with workers while the parent retains plan and judgment; lean parent context improves decision quality and cost.
 
 ## No backwards compatibility
 

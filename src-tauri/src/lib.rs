@@ -82,6 +82,7 @@ pub fn run() {
             commands::set_playback_speed,
             commands::play_queue,
             commands::preview_track_edit,
+            commands::restore_preview,
             commands::play_queue_index,
             commands::add_queue,
             commands::add_queue_batch,
@@ -133,21 +134,20 @@ pub fn run() {
         .setup(|app| {
             let mut startup_settings = load_app_settings();
             reconcile_autostart_preference(app.handle(), &mut startup_settings);
-            if startup_settings.start_minimized {
-                if let Some(window) = app.get_webview_window("main") {
-                    if let Err(error) = window.show() {
-                        log::warn(&format!(
-                            "could not show the main window at startup: {error}"
-                        ));
-                    }
+            if let Some(window) = app.get_webview_window("main") {
+                if startup_settings.start_minimized {
                     if let Err(error) = window.minimize() {
                         log::warn(&format!(
                             "could not minimize the main window at startup: {error}"
                         ));
                     }
-                } else {
-                    log::warn("could not find the main window to start minimized");
+                } else if let Err(error) = window.show() {
+                    log::warn(&format!(
+                        "could not show the main window at startup: {error}"
+                    ));
                 }
+            } else {
+                log::warn("could not find the main window at startup");
             }
 
             let state = Mutex::new(AppState::new(data_dir()));

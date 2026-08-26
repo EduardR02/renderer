@@ -2,15 +2,15 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::sync::{mpsc as std_mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use librespot_core::Session;
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
+use librespot_core::Session;
 use librespot_playback::config::{
-    AudioFormat, Bitrate, NormalisationMethod, NormalisationType, PlayerConfig,
+    AudioFormat, Bitrate, NormalisationMethod, NormalisationType, PlayerConfig, VolumeCtrl,
 };
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume};
@@ -261,6 +261,13 @@ fn player_config(normalisation: bool) -> PlayerConfig {
     }
 }
 
+fn mixer_config() -> MixerConfig {
+    MixerConfig {
+        volume_ctrl: VolumeCtrl::Cubic(60.0),
+        ..MixerConfig::default()
+    }
+}
+
 async fn create_playback_latest(
     session: Session,
     cache: Cache,
@@ -290,7 +297,7 @@ pub async fn create_playback(
     normalisation: bool,
 ) -> Result<PlaybackHandles, String> {
     let mixer = Arc::new(
-        SoftMixer::open(MixerConfig::default())
+        SoftMixer::open(mixer_config())
             .map_err(|error| format!("could not initialize software volume: {error}"))?,
     );
     let cached_volume = cache.volume().unwrap_or(u16::MAX / 2);
@@ -352,9 +359,38 @@ fn volume_to_percent(volume: u16) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OAUTH_REDIRECT_URI, extract_oauth_code, oauth_listener_addr, player_config, prepare_oauth,
+        extract_oauth_code, mixer_config, oauth_listener_addr, player_config, prepare_oauth,
+        OAUTH_REDIRECT_URI,
     };
+    use librespot_playback::config::VolumeCtrl;
+    use librespot_playback::mixer::softmixer::SoftMixer;
+    use librespot_playback::mixer::Mixer;
 
+    #[test]
+    fn mixer_uses_the_same_cubic_sixty_db_curve_as_the_sink() {
+        let config = mixer_config();
+        assert!(
+            matches!(config.volume_ctrl, VolumeCtrl::Cubic(db_range) if db_range == 60.0),
+            "unexpected volume control: {:?}",
+            config.volume_ctrl
+        );
+
+        let mixer = SoftMixer::open(config).expect("soft mixer opens with cubic control");
+        for volume in [0u16, 1, 32768, 49151, u16::MAX] {
+            mixer.set_volume(volume);
+            let audible = mixer.get_soft_volume().attenuation_factor();
+            let normalized = f64::from(volume) / f64::from(u16::MAX);
+            let expected = if volume == 0 {
+                0.0
+            } else {
+                (0.1 + 0.9 * normalized).powi(3)
+            };
+            assert!(
+                (audible - expected).abs() <= 1e-12,
+                "mixer mapping mismatch at raw volume {volume}: {audible} != {expected}"
+            );
+        }
+    }
     #[test]
     fn player_config_does_not_poll_position() {
         // Event cadence: the engine emits state on transitions plus a 2 s

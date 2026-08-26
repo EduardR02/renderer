@@ -1,21 +1,21 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use librespot_core::SpotifyUri;
 use librespot_core::cache::Cache;
+use librespot_core::SpotifyUri;
 use librespot_metadata::Metadata;
-use librespot_playback::mixer::{Mixer, softmixer::SoftMixer};
+use librespot_playback::mixer::{softmixer::SoftMixer, Mixer};
 use librespot_playback::player::{Player, PlayerEvent};
 use tokio::sync::mpsc;
 
 use crate::audio::AudioSignal;
 use crate::auth::{
-    PendingAuth, PlaybackHandles, complete_oauth, connect_cached, create_playback,
-    percent_to_volume, prepare_oauth,
+    complete_oauth, connect_cached, create_playback, percent_to_volume, prepare_oauth, PendingAuth,
+    PlaybackHandles,
 };
-use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
+use crate::customization::{validate_definition, EditTimeline, TrackEditStore};
 use crate::history::ListeningHistory;
 use crate::io::ProtocolWriter;
 use serde::Serialize;
@@ -97,6 +97,9 @@ pub struct Engine {
     /// events still update transport state, but never create listening-history
     /// rows.
     preview_mode: bool,
+    /// Process-local owner of the installed editor preview. Zero means that
+    /// no preview lease is active.
+    preview_lease_id: u64,
     /// Playback intent captured when an authenticated session dies. A normal
     /// app startup restore never sets this; only an unexpected reconnect may
     /// resume automatically.
@@ -250,6 +253,7 @@ impl Engine {
             loading_failed: false,
             current_needs_load: false,
             preview_mode: false,
+            preview_lease_id: 0,
             resume_after_reconnect: false,
             position_anchor: None,
             last_track_change: None,
@@ -590,6 +594,7 @@ impl Engine {
         self.state.queue.clear();
         self.current_needs_load = false;
         self.preview_mode = false;
+        self.preview_lease_id = 0;
         self.resume_after_reconnect = false;
         self.shuffle_pool.clear();
         self.history.clear();
@@ -902,6 +907,23 @@ impl Engine {
         if let Command::SetNormalisation { enabled } = command {
             return Ok(self.set_normalisation(enabled, auth_sender));
         }
+        // A guarded editor teardown is allowed to lose a race with a real
+        // queue command even while the player is unavailable. Treat that
+        // stale request as an unchanged no-op before readiness checks. The
+        // lease must be nonzero and still own the installed preview.
+        if let Command::RestoreQueue {
+            only_if_preview: true,
+            preview_lease_id,
+            ..
+        } = &command
+        {
+            if !self.preview_mode
+                || *preview_lease_id == 0
+                || *preview_lease_id != self.preview_lease_id
+            {
+                return Ok(false);
+            }
+        }
         self.ensure_ready()?;
         // Pace command-driven track changes so rapid next/prev spam cannot
         // burst audio-key requests (each load of an uncached track fetches
@@ -962,13 +984,25 @@ impl Engine {
                 index,
                 position_ms,
                 context,
-            } => self.restore_queue(queue, index, position_ms, context),
+                preview_lease_id,
+                only_if_preview,
+                resume_playing,
+            } => self.restore_queue(
+                queue,
+                index,
+                position_ms,
+                context,
+                preview_lease_id,
+                only_if_preview,
+                resume_playing,
+            ),
             Command::PreviewTrackEdit {
                 track,
                 cuts,
                 loop_range,
                 position_ms,
-            } => self.preview_track_edit(track, cuts, loop_range, position_ms),
+                preview_lease_id,
+            } => self.preview_track_edit(track, cuts, loop_range, position_ms, preview_lease_id),
             Command::PlayQueueIndex { index } => self.play_queue_index(index),
             Command::Play => self.play(),
             Command::Pause => self.pause(),
@@ -1300,6 +1334,7 @@ impl Engine {
 
     fn leave_preview_mode(&mut self) {
         self.preview_mode = false;
+        self.preview_lease_id = 0;
         self.finalize_listening(false);
     }
     fn validate_queue(queue: &[TrackRef], index: usize) -> Result<(), String> {
@@ -1349,7 +1384,14 @@ impl Engine {
     ) -> Result<bool, String> {
         fill_queue_context(&mut queue, &context);
         self.resolve_queue_edits(&mut queue);
-        self.play_resolved_queue(queue, index, position_ms, PositionSpace::Transport, false)
+        self.play_resolved_queue(
+            queue,
+            index,
+            position_ms,
+            PositionSpace::Transport,
+            false,
+            0,
+        )
     }
 
     fn preview_track_edit(
@@ -1358,11 +1400,27 @@ impl Engine {
         cuts: Vec<TimeRange>,
         loop_range: Option<LoopRange>,
         position_ms: u32,
+        preview_lease_id: u64,
     ) -> Result<bool, String> {
+        if preview_lease_id == 0 {
+            return Err("preview lease ID must be nonzero".to_owned());
+        }
+        // A replacement transfers ownership before draft validation. If this
+        // attempt is rejected, the old preview remains restorable by the new
+        // editor context rather than by the stale one.
+        if self.preview_mode {
+            self.preview_lease_id = preview_lease_id;
+        }
         let track = with_preview_edit(track, cuts, loop_range)?;
-        self.play_resolved_queue(vec![track], 0, position_ms, PositionSpace::Source, true)
+        self.play_resolved_queue(
+            vec![track],
+            0,
+            position_ms,
+            PositionSpace::Source,
+            true,
+            preview_lease_id,
+        )
     }
-
     /// Installs queue rows whose `effective_edit` values are already final.
     /// Preview uses this path so its draft is never resolved against the
     /// persisted edit store.
@@ -1373,6 +1431,7 @@ impl Engine {
         position_ms: u32,
         position_space: PositionSpace,
         preview: bool,
+        preview_lease_id: u64,
     ) -> Result<bool, String> {
         Self::validate_queue(&queue, index)?;
         let Some(playable_index) = first_available_from(&queue, index) else {
@@ -1382,6 +1441,7 @@ impl Engine {
                 self.player()?;
             }
             if preview {
+                self.preview_lease_id = preview_lease_id;
                 self.enter_preview_mode();
             } else {
                 self.leave_preview_mode();
@@ -1389,6 +1449,7 @@ impl Engine {
             return self.install_empty_or_unavailable_queue(queue);
         };
         if preview {
+            self.preview_lease_id = preview_lease_id;
             self.enter_preview_mode();
         } else {
             self.leave_preview_mode();
@@ -1426,14 +1487,32 @@ impl Engine {
         index: usize,
         position_ms: u32,
         context: String,
+        preview_lease_id: u64,
+        only_if_preview: bool,
+        resume_playing: bool,
     ) -> Result<bool, String> {
+        // A preview teardown can race with a real queue command. Once the
+        // latter wins, this stale restore must not even validate or resolve
+        // its snapshot against the live engine state.
+        if only_if_preview
+            && (!self.preview_mode
+                || preview_lease_id == 0
+                || self.preview_lease_id != preview_lease_id)
+        {
+            return Ok(false);
+        }
+
         fill_queue_context(&mut queue, &context);
         // The snapshot carries whatever edits were resolved when it was
         // written, which may since have been deleted or disabled. Every other
         // queue install re-resolves against the store; this one must too, or a
         // restart replays an edit the store no longer holds.
         self.resolve_queue_edits(&mut queue);
+        // Validate every input before stopping the current player or changing
+        // any engine-owned queue/playhead state. A malformed stale snapshot
+        // therefore cannot damage a live preview either.
         Self::validate_queue(&queue, index)?;
+
         self.leave_preview_mode();
         if let Some(player) = &self.player {
             player.stop();
@@ -1459,11 +1538,30 @@ impl Engine {
         self.history.clear();
         self.rebuild_shuffle_pool();
         self.play_request_id = None;
+        self.seek_in_flight = false;
+        self.seek_should_play = false;
+        self.loop_decoder_eof = false;
+        self.loop_jump_pending = false;
         self.reset_loop_pass_for_position(self.state.position_ms);
         self.loading_failed = false;
         self.current_needs_load = playable_index.is_some();
         self.recent_track_changes.clear();
         self.recent_unavailable.clear();
+
+        if resume_playing {
+            // Keep restore and resume inside one command. The command loop
+            // will therefore emit one authoritative restored-playing state,
+            // rather than publishing an intermediate paused restore first.
+            if let Err(error) = self.play() {
+                // Queue installation already left preview mode. Do not put a
+                // failed resume back into the draft preview; expose the
+                // installed real queue as paused with its failure visible.
+                self.preview_mode = false;
+                self.preview_lease_id = 0;
+                self.state.playing = false;
+                self.state.error = Some(error);
+            }
+        }
         Ok(true)
     }
 
@@ -2346,15 +2444,15 @@ fn track_change_wait(last: Option<Instant>, now: Instant, interval: Duration) ->
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::{atomic::Ordering, Arc};
     use std::time::{Duration, Instant};
 
     use super::{
+        first_available_from, first_available_wrapping, remap_current_index_after_move,
+        sequential_available_index, sequential_next_index, track_change_wait, with_preview_edit,
         AudioSignal, AuthSignal, Engine, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX,
         RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
-        UNAVAILABLE_BURST_WINDOW, first_available_from, first_available_wrapping,
-        remap_current_index_after_move, sequential_available_index, sequential_next_index,
-        track_change_wait, with_preview_edit,
+        UNAVAILABLE_BURST_WINDOW,
     };
     use crate::io::ProtocolWriter;
     use librespot_core::SpotifyUri;
@@ -2391,6 +2489,7 @@ mod tests {
 
     fn track_ref() -> TrackRef {
         TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
             ..TrackRef::default()
         }
@@ -2413,7 +2512,10 @@ mod tests {
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
             current_index: Some(0),
-            queue: vec![track_ref()],
+            queue: vec![TrackRef {
+                duration_ms,
+                ..track_ref()
+            }],
             error: None,
         }
     }
@@ -2493,7 +2595,7 @@ mod tests {
         ];
 
         assert_eq!(
-            engine.restore_queue(queue, 0, 42_000, String::new()),
+            engine.restore_queue(queue, 0, 42_000, String::new(), 0, false, false),
             Ok(true)
         );
         assert_eq!(engine.state.current_index, Some(1));
@@ -2505,6 +2607,165 @@ mod tests {
         assert!(!engine.state.playing);
         assert!(engine.current_needs_load);
         assert!(engine.play_request_id.is_none());
+    }
+
+    #[test]
+    fn guarded_restore_is_a_noop_after_real_queue_wins() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        let original_queue = engine.state.queue.clone();
+
+        // The stale snapshot is intentionally invalid: a guarded restore
+        // that has already lost the preview race must not even validate it.
+        let result = engine.restore_queue(
+            vec![TrackRef::default()],
+            4,
+            12_000,
+            String::new(),
+            1,
+            true,
+            true,
+        );
+
+        assert_eq!(result, Ok(false));
+        assert_eq!(engine.state.queue.len(), original_queue.len());
+        assert_eq!(engine.state.queue[0].uri, original_queue[0].uri);
+        assert!(engine.state.playing);
+        assert!(!engine.preview_mode);
+    }
+
+    #[test]
+    fn stale_preview_restore_cannot_overwrite_new_preview() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.preview_mode = true;
+        engine.preview_lease_id = 22;
+        let original_uri = engine.state.queue[0].uri.clone();
+
+        let result = engine.restore_queue(
+            vec![TrackRef::default()],
+            4,
+            12_000,
+            String::new(),
+            11,
+            true,
+            false,
+        );
+
+        assert_eq!(result, Ok(false));
+        assert!(engine.preview_mode);
+        assert_eq!(engine.preview_lease_id, 22);
+        assert_eq!(engine.state.queue[0].uri, original_uri);
+        assert!(engine.state.playing);
+    }
+
+    #[test]
+    fn failed_preview_replacement_transfers_restore_ownership() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.preview_mode = true;
+        engine.preview_lease_id = 1;
+        let original_track = engine.state.queue[0].clone();
+
+        let error = engine
+            .preview_track_edit(
+                original_track.clone(),
+                vec![range(10_000, 20_000), range(15_000, 25_000)],
+                None,
+                5_000,
+                2,
+            )
+            .expect_err("overlapping replacement draft must be rejected");
+        assert!(error.contains("overlap") || error.contains("sorted"));
+        assert!(engine.preview_mode);
+        assert_eq!(engine.preview_lease_id, 2);
+        assert_eq!(engine.state.queue[0].uri, original_track.uri);
+
+        assert_eq!(
+            engine.restore_queue(
+                vec![original_track],
+                0,
+                42_000,
+                String::new(),
+                2,
+                true,
+                false,
+            ),
+            Ok(true)
+        );
+        assert!(!engine.preview_mode);
+        assert_eq!(engine.preview_lease_id, 0);
+    }
+
+    #[test]
+    fn failed_first_preview_does_not_enter_preview_or_claim_lease() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        let original_uri = engine.state.queue[0].uri.clone();
+        let track = engine.state.queue[0].clone();
+
+        let error = engine
+            .preview_track_edit(track, vec![range(20_000, 10_000)], None, 5_000, 3)
+            .expect_err("invalid first draft must be rejected");
+
+        assert!(!error.is_empty());
+        assert!(!engine.preview_mode);
+        assert_eq!(engine.preview_lease_id, 0);
+        assert_eq!(engine.state.queue[0].uri, original_uri);
+    }
+
+    #[test]
+    fn invalid_restore_does_not_leave_preview_or_stop_the_current_queue() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.preview_mode = true;
+        engine.preview_lease_id = 1;
+        let original_uri = engine.state.queue[0].uri.clone();
+
+        let error = engine
+            .restore_queue(
+                vec![TrackRef::default()],
+                4,
+                12_000,
+                String::new(),
+                1,
+                true,
+                false,
+            )
+            .expect_err("out-of-range restore index must be rejected");
+
+        assert!(error.contains("out of range"));
+        assert!(engine.preview_mode);
+        assert!(engine.state.playing);
+        assert_eq!(engine.state.queue[0].uri, original_uri);
+    }
+
+    #[test]
+    fn failed_preview_resume_leaves_the_restored_queue_real_paused_and_in_error() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.preview_mode = true;
+        engine.preview_lease_id = 1;
+        let track = engine.state.queue[0].clone();
+
+        // The capture engine has no player. Restore still installs the real
+        // queue and reports the failed resume in state instead of reviving
+        // the editor preview.
+        assert_eq!(
+            engine.restore_queue(vec![track], 0, 42_000, String::new(), 1, true, true),
+            Ok(true)
+        );
+        assert!(!engine.preview_mode);
+        assert_eq!(engine.preview_lease_id, 0);
+        assert!(!engine.state.playing);
+        assert!(engine.state.error.is_some());
+        assert_eq!(engine.state.current_index, Some(0));
+        assert_eq!(engine.state.position_ms, 42_000);
     }
 
     #[test]
@@ -2551,7 +2812,7 @@ mod tests {
 
         assert!(
             with_preview_edit(
-                track,
+                track.clone(),
                 vec![
                     TimeRange {
                         start_ms: 10_000,
@@ -2583,7 +2844,7 @@ mod tests {
         let track = engine.state.queue[0].clone();
         assert!(
             engine
-                .preview_track_edit(track, vec![range(1_000, 2_000)], None, 5_000)
+                .preview_track_edit(track, vec![range(1_000, 2_000)], None, 5_000, 1)
                 .is_err(),
             "the capture engine has no player"
         );
@@ -2611,11 +2872,9 @@ mod tests {
     fn repeated_preview_updates_keep_history_empty_through_pause_and_eof() {
         let (mut engine, root) = history_playing_engine();
         let track = engine.state.queue[0].clone();
-        assert!(
-            engine
-                .preview_track_edit(track.clone(), vec![range(1_000, 2_000)], None, 5_000)
-                .is_err()
-        );
+        assert!(engine
+            .preview_track_edit(track.clone(), vec![range(1_000, 2_000)], None, 5_000, 1)
+            .is_err());
         assert!(engine.preview_mode);
 
         engine.play_request_id = Some(8);
@@ -2633,11 +2892,9 @@ mod tests {
             position_ms: 6_000,
         }));
 
-        assert!(
-            engine
-                .preview_track_edit(track, vec![range(3_000, 4_000)], None, 7_000)
-                .is_err()
-        );
+        assert!(engine
+            .preview_track_edit(track, vec![range(3_000, 4_000)], None, 7_000, 2)
+            .is_err());
         assert!(engine.preview_mode);
         engine.play_request_id = Some(9);
         assert!(engine.on_player_event(PlayerEvent::Playing {
@@ -2659,11 +2916,9 @@ mod tests {
     fn normal_queue_replacement_leaves_preview_without_persisting_it() {
         let (mut engine, root) = history_playing_engine();
         let preview_track = engine.state.queue[0].clone();
-        assert!(
-            engine
-                .preview_track_edit(preview_track, vec![range(1_000, 2_000)], None, 5_000)
-                .is_err()
-        );
+        assert!(engine
+            .preview_track_edit(preview_track, vec![range(1_000, 2_000)], None, 5_000, 1)
+            .is_err());
         assert!(engine.preview_mode);
 
         let normal_track = TrackRef {
@@ -2949,6 +3204,7 @@ mod tests {
                     Vec::new(),
                     Some(loop_range(20_000, 40_000, 2)),
                     40_000,
+                    1,
                 )
                 .is_err(),
             "the capture engine has no player"
@@ -3408,18 +3664,15 @@ mod tests {
             .seek_transport(u32::MAX)
             .expect("seek clamps at compiled EOF");
         assert_eq!(engine.state.position_ms, 10_000);
-        assert!(
-            !engine.state.queue[0]
-                .effective_edit
-                .as_ref()
-                .unwrap()
-                .cuts
-                .iter()
-                .any(|cut| {
-                    cut.start_ms <= engine.state.position_ms
-                        && engine.state.position_ms < cut.end_ms
-                })
-        );
+        assert!(!engine.state.queue[0]
+            .effective_edit
+            .as_ref()
+            .unwrap()
+            .cuts
+            .iter()
+            .any(|cut| {
+                cut.start_ms <= engine.state.position_ms && engine.state.position_ms < cut.end_ms
+            }));
     }
 
     #[test]
@@ -3432,7 +3685,7 @@ mod tests {
             ..TrackRef::default()
         };
         let error = preview_engine
-            .preview_track_edit(track, vec![range(10_000, 60_000)], None, 40_000)
+            .preview_track_edit(track, vec![range(10_000, 60_000)], None, 40_000, 1)
             .expect_err("the test engine has no player");
         assert!(error.contains("player"));
         assert_eq!(
@@ -3499,7 +3752,7 @@ mod tests {
         };
 
         engine
-            .restore_queue(vec![track], 0, 10_000, String::new())
+            .restore_queue(vec![track], 0, 10_000, String::new(), 0, false, false)
             .expect("restore");
         assert_eq!(
             engine.state.position_ms, 60_000,
@@ -3807,11 +4060,9 @@ mod tests {
         };
         let value: serde_json::Value = serde_json::from_slice(&line).expect("state json");
         assert_eq!(value["auth_state"], "needs_login");
-        assert!(
-            value["auth_url"]
-                .as_str()
-                .is_some_and(|url| { url.starts_with("https://accounts.spotify.com/authorize?") })
-        );
+        assert!(value["auth_url"]
+            .as_str()
+            .is_some_and(|url| { url.starts_with("https://accounts.spotify.com/authorize?") }));
     }
 
     #[test]
@@ -3819,11 +4070,9 @@ mod tests {
         let mut engine = playing_engine(); // ready with a player-less state
         engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Ready;
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        assert!(
-            engine
-                .login(&sender)
-                .expect("login no-ops when authenticated")
-        );
+        assert!(engine
+            .login(&sender)
+            .expect("login no-ops when authenticated"));
         assert!(!engine.auth_running);
         assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Ready);
     }
@@ -3835,11 +4084,9 @@ mod tests {
         engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?running".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        assert!(
-            engine
-                .login(&sender)
-                .expect("login no-ops while authenticating")
-        );
+        assert!(engine
+            .login(&sender)
+            .expect("login no-ops while authenticating"));
         assert!(engine.auth_running);
         assert_eq!(
             engine.state.auth_url.as_deref(),
@@ -3914,11 +4161,9 @@ mod tests {
         let mut engine = test_engine().0;
         engine.state.auth_state = spotify_playback_engine::protocol::AuthState::NeedsLogin;
         let pending = engine.begin_login_flow().expect("flow begins");
-        assert!(
-            pending
-                .auth_url
-                .starts_with("https://accounts.spotify.com/authorize?")
-        );
+        assert!(pending
+            .auth_url
+            .starts_with("https://accounts.spotify.com/authorize?"));
         assert!(
             engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating
         );
@@ -3951,13 +4196,11 @@ mod tests {
             retry_url, "https://accounts.spotify.com/authorize?first",
             "a retry must regenerate the URL"
         );
-        assert!(
-            engine
-                .state
-                .error
-                .as_deref()
-                .is_some_and(|error| { error.contains("Spotify authentication failed") })
-        );
+        assert!(engine
+            .state
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("Spotify authentication failed") }));
     }
 
     #[test]

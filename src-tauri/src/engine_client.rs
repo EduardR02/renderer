@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::sync::{oneshot, watch};
 
 use crate::app::{
-    PlaybackSnapshot, clear_playback_snapshot, engine_state_dir, load_app_settings,
-    load_playback_snapshot, save_playback_snapshot,
+    clear_playback_snapshot, engine_state_dir, load_app_settings, load_playback_snapshot,
+    save_playback_snapshot, PlaybackSnapshot,
 };
 use crate::log;
 use crate::types::{PlaybackState, Track};
@@ -309,13 +309,21 @@ impl PersistenceSchedule {
 enum PersistCommand {
     Dirty(u64),
     Clear(mpsc::Sender<Result<(), String>>),
-    Shutdown(mpsc::Sender<Result<(), String>>),
+    Shutdown {
+        generation: u64,
+        result_tx: mpsc::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
 struct RestorePlan {
     snapshot: RestoreSnapshot,
     sent: bool,
+    /// Preview leases must never be mistaken for startup/crash recovery.
+    only_if_preview: bool,
+    /// The editor context that currently owns this preview restore. The
+    /// snapshot itself remains the first real state captured for the lease.
+    preview_lease_id: Option<u64>,
 }
 
 pub struct EngineClient {
@@ -348,6 +356,8 @@ impl EngineClient {
         let restore_pending = load_playback_snapshot().map(|snapshot| RestorePlan {
             snapshot: RestoreSnapshot::from_durable(snapshot),
             sent: false,
+            only_if_preview: false,
+            preview_lease_id: None,
         });
         let client = Arc::new(Self {
             state_dir: engine_state_dir(),
@@ -378,13 +388,13 @@ impl EngineClient {
         self.state_tx.subscribe()
     }
 
-    /// Starts the pending restore exactly once, after a fresh engine reports
-    /// that authentication is ready. The plan remains stored until the engine
-    /// emits the matching final state.
+    /// Starts the pending startup/crash restore exactly once, after a fresh
+    /// engine reports that authentication is ready. Preview leases are kept
+    /// separate from this path and are never consumed here.
     pub fn begin_pending_restore(&self, state: &PlaybackState) -> Option<RestoreSnapshot> {
         let mut pending = self.restore_pending.lock();
         let plan = pending.as_mut()?;
-        if plan.sent || state.auth_state != "ready" {
+        if plan.only_if_preview || plan.sent || state.auth_state != "ready" {
             return None;
         }
         plan.sent = true;
@@ -392,16 +402,78 @@ impl EngineClient {
     }
 
     pub fn restore_is_pending(&self) -> bool {
-        self.restore_pending.lock().is_some()
+        self.restore_pending
+            .lock()
+            .as_ref()
+            .is_some_and(|plan| !plan.only_if_preview)
     }
 
-    /// Drops any pending restore (used after an explicit logout).
-    pub fn clear_restore_pending(&self) {
-        *self.restore_pending.lock() = None;
+    fn clear_preview_restore_pending(&self) {
+        let mut pending = self.restore_pending.lock();
+        if pending.as_ref().is_some_and(|plan| plan.only_if_preview) {
+            *pending = None;
+        }
+    }
+
+    /// Claims the preview restore for `preview_lease_id`, capturing the first
+    /// real state when necessary. Replacements transfer ownership before the
+    /// engine validates the draft, but never replace the retained snapshot.
+    fn capture_preview_restore(&self, preview_lease_id: u64) -> bool {
+        let mut pending = self.restore_pending.lock();
+        if let Some(plan) = pending.as_mut() {
+            if plan.only_if_preview {
+                plan.preview_lease_id = Some(preview_lease_id);
+                plan.sent = false;
+            } else {
+                // A startup/crash restore is already a real snapshot. If an
+                // editor opens before that restore is observed, promote the
+                // same snapshot to a preview lease rather than losing it.
+                plan.only_if_preview = true;
+                plan.preview_lease_id = Some(preview_lease_id);
+                plan.sent = false;
+            }
+            return false;
+        }
+        let Some(state) = self
+            .last_state
+            .lock()
+            .as_ref()
+            .filter(|state| state.auth_state == "ready")
+            .cloned()
+        else {
+            return false;
+        };
+        *pending = Some(RestorePlan {
+            snapshot: RestoreSnapshot::from_playback(&state, state.playing),
+            sent: false,
+            only_if_preview: true,
+            preview_lease_id: Some(preview_lease_id),
+        });
+        true
+    }
+
+    fn finish_preview_restore(&self, preview_lease_id: u64, success: bool) {
+        let mut pending = self.restore_pending.lock();
+        let Some(plan) = pending
+            .as_mut()
+            .filter(|plan| plan.only_if_preview && plan.preview_lease_id == Some(preview_lease_id))
+        else {
+            return;
+        };
+        if success {
+            *pending = None;
+        } else {
+            plan.sent = false;
+        }
     }
 
     pub fn retry_pending_restore(&self) {
-        if let Some(plan) = self.restore_pending.lock().as_mut() {
+        if let Some(plan) = self
+            .restore_pending
+            .lock()
+            .as_mut()
+            .filter(|plan| !plan.only_if_preview)
+        {
             plan.sent = false;
         }
     }
@@ -675,17 +747,22 @@ impl EngineClient {
         position_ms: u32,
         context: &str,
     ) -> Result<(), String> {
-        self.request(
-            "play_queue",
-            json!({
-                "queue": queue,
-                "index": index,
-                "position_ms": position_ms,
-                "context": context,
-            }),
-        )
-        .await
-        .map(|_| ())
+        let result = self
+            .request(
+                "play_queue",
+                json!({
+                    "queue": queue,
+                    "index": index,
+                    "position_ms": position_ms,
+                    "context": context,
+                }),
+            )
+            .await
+            .map(|_| ());
+        if result.is_ok() {
+            self.clear_preview_restore_pending();
+        }
+        result
     }
 
     pub async fn preview_track_edit(
@@ -694,7 +771,12 @@ impl EngineClient {
         cuts: &[spotify_playback_engine::protocol::TimeRange],
         loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
         position_ms: u32,
+        preview_lease_id: u64,
     ) -> Result<(), String> {
+        // Claim ownership before sending the draft. The engine performs the
+        // same transfer before replacement validation, so a rejected draft
+        // still leaves the installed preview restorable by this context.
+        self.capture_preview_restore(preview_lease_id);
         self.request(
             "preview_track_edit",
             json!({
@@ -702,10 +784,53 @@ impl EngineClient {
                 "cuts": cuts,
                 "loop_range": loop_range,
                 "position_ms": position_ms,
+                "preview_lease_id": preview_lease_id,
             }),
         )
         .await
         .map(|_| ())
+    }
+
+    /// Restores the first real queue captured before an editor preview. The
+    /// engine guards this request with preview mode and the lease ID, so
+    /// tearing down an old editor can never replace a newer real queue or
+    /// preview.
+    pub async fn restore_preview(&self, preview_lease_id: u64) -> Result<(), String> {
+        let snapshot = {
+            let mut pending = self.restore_pending.lock();
+            let Some(plan) = pending.as_mut().filter(|plan| {
+                plan.only_if_preview && plan.preview_lease_id == Some(preview_lease_id)
+            }) else {
+                // A stale teardown is deliberately an idempotent no-op. In
+                // particular it must not consume the current editor lease.
+                return Ok(());
+            };
+            if plan.sent {
+                return Ok(());
+            }
+            plan.sent = true;
+            plan.snapshot.clone()
+        };
+        let result = self
+            .request(
+                "restore_queue",
+                json!({
+                    "queue": snapshot.queue,
+                    "index": snapshot.current_index.unwrap_or(0),
+                    "position_ms": snapshot.position_ms,
+                    "context": "",
+                    "only_if_preview": true,
+                    "preview_lease_id": preview_lease_id,
+                    "resume_playing": snapshot.resume_playing,
+                }),
+            )
+            .await
+            .map(|_| ());
+        // A transport error is uncertain: the engine may have executed the
+        // restore. Keep ownership and permit a later settled teardown to
+        // retry. A matching successful response may consume the lease.
+        self.finish_preview_restore(preview_lease_id, result.is_ok());
+        result
     }
 
     pub async fn restore_queue(
@@ -715,50 +840,80 @@ impl EngineClient {
         position_ms: u32,
         context: &str,
     ) -> Result<(), String> {
-        self.request(
-            "restore_queue",
-            json!({
-                "queue": queue,
-                "index": index,
-                "position_ms": position_ms,
-                "context": context,
-            }),
-        )
-        .await
-        .map(|_| ())
+        let result = self
+            .request(
+                "restore_queue",
+                json!({
+                    "queue": queue,
+                    "index": index,
+                    "position_ms": position_ms,
+                    "context": context,
+                }),
+            )
+            .await
+            .map(|_| ());
+        if result.is_ok() {
+            self.clear_preview_restore_pending();
+        }
+        result
     }
 
     pub async fn play_queue_index(&self, index: usize) -> Result<(), String> {
-        self.request("play_queue_index", json!({"index": index}))
+        let result = self
+            .request("play_queue_index", json!({"index": index}))
             .await
-            .map(|_| ())
+            .map(|_| ());
+        if result.is_ok() {
+            self.clear_preview_restore_pending();
+        }
+        result
     }
 
     pub async fn add_queue(&self, track: &Track, context: &str) -> Result<(), String> {
-        self.request("add_queue", json!({"track": track, "context": context}))
+        let result = self
+            .request("add_queue", json!({"track": track, "context": context}))
             .await
-            .map(|_| ())
+            .map(|_| ());
+        if result.is_ok() {
+            self.clear_preview_restore_pending();
+        }
+        result
     }
 
     pub async fn add_queue_batch(&self, tracks: &[Track], context: &str) -> Result<(), String> {
-        self.request(
-            "add_queue_batch",
-            json!({"tracks": tracks, "context": context}),
-        )
-        .await
-        .map(|_| ())
+        let result = self
+            .request(
+                "add_queue_batch",
+                json!({"tracks": tracks, "context": context}),
+            )
+            .await
+            .map(|_| ());
+        if result.is_ok() {
+            self.clear_preview_restore_pending();
+        }
+        result
     }
 
     pub async fn remove_queue(&self, index: usize) -> Result<(), String> {
-        self.request("remove_queue", json!({"index": index}))
+        let result = self
+            .request("remove_queue", json!({"index": index}))
             .await
-            .map(|_| ())
+            .map(|_| ());
+        if result.is_ok() {
+            self.clear_preview_restore_pending();
+        }
+        result
     }
 
     pub async fn move_queue(&self, from: usize, to: usize) -> Result<(), String> {
-        self.request("move_queue", json!({"from": from, "to": to}))
+        let result = self
+            .request("move_queue", json!({"from": from, "to": to}))
             .await
-            .map(|_| ())
+            .map(|_| ());
+        if result.is_ok() {
+            self.clear_preview_restore_pending();
+        }
+        result
     }
 
     pub async fn get_history(
@@ -803,8 +958,16 @@ impl EngineClient {
 
     pub async fn logout(&self) -> Result<(), String> {
         self.request("logout", Value::Null).await?;
-        self.clear_restore_pending();
-        *self.last_state.lock() = None;
+        // EOF can race a successful logout. Keep this lock order identical to
+        // on_eof and on_state so a pre-logout real queue can never be
+        // installed after logout has invalidated it.
+        {
+            let mut pending = self.restore_pending.lock();
+            let mut last_state = self.last_state.lock();
+            *pending = None;
+            *last_state = None;
+        }
+        self.preview_active.store(false, Ordering::Release);
         self.clear_persisted_playback_state()
     }
 
@@ -812,12 +975,21 @@ impl EngineClient {
         // Invalidates any snapshot an in-flight attempt captured before logout.
         self.persist_generation.fetch_add(1, Ordering::AcqRel);
         let (result_tx, result_rx) = mpsc::channel();
-        self.persist_tx
+        let result = self
+            .persist_tx
             .send(PersistCommand::Clear(result_tx))
-            .map_err(|_| "playback-state writer is unavailable".to_owned())?;
-        result_rx
-            .recv()
-            .map_err(|error| format!("playback-state writer stopped during clear: {error}"))?
+            .map_err(|_| "playback-state writer is unavailable".to_owned())
+            .and_then(|_| {
+                result_rx.recv().map_err(|error| {
+                    format!("playback-state writer stopped during clear: {error}")
+                })?
+            });
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => clear_playback_snapshot().map_err(|fallback| {
+                format!("{error}; direct playback-state clear failed: {fallback}")
+            }),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1074,16 +1246,30 @@ impl EngineClient {
         Ok(())
     }
 
-    /// Requests an unthrottled final flush from the sole persistence writer,
-    /// waits for it to finish, then gracefully stops the engine.
+    /// Stops the engine before requesting an unthrottled final flush from the
+    /// sole persistence writer. Once shutdown starts, reader callbacks freeze
+    /// state publication so the final finite generation is stable.
     pub fn shutdown_engine(&self) {
         log::info("engine shutdown requested");
         self.shutting_down.store(true, Ordering::SeqCst);
 
+        let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
+        let _ = self.write_line(&line);
+        std::thread::sleep(Duration::from_millis(400));
+        if let Some(mut child) = self.process.lock().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        *self.stdin.lock() = None;
+
+        let generation = self.persist_generation.load(Ordering::Acquire);
         let (result_tx, result_rx) = mpsc::channel();
         if self
             .persist_tx
-            .send(PersistCommand::Shutdown(result_tx))
+            .send(PersistCommand::Shutdown {
+                generation,
+                result_tx,
+            })
             .is_ok()
         {
             match result_rx.recv() {
@@ -1097,15 +1283,6 @@ impl EngineClient {
         if let Some(writer) = self.persist_thread.lock().take() {
             let _ = writer.join();
         }
-
-        let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
-        let _ = self.write_line(&line);
-        std::thread::sleep(Duration::from_millis(400));
-        if let Some(mut child) = self.process.lock().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        *self.stdin.lock() = None;
     }
 
     /// O(1) reader-thread notification. The bounded channel coalesces bursts;
@@ -1125,20 +1302,18 @@ impl EngineClient {
     /// Clones and normalizes the queue only when the writer's deadline has
     /// arrived. Restore intermediates are never durable state.
     fn playback_snapshot_for_writer(&self, include_restore: bool) -> Option<PlaybackSnapshot> {
-        if !include_restore && self.restore_pending.lock().is_some() {
+        let pending = self.restore_pending.lock();
+        if !include_restore && pending.is_some() {
             return None;
         }
-        self.last_state
-            .lock()
+        let last_state = self.last_state.lock();
+        last_state
             .as_ref()
             .filter(|state| state.auth_state == "ready")
             .map(PlaybackSnapshot::from_playback)
             .or_else(|| {
                 if include_restore {
-                    self.restore_pending
-                        .lock()
-                        .as_ref()
-                        .map(|plan| plan.snapshot.durable())
+                    pending.as_ref().map(|plan| plan.snapshot.durable())
                 } else {
                     None
                 }
@@ -1150,20 +1325,35 @@ impl EngineClient {
     // ------------------------------------------------------------------
 
     fn on_state(&self, state: &PlaybackState) {
-        self.preview_active.store(state.preview, Ordering::Release);
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        // A false state only reconciles a lease after this client has
+        // observed the engine in preview mode. An unrelated false state
+        // arriving before activation must not clear a freshly claimed lease.
+        let was_preview = self.preview_active.swap(state.preview, Ordering::AcqRel);
         let mut pending = self.restore_pending.lock();
+        if was_preview
+            && !state.preview
+            && pending.as_ref().is_some_and(|plan| plan.only_if_preview)
+        {
+            *pending = None;
+        }
         let matched = pending
             .as_ref()
-            .is_some_and(|plan| plan.sent && plan.snapshot.matches(state));
+            .is_some_and(|plan| !plan.only_if_preview && plan.sent && plan.snapshot.matches(state));
         if matched {
             *pending = None;
         }
-        let suppress_snapshot = state.preview || (pending.is_some() && state.auth_state == "ready");
-        drop(pending);
+        let suppress_snapshot = state.preview
+            || pending
+                .as_ref()
+                .is_some_and(|plan| !plan.only_if_preview && state.auth_state == "ready");
         if !suppress_snapshot {
             *self.last_state.lock() = Some(state.clone());
             self.mark_persistence_dirty();
         }
+        drop(pending);
         let _ = self.state_tx.send(StateLine::State(state.clone()));
     }
 
@@ -1171,6 +1361,9 @@ impl EngineClient {
     /// state. Preview heartbeats still reach the window, but cannot mutate the
     /// queue snapshot used for persistence and child-crash recovery.
     fn on_position(&self, heartbeat: PositionHeartbeat) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
         let changed = if self.preview_active.load(Ordering::Acquire) {
             false
         } else if let Some(last) = self.last_state.lock().as_mut() {
@@ -1200,13 +1393,17 @@ impl EngineClient {
             });
         }
         drop(pending);
-        let last = self.last_state.lock().clone();
         let mut restore = self.restore_pending.lock();
+        let last = self.last_state.lock().clone();
         if let Some(last) = last.filter(|state| state.auth_state == "ready") {
             *restore = Some(RestorePlan {
                 snapshot: RestoreSnapshot::from_playback(&last, last.playing),
                 sent: false,
+                only_if_preview: false,
+                preview_lease_id: None,
             });
+        } else if restore.as_ref().is_some_and(|plan| plan.only_if_preview) {
+            *restore = None;
         } else if let Some(plan) = restore.as_mut() {
             plan.sent = false;
         }
@@ -1264,11 +1461,26 @@ fn run_persistence_writer(client: Weak<EngineClient>, receiver: Receiver<Persist
                 }
                 let _ = result_tx.send(result);
             }
-            Some(PersistCommand::Shutdown(result_tx)) => {
-                let result = client
-                    .upgrade()
-                    .and_then(|client| client.playback_snapshot_for_writer(true))
-                    .map_or(Ok(()), |snapshot| save_playback_snapshot(&snapshot));
+            Some(PersistCommand::Shutdown {
+                generation,
+                result_tx,
+            }) => {
+                let result = client.upgrade().map_or(Ok(()), |client| {
+                    // Shutdown is ordered after the engine is frozen, but
+                    // retain a finite generation fence around the final clone
+                    // so a last reader callback can never overwrite it with
+                    // an older snapshot.
+                    let current = client.persist_generation.load(Ordering::Acquire);
+                    let mut snapshot = client.playback_snapshot_for_writer(true);
+                    if current > generation {
+                        snapshot = client.playback_snapshot_for_writer(true);
+                    }
+                    let latest = client.persist_generation.load(Ordering::Acquire);
+                    if latest > current {
+                        snapshot = client.playback_snapshot_for_writer(true);
+                    }
+                    snapshot.map_or(Ok(()), |snapshot| save_playback_snapshot(&snapshot))
+                });
                 let _ = result_tx.send(result);
                 return;
             }
@@ -1553,13 +1765,11 @@ mod tests {
             .as_deref(),
             Some("0123456789ABCDEFGHIJKL"),
         );
-        assert!(
-            waveform_timeout_cancellation(
-                "cancel_track_waveform",
-                &json!({"track_id": "0123456789ABCDEFGHIJKL"}),
-            )
-            .is_none()
-        );
+        assert!(waveform_timeout_cancellation(
+            "cancel_track_waveform",
+            &json!({"track_id": "0123456789ABCDEFGHIJKL"}),
+        )
+        .is_none());
 
         let line = build_line(
             "waveform-1",
@@ -1600,6 +1810,7 @@ mod tests {
                 "cuts": cuts,
                 "loop_range": loop_range,
                 "position_ms": 42_000,
+                "preview_lease_id": 17,
             }),
         );
         let request: spotify_playback_engine::protocol::Request =
@@ -1609,6 +1820,7 @@ mod tests {
             cuts,
             loop_range,
             position_ms,
+            preview_lease_id,
         } = request.command
         else {
             panic!("Tauri preview request must retain the dedicated engine shape");
@@ -1617,8 +1829,39 @@ mod tests {
         assert_eq!(cuts.len(), 1);
         assert_eq!(loop_range.unwrap().end_ms, 9_000);
         assert_eq!(position_ms, 42_000);
+        assert_eq!(preview_lease_id, 17);
     }
 
+    #[test]
+    fn guarded_restore_request_carries_the_preview_lease_id() {
+        let line = build_line(
+            "restore-1",
+            "restore_queue",
+            json!({
+                "queue": [],
+                "index": 0,
+                "position_ms": 0,
+                "context": "",
+                "only_if_preview": true,
+                "preview_lease_id": 17,
+                "resume_playing": true,
+            }),
+        );
+        let request: spotify_playback_engine::protocol::Request =
+            serde_json::from_str(&line).unwrap();
+        let spotify_playback_engine::protocol::Command::RestoreQueue {
+            only_if_preview,
+            preview_lease_id,
+            resume_playing,
+            ..
+        } = request.command
+        else {
+            panic!("preview teardown must use the restore queue command");
+        };
+        assert!(only_if_preview);
+        assert_eq!(preview_lease_id, 17);
+        assert!(resume_playing);
+    }
     #[test]
     fn waveform_response_payload_is_typed_at_the_client_boundary() {
         let waveform: spotify_playback_engine::protocol::TrackWaveform = parse_data(
@@ -1918,6 +2161,99 @@ mod tests {
     }
 
     #[test]
+    fn preview_restore_lease_replacement_keeps_snapshot_and_changes_owner() {
+        let mut real = PlaybackState::default();
+        real.auth_state = "ready".to_owned();
+        real.playing = true;
+        real.current_index = Some(0);
+        real.queue = vec![Track {
+            id: "real".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        let client = client_with_last_state(real);
+
+        assert!(client.capture_preview_restore(17));
+        let captured = client
+            .restore_pending
+            .lock()
+            .as_ref()
+            .expect("preview lease captured")
+            .snapshot
+            .clone();
+
+        assert!(!client.capture_preview_restore(29));
+        let plan = client.restore_pending.lock();
+        let plan = plan.as_ref().expect("replacement keeps the lease");
+        assert_eq!(plan.preview_lease_id, Some(29));
+        assert_eq!(plan.snapshot.queue, captured.queue);
+        assert_eq!(plan.snapshot.position_ms, captured.position_ms);
+    }
+
+    #[tokio::test]
+    async fn stale_preview_restore_is_a_noop_for_the_current_lease() {
+        let mut real = PlaybackState::default();
+        real.auth_state = "ready".to_owned();
+        real.queue = vec![Track::default()];
+        let client = client_with_last_state(real);
+
+        assert!(client.capture_preview_restore(17));
+        assert!(!client.capture_preview_restore(29));
+        assert_eq!(client.restore_preview(17).await, Ok(()));
+
+        let plan = client.restore_pending.lock();
+        let plan = plan.as_ref().expect("stale restore keeps current lease");
+        assert_eq!(plan.preview_lease_id, Some(29));
+        assert!(!plan.sent, "stale restore must not reserve the request");
+    }
+
+    #[tokio::test]
+    async fn preview_restore_request_error_retains_lease_for_reconciliation() {
+        let mut real = PlaybackState::default();
+        real.auth_state = "ready".to_owned();
+        real.queue = vec![Track::default()];
+        let client = client_with_last_state(real);
+
+        assert!(client.capture_preview_restore(17));
+        assert!(client.restore_preview(17).await.is_err());
+
+        let plan = client
+            .restore_pending
+            .lock()
+            .clone()
+            .expect("transport uncertainty retains the snapshot");
+        assert_eq!(plan.preview_lease_id, Some(17));
+        assert!(!plan.sent, "a failed request is retryable");
+    }
+
+    #[test]
+    fn preview_true_to_false_clears_only_an_authoritatively_active_lease() {
+        let mut real = PlaybackState::default();
+        real.auth_state = "ready".to_owned();
+        real.queue = vec![Track::default()];
+        let client = client_with_last_state(real.clone());
+        assert!(client.capture_preview_restore(17));
+
+        // An unrelated real state before activation cannot consume the lease.
+        client.on_state(&real);
+        assert!(client.restore_pending.lock().is_some());
+
+        let mut preview = real.clone();
+        preview.preview = true;
+        client.on_state(&preview);
+        assert!(client.restore_pending.lock().is_some());
+
+        let mut restored = preview;
+        restored.preview = false;
+        client.on_state(&restored);
+        assert!(
+            client.restore_pending.lock().is_none(),
+            "authoritative preview exit reconciles a dropped restore reply"
+        );
+    }
+
+    #[test]
     fn blank_ready_state_is_suppressed_until_restored_state_matches() {
         let mut previous = PlaybackState::default();
         previous.auth_state = "ready".to_owned();
@@ -1935,6 +2271,8 @@ mod tests {
         *client.restore_pending.lock() = Some(RestorePlan {
             snapshot: RestoreSnapshot::from_playback(&previous, false),
             sent: false,
+            only_if_preview: false,
+            preview_lease_id: None,
         });
 
         let mut blank = PlaybackState::default();

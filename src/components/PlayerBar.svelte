@@ -369,7 +369,7 @@
              line: .p-now centres its children, so the check faces the whole
              title+artists stack instead of hanging off the song name. -->
         <span class="p-saved">
-          <span class="p-saved-mark"><Icon name="check" size={12} /></span>
+          <span class="p-saved-mark"><Icon name="check" size={10} /></span>
           <!-- Keyboard path: tabbing into a row button opens the panel
                through :focus-within, so the wrapper stays non-focusable
                and every interactive target remains a real button. -->
@@ -652,8 +652,8 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     border-radius: var(--rf);
     /* A SOLID rose disc with the mark punched out in ground, not a tinted
        ghost of one: a 12px glyph on a 14% wash read as a smudge. Filled is

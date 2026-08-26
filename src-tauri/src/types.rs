@@ -8,12 +8,12 @@
 use serde::{Deserialize, Serialize};
 
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, AlbumRef, ArtistBrowse, ArtistCataloguePage, ArtistOverview, ArtistPick,
-    ArtistPickItem, ArtistRef, ArtistReleaseCounts, ArtistReleasePage, ArtistReleases,
-    ArtistTopCity, CreditArtist, CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage,
-    PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, TrackCredits,
-    TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform,
-    normalize_canonical_playlist_description,
+    normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
+    ArtistCataloguePage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
+    ArtistReleaseCounts, ArtistReleasePage, ArtistReleases, ArtistTopCity, CreditArtist,
+    CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage, PlaylistBrowse,
+    PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, TrackCredits, TrackEdit,
+    TrackRef, TrackWaveform as EngineTrackWaveform,
 };
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.

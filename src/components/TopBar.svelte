@@ -80,7 +80,7 @@
                   : route.name === "appears-on"
                     ? (detail.artist ? `${detail.artist.name} / Appears On` : "")
                     : route.name === "track-editor"
-                      ? (getTrackEditorTrack(route.id, route.param)?.name ?? "Song repair")
+                      ? (getTrackEditorTrack(route.id, route.param)?.name ?? "Track edit")
                       : ""
   );
 

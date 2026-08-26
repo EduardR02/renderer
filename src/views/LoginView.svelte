@@ -41,7 +41,7 @@
     </div>
 
     {#if !playback.auth_url}
-      <p class="sub" style="margin-top:var(--s4)">Waiting for a login URL from the core…</p>
+      <p class="sub" style="margin-top:var(--s4)">Waiting for Spotify sign-in to be ready…</p>
     {/if}
     {#if session.error}
       <p class="sub" style="margin-top:var(--s2); color:var(--danger)">{session.error}</p>

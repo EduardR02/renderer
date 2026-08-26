@@ -788,7 +788,7 @@
   </div>
 
   <div class="main-stage" class:panning={drag?.kind === "pan"} bind:this={mainStage}
-    role="region" title="Hold Alt while dragging to bypass snapping." aria-label="Track waveform. Shift-drag empty space to add a cut. Hold Alt while dragging to bypass snapping."
+    role="region" title="Hold Alt while dragging to position freely." aria-label="Track waveform. Shift-drag empty space to add a cut. Hold Alt while dragging to position freely."
     onwheel={onWheel} onpointerdown={(event) => beginPointer(event, "create")}
     onpointermove={onPointerMove} onpointerleave={() => { if (!drag) hideHover(); }}
     onpointerup={(event) => finishPointer(event)} onpointercancel={(event) => finishPointer(event, true)}
@@ -799,7 +799,7 @@
     <span class="hover-cursor" bind:this={hoverCursor} hidden aria-hidden="true"></span>
     <span class="hover-time tnum" bind:this={hoverLabel} hidden aria-hidden="true"></span>
     {#if waveformState === "loading"}<span class="wave-status">Reading waveform…</span>
-    {:else if waveformState === "error"}<span class="wave-status error" title={waveformError}>Waveform unavailable · exact editing still works</span>{/if}
+    {:else if waveformState === "error"}<span class="wave-status error" title={waveformError}>Waveform unavailable · the time fields still work</span>{/if}
     <div class="region-layer">
       {#each cuts as cut (cut._key)}
         <div class="edit-region cut-region" class:selected={selected?.type === "cut" && selected.key === cut._key} style={regionStyle(cut)}
@@ -828,7 +828,7 @@
     <canvas bind:this={overviewCanvas} aria-hidden="true"></canvas>
     <span class="overview-window" style={overviewWindowStyle()} aria-hidden="true"></span>
   </div>
-  <p class="wave-hint">Shift-drag empty space creates a cut · middle-drag pans · Shift + wheel pans · Ctrl + wheel zooms · Hold Alt while dragging to bypass snapping.</p>
+  <p class="wave-hint">Shift-drag empty space creates a cut · middle-drag pans · Shift + wheel pans · Ctrl + wheel zooms · Hold Alt while dragging to position freely.</p>
 </div>
 
 <style>

@@ -44,9 +44,9 @@ pub struct TrackEditStatus {
     pub enabled: bool,
 }
 
-/// Canonical full-track 10 ms waveform envelope. `peaks_base64` is packed
-/// little-endian `(min_i16, max_i16)` pairs and contains exactly `bin_count`
-/// pairs.
+/// Canonical full-track waveform envelope at a fixed 1 ms bin interval.
+/// `peaks_base64` holds packed little-endian `(min_i16, max_i16)` pairs —
+/// exactly `bin_count = ceil(duration_ms / interval_ms)` pairs, 4 bytes each.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TrackWaveform {
     pub track_id: String,
@@ -169,6 +169,20 @@ pub enum Command {
         position_ms: u32,
         #[serde(default)]
         context: String,
+        /// The editor preview lease this restore is allowed to tear down.
+        ///
+        /// Startup restores omit this field and retain the original
+        /// unconditional restore semantics with lease ID zero.
+        #[serde(default)]
+        preview_lease_id: u64,
+        /// When true, discard the restore if a real queue has already
+        /// replaced the editor preview.
+        #[serde(default)]
+        only_if_preview: bool,
+        /// When true, restore the queue's prior playing intent through the
+        /// normal play path instead of leaving it paused.
+        #[serde(default)]
+        resume_playing: bool,
     },
     /// Replaces the queue with one track carrying the editor's exact draft.
     /// The position remains in the original source timeline.
@@ -178,6 +192,8 @@ pub enum Command {
         #[serde(default)]
         loop_range: Option<LoopRange>,
         position_ms: u32,
+        /// Process-local owner of this editor preview attempt.
+        preview_lease_id: u64,
     },
     PlayQueueIndex {
         index: usize,
@@ -1048,10 +1064,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ArtistRef, AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations,
-        PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
-        StateEvent, TrackRef, normalize_canonical_playlist_description,
-        sanitize_playlist_description,
+        normalize_canonical_playlist_description, sanitize_playlist_description, ArtistRef,
+        AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations, PlaylistRef,
+        PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse, StateEvent,
+        TrackRef,
     };
 
     #[test]
@@ -1333,15 +1349,45 @@ mod tests {
             queue,
             index,
             position_ms,
+            preview_lease_id,
+            only_if_preview,
+            resume_playing,
             ..
         } = restore.command
         else {
             panic!("restore_queue must parse as its dedicated command");
         };
+        assert!(!only_if_preview);
+        assert!(!resume_playing);
+        assert_eq!(preview_lease_id, 0);
         assert_eq!(index, 0);
         assert_eq!(position_ms, 42_000);
         assert!(!queue[0].unavailable);
         assert!(queue[0].unavailable_reason.is_none());
+    }
+
+    #[test]
+    fn restore_queue_accepts_preview_guard_and_resume_flags() {
+        let request: Request = serde_json::from_value(json!({
+            "request_id": "request-restore-preview",
+            "type": "restore_queue",
+            "queue": [],
+            "index": 0,
+            "position_ms": 0,
+            "preview_lease_id": 9,
+            "only_if_preview": true,
+            "resume_playing": true
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            request.command,
+            Command::RestoreQueue {
+                only_if_preview: true,
+                resume_playing: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1359,6 +1405,7 @@ mod tests {
                 {"start_ms": 10000, "end_ms": 12000}
             ],
             "loop_range": {"start_ms": 5000, "end_ms": 9000, "play_count": 2},
+            "preview_lease_id": 7,
             "position_ms": 42000
         }))
         .unwrap();
@@ -1367,6 +1414,7 @@ mod tests {
             cuts,
             loop_range,
             position_ms,
+            preview_lease_id,
         } = preview.command
         else {
             panic!("preview_track_edit must parse as its dedicated command");
@@ -1382,6 +1430,7 @@ mod tests {
             })
         );
         assert_eq!(position_ms, 42_000);
+        assert_eq!(preview_lease_id, 7);
     }
 
     #[test]
@@ -1396,7 +1445,7 @@ mod tests {
             },
             "cuts": [],
             "loop_range": {"start_ms": 5000, "end_ms": 9000},
-            "position_ms": 0
+            "preview_lease_id": 1,
         }))
         .expect_err("the old infinite loop shape must not deserialize");
         assert!(error.to_string().contains("play_count"));

@@ -245,16 +245,31 @@ fn absolute_seek_target(position_ms: u32) -> u32 {
 }
 
 fn relative_seek_target(direction: SeekDirection, amount_ms: u32) -> u32 {
-    let position = POSITION_MS.load(Ordering::Relaxed).min(u32::MAX as u64) as u32;
-    let duration = DURATION_MS.load(Ordering::Relaxed).min(u32::MAX as u64) as u32;
-    let target = match direction {
-        SeekDirection::Forward => position.saturating_add(amount_ms),
-        SeekDirection::Backward => position.saturating_sub(amount_ms),
-    };
-    if duration == 0 {
-        target
-    } else {
-        target.min(duration)
+    // Reserve the playhead before dispatching the asynchronous seek. SMTC can
+    // deliver several relative seeks before the engine emits a new state; a
+    // plain load would make each request start from the same old position.
+    let mut position = POSITION_MS.load(Ordering::Relaxed);
+    loop {
+        let position_ms = position.min(u32::MAX as u64) as u32;
+        let duration = DURATION_MS.load(Ordering::Relaxed).min(u32::MAX as u64) as u32;
+        let target = match direction {
+            SeekDirection::Forward => position_ms.saturating_add(amount_ms),
+            SeekDirection::Backward => position_ms.saturating_sub(amount_ms),
+        };
+        let target = if duration == 0 {
+            target
+        } else {
+            target.min(duration)
+        };
+        match POSITION_MS.compare_exchange_weak(
+            position,
+            target as u64,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return target,
+            Err(current) => position = current,
+        }
     }
 }
 
@@ -337,10 +352,10 @@ pub fn update_disconnected() {
     }
 }
 
-fn track_duration(fallback_ms: u32, track_ms: u32) -> u32 {
-    if track_ms > 0 {
-        track_ms
+fn track_duration(compiled_ms: u32, source_ms: u32) -> u32 {
+    if compiled_ms > 0 {
+        compiled_ms
     } else {
-        fallback_ms
+        source_ms
     }
 }

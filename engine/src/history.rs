@@ -139,10 +139,15 @@ impl ListeningHistory {
     }
 
     pub fn resume(&mut self) {
-        if let Some(active) = self.active.as_mut() {
-            if active.playing_since.is_none() {
-                active.playing_since = Some(Instant::now());
-            }
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if active.playing_since.is_some() {
+            return;
+        }
+        active.playing_since = Some(Instant::now());
+        if let Err(error) = self.persist() {
+            eprintln!("could not persist resumed listening history row: {error}");
         }
     }
 
@@ -496,6 +501,25 @@ mod tests {
         assert_eq!(items[1].row.track_id, "finalized");
         assert!(items[1].row.completed);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_rewrites_active_snapshot_for_crash_recovery() {
+        let root = scratch();
+        let mut history = ListeningHistory::new(root.clone());
+        history.start(&track("resumed"));
+        history.pause();
+
+        let mut resumed = ListeningHistory::new(root.clone());
+        fs::remove_file(root.join(HISTORY_FILE)).unwrap();
+        resumed.resume();
+
+        let recovered = ListeningHistory::new(root.clone());
+        let items = recovered.snapshot().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].row.track_id, "resumed");
 
         let _ = fs::remove_dir_all(root);
     }

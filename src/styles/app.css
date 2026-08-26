@@ -882,10 +882,27 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   /* A broken image must reserve exactly the same box as a loaded one, so its
      alt text is not allowed to lay out — the tile behind it is the fallback. */
   color: transparent; font-size: 0;
+  transition: opacity var(--d1) var(--ease);
 }
 .art.lg { border-radius: var(--r3); }
 .art.circle { border-radius: var(--rf); }
 .art.raised { box-shadow: var(--ring), 0 14px 34px -10px rgba(0, 0, 0, 0.85); }
+/* While known artwork is still resolving, the tile holds a calm neutral
+   ground — the identity tile's composition with the colour and the letter
+   taken out — so a cold start paints surface, never a monogram, for a cover
+   the app already knows about. Declared ahead of .art.natural on purpose:
+   a lone photograph has no fixed box, so nothing backs it. */
+.art.pending {
+  background:
+    radial-gradient(120% 110% at 18% 8%, color-mix(in srgb, var(--fg) 7%, transparent) 0%, transparent 58%),
+    linear-gradient(146deg, var(--bg-3) 0%, var(--bg-2) 100%);
+}
+/* Resolved images arrive over that ground, each fading up on its own load
+   rather than popping out of the tile; reduced motion lands directly on
+   the picture. */
+.art > img.fresh { opacity: 0; }
+@media (prefers-reduced-motion: reduce) { .art > img.fresh { opacity: 1; } }
+
 /* The image's own proportions, for a lone photograph rather than a tile in a
    row of tiles. The square shape-guard is off because width and height are no
    longer both definite, and the placeholder fill is off because there is no

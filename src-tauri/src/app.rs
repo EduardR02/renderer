@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use spotify_playback_engine::protocol::normalize_canonical_playlist_description;
 
 use crate::types::{
-    CacheStats, CacheUsage, PlaybackState, Playlist, PlaylistDetail, Track, align_artist_ids,
-    cover_urls_from_tracks, forget_cached_audio,
+    align_artist_ids, cover_urls_from_tracks, forget_cached_audio, CacheStats, CacheUsage,
+    PlaybackState, Playlist, PlaylistDetail, Track,
 };
 
 /// Number of playlists requested from the engine's rootlist browse.
@@ -156,6 +156,12 @@ pub struct AppState {
     /// more instead of the trigger being dropped.
     #[serde(skip)]
     pub library_refresh_queued: bool,
+
+    /// Monotonic process-local fence for in-flight library, detail, and
+    /// membership requests. Successful deletes advance it; disk caches do not
+    /// carry this ephemeral generation across launches.
+    #[serde(skip)]
+    pub library_generation: u64,
     /// Last computed cache sizes and the unix second they were computed at,
     /// so reopening Settings does not re-walk thousands of files. See
     /// [`CACHE_STATS_TTL_SECS`].
@@ -189,6 +195,7 @@ impl AppState {
             playlist_refresh_queued: HashSet::new(),
             library_fetching: false,
             library_refresh_queued: false,
+            library_generation: 0,
             cache_stats: None,
             memberships: Vec::new(),
             membership_fetching: false,
@@ -437,8 +444,7 @@ impl MembershipEntry {
     /// enough that re-walking it on every reconciliation pass is the cheapest
     /// honest way to see external likes and unlikes.
     pub fn stale(&self, snapshot_id: &str) -> bool {
-        self.revision.is_empty()
-            || (!snapshot_id.is_empty() && snapshot_id != self.revision)
+        self.revision.is_empty() || (!snapshot_id.is_empty() && snapshot_id != self.revision)
     }
 }
 
@@ -855,7 +861,11 @@ mod tests {
         let mut entries = Vec::new();
         assert!(upsert_membership(
             &mut entries,
-            membership("p1", "rev1", &["spotify:track:a", "spotify:track:a", "spotify:track:b"]),
+            membership(
+                "p1",
+                "rev1",
+                &["spotify:track:a", "spotify:track:a", "spotify:track:b"]
+            ),
         ));
         // Same id, same content: no change to report.
         assert!(!upsert_membership(
@@ -875,7 +885,10 @@ mod tests {
     #[test]
     fn membership_staleness_tracks_revisions_and_liked_always_refreshes() {
         let playlist = membership("p1", "rev1", &["spotify:track:a"]);
-        assert!(!playlist.stale("rev1"), "unchanged revision must not refetch");
+        assert!(
+            !playlist.stale("rev1"),
+            "unchanged revision must not refetch"
+        );
         assert!(playlist.stale("rev2"), "moved revision must refetch");
         // A rootlist row with no revision carries no signal of change; the
         // indexed data stands until a revision shows up and differs.
@@ -956,11 +969,9 @@ mod tests {
         snapshot.position_ms = 84_000;
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
         assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot));
-        assert!(
-            !playback_state_path(&dir)
-                .with_extension("json.tmp")
-                .exists()
-        );
+        assert!(!playback_state_path(&dir)
+            .with_extension("json.tmp")
+            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

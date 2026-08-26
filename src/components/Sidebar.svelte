@@ -110,8 +110,13 @@
     if (name) api.createPlaylist(name).catch(() => {});
   }
 
-  /** The playlist the current track came from, so its row can be marked. */
-  const playingId = $derived(playback.queue[playback.current_index]?.album_id ?? null);
+  /** The playlist context of the current queue row, when it is a playlist. */
+  const playingId = $derived.by(() => {
+    const context = playback.queue[playback.current_index]?.context;
+    if (typeof context !== "string") return null;
+    const match = /^playlist:([^:]+)$/.exec(context);
+    return match?.[1] ?? null;
+  });
 </script>
 
 <aside class="sidebar">

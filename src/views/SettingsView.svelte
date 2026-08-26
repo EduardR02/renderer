@@ -185,7 +185,7 @@
             <div class="d">
               {playback.auth_url
                 ? "Opens Spotify in your browser to authorise this device."
-                : "Waiting for a login URL from the core…"}
+                : "Waiting for Spotify sign-in to be ready…"}
             </div>
           </div>
           <div class="set-ctl">
@@ -279,10 +279,9 @@
         <div>
           <div class="k">Animated Canvas</div>
           <div class="d">
-            Show Spotify's official looping Canvas video in the Now playing panel when available.
-            Spotify also gates Canvas per account, server-side, and its backend returns nothing for
-            every client while that is off — so this switch can only turn Canvas off, never on.
-            Enable video in Spotify's own settings first.
+            Show Spotify's looping Canvas videos in the Now playing panel when they are available.
+            Spotify can withhold Canvas per account, so this switch can only turn it off; enable
+            video in Spotify's own settings first.
           </div>
           {#if settingErrors.animatedCanvas}<div class="inline-error" role="alert">{settingErrors.animatedCanvas}</div>{/if}
         </div>
@@ -350,7 +349,7 @@
       <div class="set-row" data-cache-stat="covers">
         <div>
           <div class="k">Cover cache</div>
-          <div class="d">Artwork fetched once by the core and served from disk afterwards.</div>
+          <div class="d">Artwork downloaded once, then served from disk.</div>
         </div>
         <div class="set-ctl">
           <span class="v" aria-live="polite">
@@ -369,7 +368,7 @@
       </div>
       <div class="set-row">
         <div>
-          <div class="k">Refresh cache stats</div>
+          <div class="k">Cache activity</div>
           <div class="d">{cacheStats.error ?? `${stats.coversResolved} cover requests this session`}</div>
         </div>
         <div class="set-ctl">
@@ -404,7 +403,7 @@
       </div>
       <div class="set-row">
         <div class="k">Version</div>
-        <div class="set-ctl"><span class="v">0.1.0 / Svelte 5 / Tauri 2</span></div>
+        <div class="set-ctl"><span class="v">0.1.0</span></div>
       </div>
     </div>
   </div>

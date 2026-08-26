@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { api, route, playback, positionMs as projectedPlaybackPositionMs, getTrackEditorTrack, goBack, setNavigationGuard } from "../lib/state.svelte.js";
+  import { api, route, playback, positionMs as projectedPlaybackPositionMs, getTrackEditorTrack, goBack, setNavigationGuard, allocatePreviewLeaseId } from "../lib/state.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import TrackEditWaveform from "../components/TrackEditWaveform.svelte";
@@ -20,6 +20,11 @@
   let definitionGeneration = 0, waveformGeneration = 0, previewGeneration = 0, keySequence = 0;
   let previewRequest = $state(null), previewQueueAwaiting = $state(null), previewQueueIdentity = $state("");
   let previewCutsSource = null, previewCutsSignature = "", previewCuts = [];
+  // The backend invocation outlives the optimistic editor generation: route
+  // teardown must be able to wait for a command that is no longer allowed to
+  // paint this component.
+  let previewInvocation = null;
+  let previewContext = null;
 
   function keyed(range, prefix) {
     return {
@@ -296,27 +301,21 @@
   );
   const previewStatus = $derived.by(() => {
     if (previewBusy) {
-      return { label: "Preparing", copy: "Compiling this snapshot. Editing stays available.", active: false };
+      return { label: "Preparing…", copy: "Applying your cuts and loop.", active: false };
     }
     if (previewState === "playing") {
-      return { label: "Playing", copy: "Preview queue active · cursor stays on the original timeline.", active: previewIsCurrent };
+      return { label: "Playing", copy: "You are hearing the edited version.", active: previewIsCurrent };
     }
     if (previewState === "paused") {
-      return { label: "Paused", copy: "Preview is paused · resume or update the current draft.", active: previewIsCurrent };
+      return { label: "Paused", copy: "Resume or update the preview.", active: previewIsCurrent };
     }
     if (previewState === "stale") {
-      return {
-        label: "Draft changed",
-        copy: previewQueueActive
-          ? "Last accepted preview remains active · update to hear the latest cuts and loop."
-          : "Update preview to hear the latest cuts and loop.",
-        active: false,
-      };
+      return { label: "Draft changed", copy: "Update preview to hear the latest edit.", active: false };
     }
     if (previewState === "error") {
-      return { label: "Preview failed", copy: "Try again. Your editor changes are still live.", active: false };
+      return { label: "Preview failed", copy: "Try again. Your edit is unchanged.", active: false };
     }
-    return { label: "Ready", copy: "Preview replaces the queue temporarily.", active: false };
+    return { label: "Ready", copy: "Play the preview to hear your edit.", active: false };
   });
 
   function markPreviewStale() {
@@ -332,6 +331,41 @@
     previewBusy = false;
     previewState = "idle";
     previewSignature = "";
+  }
+  function reportPreviewRestoreError(context, reason) {
+    if (previewContext !== context || route.name !== "track-editor" ||
+        route.id !== context.id || (route.param || null) !== context.sourcePlaylist) return;
+    actionError = String(reason || "Could not restore playback after preview.");
+  }
+
+  function maybeRestorePreview(context) {
+    if (!context || context.restoreRequested || !context.attempted) return;
+    context.restoreRequested = true;
+    let restore;
+    try {
+      restore = api.restorePreview(context.previewLeaseId);
+    } catch (reason) {
+      reportPreviewRestoreError(context, reason);
+      return;
+    }
+    Promise.resolve(restore).catch((reason) => reportPreviewRestoreError(context, reason));
+  }
+
+  function teardownPreview(context) {
+    if (!context || context.tornDown) return;
+    context.tornDown = true;
+    resetPreviewLifecycle();
+    const record = context.invocation;
+    if (record && !record.settled) {
+      // The backend command may still be compiling. Restore only after that
+      // command settles so an older preview cannot race the cleanup.
+      record.promise.then(
+        () => maybeRestorePreview(context),
+        () => maybeRestorePreview(context),
+      );
+    } else {
+      maybeRestorePreview(context);
+    }
   }
 
   function previewRequestActive(request) {
@@ -376,6 +410,8 @@
 
   async function playPreview() {
     if (!ready || !track || previewBusy || previewQueueAwaiting || validation.firstError) return;
+    const context = previewContext;
+    if (!context) return;
     const id = track.id;
     const sourcePlaylist = playlistId;
     const nextCuts = canonicalCuts();
@@ -396,8 +432,32 @@
     previewState = "loading";
     actionError = "";
     const position = Math.max(0, Math.min(duration, Math.round(Number(cursorMs) || 0)));
+    context.attempted = true;
+    let invocation;
     try {
-      await api.previewTrackEdit(track, nextCuts, nextLoop, position);
+      invocation = Promise.resolve(api.previewTrackEdit(
+        track,
+        nextCuts,
+        nextLoop,
+        position,
+        context.previewLeaseId,
+      ));
+    } catch (reason) {
+      invocation = Promise.reject(reason);
+    }
+    const record = { promise: invocation, settled: false };
+    context.invocation = record;
+    previewInvocation = invocation;
+    invocation.then(
+      () => {
+        record.settled = true;
+      },
+      () => {
+        record.settled = true;
+      },
+    );
+    try {
+      await invocation;
       if (!previewRequestActive(request)) return;
       const targetQueue = editorTrackCurrent && queueEditSignature === request.signature;
       previewSignature = request.signature;
@@ -424,6 +484,9 @@
       // the draft is still stale, but Pause/Resume must not disappear.
       previewState = recoveryState && previewQueueMatches ? "stale" : "error";
       actionError = String(reason || "Could not preview this edit.");
+    } finally {
+      if (context?.invocation === record) context.invocation = null;
+      if (previewInvocation === invocation) previewInvocation = null;
     }
   }
 
@@ -463,6 +526,23 @@
       }
     });
   }
+  $effect(() => {
+    const routeName = route.name;
+    const routeId = route.id;
+    const sourcePlaylist = route.param || null;
+    if (routeName !== "track-editor" || !routeId) return;
+    const context = {
+      id: routeId,
+      sourcePlaylist,
+      previewLeaseId: allocatePreviewLeaseId(),
+      attempted: false,
+      invocation: null,
+      restoreRequested: false,
+      tornDown: false,
+    };
+    previewContext = context;
+    return () => teardownPreview(context);
+  });
   const previewIsCurrent = $derived(
     previewQueueMatches &&
       draftSignature === previewSignature &&
@@ -596,24 +676,23 @@
 <section class="view page edit-page">
   <button class="edit-back" onclick={goBack}><Icon name="back" size={14} />Back</button>
   {#if !track}
-    <div class="empty-state"><h1>Track unavailable</h1><p>Open the editor from a track’s menu so its playback metadata is available.</p></div>
+    <div class="empty-state"><h1>Track unavailable</h1><p>Open the editor from a track’s menu.</p></div>
   {:else}
     <header class="edit-head">
       <Cover src={track.cover_url} id={track.album_id || track.uri} name={track.name} size={76} lg />
       <div class="edit-title">
-        <span class="tag">Song repair</span>
+        <span class="tag">Track edit</span>
         <h1>{track.name}</h1>
         <p>{(track.artist_names ?? []).join(", ")} · <span class="tnum">{formatTime(track.duration_ms)}</span> original</p>
       </div>
     </header>
     <section class="repair-sheet" aria-busy={loading}>
       <div class="sheet-head">
-        <div class="sheet-intro"><p class="caps">Original timeline</p><h2>Remove damage. Keep the timing exact.</h2></div>
-        <p class="sheet-note">Edits stay on the original timeline. Progress, seeking, and resampling remain unchanged.</p>
+        <div class="sheet-intro"><p class="caps">Original timeline</p><h2>Remove sections or repeat a passage.</h2></div>
+        <p class="sheet-note">Cuts and loops change playback only — the audio file is never modified.</p>
       </div>
       <div class="preview-strip">
         <div class="preview-actions">
-          <span class="preview-kicker caps">Transport</span>
           <button class="preview-button" disabled={!ready || previewBusy || !!validation.firstError} onclick={playPreview} title={previewActionLabel}>
             <Icon name="play" size={14} />
             {previewActionLabel}
@@ -651,7 +730,7 @@
         onredo={redo}
         onseek={seekPreview}
       />
-      {#if loading}<p class="definition-status">Loading the saved definition before editing is enabled…</p>
+      {#if loading}<p class="definition-status">Loading your saved edit…</p>
       {:else if loadError}<div class="definition-error" role="alert"><span>{loadError}</span><button class="btn-ghost" onclick={() => (retryGeneration += 1)}>Try again</button></div>{/if}
 
       <section class="range-section">
@@ -673,7 +752,7 @@
       </section>
 
       <section class="range-section">
-        <div class="range-heading"><div><h3>Loop</h3><p>Optionally repeat one clean section. Plays is total passes, including the first.</p></div><span class="loop-chip">{loopRange ? "Set" : "Off"}</span></div>
+        <div class="range-heading"><div><h3>Loop</h3><p>Repeat one section several times. Plays includes the first pass.</p></div><span class="loop-chip">{loopRange ? "Set" : "Off"}</span></div>
         {#if loopRange}
           <div class="exact-row loop-row" class:selected={selected?.type === "loop"}>
             <button class="region-index" onclick={() => (selected = { type: "loop", key: loopRange._key })} aria-label="Select loop"><span></span>LP</button>
@@ -688,7 +767,7 @@
         {:else}<p class="empty-range">No loop. Use Add loop or press L to create one.</p>{/if}
       </section>
 
-      {#if playlistId}<label class="enable-row"><input class="enable-check" type="checkbox" checked={enabled} disabled={!ready || saving || !definitionExists} onchange={(event) => setEnabled(event.currentTarget.checked)} /><span><strong>Use repaired version in this playlist</strong><small>Off by default. Other playlists still play the intact track.</small></span></label>{/if}
+      {#if playlistId}<label class="enable-row"><input class="enable-check" type="checkbox" checked={enabled} disabled={!ready || saving || !definitionExists} onchange={(event) => setEnabled(event.currentTarget.checked)} /><span><strong>Use edited version in this playlist</strong><small>Other playlists play the original.</small></span></label>{/if}
       {#if actionError}<p class="edit-error" role="alert">{actionError}</p>{/if}
       {#if validation.firstError}<p class="edit-error" role="alert">Fix the highlighted range before saving.</p>{/if}
       <footer class="edit-footer">
@@ -697,7 +776,7 @@
             <button class="btn-ghost compact" disabled={!undoStack.length || !ready || saving} onclick={undo} title="Undo (Ctrl+Z)">Undo</button>
             <button class="btn-ghost compact" disabled={!redoStack.length || !ready || saving} onclick={redo} title="Redo (Ctrl+Shift+Z)">Redo</button>
           </div>
-          <div class="save-state" class:dirty><span></span>{saving ? "Saving definition…" : dirty ? "Unsaved changes" : definitionExists ? "Saved" : "No saved definition"}</div>
+          <div class="save-state" class:dirty><span></span>{saving ? "Saving edit…" : dirty ? "Unsaved changes" : definitionExists ? "Saved" : "No edit saved"}</div>
         </div>
         <div><button class="btn-ghost danger" disabled={!ready || saving || !definitionExists} onclick={removeDefinition}>Delete edit</button><button class="btn-accent" disabled={!dirty || !ready || saving || !!validation.firstError || (!cuts.length && !loopRange)} onclick={save}>{saving ? "Saving…" : "Save edit"}</button></div>
       </footer>
@@ -753,10 +832,6 @@
   border-radius: var(--r2); background: color-mix(in srgb, var(--accent) 7%, var(--bg-1));
 }
 .preview-actions { display: flex; align-items: center; gap: 6px; flex: none; }
-.preview-kicker {
-  padding-right: 9px; color: var(--accent); line-height: 1;
-  border-right: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-}
 .preview-button, .preview-pause {
   display: inline-flex; align-items: center; gap: 7px; min-height: 34px;
   border-radius: var(--r2); white-space: nowrap;
@@ -911,10 +986,6 @@
   .sheet-head { display: block; }.sheet-note { margin-top: var(--s2); }
   .preview-strip { grid-template-columns: 1fr; align-items: flex-start; }
   .preview-actions { flex-wrap: wrap; }.preview-status { margin-left: 0; }
-  .preview-kicker {
-    width: 100%; padding: 0 0 6px;
-    border-right: 0; border-bottom: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-  }
   .exact-row, .exact-row.cut-row, .exact-row.loop-row {
     grid-template-columns: 38px minmax(0, 1fr) 40px; row-gap: 6px;
   }
