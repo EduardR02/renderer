@@ -20,7 +20,7 @@ use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use spotify_playback_engine::protocol::{
-    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistReleasePage, Canvas, Command,
+    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, Canvas, Command,
     LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
     RadioBrowse, Response, SearchBrowse, SongwriterPlaylist, TrackCredits, TrackWaveform,
 };
@@ -62,10 +62,6 @@ enum BrowseOutcome {
     ArtistSongwriter {
         request_id: String,
         result: Result<Option<SongwriterPlaylist>, String>,
-    },
-    ArtistReleases {
-        request_id: String,
-        result: Result<ArtistReleasePage, String>,
     },
     ArtistCatalogue {
         request_id: String,
@@ -467,27 +463,6 @@ async fn run(
                                     }
                                 }
                             }
-                            Command::BrowseArtistReleases { id, release_types, offset, limit } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::artist_releases_browse(
-                                                &session,
-                                                &id,
-                                                &release_types,
-                                                offset,
-                                                limit,
-                                            )
-                                            .await;
-                                            let _ = sender.send(BrowseOutcome::ArtistReleases { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::ArtistReleases { request_id, result: Err(error) });
-                                    }
-                                }
-                            }
                             Command::BrowseArtistCatalogue { id, release_types, offset, limit } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -770,9 +745,6 @@ async fn run(
                                 "browse_artist_songwriter",
                                 &result,
                             )?;
-                        }
-                        BrowseOutcome::ArtistReleases { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_artist_releases", &result)?;
                         }
                         BrowseOutcome::ArtistCatalogue { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_artist_catalogue", &result)?;
@@ -1306,14 +1278,19 @@ mod tests {
         );
     }
 
-    /// The panic hook is process-global: tests that install it must not run
-    /// concurrently with each other (or with tests that intentionally panic,
-    /// which would hit a half-installed hook).
-    static PANIC_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The std::panic hook is process-global while every test thread runs
+    /// concurrently: tests that install it must not overlap each other, nor
+    /// any deliberately-panicking test such as the waveform worker regression
+    /// test, whose report would otherwise land in whatever hook happens to be
+    /// installed. Both sides take this lock; poisoning is tolerated so one
+    /// genuinely failing test cannot cascade into its siblings.
+    pub(crate) static TEST_PANIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn panic_report_names_the_thread_payload_and_location() {
-        let _guard = PANIC_HOOK_TEST_LOCK.lock().expect("hook test lock");
+        let _guard = TEST_PANIC_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Capture the report produced for a real panic, then assert on it
         // after the unwind completes (asserting inside the hook would
         // double-panic and abort the process).
@@ -1343,7 +1320,9 @@ mod tests {
 
     #[test]
     fn panic_hook_appends_the_report_to_the_engine_log_file() {
-        let _guard = PANIC_HOOK_TEST_LOCK.lock().expect("hook test lock");
+        let _guard = TEST_PANIC_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let scratch = ScratchDir::new();
         // Mirror production: the app creates the log directory before the
         // engine starts (the hook opens the file with create(true), which

@@ -2,6 +2,7 @@
 //! frontend as `cover://<sha1hex-of-url>` via a custom URI scheme.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -37,13 +38,38 @@ fn cover_path(data_dir: &Path, url: &str) -> PathBuf {
     data_dir.join("covers").join(sha1_hex(url.as_bytes()))
 }
 
+/// True when the magic bytes identify a format the cache serves as an image.
+/// Everything else — an empty body, a truncated file, an HTML error page — is
+/// treated as a miss.
+fn is_image(bytes: &[u8]) -> bool {
+    sniff_content_type(bytes) != "application/octet-stream"
+}
+
+/// Writes `bytes` to `path` through a unique temp sibling plus the same
+/// platform-correct atomic replacement the JSON caches use (plain `rename`
+/// cannot replace an existing file on Windows), so a crash mid-write can
+/// never leave a truncated image behind as a cache hit.
+fn write_cover_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let temp =
+        path.with_extension(format!("tmp{}", NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&temp, bytes)
+        .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
+    crate::app::replace_file_atomically(&temp, path)
+        .map_err(|error| format!("could not replace {}: {error}", path.display()))
+}
+
 /// Returns the `cover://` URL for `url`, downloading and caching the image
-/// bytes on first use.
+/// bytes on first use. A cached entry only counts as a hit when it is a real
+/// image; corrupt leftovers are evicted and refetched.
 pub async fn get_cover(url: &str) -> Result<String, String> {
     let dir = data_dir();
     let path = cover_path(&dir, url);
-    if path.is_file() {
-        return Ok(cover_url_for(url));
+    if let Ok(cached) = std::fs::read(&path) {
+        if is_image(&cached) {
+            return Ok(cover_url_for(url));
+        }
+        let _ = std::fs::remove_file(&path);
     }
     let response = http_client()
         .get(url)
@@ -60,15 +86,14 @@ pub async fn get_cover(url: &str) -> Result<String, String> {
         .bytes()
         .await
         .map_err(|error| format!("could not read cover {url}: {error}"))?;
-    if bytes.is_empty() {
-        return Err(format!("cover fetch returned an empty body for {url}"));
+    if !is_image(&bytes) {
+        return Err(format!("cover fetch returned a non-image body for {url}"));
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("could not create covers dir: {error}"))?;
     }
-    std::fs::write(&path, &bytes)
-        .map_err(|error| format!("could not cache cover {url}: {error}"))?;
+    write_cover_atomically(&path, &bytes)?;
     Ok(cover_url_for(url))
 }
 
@@ -77,7 +102,7 @@ pub async fn get_cover(url: &str) -> Result<String, String> {
 pub fn serve_cover(hex: &str) -> tauri::http::Response<std::borrow::Cow<'static, [u8]>> {
     let path = data_dir().join("covers").join(hex);
     match std::fs::read(&path) {
-        Ok(bytes) => tauri::http::Response::builder()
+        Ok(bytes) if is_image(&bytes) => tauri::http::Response::builder()
             .status(200)
             .header("Content-Type", sniff_content_type(&bytes))
             // Lets the frontend read cover pixels back off a canvas, which is
@@ -88,11 +113,22 @@ pub fn serve_cover(hex: &str) -> tauri::http::Response<std::borrow::Cow<'static,
             .header("Access-Control-Allow-Origin", "*")
             .body(std::borrow::Cow::Owned(bytes))
             .expect("cover response is valid"),
-        Err(_) => tauri::http::Response::builder()
-            .status(404)
-            .body(std::borrow::Cow::Borrowed(&b"cover not found"[..]))
-            .expect("404 response is valid"),
+        // A zero-length or non-image file is a corrupt entry (a crashed
+        // write, a stored error page): evict it so the next `get_cover`
+        // round refetches instead of answering with garbage forever.
+        Ok(_) => {
+            let _ = std::fs::remove_file(&path);
+            cover_not_found()
+        }
+        Err(_) => cover_not_found(),
     }
+}
+
+fn cover_not_found() -> tauri::http::Response<std::borrow::Cow<'static, [u8]>> {
+    tauri::http::Response::builder()
+        .status(404)
+        .body(std::borrow::Cow::Borrowed(&b"cover not found"[..]))
+        .expect("404 response is valid")
 }
 
 /// Sniffs the image format from its magic bytes (png/jpg/webp/gif), falling
@@ -116,6 +152,13 @@ fn sniff_content_type(bytes: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Unix seconds, unique enough per test run to avoid temp-dir collisions.
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or_default()
+    }
 
     #[test]
     fn content_type_sniffing_recognizes_common_formats() {
@@ -140,5 +183,36 @@ mod tests {
         assert!(first.starts_with("cover://"));
         assert_eq!(first.len(), "cover://".len() + 40);
         assert_ne!(first, cover_url_for("https://i.scdn.co/image/abd"));
+    }
+
+    #[test]
+    fn zero_length_and_non_image_payloads_are_not_image_hits() {
+        assert!(!is_image(&[]));
+        assert!(!is_image(b"<html><body>503</body></html>"));
+        assert!(is_image(b"GIF89a"));
+        assert!(is_image(&[0x89, b'P', b'N', b'G', 0x0D]));
+    }
+
+    #[test]
+    fn cover_writes_replace_atomically_without_leaving_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotify-renderer-cover-write-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("deadbeef");
+
+        write_cover_atomically(&path, b"GIF89a").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"GIF89a");
+
+        // Replacing an existing entry must work (a plain Windows rename
+        // would silently fail) and leave exactly the one image behind.
+        write_cover_atomically(&path, &[0x89, b'P', b'N', b'G']).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), &[0x89, b'P', b'N', b'G']);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp sibling survives");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

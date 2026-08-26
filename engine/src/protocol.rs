@@ -321,16 +321,6 @@ pub enum Command {
         id: String,
         name: String,
     },
-    /// One bounded page of an artist's release artwork/metadata.
-    BrowseArtistReleases {
-        id: String,
-        #[serde(default)]
-        release_types: Vec<String>,
-        #[serde(default)]
-        offset: usize,
-        #[serde(default = "default_browse_page_size")]
-        limit: usize,
-    },
     /// A bounded number of complete releases for the expanded catalogue view.
     BrowseArtistCatalogue {
         id: String,
@@ -444,10 +434,6 @@ pub struct HistoryItem {
     #[serde(flatten)]
     pub row: HistoryRow,
     pub track: TrackRef,
-}
-
-fn default_browse_page_size() -> usize {
-    20
 }
 
 fn default_catalogue_release_page_size() -> usize {

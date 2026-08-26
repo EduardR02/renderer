@@ -108,15 +108,3 @@ export function parseBiography(source) {
     return [{ kind: "text", value: text }];
   }
 }
-
-/** Plain text of a parsed biography — for length checks and `title`. */
-export function biographyText(nodes) {
-  return nodes
-    .map((node) => {
-      if (node.kind === "text") return node.value;
-      if (node.kind === "break") return "\n";
-      if (node.kind === "paragraph") return `${biographyText(node.children)}\n\n`;
-      return node.children ? biographyText(node.children) : "";
-    })
-    .join("");
-}

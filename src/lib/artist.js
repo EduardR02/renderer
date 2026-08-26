@@ -131,7 +131,7 @@ function containsCompletePlaylistMarkup(value) {
   return /<!--[\s\S]*?-->|<\/?[A-Za-z][^>]*>/u.test(value);
 }
 
-export function sanitizePlaylistDescription(value) {
+function sanitizePlaylistDescription(value) {
   const raw = String(value ?? "");
   if (!raw) return "";
   return normalizePlainText(decodeHtmlEntities(stripPlaylistMarkup(raw)));

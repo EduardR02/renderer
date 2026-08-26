@@ -105,7 +105,6 @@ pub fn run() {
             commands::browse_album,
             commands::browse_artist,
             commands::browse_artist_songwriter,
-            commands::browse_artist_releases,
             commands::browse_artist_catalogue,
             commands::browse_liked_songs,
             commands::browse_track_credits,

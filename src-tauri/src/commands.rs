@@ -21,7 +21,7 @@ use crate::log;
 use crate::media_keys;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
-    ArtistReleasePageDetail, CacheStats, HistoryEntry, LikedSongsDetail, Playlist, PlaylistDetail,
+    CacheStats, HistoryEntry, LikedSongsDetail, Playlist, PlaylistDetail,
     PlaylistRecommendationsDetail, RadioDetail, SearchResult, SongwriterPlaylist, Track,
     TrackCreditsDetail, TrackPlaylistRef, TrackWaveform,
 };
@@ -61,6 +61,9 @@ pub async fn seek(client: State<'_, Arc<EngineClient>>, position_ms: u32) -> Res
 
 #[tauri::command]
 pub async fn set_volume(client: State<'_, Arc<EngineClient>>, percent: u8) -> Result<(), String> {
+    if percent > 100 {
+        return Err("volume percent must be between 0 and 100".to_owned());
+    }
     client.set_volume(percent).await
 }
 
@@ -393,26 +396,6 @@ pub async fn browse_artist_songwriter(
         .browse_artist_songwriter(&id, &name)
         .await?
         .map(SongwriterPlaylist::from))
-}
-
-#[tauri::command]
-pub async fn browse_artist_releases(
-    client: State<'_, Arc<EngineClient>>,
-    id: String,
-    release_types: Option<Vec<String>>,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> Result<ArtistReleasePageDetail, String> {
-    Ok(ArtistReleasePageDetail::from(
-        client
-            .browse_artist_releases(
-                &id,
-                release_types.as_deref().unwrap_or_default(),
-                offset.unwrap_or(0),
-                limit.unwrap_or(20).clamp(1, 40),
-            )
-            .await?,
-    ))
 }
 
 #[tauri::command]
@@ -1001,7 +984,20 @@ pub async fn consume_states(app: AppHandle) {
         if let Some(snapshot) = client.begin_pending_restore(&state) {
             if let Err(error) = restore_playback(&client, &snapshot).await {
                 log::warn(&format!("could not restore playback: {error}"));
-                client.retry_pending_restore();
+                // Exhausted attempts disarm the plan (`None`): the engine
+                // keeps its freshly synced state and retrying would only
+                // hammer a broken restore forever. The user still hears
+                // about it once on the sticky session channel.
+                if client.retry_pending_restore().is_none() {
+                    let _ = app.emit(
+                        "session",
+                        json!({
+                            "auth_state": state.auth_state,
+                            "username": state.username,
+                            "error": format!("could not restore the previous session: {error}"),
+                        }),
+                    );
+                }
                 let _ = client.status().await;
             }
             continue;

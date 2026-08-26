@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use spotify_playback_engine::protocol::{
     normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
     ArtistCataloguePage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
-    ArtistReleaseCounts, ArtistReleasePage, ArtistReleases, ArtistTopCity, CreditArtist,
+    ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist,
     CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage, PlaylistBrowse,
     PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse,
     SongwriterPlaylist as EngineSongwriterPlaylist, TrackCredits, TrackEdit, TrackRef,
@@ -589,14 +589,6 @@ impl From<ArtistReleaseCounts> for ArtistReleaseTotals {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct ArtistReleasePageDetail {
-    pub releases: ArtistReleaseGroups,
-    pub total: usize,
-    pub next_offset: Option<usize>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
 pub struct ArtistCataloguePageDetail {
     pub releases: Vec<AlbumDetail>,
     pub total: usize,
@@ -607,16 +599,6 @@ impl From<ArtistCataloguePage> for ArtistCataloguePageDetail {
     fn from(page: ArtistCataloguePage) -> Self {
         Self {
             releases: page.releases.into_iter().map(AlbumDetail::from).collect(),
-            total: page.total,
-            next_offset: page.next_offset,
-        }
-    }
-}
-
-impl From<ArtistReleasePage> for ArtistReleasePageDetail {
-    fn from(page: ArtistReleasePage) -> Self {
-        Self {
-            releases: page.releases.into(),
             total: page.total,
             next_offset: page.next_offset,
         }

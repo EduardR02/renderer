@@ -398,7 +398,7 @@ export function maybeBackfillLazyQueue() {
   return backfillLazyQueue(false);
 }
 
-export const session = $state({ auth_state: null, username: null, error: null });
+export const session = $state({ username: null, error: null });
 
 /* ---------------- Playhead projection ---------------- */
 /* The Rust side emits a full `state` only when something other than the
@@ -504,7 +504,8 @@ export function applySession(payload) {
   if (!payload) return;
   const loggedOut = observeSearchSession(payload);
   if (payload.auth_state != null) {
-    session.auth_state = payload.auth_state;
+    // Auth identity lives once, on `playback`: every reader needs the same
+    // value and two copies could disagree mid-transition.
     playback.auth_state = payload.auth_state;
   }
   if (loggedOut) {
@@ -523,8 +524,7 @@ export function isLoggedOut() {
   // The engine emits `needs_login` (with a fresh auth_url) when no session
   // exists or the last connect attempt failed; `logged_out` is kept for
   // compatibility with older engines. Both must show the LoginView.
-  return ["logged_out", "needs_login"].includes(playback.auth_state) ||
-    ["logged_out", "needs_login"].includes(session.auth_state);
+  return ["logged_out", "needs_login"].includes(playback.auth_state);
 }
 
 /* ---------------- Browse data ---------------- */
@@ -1714,6 +1714,8 @@ export const api = {
   browseCanvas: (id) => invoke("browse_canvas", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
   getAppSettings: readAppSettings,
+  /** Explicit Settings-only cache wipe; returns fresh audio/covers stats. */
+  clearCache: (kind) => invoke("clear_cache", { kind }),
   setAudioCacheLimit: (mb) => invoke("set_audio_cache_limit", { mb }),
   setNormalisation: (enabled) =>
     mutateAppSettings("set_normalisation", { enabled: !!enabled }),
@@ -1730,8 +1732,6 @@ export const api = {
   browseArtist: (id) => invoke("browse_artist", { id }),
   browseArtistSongwriter: (id, name) =>
     invoke("browse_artist_songwriter", { id, name }),
-  browseArtistReleases: (id, releaseTypes = [], offset = 0, limit = 20) =>
-    invoke("browse_artist_releases", { id, releaseTypes, offset, limit }),
   createPlaylist: (name) => invoke("create_playlist", { name }),
   renamePlaylist: (id, name) => invoke("rename_playlist", { id, name }),
   deletePlaylist: (id) => invoke("delete_playlist", { id }),
@@ -1871,83 +1871,110 @@ export function openAuthUrl() {
 
 let bootstrapped = false;
 
+/** One readable reason out of an unknown subscription rejection. */
+function describeWiringFailure(error) {
+  return String(error instanceof Error ? error.message : error);
+}
+
+/**
+ * A playlist opened from cache is served instantly and refreshed behind it.
+ * This is that refresh landing.
+ *
+ * It is applied only if the playlist is still the one on screen, because the
+ * fetch outlives the navigation that started it — and it is MERGED rather
+ * than assigned. `TrackList` treats a new array as a new list and resets the
+ * shared pane scroller to the top, so swapping `tracks` wholesale would yank
+ * the reader back to row one a second after they opened the page and started
+ * scrolling. Same rows in the same order means patch the fields in place;
+ * only a genuinely different list earns a replacement, where starting at the
+ * top is the honest thing to do anyway.
+ */
+function handlePlaylistRefresh(e) {
+  const fresh = e.payload;
+  const id = fresh?.id;
+  if (!id || route.name !== "playlist" || route.id !== id) return;
+  const open = detail.playlist;
+  // The refresh may beat the cached browse command response. Publishing it
+  // now gives that response something authoritative to preserve.
+  if (!open) {
+    detail.playlist = fresh;
+    return;
+  }
+
+  // `PlaylistDetail` is flattened by serde: metadata and `tracks` are
+  // siblings. Refresh the metadata in place without replacing the detail or
+  // track array that the open list is rendering.
+  for (const key of Object.keys(fresh)) {
+    if (key !== "tracks" && open[key] !== fresh[key]) open[key] = fresh[key];
+  }
+
+  const current = open.tracks ?? [];
+  const incoming = fresh.tracks ?? [];
+  const sameRows =
+    current.length === incoming.length &&
+    current.every((track, i) => track.id === incoming[i]?.id);
+
+  if (!sameRows) {
+    open.tracks = incoming;
+    return;
+  }
+  /* The fields a refresh can legitimately move. Assigning only on a real
+     difference keeps this from waking every row's subscribers each time a
+     background refresh finds nothing new. */
+  for (let i = 0; i < current.length; i++) {
+    const from = incoming[i];
+    const into = current[i];
+    if (into.cached !== from.cached) into.cached = from.cached;
+    if (into.play_count !== from.play_count) into.play_count = from.play_count;
+    if (into.unavailable !== from.unavailable) into.unavailable = from.unavailable;
+    if (into.unavailable_reason !== from.unavailable_reason) {
+      into.unavailable_reason = from.unavailable_reason;
+    }
+    if (into.added_at !== from.added_at) into.added_at = from.added_at;
+  }
+}
+
 export async function initEvents() {
   if (bootstrapped) return;
   bootstrapped = true;
 
-  listen("state", (e) => applyPlayback(e.payload)).catch(() => {});
-  // Heartbeats carry only the projected compiled position as a scalar; the
-  // full state event remains authoritative for duration and queue metadata.
-  listen("position", (e) => {
-    const position = Number(e.payload);
-    if (!Number.isFinite(position)) return;
-    playback.position_ms = Math.max(0, Math.round(position));
-    anchorPlayhead(playback.position_ms);
-  }).catch(() => {});
-  /**
-   * A playlist opened from cache is served instantly and refreshed behind it.
-   * This is that refresh landing.
-   *
-   * It is applied only if the playlist is still the one on screen, because the
-   * fetch outlives the navigation that started it — and it is MERGED rather
-   * than assigned. `TrackList` treats a new array as a new list and resets the
-   * shared pane scroller to the top, so swapping `tracks` wholesale would yank
-   * the reader back to row one a second after they opened the page and started
-   * scrolling. Same rows in the same order means patch the fields in place;
-   * only a genuinely different list earns a replacement, where starting at the
-   * top is the honest thing to do anyway.
-   */
-  listen("playlist", (e) => {
-    const fresh = e.payload;
-    const id = fresh?.id;
-    if (!id || route.name !== "playlist" || route.id !== id) return;
-    const open = detail.playlist;
-    // The refresh may beat the cached browse command response. Publishing it
-    // now gives that response something authoritative to preserve.
-    if (!open) {
-      detail.playlist = fresh;
-      return;
-    }
+  // Subscriptions reject only when the event bridge itself is broken
+  // (missing plugin, webview teardown). Swallowing that left a permanently
+  // deaf UI, so the first failure surfaces as a playback error banner.
+  const targets = [
+    ["state", (e) => applyPlayback(e.payload)],
+    // Heartbeats carry only the projected compiled position as a scalar; the
+    // full state event remains authoritative for duration and queue metadata.
+    [
+      "position",
+      (e) => {
+        const position = Number(e.payload);
+        if (!Number.isFinite(position)) return;
+        playback.position_ms = Math.max(0, Math.round(position));
+        anchorPlayhead(playback.position_ms);
+      },
+    ],
+    ["playlist", handlePlaylistRefresh],
+    ["session", (e) => applySession(e.payload)],
+    // The one authoritative rootlist answer; the only writer that promotes
+    // `libraryState.fresh` (a completed play may also, via promotePlaylist).
+    ["library", (e) => setLibrary(e.payload, { fresh: true })],
+    // A mutation's refreshed summary patches the one library row it names;
+    // full rootlist answers still arrive as `library`.
+    ["playlist_summary", (e) => applyPlaylistSummary(e.payload)],
+  ];
 
-    // `PlaylistDetail` is flattened by serde: metadata and `tracks` are
-    // siblings. Refresh the metadata in place without replacing the detail or
-    // track array that the open list is rendering.
-    for (const key of Object.keys(fresh)) {
-      if (key !== "tracks" && open[key] !== fresh[key]) open[key] = fresh[key];
-    }
-
-    const current = open.tracks ?? [];
-    const incoming = fresh.tracks ?? [];
-    const sameRows =
-      current.length === incoming.length &&
-      current.every((track, i) => track.id === incoming[i]?.id);
-
-    if (!sameRows) {
-      open.tracks = incoming;
-      return;
-    }
-    /* The fields a refresh can legitimately move. Assigning only on a real
-       difference keeps this from waking every row's subscribers each time a
-       background refresh finds nothing new. */
-    for (let i = 0; i < current.length; i++) {
-      const from = incoming[i];
-      const into = current[i];
-      if (into.cached !== from.cached) into.cached = from.cached;
-      if (into.play_count !== from.play_count) into.play_count = from.play_count;
-      if (into.unavailable !== from.unavailable) into.unavailable = from.unavailable;
-      if (into.unavailable_reason !== from.unavailable_reason) {
-        into.unavailable_reason = from.unavailable_reason;
-      }
-      if (into.added_at !== from.added_at) into.added_at = from.added_at;
-    }
-  }).catch(() => {});
-  listen("session", (e) => applySession(e.payload)).catch(() => {});
-  // The one authoritative rootlist answer; the only writer that promotes
-  // `libraryState.fresh` (a completed play may also, via promotePlaylist).
-  listen("library", (e) => setLibrary(e.payload, { fresh: true })).catch(() => {});
-  // A mutation's refreshed summary patches the one library row it names;
-  // full rootlist answers still arrive as `library`.
-  listen("playlist_summary", (e) => applyPlaylistSummary(e.payload)).catch(() => {});
+  const results = await Promise.allSettled(
+    targets.map(([event, handler]) => listen(event, handler)),
+  );
+  const failures = results.flatMap((result, index) =>
+    result.status === "rejected"
+      ? [`"${targets[index][0]}" — ${describeWiringFailure(result.reason)}`]
+      : [],
+  );
+  if (failures.length > 0) {
+    playback.error = failures.join("; ");
+  }
 
   // Pull initial state. The engine may not be ready yet, so the cached
   // library snapshot (hydrated by the Rust side at startup) is applied here
@@ -1960,5 +1987,4 @@ export async function initEvents() {
       if (payload && Array.isArray(payload.playlists)) setLibrary(payload.playlists);
     })
     .catch(() => {});
-
 }

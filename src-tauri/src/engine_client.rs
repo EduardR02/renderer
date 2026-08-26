@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -38,6 +38,22 @@ const WAVEFORM_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Engine respawn backoff bounds.
 const RESPAWN_BACKOFF_START: Duration = Duration::from_secs(2);
 const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Crash-restore retries use the same shape as the shell's library refresh:
+/// at most [`RESTORE_RETRY_ATTEMPTS`] total attempts, with 5s backoff
+/// doubling to a 60s cap, after which the durable restore stays disarmed
+/// instead of hammering a broken engine forever.
+const RESTORE_RETRY_ATTEMPTS: usize = 5;
+const RESTORE_RETRY_BASE: Duration = Duration::from_secs(5);
+const RESTORE_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Delay before the restore retry after the `attempt`-th failure (1-based).
+fn restore_retry_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4) as u32;
+    RESTORE_RETRY_BASE
+        .saturating_mul(2_u32.pow(exponent))
+        .min(RESTORE_RETRY_MAX)
+}
 
 /// Playback-state writes are coalesced on one background thread. Successful
 /// writes are throttled, while transient failures retry promptly without
@@ -226,19 +242,41 @@ struct PersistedSnapshot {
 
 impl PersistedSnapshot {
     /// Position alone is exempt until it has drifted far enough to be worth a
-    /// write. Compare fields directly so checking the threshold never clones
-    /// the queue.
-    fn superseded_by(&self, next: &PlaybackSnapshot) -> bool {
+    /// write. Everything is compared directly against the live retained
+    /// state, so the writer's periodic deadline check never clones the queue.
+    fn superseded_by_state(&self, next: &PlaybackState) -> bool {
         let previous = &self.snapshot;
-        previous.version != next.version
-            || previous.queue != next.queue
-            || previous.current_index != next.current_index
+        previous.current_index != next.current_index
             || previous.volume != next.volume
             || previous.shuffle != next.shuffle
             || previous.repeat != next.repeat
             || previous.playback_speed != next.playback_speed
+            || !normalized_rows_match(&previous.queue, &next.queue)
             || next.position_ms.abs_diff(previous.position_ms) >= PERSIST_POSITION_DRIFT_MS
     }
+}
+
+/// Queue equality under `PlaybackSnapshot::from_playback`'s normalization
+/// (it clears the session-live `cached` mark), without cloning the queue: a
+/// row whose only difference is that mark counts as equal, and only such a
+/// row costs a single-row copy to confirm.
+fn normalized_rows_match(a: &[Track], b: &[Track]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x == y
+                || (x.cached != y.cached && {
+                    // The persisted queue strips the session-live download
+                    // mark, so exactly one side carries it; clear that side
+                    // (a single-row copy) before comparing.
+                    let mut cleared = if x.cached { x.clone() } else { y.clone() };
+                    cleared.cached = false;
+                    if x.cached {
+                        &cleared == y
+                    } else {
+                        cleared == *x
+                    }
+                })
+        })
 }
 
 #[derive(Debug, Default)]
@@ -268,12 +306,6 @@ impl PersistenceSchedule {
             });
             deadline.saturating_duration_since(now)
         })
-    }
-
-    fn should_write(&self, snapshot: &PlaybackSnapshot) -> bool {
-        self.committed
-            .as_ref()
-            .is_none_or(|committed| committed.superseded_by(snapshot))
     }
 
     fn record_unchanged(&mut self, attempted_generation: u64, latest_generation: u64) {
@@ -319,6 +351,9 @@ enum PersistCommand {
 struct RestorePlan {
     snapshot: RestoreSnapshot,
     sent: bool,
+    /// Failed restore attempts so far; at [`RESTORE_RETRY_ATTEMPTS`] the
+    /// plan is disarmed instead of retried forever.
+    attempts: usize,
     /// Preview leases must never be mistaken for startup/crash recovery.
     only_if_preview: bool,
     /// The editor context that currently owns this preview restore. The
@@ -356,6 +391,7 @@ impl EngineClient {
         let restore_pending = load_playback_snapshot().map(|snapshot| RestorePlan {
             snapshot: RestoreSnapshot::from_durable(snapshot),
             sent: false,
+            attempts: 0,
             only_if_preview: false,
             preview_lease_id: None,
         });
@@ -446,6 +482,7 @@ impl EngineClient {
         *pending = Some(RestorePlan {
             snapshot: RestoreSnapshot::from_playback(&state, state.playing),
             sent: false,
+            attempts: 0,
             only_if_preview: true,
             preview_lease_id: Some(preview_lease_id),
         });
@@ -467,15 +504,21 @@ impl EngineClient {
         }
     }
 
-    pub fn retry_pending_restore(&self) {
-        if let Some(plan) = self
-            .restore_pending
-            .lock()
-            .as_mut()
-            .filter(|plan| !plan.only_if_preview)
-        {
-            plan.sent = false;
+    /// Re-arms the durable restore for another attempt after a failure,
+    /// returning the backoff to wait before that attempt. At the attempt cap
+    /// the plan is disarmed (`None`) — the engine keeps whatever state it
+    /// reached instead of the shell hammering a broken restore forever.
+    /// Preview leases are never consumed here.
+    pub fn retry_pending_restore(&self) -> Option<Duration> {
+        let mut pending = self.restore_pending.lock();
+        let plan = pending.as_mut().filter(|plan| !plan.only_if_preview)?;
+        plan.attempts += 1;
+        if plan.attempts >= RESTORE_RETRY_ATTEMPTS {
+            *pending = None;
+            return None;
         }
+        plan.sent = false;
+        Some(restore_retry_delay(plan.attempts))
     }
 
     /// Respawn loop: waits for the reader thread to signal EOF, sleeps with
@@ -550,7 +593,7 @@ impl EngineClient {
         let logs_dir = crate::app::logs_dir();
         let _ = std::fs::create_dir_all(&logs_dir);
         let engine_log = logs_dir.join("playback_engine.log");
-        rotate_if_large(&engine_log);
+        crate::log::rotate_if_large(&engine_log, ENGINE_LOG_MAX_BYTES);
         let mut command = Command::new(&exe);
         // Read fresh on every spawn (including supervisor respawns) so a
         // saved preference is picked up without restarting the whole app.
@@ -708,7 +751,12 @@ impl EngineClient {
             .map(|_| ())
     }
 
+    /// Rejects out-of-range percentages before they reach the engine: the
+    /// IPC layer passes raw `u8`s and a corrupted durable snapshot could too.
     pub async fn set_volume(&self, percent: u8) -> Result<(), String> {
+        if percent > 100 {
+            return Err("volume percent must be between 0 and 100".to_owned());
+        }
         self.request("set_volume", json!({"percent": percent}))
             .await
             .map(|_| ())
@@ -1061,22 +1109,6 @@ impl EngineClient {
         parse_data(reply, "browse_artist_songwriter")
     }
 
-    pub async fn browse_artist_releases(
-        &self,
-        id: &str,
-        release_types: &[String],
-        offset: usize,
-        limit: usize,
-    ) -> Result<spotify_playback_engine::protocol::ArtistReleasePage, String> {
-        let reply = self
-            .request(
-                "browse_artist_releases",
-                json!({"id": id, "release_types": release_types, "offset": offset, "limit": limit}),
-            )
-            .await?;
-        parse_data(reply, "browse_artist_releases")
-    }
-
     pub async fn browse_artist_catalogue(
         &self,
         id: &str,
@@ -1330,25 +1362,34 @@ impl EngineClient {
         }
     }
 
-    /// Clones and normalizes the queue only when the writer's deadline has
-    /// arrived. Restore intermediates are never durable state.
-    fn playback_snapshot_for_writer(&self, include_restore: bool) -> Option<PlaybackSnapshot> {
+    /// The final shutdown flush: the retained live state, falling back to the
+    /// pending durable restore when no live state was ever observed. Clones
+    /// and normalizes the queue — once, at process exit.
+    fn playback_snapshot_for_shutdown(&self) -> Option<PlaybackSnapshot> {
         let pending = self.restore_pending.lock();
-        if !include_restore && pending.is_some() {
-            return None;
-        }
         let last_state = self.last_state.lock();
         last_state
             .as_ref()
             .filter(|state| state.auth_state == "ready")
             .map(PlaybackSnapshot::from_playback)
-            .or_else(|| {
-                if include_restore {
-                    pending.as_ref().map(|plan| plan.snapshot.durable())
-                } else {
-                    None
-                }
-            })
+            .or_else(|| pending.as_ref().map(|plan| plan.snapshot.durable()))
+    }
+
+    /// The writer's deadline arm: borrows the retained state under the lock,
+    /// consults the committed snapshot's throttle, and clones into an owned
+    /// snapshot only when a write is actually due. The 2-second heartbeat
+    /// must never deep-copy the queue just to decide against writing.
+    /// Restore intermediates are never durable state, mirroring
+    /// [`Self::playback_snapshot_for_shutdown`]'s eligibility.
+    fn writable_snapshot(&self, committed: Option<&PersistedSnapshot>) -> Option<PlaybackSnapshot> {
+        if self.restore_pending.lock().is_some() {
+            return None;
+        }
+        let last_state = self.last_state.lock();
+        let state = last_state.as_ref().filter(|state| state.auth_state == "ready")?;
+        committed
+            .is_none_or(|committed| committed.superseded_by_state(state))
+            .then(|| PlaybackSnapshot::from_playback(state))
     }
 
     // ------------------------------------------------------------------
@@ -1430,6 +1471,7 @@ impl EngineClient {
             *restore = Some(RestorePlan {
                 snapshot: RestoreSnapshot::from_playback(&last, last.playing),
                 sent: false,
+                attempts: 0,
                 only_if_preview: false,
                 preview_lease_id: None,
             });
@@ -1502,13 +1544,13 @@ fn run_persistence_writer(client: Weak<EngineClient>, receiver: Receiver<Persist
                     // so a last reader callback can never overwrite it with
                     // an older snapshot.
                     let current = client.persist_generation.load(Ordering::Acquire);
-                    let mut snapshot = client.playback_snapshot_for_writer(true);
+                    let mut snapshot = client.playback_snapshot_for_shutdown();
                     if current > generation {
-                        snapshot = client.playback_snapshot_for_writer(true);
+                        snapshot = client.playback_snapshot_for_shutdown();
                     }
                     let latest = client.persist_generation.load(Ordering::Acquire);
                     if latest > current {
-                        snapshot = client.playback_snapshot_for_writer(true);
+                        snapshot = client.playback_snapshot_for_shutdown();
                     }
                     snapshot.map_or(Ok(()), |snapshot| save_playback_snapshot(&snapshot))
                 });
@@ -1521,19 +1563,14 @@ fn run_persistence_writer(client: Weak<EngineClient>, receiver: Receiver<Persist
                 };
                 // The queued wake may represent an older generation because
                 // the bounded channel coalesces bursts. Snapshot the current
-                // generation at the deadline so this attempt commits exactly
-                // the state it is about to clone.
+                // generation at the deadline, and let the borrowed throttle
+                // check under the lock decide before anything is cloned.
                 let attempted_generation = client.persist_generation.load(Ordering::Acquire);
-                let Some(snapshot) = client.playback_snapshot_for_writer(false) else {
+                let Some(snapshot) = client.writable_snapshot(schedule.committed.as_ref()) else {
                     let latest = client.persist_generation.load(Ordering::Acquire);
                     schedule.record_unchanged(attempted_generation, latest);
                     continue;
                 };
-                if !schedule.should_write(&snapshot) {
-                    let latest = client.persist_generation.load(Ordering::Acquire);
-                    schedule.record_unchanged(attempted_generation, latest);
-                    continue;
-                }
 
                 let written_at = Instant::now();
                 match save_playback_snapshot(&snapshot) {
@@ -1659,27 +1696,6 @@ fn parse_line(value: Value) -> Option<Line> {
                 data,
             })
         }
-    }
-}
-
-/// Rolls the engine log to `<name>.log.1` once it grows past
-/// [`ENGINE_LOG_MAX_BYTES`], discarding the previous generation. Best-effort:
-/// if anything fails the current file simply keeps growing.
-fn rotate_if_large(path: &Path) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
-    if metadata.len() < ENGINE_LOG_MAX_BYTES {
-        return;
-    }
-    let previous = path.with_extension("log.1");
-    let _ = std::fs::remove_file(&previous);
-    if std::fs::rename(path, &previous).is_ok() {
-        log::info(&format!(
-            "engine log rolled at {} bytes -> {}",
-            metadata.len(),
-            previous.display()
-        ));
     }
 }
 
@@ -1930,26 +1946,35 @@ mod tests {
         let written = persisted(PlaybackSnapshot::from_playback(&state));
 
         assert!(
-            !written.superseded_by(&PlaybackSnapshot::from_playback(&state)),
+            !written.superseded_by_state(&state),
             "an identical snapshot is not worth a write"
+        );
+
+        // The persisted queue strips the session-live download mark, so a
+        // row that only gained a `cached` flag is still the same snapshot.
+        let mut marked = state.clone();
+        marked.queue[0].cached = true;
+        assert!(
+            !written.superseded_by_state(&marked),
+            "a download mark alone is not worth a write"
         );
 
         let mut nudged = state.clone();
         nudged.position_ms = 30_000 + PERSIST_POSITION_DRIFT_MS - 1;
         assert!(
-            !written.superseded_by(&PlaybackSnapshot::from_playback(&nudged)),
+            !written.superseded_by_state(&nudged),
             "the playhead alone is exempt until it has drifted far enough"
         );
 
         let mut drifted = state.clone();
         drifted.position_ms = 30_000 + PERSIST_POSITION_DRIFT_MS;
-        assert!(written.superseded_by(&PlaybackSnapshot::from_playback(&drifted)));
+        assert!(written.superseded_by_state(&drifted));
 
         let mut paused_elsewhere = state.clone();
         paused_elsewhere.position_ms = 30_100;
         paused_elsewhere.volume = 41;
         assert!(
-            written.superseded_by(&PlaybackSnapshot::from_playback(&paused_elsewhere)),
+            written.superseded_by_state(&paused_elsewhere),
             "anything but the playhead is worth a write immediately"
         );
     }
@@ -1983,8 +2008,8 @@ mod tests {
     fn persistence_failure_does_not_advance_the_committed_marker_and_retries() {
         let started = Instant::now();
         let original = PlaybackSnapshot::from_playback(&PlaybackState::default());
-        let mut changed = original.clone();
-        changed.volume = 42;
+        let mut changed_state = PlaybackState::default();
+        changed_state.volume = 42;
         let mut schedule = PersistenceSchedule::default();
         schedule.record_success(original.clone(), 1, 1, started);
         schedule.mark_dirty(2);
@@ -1997,13 +2022,18 @@ mod tests {
             Some(&original)
         );
         assert_eq!(schedule.wait_for(failed_at), Some(PERSIST_RETRY_INTERVAL));
-        assert!(schedule.should_write(&changed));
+        assert!(schedule.committed.as_ref().unwrap().superseded_by_state(&changed_state));
 
-        schedule.record_success(changed.clone(), 2, 2, failed_at + PERSIST_RETRY_INTERVAL);
+        schedule.record_success(
+            PlaybackSnapshot::from_playback(&changed_state),
+            2,
+            2,
+            failed_at + PERSIST_RETRY_INTERVAL,
+        );
         assert_eq!(schedule.committed_generation, 2);
         assert_eq!(
             schedule.committed.as_ref().map(|value| &value.snapshot),
-            Some(&changed)
+            Some(&PlaybackSnapshot::from_playback(&changed_state))
         );
         assert_eq!(schedule.wait_for(Instant::now()), None);
     }
@@ -2361,6 +2391,7 @@ mod tests {
         *client.restore_pending.lock() = Some(RestorePlan {
             snapshot: RestoreSnapshot::from_playback(&previous, false),
             sent: false,
+            attempts: 0,
             only_if_preview: false,
             preview_lease_id: None,
         });
@@ -2388,6 +2419,48 @@ mod tests {
             client.last_state.lock().as_ref().unwrap().position_ms,
             42_000
         );
+    }
+
+    #[test]
+    fn durable_restore_retries_are_capped_and_then_disarmed() {
+        let client = client_with_last_state(PlaybackState::default());
+        let plan = || RestorePlan {
+            snapshot: RestoreSnapshot::from_playback(&PlaybackState::default(), false),
+            sent: false,
+            attempts: 0,
+            only_if_preview: false,
+            preview_lease_id: None,
+        };
+        *client.restore_pending.lock() = Some(plan());
+
+        // Attempts 1..=4 re-arm with the capped backoff shape; attempt 5
+        // disarms the durable restore instead of looping forever.
+        let mut delays = Vec::new();
+        loop {
+            match client.retry_pending_restore() {
+                Some(delay) => delays.push(delay),
+                None => break,
+            }
+        }
+        assert_eq!(delays.len(), RESTORE_RETRY_ATTEMPTS - 1);
+        assert_eq!(delays[0], Duration::from_secs(5));
+        assert_eq!(delays[1], Duration::from_secs(10));
+        assert_eq!(*delays.last().unwrap(), Duration::from_secs(40));
+        assert!(client.restore_pending.lock().is_none());
+        assert!(client.retry_pending_restore().is_none());
+
+        // A preview lease is never consumed (nor disarmed) by this path.
+        *client.restore_pending.lock() = Some(RestorePlan {
+            preview_lease_id: Some(7),
+            only_if_preview: true,
+            ..plan()
+        });
+        assert!(client.retry_pending_restore().is_none());
+        assert!(client
+            .restore_pending
+            .lock()
+            .as_ref()
+            .is_some_and(|plan| plan.only_if_preview && plan.attempts == 0));
     }
 
     #[test]

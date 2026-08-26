@@ -789,12 +789,12 @@ fn write_json_atomic_result<T: Serialize>(path: PathBuf, value: &T) -> Result<()
 }
 
 #[cfg(not(windows))]
-fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::rename(source, destination)
 }
 
 #[cfg(windows)]
-fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "Kernel32")]

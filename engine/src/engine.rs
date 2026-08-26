@@ -974,7 +974,6 @@ impl Engine {
             | Command::BrowseAlbum { .. }
             | Command::BrowseArtist { .. }
             | Command::BrowseArtistSongwriter { .. }
-            | Command::BrowseArtistReleases { .. }
             | Command::BrowseArtistCatalogue { .. }
             | Command::BrowseLikedSongs { .. }
             | Command::BrowseLikedUris { .. }
