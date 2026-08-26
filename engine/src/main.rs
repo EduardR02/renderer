@@ -22,7 +22,7 @@ use librespot_core::cache::Cache;
 use spotify_playback_engine::protocol::{
     AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistReleasePage, Canvas, Command,
     LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
-    RadioBrowse, Response, SearchBrowse, TrackCredits, TrackWaveform,
+    RadioBrowse, Response, SearchBrowse, SongwriterPlaylist, TrackCredits, TrackWaveform,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -58,6 +58,10 @@ enum BrowseOutcome {
     Artist {
         request_id: String,
         result: Result<ArtistBrowse, String>,
+    },
+    ArtistSongwriter {
+        request_id: String,
+        result: Result<Option<SongwriterPlaylist>, String>,
     },
     ArtistReleases {
         request_id: String,
@@ -441,6 +445,28 @@ async fn run(
                                     }
                                 }
                             }
+                            Command::BrowseArtistSongwriter { id, name } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result =
+                                                browse::artist_songwriter_browse(&session, &id, &name)
+                                                    .await;
+                                            let _ = sender.send(BrowseOutcome::ArtistSongwriter {
+                                                request_id,
+                                                result,
+                                            });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::ArtistSongwriter {
+                                            request_id,
+                                            result: Err(error),
+                                        });
+                                    }
+                                }
+                            }
                             Command::BrowseArtistReleases { id, release_types, offset, limit } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -737,6 +763,13 @@ async fn run(
                         }
                         BrowseOutcome::Artist { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_artist", &result)?;
+                        }
+                        BrowseOutcome::ArtistSongwriter { request_id, result } => {
+                            engine.send_browse_response(
+                                &request_id,
+                                "browse_artist_songwriter",
+                                &result,
+                            )?;
                         }
                         BrowseOutcome::ArtistReleases { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_artist_releases", &result)?;

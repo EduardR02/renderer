@@ -113,12 +113,11 @@ fixtures.longTrack = {
 
 /**
  * The artist-page fixture. Quiet on purpose — a couple of releases and a
- * short About are all the context the Written-by section needs — except for
- * the verified songwriter playlist, which arrives exactly the way the engine
- * sends it: titled "Written by <artist>", owned by user id `spotify`, TEN
- * tracks in source order, while `tracks_total` reports the full 37 so the
- * expanded CTA has a count to append. `setSongwriterPlaylist()` below swaps
- * it out without touching anything else here.
+ * short About are all the context the Written-by section needs. Songwriter
+ * discovery is a separate request so the artist overview can render first;
+ * the verified playlist below mirrors that later engine response: titled
+ * "Written by <artist>", owned by user id `spotify`, TEN tracks in source
+ * order, while `tracks_total` reports the full 37.
  */
 const songwriterPlaylist = {
   playlist: {
@@ -172,9 +171,9 @@ fixtures.artist = {
     discovered_on: [],
     artist_playlists: [],
     artist_pick: null,
-    songwriter_playlist: clone(songwriterPlaylist),
   },
 };
+fixtures.songwriterPlaylist = clone(songwriterPlaylist);
 
 /** The routes that read one cached artist payload — mirrors state.svelte.js. */
 const ARTIST_ROUTE_NAMES = [
@@ -503,6 +502,8 @@ window.__TAURI_INTERNALS__ = {
       }
       case "browse_artist":
         return clone(fixtures.artist);
+      case "browse_artist_songwriter":
+        return clone(fixtures.songwriterPlaylist);
       case "browse_playlist":
         return clone(detailFor(args.id ?? args.playlistId));
       case "get_app_settings":
@@ -756,6 +757,8 @@ const { default: App } = await import("../src/App.svelte");
 const state = await import("../src/lib/state.svelte.js");
 Object.assign(window.__harness, {
   navigate: (name, id = null, param = null) => state.navigate(name, id, param),
+  back: () => state.goBack(),
+  forward: () => state.goForward(),
   openEditor: (trackId = playback.current_uri, playlistId = "p1") => {
     const track = findTrack(trackId);
     state.openTrackEditor(track, playlistId);
@@ -777,24 +780,21 @@ Object.assign(window.__harness, {
     emitState();
   },
   /**
-   * Swap the verified songwriter playlist on the artist fixture, then make
-   * the swap VISIBLE: `detail.artist` is cached per artist id, so an open
-   * artist page is left and re-entered to force one fresh browse. Called
-   * with no argument (or null) the section's data is gone — presence and
-   * absence are both deterministic states. A truthy argument restores the
-   * canonical ten-track payload.
+   * Swap the independent songwriter-discovery response, then leave and
+   * re-enter the artist route so its keyed post-overview request runs again.
+   * Presence and absence are both deterministic states.
    */
   setSongwriterPlaylist: (value = null) => {
-    fixtures.artist.overview.songwriter_playlist = value ? clone(songwriterPlaylist) : null;
+    fixtures.songwriterPlaylist = value ? clone(songwriterPlaylist) : null;
     if (ARTIST_ROUTE_NAMES.includes(state.route?.name)) state.navigate("library");
     state.navigate("artist", fixtures.artist.id);
-    return clone(fixtures.artist.overview.songwriter_playlist);
+    return clone(fixtures.songwriterPlaylist);
   },
   selectHistory: () => state.navigate("history"),
   bootCachedLibrary: () => {
-    // Stage 1 of the cached-then-fresh boot: hydrate the grid from the cached
-    // get_state snapshot — including one extra recent row a real snapshot can
-    // carry — without marking the library fresh. Shelves stay hidden.
+    // Stage 1 of the cached-then-fresh boot: hydrate from a cached get_state
+    // snapshot — including one row the fresh rootlist will drop — without
+    // marking it authoritative. Home must remain one cover-free skeleton.
     const stamp = Math.floor(Date.now() / 1000);
     state.libraryState.loaded = true;
     state.libraryState.fresh = false;

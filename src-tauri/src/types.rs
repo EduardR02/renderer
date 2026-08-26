@@ -17,7 +17,8 @@ use spotify_playback_engine::protocol::{
     TrackWaveform as EngineTrackWaveform,
 };
 
-/// The verified songwriter playlist attached to an artist overview.
+/// The verified songwriter playlist returned by the artist's separate
+/// discovery request.
 ///
 /// The playlist remains nested so the frontend can use the same navigation
 /// metadata as every other playlist surface, while `tracks` keeps the
@@ -670,7 +671,6 @@ pub struct ArtistOverviewDetail {
     pub discovered_on: Vec<Playlist>,
     pub artist_playlists: Vec<Playlist>,
     pub artist_pick: Option<ArtistPickDetail>,
-    pub songwriter_playlist: Option<SongwriterPlaylist>,
 }
 
 /// The item pinned to the top of an artist's page, with the artist's note.
@@ -741,7 +741,6 @@ impl From<ArtistOverview> for ArtistOverviewDetail {
                 .map(Playlist::from)
                 .collect(),
             artist_pick: overview.artist_pick.as_ref().map(ArtistPickDetail::from),
-            songwriter_playlist: overview.songwriter_playlist.map(SongwriterPlaylist::from),
         }
     }
 }
@@ -1228,7 +1227,6 @@ mod tests {
             discovered_on: Vec::new(),
             artist_playlists: Vec::new(),
             artist_pick: None,
-            songwriter_playlist: None,
         };
 
         let frontend = ArtistOverviewDetail::from(overview);
@@ -1247,11 +1245,7 @@ mod tests {
         assert_eq!(json["related_artists"][0]["name"], "Related");
     }
     #[test]
-    fn songwriter_playlist_defaults_when_missing_from_legacy_overview_json() {
-        let overview: ArtistOverviewDetail =
-            serde_json::from_str(r#"{"biography":"Legacy artist"}"#).unwrap();
-        assert!(overview.songwriter_playlist.is_none());
-
+    fn songwriter_playlist_defaults_when_missing_from_standalone_payload() {
         let empty: SongwriterPlaylist = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.playlist, Playlist::default());
         assert!(empty.tracks.is_empty());
@@ -1285,13 +1279,8 @@ mod tests {
                 })
                 .collect(),
         };
-        let overview = ArtistOverview {
-            songwriter_playlist: Some(source),
-            ..ArtistOverview::default()
-        };
 
-        let frontend = ArtistOverviewDetail::from(overview);
-        let songwriter = frontend.songwriter_playlist.expect("songwriter playlist");
+        let songwriter = SongwriterPlaylist::from(source);
         assert_eq!(songwriter.playlist.id, "writers");
         assert_eq!(songwriter.playlist.name, "Written by Artist");
         assert_eq!(songwriter.playlist.owner, "Spotify");
@@ -1320,21 +1309,11 @@ mod tests {
         assert_eq!(songwriter.tracks[0].album_id, "album-0");
         assert_eq!(songwriter.tracks[0].album_name, "Album 0");
 
-        let json = serde_json::to_value(ArtistOverviewDetail {
-            songwriter_playlist: Some(songwriter),
-            ..ArtistOverviewDetail::default()
-        })
-        .unwrap();
-        assert_eq!(json["songwriter_playlist"]["playlist"]["id"], "writers");
-        assert_eq!(json["songwriter_playlist"]["playlist"]["tracks_total"], 37);
-        assert_eq!(
-            json["songwriter_playlist"]["tracks"]
-                .as_array()
-                .unwrap()
-                .len(),
-            10
-        );
-        assert_eq!(json["songwriter_playlist"]["tracks"][9]["name"], "Song 9");
+        let json = serde_json::to_value(songwriter).unwrap();
+        assert_eq!(json["playlist"]["id"], "writers");
+        assert_eq!(json["playlist"]["tracks_total"], 37);
+        assert_eq!(json["tracks"].as_array().unwrap().len(), 10);
+        assert_eq!(json["tracks"][9]["name"], "Song 9");
     }
 
     #[test]

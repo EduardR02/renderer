@@ -1,0 +1,632 @@
+<!doctype html>
+<!--
+  dev concept — FULL-WIDTH NATURAL-RATIO canvas strategy
+  Standalone facsimile of the right-side now-playing rail (NowPlayingPanel.svelte
+  + its .np-* rules). Not wired into the app; parent compares this against the
+  contained-square variant. Accepts ?video= and ?cover= overrides; defaults are
+  the shared pair mandated by the parent (Cloudinary sea-turtle, 9:16 + 1:1),
+  mirrored verbatim in canvas-contained-concept.html.
+
+  Strategy: the square cover is the deliberate opening state — a full-bleed
+  placeholder at rest. When the Canvas video reports metadata, the media region
+  relaxes to the video's natural ratio at full rail width (no crop: the box is
+  sized TO the ratio, and the video is object-fit contain regardless), and the
+  video is revealed by a slow downward pour out of the cover while the cover
+  recedes beneath it. The taller stage pushes identity/album/credits/queue down
+  through normal flow — the layout shift itself is the choreography.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>Canvas concept — full width</title>
+<style>
+  /* ==== tokens (subset mirrored from src/styles/app.css) ================ */
+  :root {
+    color-scheme: dark;
+    --bg-0: #080808;
+    --bg-nav: #0e0e0e;
+    --bg-2: #1c1c1c;
+    --bg-3: #242424;
+    --fg: #f2f2f2; --fg-1: #c4c4c4; --fg-2: #a0a0a0; --fg-3: #757575;
+    --foam: #9ccfd8; --rose-ink: #f99e98; --gold: #f6c177;
+    --accent: var(--foam);
+    --line: rgba(255, 255, 255, 0.06);
+    --line-2: rgba(255, 255, 255, 0.11);
+    --ring: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+    --font-display: "Segoe UI Variable Display", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-text: "Segoe UI Variable Text", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --font-small: "Segoe UI Variable Small", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --w-body: 430; --w-med: 520; --w-semi: 600; --w-bold: 650;
+    --t-caps: 11px; --track-caps: 0.12em;
+    --t-11: 11.5px; --t-12: 12.5px; --t-13: 13.5px; --t-23: 23px;
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 20px; --s6: 24px;
+    --r1: 3px; --r2: 6px; --r3: 10px; --r4: 14px; --rf: 999px;
+    --d1: 90ms; --ease: cubic-bezier(0.2, 0, 0, 1);
+    --inspector-w: 336px; --r-panel: 12px;
+    /* Cover-derived tone; refined from the actual pixels by one-shot
+       extraction below, so an arbitrary ?cover= re-tints the rail.
+       Pre-extraction defaults sit near the shared cover's teal. */
+    --tone-wash: #1d3940;
+    --tone-wash-deep: #102227;
+    --tone-glow: #34606b;
+    --tone-a: #3d6670;
+    --tone-b: #14262b;
+    /* Media-region geometry. Closed = the square cover placeholder
+       (padding-top 100%). Open = the video's natural ratio as a
+       padding-top percentage; the root fallback is the mandated 9:16,
+       and JS overwrites it from real metadata (any ?video= override
+       reshapes the stage to ITS ratio). Percentages interpolate, so the
+       growth tweens instead of snapping. */
+    --stage-closed: 100%;
+    --stage-open: 177.7778%;
+    --ease-open: cubic-bezier(0.32, 0.72, 0.08, 1);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    min-height: 100vh;
+    display: grid; place-items: center;
+    padding: 24px;
+    background: var(--bg-0);
+    color: var(--fg);
+    font-family: var(--font-text);
+    font-weight: var(--w-body);
+    font-variant-numeric: proportional-nums;
+  }
+
+  /* Quiet provenance mark, outside the rail so screenshots stay comparable. */
+  .dev-note {
+    position: fixed; top: 14px; left: 18px; margin: 0;
+    font-family: var(--font-small); font-size: 10px; font-weight: var(--w-semi);
+    letter-spacing: var(--track-caps); text-transform: uppercase;
+    color: var(--fg-3); user-select: none;
+  }
+
+  button { font: inherit; border: 0; background: none; padding: 0; cursor: pointer; color: inherit; }
+  button:focus-visible {
+    outline: 1px solid color-mix(in srgb, var(--foam) 65%, transparent);
+    outline-offset: 2px;
+  }
+
+  /* ==== the rail ======================================================== */
+  .np-panel {
+    width: var(--inspector-w);
+    max-height: calc(100vh - 48px);
+    align-self: center;
+    display: flex; flex-direction: column; min-height: 0;
+    overflow-y: auto; overflow-x: hidden;
+    padding: 0 0 var(--s6);
+    border-radius: var(--r-panel);
+    background:
+      linear-gradient(180deg,
+        color-mix(in srgb, var(--tone-wash) 62%, var(--bg-nav)) 0,
+        var(--bg-nav) 320px),
+      var(--bg-nav);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    animation: k-arrive 0.5s var(--ease) both;
+  }
+  .np-panel::-webkit-scrollbar { width: 10px; }
+  .np-panel::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: var(--rf); border: 3px solid var(--bg-nav); }
+
+  .np-head {
+    position: sticky; top: 0; z-index: 4;
+    display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+    height: 44px; flex: none; padding: 0 var(--s2) 0 var(--s4);
+    background: color-mix(in srgb, var(--bg-nav) 45%, transparent);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
+            backdrop-filter: blur(16px) saturate(1.6);
+  }
+  .tag {
+    display: inline-flex; align-items: center;
+    height: 19px; padding: 0 var(--s2) 0 9px;
+    border-radius: var(--rf);
+    background: var(--foam); color: var(--bg-0);
+    font-family: var(--font-small);
+    font-size: 10px; font-weight: var(--w-bold);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .tag.credit { background: var(--gold); }
+  .btn-icon {
+    display: grid; place-items: center; width: 32px; height: 32px; flex: none;
+    border-radius: var(--rf); color: var(--fg-2);
+    transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+  }
+  .btn-icon:hover { color: var(--fg); background: rgba(255, 255, 255, 0.06); }
+
+  /* ==== the stage — full-bleed natural-ratio composition =================
+     The media region spans the entire rail width with no gutter. Its height
+     comes from a padding-top ratio box: square while only the cover exists,
+     the video's own ratio once metadata lands. Because the BOX adopts the
+     source ratio and the video uses object-fit contain, the source can never
+     crop — at the default pair the two coincide exactly and the frame is
+     edge-to-edge. The cover stays pinned underneath as the backing print and
+     recedes as the canvas pours over it. ================================= */
+  .np-stage { position: relative; flex: none; }
+
+  /* Static cover-derived atmosphere behind the media (one composited
+     layer, exactly the production glow), biased toward the region the
+     growth opens up. */
+  .np-glow {
+    position: absolute; z-index: 0; inset: -6% 7% 12%;
+    display: block; filter: blur(46px) saturate(1.5); opacity: 0.4;
+    transform: translateY(28px) scale(1.03);
+    pointer-events: none;
+  }
+  .np-glow img {
+    display: block; width: 100%; height: 100%;
+    object-fit: cover; border-radius: var(--r4);
+  }
+
+  .np-stage-box {
+    position: relative; z-index: 1;
+    overflow: hidden;
+    background: linear-gradient(160deg, var(--tone-a) 0%, var(--tone-b) 100%);
+  }
+  /* The ratio strut: percentage padding resolves against the rail's content
+     width, so height is always exactly width × ratio. Transitioning between
+     two percentages lets the region breathe open; reduced motion snaps. */
+  .np-stage-box::before {
+    content: "";
+    display: block;
+    padding-top: var(--stage-closed);
+  }
+  .play .np-stage-box::before {
+    padding-top: var(--stage-open);
+    transition: padding-top 1.15s var(--ease-open);
+  }
+
+  /* Backing print. While the region is square it IS the artwork at rest; as
+     the box outgrows the square, object-fit cover keeps it filling (a quiet
+     zoom-crop) while the recede animation hands prominence to the video. */
+  .sleeve {
+    position: absolute; inset: 0; z-index: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    filter: brightness(0.94) saturate(1.04);
+  }
+  .play .sleeve { animation: k-recede 1.2s var(--ease-open) both; }
+
+  /* The Canvas, full rail width. Sized by the box, never by itself:
+     object-fit contain means the source cannot crop even if an override
+     ratio disagrees with the box. Hidden until the video is live so the
+     cover placeholder owns the opening state. */
+  .np-canvas {
+    position: absolute; inset: 0; z-index: 2;
+    display: block;
+    width: 100%; height: 100%;
+    object-fit: contain; object-position: center;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateZ(0);
+  }
+  .live .np-canvas { opacity: 1; }
+  .play .np-canvas { animation: k-pour 1.3s cubic-bezier(0.3, 0.6, 0.1, 1) 0.18s both; }
+
+  /* Grounding vignette + hairline frame above everything in the stage:
+     tops the light, seats the bottom edge before the identity block. */
+  .mat {
+    position: absolute; inset: 0; z-index: 3; pointer-events: none;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 14%),
+      linear-gradient(180deg, transparent 64%, rgba(4, 8, 9, 0.4) 100%);
+  }
+  .play .mat { animation: k-deepen 0.9s var(--ease-open) 0.5s both; }
+
+  /* ==== identity, album, credits, queue ================================= */
+  .np-block { flex: none; padding: 0 var(--s4); min-width: 0; }
+  .np-identity { margin-top: var(--s5); }
+  .np-identity h2 {
+    margin: 0;
+    font-family: var(--font-display); font-size: var(--t-23); font-weight: var(--w-bold);
+    letter-spacing: -0.02em; line-height: 1.16; overflow-wrap: anywhere;
+  }
+  .np-artists {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    min-width: 0; margin-top: var(--s2);
+    color: var(--fg-1); font-size: var(--t-13);
+    overflow: hidden; overflow-wrap: anywhere;
+  }
+  .np-meta {
+    display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
+    margin: var(--s3) 0 0;
+    color: var(--fg-2);
+    font-family: var(--font-small); font-size: var(--t-12);
+  }
+  .np-dot { width: 3px; height: 3px; border-radius: 50%; background: var(--fg-3); flex: none; }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  .np-album {
+    display: grid; grid-template-columns: 34px minmax(0, 1fr) auto;
+    align-items: center; gap: var(--s3);
+    width: calc(100% - var(--s6)); margin: var(--s5) var(--s3) 0;
+    padding: var(--s2); border-radius: var(--r2);
+    color: var(--fg-1); text-align: left;
+    transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
+  }
+  .np-album:hover { background: rgba(255, 255, 255, 0.05); color: var(--fg); }
+  .np-album-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .np-album-name { font-size: var(--t-12); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .np-label {
+    color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-caps);
+    font-weight: var(--w-semi); text-transform: uppercase; letter-spacing: var(--track-caps);
+  }
+  .art-sm {
+    display: block; width: 34px; height: 34px; flex: none;
+    border-radius: var(--r1); object-fit: cover;
+  }
+
+  .np-credits, .np-upnext { margin-top: var(--s6); padding-top: var(--s5); }
+  .np-credits {
+    border-top: 1px solid transparent;
+    border-image: linear-gradient(90deg,
+      color-mix(in srgb, var(--gold) 62%, transparent), var(--line) 34%, var(--line)) 1;
+  }
+  .np-upnext {
+    border-top: 1px solid transparent;
+    border-image: linear-gradient(90deg,
+      color-mix(in srgb, var(--foam) 55%, transparent), var(--line) 34%, var(--line)) 1;
+  }
+  .np-section-head {
+    display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+    margin-bottom: var(--s4);
+  }
+  .np-count {
+    font-family: var(--font-text); font-size: var(--t-11); font-weight: var(--w-med);
+    color: color-mix(in srgb, var(--foam) 62%, var(--fg-2));
+  }
+  .caps {
+    margin: 0;
+    font-family: var(--font-small); font-size: var(--t-caps); font-weight: var(--w-semi);
+    letter-spacing: var(--track-caps); text-transform: uppercase;
+    color: var(--fg-2);
+  }
+  .np-role {
+    display: block;
+    font-family: var(--font-small); font-size: var(--t-caps); font-weight: var(--w-semi);
+    letter-spacing: var(--track-caps); text-transform: uppercase;
+    color: color-mix(in srgb, var(--gold) 76%, var(--fg-2));
+  }
+  .np-credit-line + .np-credit-line { margin-top: var(--s4); }
+  .np-credit-line p {
+    margin: 3px 0 0; color: var(--fg-1); font-size: var(--t-12); line-height: 1.42;
+    overflow-wrap: anywhere;
+  }
+  .np-more-inline { color: color-mix(in srgb, var(--gold) 70%, var(--fg-2)); font-weight: var(--w-med); }
+  .np-link {
+    display: inline-flex; align-items: center; gap: var(--s1);
+    margin-top: var(--s4); color: var(--fg-2);
+    font-family: var(--font-small); font-size: var(--t-12);
+    transition: color var(--d1) var(--ease);
+  }
+  .np-link:hover { color: var(--accent); }
+  .np-link.credit:hover { color: var(--gold); }
+  .np-section-head .np-link { margin-top: 0; }
+
+  .np-next {
+    display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: center;
+    gap: var(--s3); width: calc(100% + var(--s4)); margin-left: calc(var(--s2) * -1);
+    padding: var(--s2); border-radius: var(--r2); text-align: left;
+    transition: background-color var(--d1) var(--ease);
+  }
+  .np-next:hover { background: rgba(255, 255, 255, 0.05); }
+  .np-next-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .np-next-copy strong, .np-next-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .np-next-copy strong { font-size: var(--t-12); font-weight: var(--w-med); }
+  .np-next-copy span { color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11); }
+  .art-xs { display: block; width: 38px; height: 38px; flex: none; border-radius: var(--r1); object-fit: cover; }
+
+  /* ==== reveal choreography — slow, ordered, CSS-only ====================
+     Base styles ARE every settled state; each animation declares its own
+     `from`, so reduced motion (animation: none) simply arrives finished.
+     Timeline once the video is decodable: the ratio box breathes open
+     (1.15s) → the canvas pours down out of the cover (1.3s, from 180ms)
+     → the cover recedes to a backing print (1.2s) → the vignette deepens
+     last (from 500ms). Metadata shifting down rides the box growth in
+     normal flow, so text and media move as one piece. ==================== */
+  @keyframes k-arrive { from { opacity: 0; } }
+  @keyframes k-pour {
+    from { opacity: 0; clip-path: inset(0 0 100% 0); transform: scale(1.045); }
+    40%  { opacity: 1; }
+    to   { opacity: 1; clip-path: inset(0 0 0 0); transform: scale(1); }
+  }
+  @keyframes k-recede {
+    from { filter: brightness(0.94) saturate(1.04); transform: scale(1); }
+    to   { filter: brightness(0.4) saturate(1.02); transform: scale(1.06); }
+  }
+  @keyframes k-deepen { from { opacity: 0; } }
+
+  /* ==== the replay control ==============================================
+     Lives outside the rail so the facsimile stays honest; hidden until the
+     video is live, then a quiet pill bottom-right. */
+  .replay {
+    position: fixed; right: 20px; bottom: 20px; z-index: 10;
+    display: inline-flex; align-items: center; gap: 8px;
+    height: 34px; padding: 0 14px;
+    border-radius: var(--rf);
+    background: var(--bg-2); color: var(--fg-1);
+    box-shadow: var(--ring), 0 8px 20px -8px rgba(0, 0, 0, 0.8);
+    font-family: var(--font-small); font-size: var(--t-12); font-weight: var(--w-med);
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.4s var(--ease), background-color var(--d1) var(--ease), color var(--d1) var(--ease);
+  }
+  .replay.show { opacity: 0.88; pointer-events: auto; }
+  .replay.show:hover { opacity: 1; background: var(--bg-3); color: var(--fg); }
+  .replay svg { flex: none; }
+
+  /* ==== preference handling ============================================ */
+  @media (prefers-reduced-motion: reduce) {
+    .np-panel, .play .sleeve, .play .np-canvas, .play .mat,
+    .btn-icon, .np-album, .np-link, .np-next, .replay {
+      animation: none;
+    }
+    .play .np-stage-box::before { transition: none; }
+    .btn-icon, .np-album, .np-link, .np-next, .replay { transition: none; }
+  }
+  @media (prefers-reduced-transparency: reduce) {
+    .np-glow { display: none; }
+    .np-head {
+      background: var(--bg-nav);
+      -webkit-backdrop-filter: none;
+              backdrop-filter: none;
+    }
+  }
+</style>
+</head>
+<body>
+  <p class="dev-note">dev / canvas-full-concept</p>
+
+  <aside class="np-panel" id="panel" aria-label="Now playing details">
+    <div class="np-head">
+      <span class="tag">Now playing</span>
+      <button class="btn-icon" type="button" aria-label="Close">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </div>
+
+    <div class="np-stage">
+      <span class="np-glow" aria-hidden="true"><img id="cover-glow" alt="" /></span>
+      <div class="np-stage-box">
+        <img id="cover-sleeve" class="sleeve" alt="" />
+        <video
+          id="canvas"
+          class="np-canvas"
+          muted
+          loop
+          playsinline
+          preload="auto"
+          aria-label="Canvas animation"
+        ></video>
+        <div class="mat" aria-hidden="true"></div>
+      </div>
+    </div>
+
+    <div class="np-block np-identity">
+      <h2>Undertow</h2>
+      <span class="np-artists">Marisa Hale</span>
+      <p class="np-meta">
+        <span class="tnum">3:42</span>
+        <span class="np-dot" aria-hidden="true"></span>
+        <span><span class="tnum">128,404</span> plays</span>
+      </p>
+    </div>
+
+    <button class="np-block np-album" type="button">
+      <img id="cover-album" class="art-sm" alt="" />
+      <span class="np-album-copy">
+        <span class="np-label">Album</span>
+        <span class="np-album-name">Tidal Register</span>
+      </span>
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3l5 5-5 5"/></svg>
+    </button>
+
+    <section class="np-block np-credits">
+      <div class="np-section-head">
+        <span class="tag credit">Credits</span>
+        <span class="np-count tnum">7</span>
+      </div>
+      <div class="np-credit-line">
+        <span class="np-role">Songwriter</span>
+        <p>Mara Voss, Emil Brandt<span class="np-more-inline">&nbsp;+2</span></p>
+      </div>
+      <div class="np-credit-line">
+        <span class="np-role">Producer</span>
+        <p>Marisa Hale</p>
+      </div>
+      <div class="np-credit-line">
+        <span class="np-role">Mixing</span>
+        <p>J. Holm</p>
+      </div>
+      <button class="np-link credit" type="button">
+        All 7 credits
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3l5 5-5 5"/></svg>
+      </button>
+    </section>
+
+    <section class="np-block np-upnext">
+      <div class="np-section-head">
+        <h3 class="caps">Up next</h3>
+        <button class="np-link" type="button">
+          Queue
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3l5 5-5 5"/></svg>
+        </button>
+      </div>
+      <button class="np-next" type="button">
+        <img class="art-xs" src="https://res.cloudinary.com/demo/image/upload/ar_1:1,c_fill,w_76/samples/sea-turtle.jpg" alt="" />
+        <span class="np-next-copy">
+          <strong>Salt &amp; Signal</strong>
+          <span>Marisa Hale</span>
+        </span>
+      </button>
+    </section>
+  </aside>
+
+  <button class="replay" id="replay" type="button">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 2.64-6.36L3 8"/><path d="M3 3v5h5"/></svg>
+    Replay reveal
+  </button>
+
+<script>
+(() => {
+  "use strict";
+
+  /* Defaults mandated by the parent and mirrored verbatim in
+     dev/canvas-contained-concept.html so the two strategies show identical
+     content side by side. */
+  const DEFAULT_VIDEO =
+    "https://res.cloudinary.com/demo/video/upload/ar_9:16,c_fill,w_720/samples/sea-turtle.mp4";
+  const DEFAULT_COVER =
+    "https://res.cloudinary.com/demo/video/upload/so_0,ar_1:1,c_fill,w_720/samples/sea-turtle.jpg";
+
+  const params = new URLSearchParams(location.search);
+  const videoUrl = params.get("video") || DEFAULT_VIDEO;
+  const coverUrl = params.get("cover") || DEFAULT_COVER;
+
+  const panel = document.getElementById("panel");
+  const video = document.getElementById("canvas");
+  const replay = document.getElementById("replay");
+
+  document.getElementById("cover-glow").src = coverUrl;
+  document.getElementById("cover-sleeve").src = coverUrl;
+  document.getElementById("cover-album").src = coverUrl;
+  video.setAttribute("aria-label", "Canvas animation for Undertow");
+
+  /* ---- geometry --------------------------------------------------------
+     Once the real dimensions are known, reshape the media region to the
+     video's natural ratio: padding-top percentage against the full rail
+     width. Until then the CSS fallback (--stage-open: 9:16) already names
+     the mandated default shape. Any ?video= override therefore re-proports
+     the stage to its own ratio, and object-fit contain keeps it uncropped
+     even if the numbers ever disagree. */
+  video.addEventListener("loadedmetadata", () => {
+    const w = video.videoWidth | 0;
+    const h = video.videoHeight | 0;
+    if (!w || !h) return;
+    panel.style.setProperty("--stage-open", ((h / w) * 100).toFixed(4) + "%");
+  });
+
+  /* ---- reveal ----------------------------------------------------------
+     Strictly gated on a decodable frame: the square cover is the resting
+     placeholder, and the shift/reveal only happens when there is something
+     to reveal. An offline open still shows the complete rail at rest. */
+  let started = false;
+  function start() {
+    if (started) return;
+    started = true;
+    panel.classList.add("live", "play");
+    replay.classList.add("show");
+    video.play().catch(() => {});
+  }
+  video.addEventListener("canplay", start, { once: true });
+  video.src = videoUrl;
+
+  document.addEventListener("visibilitychange", () => {
+    if (!started) return;
+    if (document.hidden) video.pause();
+    else video.play().catch(() => {});
+  });
+
+  replay.addEventListener("click", () => {
+    if (!started) return;
+    started = false;
+    panel.classList.remove("play");   /* drop to the square, cover-at-rest state … */
+    void panel.offsetWidth;           /* … force one reflow … */
+    video.currentTime = 0;
+    start();                          /* … and run the timeline again. */
+  });
+
+  /* ---- cover tone (one-shot, no per-frame work) -----------------------
+     Port of lib/covertone.svelte.js: 16x16 downsample, Oklab hue buckets,
+     the L/chroma clamps, and the amber lift. Sets the same custom properties
+     the real panel binds, so an arbitrary ?cover= re-tints the whole rail.
+     Failure (tainted canvas, dead URL) falls back to the identity hue. */
+
+  const toLinear = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  function oklab(r8, g8, b8) {
+    const r = toLinear(r8 / 255), g = toLinear(g8 / 255), b = toLinear(b8 / 255);
+    const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    return [
+      0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+      1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+      0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ];
+  }
+  function hex(L, C, hueDeg) {
+    const hr = (hueDeg * Math.PI) / 180;
+    const a = Math.cos(hr) * C, b = Math.sin(hr) * C;
+    const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+    const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+    const s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+    const g2 = (c) => {
+      c = Math.min(1, Math.max(0, c));
+      return c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
+    };
+    const r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+    const g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+    const bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+    return "#" + [r, g, bl].map((c) => Math.round(g2(c) * 255).toString(16).padStart(2, "0")).join("");
+  }
+  function palette(hue, chroma) {
+    const c = Math.min(0.115, Math.max(0, chroma));
+    const amber = Math.max(0, 1 - Math.abs(hue - 68) / 32);
+    const lift = 0.055 * amber;
+    return {
+      wash: hex(0.35 + lift, c, hue),
+      washDeep: hex(0.26 + lift * 0.7, c * 0.82, hue),
+      glow: hex(0.6, Math.min(0.14, c * 1.25), hue),
+      tileA: hex(0.68, Math.min(0.14, c * 1.3), hue),
+      tileB: hex(0.32, Math.min(0.1, c * 0.9), hue),
+    };
+  }
+  function applyPalette(p) {
+    for (const [k, v] of Object.entries(p)) panel.style.setProperty(`--tone-${k === "washDeep" ? "wash-deep" : k}`, v);
+  }
+
+  async function extractTone(url) {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.decoding = "async";
+    img.src = url;
+    await img.decode();
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = 16;
+    const cx = cv.getContext("2d", { willReadFrequently: true });
+    cx.drawImage(img, 0, 0, 16, 16);
+    const px = cx.getImageData(0, 0, 16, 16).data;
+    const BUCKETS = 24;
+    const wSum = new Array(BUCKETS).fill(0);
+    const sinSum = new Array(BUCKETS).fill(0);
+    const cosSum = new Array(BUCKETS).fill(0);
+    const cSum = new Array(BUCKETS).fill(0);
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i + 3] < 200) continue;
+      const [L, a, b] = oklab(px[i], px[i + 1], px[i + 2]);
+      if (L < 0.16 || L > 0.93) continue;           /* borders, shadows, paper */
+      const C = Math.hypot(a, b);
+      if (C < 0.035) continue;                       /* greys */
+      let hue = (Math.atan2(b, a) * 180) / Math.PI;
+      if (hue < 0) hue += 360;
+      const k = Math.min(BUCKETS - 1, Math.floor(hue / 15));
+      wSum[k] += C;
+      sinSum[k] += Math.sin((hue * Math.PI) / 180) * C;
+      cosSum[k] += Math.cos((hue * Math.PI) / 180) * C;
+      cSum[k] += C;
+    }
+    let best = -1, bestW = 0;
+    for (let k = 0; k < BUCKETS; k++) if (wSum[k] > bestW) { bestW = wSum[k]; best = k; }
+    if (best < 0) throw new Error("no chroma");
+    const hue = ((Math.atan2(sinSum[best], cosSum[best]) * 180) / Math.PI + 360) % 360;
+    applyPalette(palette(hue, cSum[best] / wSum[best]));
+  }
+
+  extractTone(coverUrl).catch(() => applyPalette(palette(198, 0.09)));
+})();
+</script>
+</body>
+</html>

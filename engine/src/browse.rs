@@ -2183,6 +2183,24 @@ async fn cached_songwriter_playlist(
     }
     value
 }
+/// Resolves the optional verified `Written by <artist>` playlist independently
+/// from the artist overview. The canonical identity comes from `artist_browse`,
+/// so this request does not repeat artist metadata work.
+pub async fn artist_songwriter_browse(
+    session: &Session,
+    artist_id: &str,
+    canonical_artist_name: &str,
+) -> Result<Option<SongwriterPlaylist>, String> {
+    if artist_id.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(cached_songwriter_playlist(
+        session,
+        artist_id,
+        canonical_artist_name,
+    )
+    .await)
+}
 
 /// Artist portrait, top tracks, and the grouped release catalogue via the
 /// extended-metadata artist endpoint.
@@ -2202,11 +2220,10 @@ pub async fn artist_browse(
     let artist_uri = uri_of(&artist.id);
     let top_track_uris = artist.top_tracks.for_country(&session.country());
     let groups = artist_release_groups(&artist);
-    let (query_overview, visual_identity, top_tracks, songwriter_playlist, page) = tokio::join!(
+    let (query_overview, visual_identity, top_tracks, page) = tokio::join!(
         cached_artist_overview(session, id, &artist_uri),
         artist_visual_identity(session, &uri),
         fetch_tracks(session, top_track_uris.iter()),
-        cached_songwriter_playlist(session, id, &artist.name),
         resolve_initial_artist_release_page(session, &groups),
     );
     let visual_identity = visual_identity
@@ -2230,12 +2247,8 @@ pub async fn artist_browse(
         }
     }
 
-    let mut overview =
+    let overview =
         merge_artist_overview(&artist, query_overview.as_ref(), visual_identity.as_ref());
-    if let Some(songwriter_playlist) = songwriter_playlist {
-        let overview = overview.get_or_insert_with(ArtistOverview::default);
-        overview.songwriter_playlist = Some(songwriter_playlist);
-    }
     let page = page?;
     Ok(spotify_playback_engine::protocol::ArtistBrowse {
         id: id_of(&artist.id),
@@ -4306,7 +4319,6 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
             discovered_on,
             artist_playlists,
             artist_pick,
-            songwriter_playlist: None,
         },
         top_playcounts,
     })

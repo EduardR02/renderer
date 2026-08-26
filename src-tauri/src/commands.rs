@@ -22,8 +22,8 @@ use crate::media_keys;
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
     ArtistReleasePageDetail, CacheStats, HistoryEntry, LikedSongsDetail, Playlist, PlaylistDetail,
-    PlaylistRecommendationsDetail, RadioDetail, SearchResult, Track, TrackCreditsDetail,
-    TrackPlaylistRef, TrackWaveform,
+    PlaylistRecommendationsDetail, RadioDetail, SearchResult, SongwriterPlaylist, Track,
+    TrackCreditsDetail, TrackPlaylistRef, TrackWaveform,
 };
 use parking_lot::Mutex;
 use serde_json::json;
@@ -381,6 +381,18 @@ pub async fn browse_artist(
     id: String,
 ) -> Result<ArtistDetail, String> {
     Ok(ArtistDetail::from(client.browse_artist(&id).await?))
+}
+
+#[tauri::command]
+pub async fn browse_artist_songwriter(
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+    name: String,
+) -> Result<Option<SongwriterPlaylist>, String> {
+    Ok(client
+        .browse_artist_songwriter(&id, &name)
+        .await?
+        .map(SongwriterPlaylist::from))
 }
 
 #[tauri::command]

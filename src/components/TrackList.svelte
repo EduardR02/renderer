@@ -525,11 +525,14 @@
    *
    * Optimistic on purpose: the shared id array is patched FIRST, so the mark
    * on the row, the sr-only text and the header's next start row all move in
-   * the same frame as the click. A refused command puts the id back exactly
-   * where the edit took it from and says so inside the open menu — the store
-   * is the truth, and the list follows it, never the reverse. The item stays
-   * disabled while the command is in flight, which makes the preference read
-   * as deliberate rather than spammable.
+   * the same frame as the click. A confirmed command closes the menu through
+   * the usual path — the mark appearing on the row is the acknowledgement,
+   * the same way every other fire-and-forget item dismisses. A refused
+   * command puts the id back exactly where the edit took it from and says so
+   * inside the still-open menu — the store is the truth, and the list follows
+   * it, never the reverse. The item stays disabled while the command is in
+   * flight, which makes the preference read as deliberate rather than
+   * spammable.
    */
   async function toggleRowSkip() {
     const track = menu.track;
@@ -551,9 +554,11 @@
     } catch (reason) {
       setPresent(!exclude);
       menu.skipError = String(reason || "Could not update this playlist.");
+      return;
     } finally {
       menu.skipPending = false;
     }
+    closeMenus();
   }
 
   function openPicker(e) {
@@ -735,7 +740,6 @@
   }
 
   function resetWindow(length, scroller) {
-    if (scroller) scroller.scrollTop = 0;
     const initialLast = scroller
       ? Math.min(length, Math.ceil(scroller.clientHeight / ROW_H) + OVERSCAN)
       : length;
@@ -756,10 +760,11 @@
   }
 
   /*
-   * Reset before the new rows are patched into the DOM. Identity changes reset
-   * the shared pane scroll and retained range; length-only changes preserve the
-   * position but clamp the window so a shortened list cannot render a stale
-   * blank range.
+   * Reset the retained row range before a new list is patched. The shared pane
+   * owns its scroll position in App.svelte; a child table must not erase a
+   * route restoration when async playlist rows arrive. The post-effect below
+   * measures the live offset immediately and selects the matching row window.
+   * Length-only changes preserve and clamp the current window.
    */
   $effect.pre(() => {
     if (disableWindowing) return;
@@ -1130,9 +1135,10 @@
     {/if}
     {#if skipsTracked && menu.track?.id}
       <!-- The one playlist-local listening preference. It sits with the edit
-           cluster because both are "how this row behaves inside THIS list",
-           and it stays open on click so the label flipping over is the
-           acknowledgement — same reasoning as Copy link above. -->
+           cluster because both are "how this row behaves inside THIS list".
+           Unlike Copy link, the row itself acknowledges the click — the skip
+           mark moves — so a confirmed toggle closes the menu, and only a
+           refused command keeps it up, long enough to say why. -->
       <button
         class="menu-item"
         disabled={menu.skipPending}

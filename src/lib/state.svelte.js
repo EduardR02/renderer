@@ -1673,6 +1673,8 @@ export const api = {
   browsePlaylistRecommendations: (id) => invoke("browse_playlist_recommendations", { id }),
   browseAlbum: (id) => invoke("browse_album", { id }),
   browseArtist: (id) => invoke("browse_artist", { id }),
+  browseArtistSongwriter: (id, name) =>
+    invoke("browse_artist_songwriter", { id, name }),
   browseArtistReleases: (id, releaseTypes = [], offset = 0, limit = 20) =>
     invoke("browse_artist_releases", { id, releaseTypes, offset, limit }),
   createPlaylist: (name) => invoke("create_playlist", { name }),

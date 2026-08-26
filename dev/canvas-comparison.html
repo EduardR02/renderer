@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Canvas presentation comparison</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111019;
+      --surface: #191724;
+      --line: rgba(224, 222, 244, 0.12);
+      --muted: #908caa;
+      --text: #e0def4;
+      --accent: #ebbcba;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 820px;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 50% -20%, rgba(196, 167, 231, 0.13), transparent 42rem),
+        var(--bg);
+      color: var(--text);
+      font: 13px/1.45 "Segoe UI Variable", "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 32px;
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 28px 20px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0 0 5px; font-size: 20px; letter-spacing: -0.02em; }
+    p { margin: 0; color: var(--muted); }
+    .hint { max-width: 420px; text-align: right; font-size: 12px; }
+    main {
+      display: grid;
+      grid-template-columns: repeat(2, 360px);
+      justify-content: center;
+      align-items: start;
+      gap: 40px;
+      padding: 26px 24px 48px;
+    }
+    article { min-width: 0; }
+    .label {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin: 0 2px 10px;
+    }
+    h2 { margin: 0; font-size: 14px; font-weight: 650; }
+    .label span { color: var(--muted); font-size: 11px; }
+    iframe {
+      display: block;
+      width: 360px;
+      height: min(820px, calc(100vh - 145px));
+      min-height: 620px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+    }
+    @media (max-width: 900px) {
+      body { min-width: 390px; }
+      header { align-items: start; }
+      .hint { display: none; }
+      main { grid-template-columns: 360px; }
+      iframe { height: 760px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Canvas presentation study</h1>
+      <p>Same media, same rail, two geometry decisions.</p>
+    </div>
+    <p class="hint">Judge the handoff from cover to motion, whether the frame feels intentional, and how naturally the information below follows it.</p>
+  </header>
+  <main>
+    <article>
+      <div class="label"><h2>Contained sleeve</h2><span>Stable square · no crop</span></div>
+      <iframe id="contained" title="Contained Canvas concept"></iframe>
+    </article>
+    <article>
+      <div class="label"><h2>Full frame</h2><span>Natural ratio · variable height</span></div>
+      <iframe id="full" title="Full-size Canvas concept"></iframe>
+    </article>
+  </main>
+  <script>
+    const media = new URLSearchParams(location.search);
+    const forwarded = new URLSearchParams();
+    if (media.get("video")) forwarded.set("video", media.get("video"));
+    if (media.get("cover")) forwarded.set("cover", media.get("cover"));
+    const suffix = forwarded.size ? `?${forwarded}` : "";
+    document.querySelector("#contained").src = `canvas-contained-concept.html${suffix}`;
+    document.querySelector("#full").src = `canvas-full-concept.html${suffix}`;
+  </script>
+</body>
+</html>

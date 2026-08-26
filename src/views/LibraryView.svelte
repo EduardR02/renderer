@@ -43,7 +43,8 @@
    * Provisional shelves stay empty until the fresh rootlist lands. The cached
    * snapshot can carry stale `last_played` rows; deriving shelves from it
    * would mount a listening-history band that the fresh answer immediately
-   * reshuffles. Your library below renders from the same snapshot unwaited.
+   * reshuffles. Until then Home renders one skeleton frame that reserves the
+   * settled hierarchy — no cached row mounts early enough to be reordered.
    */
   const recentlyPlayed = $derived.by(() => {
     if (!libraryState.fresh) return [];
@@ -102,7 +103,9 @@
     uniqueLibrary.filter((playlist) => !shownIds.has(playlist.id)),
   );
 
-  const tonePlaylist = $derived(recentShelf[0] ?? uniqueLibrary[0] ?? null);
+  const tonePlaylist = $derived(
+    libraryState.fresh ? (recentShelf[0] ?? uniqueLibrary[0] ?? null) : null,
+  );
   const tone = $derived(
     coverTone(
       tonePlaylist?.cover_url || tonePlaylist?.cover_urls?.[0] || "",
@@ -192,6 +195,16 @@
   </div>
 {/snippet}
 
+{#snippet skeletonCard(seed)}
+  <div class="card" aria-hidden="true">
+    <span class="skeleton" style="display:block;aspect-ratio:1;width:100%;border-radius:var(--r3)"></span>
+    <span class="card-copy">
+      <span class="skeleton line" style="width:{74 - ((seed * 11) % 30)}%;height:12px;margin:0"></span>
+      <span class="skeleton line" style="width:38%;height:10px;margin:6px 0 0"></span>
+    </span>
+  </div>
+{/snippet}
+
 <!-- `soft`: a third of the usual wash. A greeting is not a 56px record title,
      and the first row of covers sits inside this field — at full strength the
      colour would compete with the artwork it is supposed to introduce. -->
@@ -205,6 +218,40 @@
     <h1 class="page-title">{greeting}</h1>
   </div>
 
+{#if !libraryState.fresh}
+  <!-- One coherent home loading frame. The cached snapshot still hydrates the
+       sidebar and detail views, but Home itself waits for the authoritative
+       rootlist so nothing real mounts ahead of shelves the fresh answer may
+       reorder. The frame reserves the settled hierarchy — Recently played,
+       Made for you, Your library — at real card geometry and no cached art;
+       the fresh event then replaces it exactly once, atomically. -->
+  <div class="section home-shelf-section" style="margin-top:0">
+    <div class="section-head"><h2 class="section-title">Recently played</h2></div>
+    <div class="grid home-shelf" style={`--shelf-columns:${cardsPerRow}`}>
+      {#each Array.from({ length: cardsPerRow }) as _, i (i)}
+        {@render skeletonCard(i)}
+      {/each}
+    </div>
+  </div>
+
+  <div class="section home-shelf-section">
+    <div class="section-head"><h2 class="section-title">Made for you</h2></div>
+    <div class="grid home-shelf" style={`--shelf-columns:${cardsPerRow}`}>
+      {#each Array.from({ length: madeForYouInitialCount }) as _, i (i)}
+        {@render skeletonCard(cardsPerRow + i)}
+      {/each}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head"><h2 class="section-title">Your library</h2></div>
+    <div class="grid">
+      {#each Array.from({ length: 12 }) as _, i (i)}
+        {@render skeletonCard(i)}
+      {/each}
+    </div>
+  </div>
+{:else}
   {#if recentShelf.length}
     <div class="section home-shelf-section" style="margin-top:0">
       <div class="section-head"><h2 class="section-title">Recently played</h2></div>
@@ -258,32 +305,19 @@
       </div>
     </div>
   {:else}
-    <!-- The library arrives asynchronously and this is what you look at while
-         it does, so it is a frame rather than a sentence: real card geometry
-         lands without a jump. Once the library answers, the holes disappear. -->
+    <!-- Only reachable once fresh: an empty rootlist is a real answer now,
+         not a loading state, so the frame above has already been replaced. -->
     <div class="section" style="margin-top:0">
       <div class="section-head"><h2 class="section-title">Your library</h2></div>
       <div class="grid">
         {@render likedCard(false)}
-        {#if !libraryState.loaded}
-          {#each Array.from({ length: 11 }) as _, i (i)}
-            <div class="card" aria-hidden="true">
-              <span class="skeleton" style="display:block;aspect-ratio:1;width:100%;border-radius:var(--r3)"></span>
-              <span class="card-copy">
-                <span class="skeleton line" style="width:{74 - ((i * 11) % 30)}%;height:12px;margin:0"></span>
-                <span class="skeleton line" style="width:38%;height:10px;margin:6px 0 0"></span>
-              </span>
-            </div>
-          {/each}
-        {/if}
       </div>
-      {#if libraryState.loaded}
-        <p class="sub" style="margin-top:var(--s5)">
-          No playlists yet — anything you save in Spotify shows up here.
-        </p>
-      {/if}
+      <p class="sub" style="margin-top:var(--s5)">
+        No playlists yet — anything you save in Spotify shows up here.
+      </p>
     </div>
   {/if}
+{/if}
 
   {#if error}<p class="inline-error" role="alert">{error}</p>{/if}
 </section>

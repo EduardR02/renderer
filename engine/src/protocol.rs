@@ -313,6 +313,14 @@ pub enum Command {
     BrowseArtist {
         id: String,
     },
+    /// Verified official `Written by <artist>` playlist discovery. The
+    /// canonical artist id and display name come from the preceding artist
+    /// browse, keeping this optional enhancement out of that critical path.
+    /// Responded to with a `browse_artist_songwriter` message.
+    BrowseArtistSongwriter {
+        id: String,
+        name: String,
+    },
     /// One bounded page of an artist's release artwork/metadata.
     BrowseArtistReleases {
         id: String,
@@ -678,9 +686,9 @@ pub struct PlaylistRef {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_count: Option<u32>,
 }
-/// The verified official playlist and the first playable rows shown on an
-/// artist's page. Track order is the playlist's source order; it is not a
-/// popularity ranking.
+/// The verified official playlist and the first playable rows returned by the
+/// separate artist songwriter request. Track order is the playlist's source
+/// order; it is not a popularity ranking.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SongwriterPlaylist {
@@ -906,10 +914,6 @@ pub struct ArtistOverview {
     /// Whatever the artist pinned to the top of their page — see [`ArtistPick`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artist_pick: Option<ArtistPick>,
-    /// The verified official Spotify `Written by <artist>` playlist, when it
-    /// was found and at least one track resolved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub songwriter_playlist: Option<SongwriterPlaylist>,
 }
 
 /// The item an artist pinned to the top of their page, and the note they
@@ -1113,10 +1117,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        normalize_canonical_playlist_description, sanitize_playlist_description, ArtistOverview,
         ArtistRef, AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations,
         PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
-        SongwriterPlaylist, StateEvent, TrackRef,
+        SongwriterPlaylist, StateEvent, TrackRef, normalize_canonical_playlist_description,
+        sanitize_playlist_description,
     };
 
     #[test]
@@ -1609,6 +1613,18 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(artist.command, Command::BrowseArtist { .. }));
+        let songwriter: Request = serde_json::from_value(json!({
+            "request_id": "request-songwriter",
+            "type": "browse_artist_songwriter",
+            "id": "0123456789ABCDEFGHIJKL",
+            "name": "Artist",
+        }))
+        .unwrap();
+        assert!(matches!(
+            songwriter.command,
+            Command::BrowseArtistSongwriter { ref id, ref name }
+                if id == "0123456789ABCDEFGHIJKL" && name == "Artist"
+        ));
 
         let catalogue: Request = serde_json::from_value(json!({
             "request_id": "request-catalogue",
@@ -2035,16 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn songwriter_playlist_is_optional_and_defaults_nested_fields() {
-        let legacy: ArtistOverview =
-            serde_json::from_value(json!({"biography": "Legacy artist"})).unwrap();
-        assert!(legacy.songwriter_playlist.is_none());
-        assert!(!serde_json::to_value(&legacy)
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .contains_key("songwriter_playlist"));
-
+    fn songwriter_playlist_is_a_standalone_payload() {
         let empty: SongwriterPlaylist = serde_json::from_value(json!({})).unwrap();
         assert!(empty.playlist.id.is_empty());
         assert!(empty.tracks.is_empty());
@@ -2067,15 +2074,8 @@ mod tests {
                 ..TrackRef::default()
             }],
         };
-        let overview = ArtistOverview {
-            songwriter_playlist: Some(payload),
-            ..ArtistOverview::default()
-        };
-        let encoded = serde_json::to_value(overview).unwrap();
-        assert_eq!(
-            encoded["songwriter_playlist"]["playlist"]["owner_id"],
-            "spotify"
-        );
-        assert_eq!(encoded["songwriter_playlist"]["tracks"][0]["name"], "Song");
+        let encoded = serde_json::to_value(payload).unwrap();
+        assert_eq!(encoded["playlist"]["owner_id"], "spotify");
+        assert_eq!(encoded["tracks"][0]["name"], "Song");
     }
 }

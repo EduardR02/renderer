@@ -65,18 +65,133 @@
     return () => observer.disconnect();
   });
 
-  /* Every route reuses this one scroll container. Without an explicit reset,
-     the incoming view inherits the outgoing view's pixel offset; shorter pages
-     are then clamped to their bottom. Reset after Svelte commits the new view
-     for forward, back, and history navigation alike. */
+  /* Every route reuses this one scroll container, so the pane keeps a small
+     ledger of where each route identity (name + id + param) was last left,
+     written by a passive scroll listener for as long as a view is live.
+     Revisiting a route restores its entry; a first visit opens at the top.
+     Recording from the listener rather than at navigation time matters:
+     leaving a detail route drops its data before the route flips, the
+     outgoing view collapses, and by the time navigation could read the
+     pane the browser has already clamped scrollTop — the last event that
+     fired under the outgoing identity is the honest position. Zeroing in
+     $effect.pre keeps the incoming view from inheriting those pixels for
+     even one frame.
+
+     Detail pages fetch their body after mounting, so a remembered offset
+     routinely exceeds what is laid out yet. Restoration then stays
+     pending: it follows layout growth with a ResizeObserver over the
+     view's children and applies once the scroll range can represent the
+     target. While pending, every scroll event is noise — the browser's
+     clamp, our own zeroing, view-internal autoscrolls — and is ignored, so
+     none of them can overwrite the saved target. Once applied, programmatic
+     scrolls simply re-record the same offset under the incoming key.
+     No timers, no polling: growth itself wakes the observer, and every
+     exit path disconnects both it and the listener. */
   let scrollEl = $state(null);
+  const SCROLL_MEMORY_MAX = 50; // matches the navigation history scale
+  const scrollMemory = new Map(); // route identity -> last pane offset
+  let lastRouteKey = null;
+  let pendingRestoreKey = null;
+
+  function routeKey() {
+    return `${route.name}\u0000${route.id ?? ""}\u0000${route.param ?? ""}`;
+  }
+
+  function remember(key, offset) {
+    scrollMemory.delete(key);
+    scrollMemory.set(key, offset);
+    if (scrollMemory.size > SCROLL_MEMORY_MAX) {
+      scrollMemory.delete(scrollMemory.keys().next().value);
+    }
+  }
+
+  $effect.pre(() => {
+    const key = routeKey();
+    const node = scrollEl;
+    const previous = lastRouteKey;
+    lastRouteKey = key;
+    if (!node || previous === null || previous === key) return;
+    pendingRestoreKey = key;
+    node.scrollTop = 0;
+  });
+
   $effect(() => {
-    route.name;
-    route.id;
-    route.param;
     const node = scrollEl;
     if (!node) return;
-    tick().then(() => node.scrollTo({ top: 0, behavior: "instant" }));
+    const onScroll = () => {
+      if (lastRouteKey === null || lastRouteKey === pendingRestoreKey) return;
+      remember(lastRouteKey, node.scrollTop);
+    };
+    node.addEventListener("scroll", onScroll, { passive: true });
+    return () => node.removeEventListener("scroll", onScroll);
+  });
+
+  $effect(() => {
+    const key = routeKey();
+    const node = scrollEl;
+    if (!node) return;
+    const target = scrollMemory.get(key) ?? 0;
+    let disposed = false;
+    let observer = null;
+
+    function fitsTarget() {
+      return node.scrollHeight - node.clientHeight >= target;
+    }
+    function stopWaiting() {
+      if (observer) {
+        observer.disconnect();
+        observer = null;
+      }
+      if (pendingRestoreKey === key) pendingRestoreKey = null;
+    }
+    function followGrowth() {
+      pendingRestoreKey = key;
+      const watching = new Set();
+      // Observing a child that leaves the DOM reports it with a zero rect,
+      // so a wholesale skeleton-for-content swap re-enters here on its own
+      // and picks up the replacement nodes; growth inside a child reports
+      // directly. Either wake rechecks the range against the target.
+      function watchChildren() {
+        for (const child of node.children) {
+          if (!watching.has(child)) {
+            watching.add(child);
+            observer.observe(child);
+          }
+        }
+        for (const child of watching) {
+          if (!child.isConnected) {
+            watching.delete(child);
+            observer.unobserve(child);
+          }
+        }
+      }
+      observer = new ResizeObserver(() => {
+        watchChildren();
+        if (!disposed && fitsTarget()) {
+          stopWaiting();
+          apply();
+        }
+      });
+      watchChildren();
+    }
+    function apply() {
+      node.scrollTo({ top: target, behavior: "instant" });
+    }
+
+    // Restore only after Svelte commits the incoming view, so the range we
+    // measure belongs to the new route.
+    tick().then(() => {
+      if (disposed) return;
+      if (fitsTarget()) {
+        stopWaiting();
+        apply();
+      } else followGrowth();
+    });
+
+    return () => {
+      disposed = true;
+      stopWaiting();
+    };
   });
 
   // Dynamic album/catalogue queues stay small. The next bounded page is

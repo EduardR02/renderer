@@ -388,46 +388,84 @@
   }
 
   /* ------------------------------------------------------- written by
-     The engine's verified songwriter playlist arrives whole inside the
-     overview — the playlist reference plus at most ten tracks, already in
-     the source order. This page adds nothing to it: no fetch of its own,
-     no skeleton, no count pill. A section the page cannot guarantee is a
-     section that must be able to simply not exist, so any payload without
-     an id or without rows erases it (`songwriter` is null) and the page
-     never notices.
+     The verified playlist is an optional enhancement, so it gets its own
+     request after BrowseArtist has painted the identity, Popular rows, and
+     shelves. The request key includes both canonical identity fields: an
+     answer for a previous artist can never populate this section after a
+     navigation race.
 
-     `tracks_total` rides along only for the expanded CTA's count; it is
-     metadata about the FULL playlist, not a popularity figure for these
-     rows, and stays unknown when absent. */
+     The engine returns the playlist reference plus at most ten source-order
+     tracks. A missing playlist or an empty track payload is intentionally
+     indistinguishable from no section: there is nothing useful to render. */
+  const songwriterArtistKey = $derived.by(() => {
+    const id = artist?.id ?? "";
+    const name = artist?.name ?? "";
+    return id && name ? `${id}\u0000${name}` : "";
+  });
+  let songwriterPayload = $state(null);
+  let songwriterLoading = $state(false);
+  let songwriterForArtist = $state("");
+  let songwriterRequestKey = "";
+  let songwriterExpanded = $state(false);
+  let songwriterRequestGeneration = 0;
+
+  $effect(() => {
+    const key = songwriterArtistKey;
+    if (key === songwriterRequestKey) return;
+    songwriterRequestKey = key;
+    const generation = ++songwriterRequestGeneration;
+    songwriterForArtist = key;
+    songwriterPayload = null;
+    songwriterExpanded = false;
+    songwriterLoading = false;
+    if (!key) return;
+
+    const id = artist?.id;
+    const name = artist?.name;
+    if (!id || !name) return;
+    songwriterLoading = true;
+    api
+      .browseArtistSongwriter(id, name)
+      .then((value) => {
+        if (generation !== songwriterRequestGeneration || songwriterArtistKey !== key) return;
+        songwriterLoading = false;
+        songwriterPayload = value ?? null;
+      })
+      .catch(() => {
+        if (generation !== songwriterRequestGeneration || songwriterArtistKey !== key) return;
+        songwriterLoading = false;
+      });
+  });
+
   const songwriter = $derived.by(() => {
-    const raw = overview?.songwriter_playlist ?? null;
+    if (songwriterForArtist !== songwriterArtistKey) return null;
+    const raw = songwriterPayload;
     const id = raw?.playlist?.id ?? "";
-    if (!id || !Array.isArray(raw.tracks) || !raw.tracks.length) return null;
+    if (!id || !Array.isArray(raw?.tracks) || !raw.tracks.length) return null;
     const total = Number(raw.playlist.tracks_total);
     return {
       id,
       tracks: raw.tracks.slice(0, POPULAR_EXPANDED),
-      total: Number.isFinite(total) ? Math.round(total) : 0,
+      total: Number.isFinite(total) && total > 0 ? Math.round(total) : 0,
     };
   });
-  /* Same rhythm as Popular: five rows, expansion reveals ten, and both are
-     prefix slices of one array so row indices need no remapping. Unlike
-     Popular there is no way back — the expanded state's single action is
-     leaving for the full playlist. */
-  let songwriterExpanded = $state(false);
   const visibleSongwriter = $derived(
     songwriter
       ? songwriter.tracks.slice(0, songwriterExpanded ? POPULAR_EXPANDED : POPULAR_PREVIEW)
       : [],
   );
-  /* The count appended to "Open full playlist", and only that: known (>0)
-     and larger than what the rows could ever show. */
   const songwriterTotal = $derived(
-    songwriter && songwriter.total > POPULAR_EXPANDED ? songwriter.total : 0,
+    songwriter ? songwriter.total || songwriter.tracks.length : 0,
+  );
+  const songwriterHasMore = $derived(
+    !!songwriter &&
+      (songwriter.tracks.length > POPULAR_PREVIEW || songwriter.total > POPULAR_PREVIEW),
   );
 
   function playSongwriter(i) {
     if (!songwriter?.tracks.length) return;
+    /* Direct row playback remains in the full playlist context, even though
+       only the first ten source rows are painted on this artist page. */
     api.playQueue(songwriter.tracks, i, `playlist:${songwriter.id}`).catch(() => {});
   }
 
@@ -754,6 +792,55 @@
       </div>
     {/if}
 
+    {#if songwriter}
+      <!--
+        WRITTEN BY — this arrives after the artist overview and is deliberately
+        optional. It sits immediately below Popular so the late response adds
+        one self-contained section without replacing any already-rendered page.
+        The rows stay in playlist source order and direct playback carries the
+        playlist context.
+      -->
+      <section class="section written-by" aria-labelledby="written-by-title">
+        <div class="section-head">
+          <h2 class="section-title" id="written-by-title">Written by</h2>
+        </div>
+        <TrackList
+          tracks={visibleSongwriter}
+          playFrom={playSongwriter}
+          showAlbum
+          showPlays
+          disableWindowing
+          queueContext={`playlist:${songwriter.id}`}
+        />
+        {#if songwriterExpanded}
+          <!-- Expanded state has one action only: leave for the complete
+               playlist. It never duplicates the collapsed action. -->
+          <button class="link-more popular-more" onclick={() => navigate("playlist", songwriter.id)}>
+            {songwriterTotal
+              ? `Open full playlist · ${NUMBER_FORMAT.format(songwriterTotal)} songs`
+              : "Open full playlist"}
+          </button>
+        {:else}
+          <div class="written-actions">
+            <button class="link-more written-open" onclick={() => navigate("playlist", songwriter.id)}>
+              {songwriterTotal
+                ? `Open full playlist · ${NUMBER_FORMAT.format(songwriterTotal)} songs`
+                : "Open full playlist"}
+            </button>
+            {#if songwriterHasMore}
+              <button
+                class="link-more popular-more"
+                aria-expanded={false}
+                onclick={() => (songwriterExpanded = true)}
+              >
+                See more
+              </button>
+            {/if}
+          </div>
+        {/if}
+      </section>
+    {/if}
+
     {#if hasReleases}
       <section class="section dx" aria-labelledby="dx-title">
         <div class="section-head">
@@ -884,56 +971,6 @@
       </section>
     {/if}
 
-    {#if songwriter}
-      <!--
-        WRITTEN BY — the one playlist about this artist that could be VERIFIED:
-        titled exactly "Written by <name>" and owned by Spotify itself. The
-        engine proved both before sending it, so the page renders no badge, no
-        owner line and no count pill — quietness here is what verification
-        buys. It is also the one section with nothing to recover from: if the
-        proof failed upstream, `songwriter` is null and there is no section.
-
-        Rows are the playlist's own order — a tracklist, not a ranking — so
-        they play directly in playlist context, and the only expanded action
-        hands you to the whole thing.
-      -->
-      <section class="section" aria-labelledby="written-by-title">
-        <div class="section-head">
-          <h2 class="section-title" id="written-by-title">Written by</h2>
-        </div>
-        <!-- Bounded exactly like Popular: every row rendered, none windowed,
-             five at first. -->
-        <TrackList
-          tracks={visibleSongwriter}
-          playFrom={playSongwriter}
-          showAlbum
-          showPlays
-          disableWindowing
-          queueContext={`playlist:${songwriter.id}`}
-        />
-        {#if songwriterExpanded}
-          <!-- Expanded, the section's one action becomes the exit: the full
-               playlist, counted only when its size is known to outrun these
-               ten rows. There is deliberately no way back to five. -->
-          <button class="link-more popular-more" onclick={() => navigate("playlist", songwriter.id)}>
-            {songwriterTotal
-              ? `Open full playlist · ${NUMBER_FORMAT.format(songwriterTotal)} songs`
-              : "Open full playlist"}
-          </button>
-        {:else if songwriter.tracks.length > POPULAR_PREVIEW}
-          <!-- Collapsed, the same left-aligned slot Popular uses; hidden rows
-               are all it promises. aria-expanded keeps the state honest to
-               ATs even though this one never collapses back. -->
-          <button
-            class="link-more popular-more"
-            aria-expanded={songwriterExpanded}
-            onclick={() => (songwriterExpanded = true)}
-          >
-            See more
-          </button>
-        {/if}
-      </section>
-    {/if}
 
     <!--
       ABOUT — the liner-note layer of this page, and it is set as one.
@@ -1160,7 +1197,7 @@
 
 
 
-    {#if !top.length && !hasReleases && !appearsOnCount && !popularReleases.length && !relatedArtists.length && !pick && !playlistShelves.artist.length && !playlistShelves.discovered.length && !songwriter}
+    {#if !top.length && !hasReleases && !appearsOnCount && !popularReleases.length && !relatedArtists.length && !pick && !playlistShelves.artist.length && !playlistShelves.discovered.length && !songwriter && !songwriterLoading}
       <div class="empty">
         <p class="h">Nothing to show for this artist.</p>
         <p class="sub">The engine returned no popular songs or releases.</p>
@@ -1186,6 +1223,13 @@
     grid-template-columns: repeat(var(--per-row, 5), minmax(0, 1fr));
   }
   .playlist-shelf { margin-top: var(--s1); }
+  .written-actions {
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--s4);
+    margin-top: var(--s4);
+  }
+  .written-actions .link-more { margin-top: 0; }
+  .written-open { color: var(--fg); }
+  .written-open:hover { color: var(--accent); }
   /* The overflow, named. It sits under the shelf rather than beside the
      heading because it is about the row you just looked at. */
   .shelf-more {

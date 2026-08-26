@@ -1050,6 +1050,17 @@ impl EngineClient {
         parse_data(reply, "browse_artist")
     }
 
+    pub async fn browse_artist_songwriter(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> Result<Option<spotify_playback_engine::protocol::SongwriterPlaylist>, String> {
+        let reply = self
+            .request("browse_artist_songwriter", json!({"id": id, "name": name}))
+            .await?;
+        parse_data(reply, "browse_artist_songwriter")
+    }
+
     pub async fn browse_artist_releases(
         &self,
         id: &str,
