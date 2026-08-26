@@ -743,6 +743,14 @@ pub struct RodioSink {
     ring: Arc<SampleRing>,
     output_rate: rodio::SampleRate,
     processing: Arc<Mutex<AudioProcessing>>,
+    /// Per-packet staging reused across writes so edited/resampled packets
+    /// allocate only the ring's own packet copy, not a fresh intermediate Vec
+    /// per stage. Only `write` (the player thread) touches them; they live on
+    /// the sink rather than in `AudioProcessing` because the finished packet
+    /// has to outlive the processing lock while the ring's backpressure wait
+    /// runs.
+    pipeline_scratch: Vec<f32>,
+    resampler_scratch: Vec<f32>,
     _stream: rodio::OutputStream,
 }
 
@@ -920,6 +928,8 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
         ring,
         output_rate,
         processing,
+        pipeline_scratch: Vec::new(),
+        resampler_scratch: Vec::new(),
         _stream: stream,
     }
 }
@@ -967,7 +977,6 @@ impl Sink for RodioSink {
         }
         Ok(())
     }
-
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         let ring_generation = self.ring.generation.load(Ordering::Acquire);
         let samples = packet
@@ -985,52 +994,79 @@ impl Sink for RodioSink {
         }
 
         let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
-        let (queued, loop_to_ms) = {
-            let mut processing = self
-                .processing
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            processing.synchronize_pipeline(revision);
-            let (processed, loop_to_ms) = if let Some(pipeline) = processing.pipeline.as_mut() {
-                let mut processed = Vec::new();
-                let loop_to_ms = pipeline.process(&samples_f32, &mut processed);
-                (processed, loop_to_ms)
-            } else {
-                // Load-bearing bypass: the ordinary 1.0/no-edit path hands
-                // converter output directly to the resampler/ring flow.
-                (samples_f32, None)
-            };
+        let processing = Arc::clone(&self.processing);
+        let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
+        processing.synchronize_pipeline(revision);
 
-            let queued = match &mut processing.resampler {
-                Some(resampler) => {
-                    let mut resampled = Vec::new();
-                    resampler.process(&processed, &mut resampled);
-                    resampled
+        if processing.pipeline.is_none() && processing.resampler.is_none() {
+            // Load-bearing bypass: the ordinary 1.0/no-edit path hands
+            // converter output directly to the ring flow, still move-based.
+            drop(processing);
+            return self.queue(ring_generation, revision, samples_f32, None);
+        }
+
+        // Edited or rate-converted packets render into the reusable scratch
+        // buffers; only the ring's own packet copy allocates.
+        self.pipeline_scratch.clear();
+        self.resampler_scratch.clear();
+        let (final_in_pipeline_scratch, loop_to_ms) =
+            match processing.pipeline.as_mut() {
+                Some(pipeline) => {
+                    let loop_to_ms = pipeline.process(&samples_f32, &mut self.pipeline_scratch);
+                    match processing.resampler.as_mut() {
+                        Some(resampler) => {
+                            resampler.process(&self.pipeline_scratch, &mut self.resampler_scratch);
+                            (false, loop_to_ms)
+                        }
+                        None => (true, loop_to_ms),
+                    }
                 }
-                None => processed,
+                None => {
+                    processing
+                        .resampler
+                        .as_mut()
+                        .expect("bypass case returned above")
+                        .process(&samples_f32, &mut self.resampler_scratch);
+                    (false, None)
+                }
             };
-            (queued, loop_to_ms)
+        drop(processing);
+        let queued = if final_in_pipeline_scratch {
+            &self.pipeline_scratch[..]
+        } else {
+            &self.resampler_scratch[..]
         };
+
         // Do not pace an empty customized packet. The ring's queued audible
         // samples already provide normal backpressure; sleeping for removed
         // source frames makes LiveSource emit underrun silence for the cut's
         // original duration, turning a cut into a mute.
-
         if queued.is_empty() && loop_to_ms.is_none() {
             return Ok(());
         }
 
-        // Backpressure: the ring holds about WRITE_AHEAD_MS of audio, small
-        // enough that seek/volume/track changes land almost immediately, large
-        // enough to absorb decode jitter. The wait is bounded so a dead audio
-        // thread cannot wedge the player thread forever: after
-        // WRITE_DRAIN_TIMEOUT the write fails with a normal sink error and
-        // librespot pauses playback (its `handle_packet` error path), which
-        // stops further writes and leaves the engine alive and recoverable.
+        self.queue(ring_generation, revision, queued.to_vec(), loop_to_ms)
+    }
+}
+
+impl RodioSink {
+    /// Hands one finished packet to the ring; the shared backpressure tail of
+    /// every write path. The wait is bounded so a dead audio thread cannot
+    /// wedge the player thread forever: after WRITE_DRAIN_TIMEOUT the write
+    /// fails with a normal sink error and librespot pauses playback (its
+    /// `handle_packet` error path), which stops further writes and leaves the
+    /// engine alive and recoverable.
+    fn queue(
+        &mut self,
+        ring_generation: u64,
+        revision: u64,
+        samples: Vec<f32>,
+        loop_to_ms: Option<u32>,
+    ) -> SinkResult<()> {
         self.ring
             .push_marked_at_generation(
                 ring_generation,
-                queued,
+                samples,
                 loop_to_ms,
                 loop_to_ms.map_or(0, |_| revision),
                 WRITE_DRAIN_TIMEOUT,

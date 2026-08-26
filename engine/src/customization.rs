@@ -3,6 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use spotify_playback_engine::atomic::replace_file_atomically;
 use spotify_playback_engine::protocol::{
     LoopRange, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
 };
@@ -337,45 +339,6 @@ impl TrackEditStore {
             .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
         replace_file_atomically(&temporary, &self.path)
             .map_err(|error| format!("could not install {}: {error}", self.path.display()))
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            flags: u32,
-        ) -> i32;
-    }
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }
 

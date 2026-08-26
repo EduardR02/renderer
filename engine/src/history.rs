@@ -2,9 +2,11 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use spotify_playback_engine::atomic::replace_file_atomically;
 use spotify_playback_engine::protocol::{HistoryItem, HistoryRow, TrackRef};
 
 const HISTORY_FILE: &str = "listening_history.json";
@@ -41,235 +43,39 @@ struct StoredHistoryRef<'a> {
 /// A bounded, memory-resident listening history backed by one atomic snapshot.
 ///
 /// The file always contains finalized rows and the recoverable active row
-/// together. It is loaded once; reads never revisit disk. An unreadable or
-/// invalid snapshot leaves the store read-only so a later playback event cannot
-/// replace user data with a fresh empty history.
+/// together. It is loaded once; reads never revisit disk. Writes are
+/// single-flight: every playback event queues a generation and one background
+/// writer serializes, fsyncs, and atomically replaces the complete snapshot
+/// off the transport loop, with superseded generations coalescing into the
+/// newest state. An unreadable or invalid snapshot leaves the store read-only
+/// so a later playback event cannot replace user data with a fresh empty
+/// history.
 pub struct ListeningHistory {
     root: PathBuf,
-    finalized: VecDeque<HistoryItem>,
-    active: Option<ActivePlay>,
     load_error: Option<String>,
+    /// Playback state and persistence bookkeeping, shared with the writer so
+    /// it can serialize the newest snapshot without blocking callers.
+    core: Arc<Mutex<HistoryCore>>,
 }
 
-impl ListeningHistory {
-    pub fn new(root: PathBuf) -> Self {
-        if root.as_os_str().is_empty() {
-            return Self {
-                root,
-                finalized: VecDeque::new(),
-                active: None,
-                load_error: None,
-            };
-        }
+/// Playback state plus the generation bookkeeping that keeps exactly one
+/// background writer draining snapshots to disk.
+struct HistoryCore {
+    finalized: VecDeque<HistoryItem>,
+    active: Option<ActivePlay>,
+    /// Bumped by every playback event that must reach the snapshot file.
+    requested_generation: u64,
+    /// Highest generation known to be fully on disk. Advances on success
+    /// only, which is what makes a failed write retry on the next event.
+    written_generation: u64,
+    /// Highest generation any writer has attempted. A failed attempt parks
+    /// here so the writer exits instead of spinning on a persistent error.
+    attempted_generation: u64,
+    /// True while one writer loop is draining generations.
+    worker_running: bool,
+}
 
-        let path = root.join(HISTORY_FILE);
-        match fs::read(&path) {
-            Ok(bytes) => match parse_snapshot(&path, &bytes) {
-                Ok(stored) => Self {
-                    root,
-                    finalized: stored.finalized,
-                    active: stored.active.map(|persisted| ActivePlay {
-                        persisted,
-                        playing_since: None,
-                    }),
-                    load_error: None,
-                },
-                Err(error) => {
-                    eprintln!("listening history persistence disabled: {error}");
-                    Self::read_only(root, error)
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self {
-                root,
-                finalized: VecDeque::new(),
-                active: None,
-                load_error: None,
-            },
-            Err(error) => {
-                let error = format!("could not read {}: {error}", path.display());
-                eprintln!("listening history persistence disabled: {error}");
-                Self::read_only(root, error)
-            }
-        }
-    }
-
-    fn read_only(root: PathBuf, error: String) -> Self {
-        Self {
-            root,
-            finalized: VecDeque::new(),
-            active: None,
-            load_error: Some(error),
-        }
-    }
-
-    /// Begins a logical play only after the authoritative `Playing` event.
-    /// Replacing an active play finalizes it and installs the new active row in
-    /// the same durable snapshot.
-    pub fn start(&mut self, track: &TrackRef) {
-        if self.root.as_os_str().is_empty() || !self.writable() {
-            return;
-        }
-
-        self.accrue_active();
-        if let Some(previous) = self.active.take() {
-            self.finalized.push_back(previous.persisted.item);
-        }
-        self.active = Some(ActivePlay {
-            persisted: PersistedActive {
-                item: HistoryItem {
-                    row: HistoryRow {
-                        track_id: track.id.clone(),
-                        started_at: now_millis(),
-                        ms_played: 0,
-                        completed: false,
-                        context: compact_context(&track.context),
-                    },
-                    track: sanitize_track(track),
-                },
-                duration_ms: track.duration_ms,
-            },
-            playing_since: Some(Instant::now()),
-        });
-        self.enforce_bound();
-        if let Err(error) = self.persist() {
-            // Keep the complete new state in memory. Pause, finalize, or the
-            // next track transition will retry the same atomic snapshot.
-            eprintln!("could not persist active listening history row: {error}");
-        }
-    }
-
-    pub fn resume(&mut self) {
-        let Some(active) = self.active.as_mut() else {
-            return;
-        };
-        if active.playing_since.is_some() {
-            return;
-        }
-        active.playing_since = Some(Instant::now());
-        if let Err(error) = self.persist() {
-            eprintln!("could not persist resumed listening history row: {error}");
-        }
-    }
-
-    pub fn start_or_resume(&mut self, track: &TrackRef) {
-        let same_track = self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.persisted.item.row.track_id == track.id);
-        if same_track {
-            self.resume();
-        } else {
-            self.start(track);
-        }
-    }
-
-    pub fn pause(&mut self) {
-        if !self.writable() {
-            return;
-        }
-        self.accrue_active();
-        if self.active.is_some() {
-            if let Err(error) = self.persist() {
-                eprintln!("could not persist paused listening history row: {error}");
-            }
-        }
-    }
-
-    /// Finalizes the current play. A failed atomic replace restores the active
-    /// row in memory, allowing a later transition to retry without duplication.
-    pub fn finalize(&mut self, completed: bool) -> bool {
-        if !self.writable() {
-            return false;
-        }
-        if self.active.is_none() {
-            return true;
-        }
-
-        self.accrue_active();
-        let mut active = self.active.take().expect("active play checked above");
-        if completed {
-            active.persisted.item.row.completed = true;
-            active.persisted.item.row.ms_played = u64::from(active.persisted.duration_ms);
-        }
-
-        let dropped = if self.finalized.len() >= MAX_HISTORY_ITEMS {
-            self.finalized.pop_front()
-        } else {
-            None
-        };
-        self.finalized.push_back(active.persisted.item.clone());
-        if let Err(error) = self.persist() {
-            self.finalized.pop_back();
-            if let Some(item) = dropped {
-                self.finalized.push_front(item);
-            }
-            self.active = Some(active);
-            eprintln!("could not persist listening history row: {error}");
-            return false;
-        }
-        true
-    }
-
-    /// Returns one capped snapshot, newest first, including the current play.
-    pub fn snapshot(&self) -> Result<Vec<HistoryItem>, String> {
-        if let Some(error) = &self.load_error {
-            return Err(format!("listening history is read-only: {error}"));
-        }
-        if self.root.as_os_str().is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut items = Vec::with_capacity(
-            (self.finalized.len() + usize::from(self.active.is_some())).min(MAX_HISTORY_ITEMS),
-        );
-        if let Some(active) = &self.active {
-            let mut item = active.persisted.item.clone();
-            if active.playing_since.is_some() {
-                item.row.ms_played = item
-                    .row
-                    .ms_played
-                    .saturating_add(elapsed_ms(active.playing_since))
-                    .min(u64::from(active.persisted.duration_ms));
-            }
-            items.push(item);
-        }
-        items.extend(self.finalized.iter().rev().cloned());
-        items.truncate(MAX_HISTORY_ITEMS);
-        Ok(items)
-    }
-
-    pub fn clear(&mut self) -> Result<(), String> {
-        self.ensure_writable()?;
-        if self.root.as_os_str().is_empty() {
-            return Ok(());
-        }
-
-        let finalized = std::mem::take(&mut self.finalized);
-        let active = self.active.take();
-        if let Err(error) = self.persist() {
-            self.finalized = finalized;
-            self.active = active;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn writable(&self) -> bool {
-        if let Some(error) = &self.load_error {
-            eprintln!("listening history mutation rejected: {error}");
-            false
-        } else {
-            true
-        }
-    }
-
-    fn ensure_writable(&self) -> Result<(), String> {
-        match &self.load_error {
-            Some(error) => Err(format!("listening history is read-only: {error}")),
-            None => Ok(()),
-        }
-    }
-
+impl HistoryCore {
     fn accrue_active(&mut self) {
         let Some(active) = self.active.as_mut() else {
             return;
@@ -292,18 +98,311 @@ impl ListeningHistory {
             self.finalized.pop_front();
         }
     }
+}
 
-    fn persist(&self) -> Result<(), String> {
+impl ListeningHistory {
+    pub fn new(root: PathBuf) -> Self {
+        if root.as_os_str().is_empty() {
+            return Self::from_parts(root, VecDeque::new(), None, None);
+        }
+
+        let path = root.join(HISTORY_FILE);
+        match fs::read(&path) {
+            Ok(bytes) => match parse_snapshot(&path, &bytes) {
+                Ok(stored) => {
+                    let active = stored.active.map(|persisted| ActivePlay {
+                        persisted,
+                        playing_since: None,
+                    });
+                    Self::from_parts(root, stored.finalized, active, None)
+                }
+                Err(error) => {
+                    eprintln!("listening history persistence disabled: {error}");
+                    Self::read_only(root, error)
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::from_parts(root, VecDeque::new(), None, None)
+            }
+            Err(error) => {
+                let error = format!("could not read {}: {error}", path.display());
+                eprintln!("listening history persistence disabled: {error}");
+                Self::read_only(root, error)
+            }
+        }
+    }
+
+    fn from_parts(
+        root: PathBuf,
+        finalized: VecDeque<HistoryItem>,
+        active: Option<ActivePlay>,
+        load_error: Option<String>,
+    ) -> Self {
+        Self {
+            root,
+            load_error,
+            core: Arc::new(Mutex::new(HistoryCore {
+                finalized,
+                active,
+                requested_generation: 0,
+                written_generation: 0,
+                attempted_generation: 0,
+                worker_running: false,
+            })),
+        }
+    }
+
+    fn read_only(root: PathBuf, error: String) -> Self {
+        Self::from_parts(root, VecDeque::new(), None, Some(error))
+    }
+
+    /// Begins a logical play only after the authoritative `Playing` event.
+    /// Replacing an active play finalizes it and installs the new active row
+    /// in the same durable snapshot.
+    pub fn start(&mut self, track: &TrackRef) {
+        if self.root.as_os_str().is_empty() || !self.writable() {
+            return;
+        }
+
+        {
+            let mut core = self.lock_core();
+            core.accrue_active();
+            if let Some(previous) = core.active.take() {
+                core.finalized.push_back(previous.persisted.item);
+            }
+            core.active = Some(ActivePlay {
+                persisted: PersistedActive {
+                    item: HistoryItem {
+                        row: HistoryRow {
+                            track_id: track.id.clone(),
+                            started_at: now_millis(),
+                            ms_played: 0,
+                            completed: false,
+                            context: compact_context(&track.context),
+                        },
+                        track: sanitize_track(track),
+                    },
+                    duration_ms: track.duration_ms,
+                },
+                playing_since: Some(Instant::now()),
+            });
+            core.enforce_bound();
+        }
+        // A failed background write leaves the store dirty; pause, finalize,
+        // or the next transition queues a fresh generation and retries.
+        self.persist();
+    }
+
+    pub fn resume(&mut self) {
+        {
+            let mut core = self.lock_core();
+            let Some(active) = core.active.as_mut() else {
+                return;
+            };
+            if active.playing_since.is_some() {
+                return;
+            }
+            active.playing_since = Some(Instant::now());
+        }
+        self.persist();
+    }
+
+    pub fn start_or_resume(&mut self, track: &TrackRef) {
+        let same_track = {
+            let core = self.lock_core();
+            core.active
+                .as_ref()
+                .is_some_and(|active| active.persisted.item.row.track_id == track.id)
+        };
+        if same_track {
+            self.resume();
+        } else {
+            self.start(track);
+        }
+    }
+
+    pub fn pause(&mut self) {
+        if !self.writable() {
+            return;
+        }
+        let has_active = {
+            let mut core = self.lock_core();
+            core.accrue_active();
+            core.active.is_some()
+        };
+        if has_active {
+            self.persist();
+        }
+    }
+
+    /// Finalizes the current play. The snapshot itself is written by the
+    /// single-flight background writer; a failed write leaves the store dirty
+    /// so the next playback event retries the same complete snapshot.
+    pub fn finalize(&mut self, completed: bool) -> bool {
+        if !self.writable() {
+            return false;
+        }
+        {
+            let mut core = self.lock_core();
+            if core.active.is_none() {
+                return true;
+            }
+
+            core.accrue_active();
+            let mut active = core.active.take().expect("active play checked above");
+            if completed {
+                active.persisted.item.row.completed = true;
+                active.persisted.item.row.ms_played = u64::from(active.persisted.duration_ms);
+            }
+
+            if core.finalized.len() >= MAX_HISTORY_ITEMS {
+                core.finalized.pop_front();
+            }
+            core.finalized.push_back(active.persisted.item);
+        }
+        self.persist();
+        true
+    }
+
+    /// Returns one capped snapshot, newest first, including the current play.
+    pub fn snapshot(&self) -> Result<Vec<HistoryItem>, String> {
+        if let Some(error) = &self.load_error {
+            return Err(format!("listening history is read-only: {error}"));
+        }
+        if self.root.as_os_str().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let core = self.lock_core();
+        let mut items = Vec::with_capacity(
+            (core.finalized.len() + usize::from(core.active.is_some())).min(MAX_HISTORY_ITEMS),
+        );
+        if let Some(active) = &core.active {
+            let mut item = active.persisted.item.clone();
+            if active.playing_since.is_some() {
+                item.row.ms_played = item
+                    .row
+                    .ms_played
+                    .saturating_add(elapsed_ms(active.playing_since))
+                    .min(u64::from(active.persisted.duration_ms));
+            }
+            items.push(item);
+        }
+        items.extend(core.finalized.iter().rev().cloned());
+        items.truncate(MAX_HISTORY_ITEMS);
+        Ok(items)
+    }
+
+    pub fn clear(&mut self) -> Result<(), String> {
+        self.ensure_writable()?;
         if self.root.as_os_str().is_empty() {
             return Ok(());
         }
-        self.ensure_writable()?;
-        let snapshot = StoredHistoryRef {
-            version: HISTORY_VERSION,
-            finalized: &self.finalized,
-            active: self.active.as_ref().map(|active| &active.persisted),
+
+        {
+            let mut core = self.lock_core();
+            core.finalized.clear();
+            core.active = None;
+        }
+        self.persist();
+        Ok(())
+    }
+
+    fn writable(&self) -> bool {
+        if let Some(error) = &self.load_error {
+            eprintln!("listening history mutation rejected: {error}");
+            false
+        } else {
+            true
+        }
+    }
+
+    fn ensure_writable(&self) -> Result<(), String> {
+        match &self.load_error {
+            Some(error) => Err(format!("listening history is read-only: {error}")),
+            None => Ok(()),
+        }
+    }
+
+    fn lock_core(&self) -> MutexGuard<'_, HistoryCore> {
+        self.core.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queues the newest state for persistence and keeps exactly one writer
+    /// loop draining generations. Inside the engine runtime the
+    /// serialize+fsync+replace work runs on the blocking pool, so transport
+    /// events never wait on disk; with no runtime (tests) it drains inline and
+    /// stays synchronous and deterministic. `written_generation` advances on
+    /// success only, so a failed write is retried by the next playback event.
+    fn persist(&self) {
+        if self.root.as_os_str().is_empty() || self.load_error.is_some() {
+            return;
+        }
+        let start_worker = {
+            let mut core = self.lock_core();
+            core.requested_generation = core.requested_generation.wrapping_add(1).max(1);
+            let start_worker = !core.worker_running;
+            core.worker_running = true;
+            start_worker
         };
-        write_json_atomic(&self.root.join(HISTORY_FILE), &snapshot)
+        if start_worker {
+            self.spawn_persistence_worker();
+        }
+    }
+
+    fn spawn_persistence_worker(&self) {
+        let core = Arc::clone(&self.core);
+        let path = self.root.join(HISTORY_FILE);
+        match tokio::runtime::Handle::try_current() {
+            // Off the async loop: serialize, fsync, and MoveFileExW belong on
+            // the blocking pool, not inside the engine's select loop.
+            Ok(handle) => {
+                handle.spawn_blocking(move || drain_persistence(core, path));
+            }
+            Err(_) => drain_persistence(core, path),
+        }
+    }
+}
+
+/// Lock recovery: every history field update is one uninterruptible step
+/// behind this mutex, so the state behind a poison is consistent and safe to
+/// reuse.
+fn lock_history_core(core: &Mutex<HistoryCore>) -> MutexGuard<'_, HistoryCore> {
+    core.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Drains requested generations until the store is caught up, or until a
+/// failed write parks the attempt counter so retry waits for the next
+/// playback event instead of spinning. Each iteration serializes the newest
+/// complete snapshot under the lock and writes it outside the lock, so the
+/// file holds a recoverable state — finalized rows and the active row
+/// together — at every instant and never lands behind an older generation
+/// than the one before it.
+fn drain_persistence(core: Arc<Mutex<HistoryCore>>, path: PathBuf) {
+    loop {
+        let (target, serialized) = {
+            let mut core = lock_history_core(&core);
+            if core.requested_generation <= core.attempted_generation {
+                // Caught up, or the last attempt failed and no newer event has
+                // arrived: release the single worker slot either way.
+                core.worker_running = false;
+                return;
+            }
+            core.attempted_generation = core.requested_generation;
+            let target = core.requested_generation;
+            let serialized = serde_json::to_vec(&StoredHistoryRef {
+                version: HISTORY_VERSION,
+                finalized: &core.finalized,
+                active: core.active.as_ref().map(|active| &active.persisted),
+            })
+            .map_err(|error| format!("could not serialize {}: {error}", path.display()));
+            (target, serialized)
+        };
+
+        match serialized.and_then(|bytes| write_snapshot_atomic(&path, &bytes)) {
+            Ok(()) => lock_history_core(&core).written_generation = target,
+            Err(error) => eprintln!("could not persist listening history: {error}"),
+        }
     }
 }
 
@@ -389,9 +488,9 @@ fn elapsed_ms(since: Option<Instant>) -> u64 {
         .unwrap_or(0)
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| format!("could not serialize {}: {error}", path.display()))?;
+/// Writes one complete snapshot: create parent, temp file, fsync, atomic
+/// replace. The caller serializes; this only owns the durable handoff.
+fn write_snapshot_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
@@ -399,56 +498,19 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
     let temporary = path.with_extension("json.tmp");
     let mut file = File::create(&temporary)
         .map_err(|error| format!("could not create {}: {error}", temporary.display()))?;
-    file.write_all(&bytes)
+    file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
     replace_file_atomically(&temporary, path)
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
 }
 
-#[cfg(not(windows))]
-fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            flags: u32,
-        ) -> i32;
-    }
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use spotify_playback_engine::protocol::{TimeRange, TrackEdit};
+    use std::time::Duration;
 
     fn scratch() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -528,16 +590,19 @@ mod tests {
     fn snapshot_is_newest_first_and_caps_active_plus_finalized() {
         let root = scratch();
         let mut history = ListeningHistory::new(root.clone());
-        for index in 0..MAX_HISTORY_ITEMS {
-            let track = track(&format!("track-{index}"));
-            history.finalized.push_back(HistoryItem {
-                row: HistoryRow {
-                    track_id: track.id.clone(),
-                    started_at: index as i64,
-                    ..HistoryRow::default()
-                },
-                track: sanitize_track(&track),
-            });
+        {
+            let mut core = history.lock_core();
+            for index in 0..MAX_HISTORY_ITEMS {
+                let track = track(&format!("track-{index}"));
+                core.finalized.push_back(HistoryItem {
+                    row: HistoryRow {
+                        track_id: track.id.clone(),
+                        started_at: index as i64,
+                        ..HistoryRow::default()
+                    },
+                    track: sanitize_track(&track),
+                });
+            }
         }
         history.start(&track("active"));
 
@@ -589,6 +654,43 @@ mod tests {
         assert!(!track.cached);
         assert!(track.context.is_empty());
         assert!(track.effective_edit.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The single-flight writer must coalesce superseded generations: whatever
+    /// lands on disk is the newest complete snapshot, never an older one.
+    #[tokio::test]
+    async fn background_writer_drains_superseded_snapshots_to_the_latest_state() {
+        let root = scratch();
+        let mut history = ListeningHistory::new(root.clone());
+        history.start(&track("first"));
+        // Supersedes the first start while its snapshot may still be queued.
+        history.start(&track("second"));
+        history.pause();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let caught_up = {
+                    let core = history.lock_core();
+                    !core.worker_running
+                        && core.written_generation == core.requested_generation
+                };
+                if caught_up {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the single-flight writer must drain every queued generation");
+
+        let recovered = ListeningHistory::new(root.clone());
+        let items = recovered.snapshot().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].row.track_id, "second");
+        assert!(!items[0].row.completed);
+        assert_eq!(items[1].row.track_id, "first");
 
         let _ = fs::remove_dir_all(root);
     }

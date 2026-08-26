@@ -340,9 +340,15 @@ fn any_file_on_disk(files: impl IntoIterator<Item = FileId>, cache: &Cache) -> b
 /// an id string and a handful of 20-byte file ids per track, so ten thousand
 /// tracks sit comfortably under a megabyte. It is memory-only on purpose — a
 /// file id outliving the metadata it came from would send us looking for the
-/// wrong file, and a browse refills it for free.
+/// wrong file, and a browse refills it for free. Growth is bounded anyway
+/// ([`FILE_IDS_CAPACITY`]): overwriting a known track is refresh-only, so a
+/// long session ages out its stalest parse instead of growing without limit.
 static FILE_IDS: LazyLock<RwLock<HashMap<String, TrackFiles>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+/// The id index is process-lifetime state with no explicit retirement, so its
+/// worst case is declared here rather than trusted: one entry per distinct
+/// track id parsed this session, refreshed whenever that payload reparses.
+const FILE_IDS_CAPACITY: usize = 10_000;
 
 /// Canvas answers are intentionally process-memory only. A panel opening can
 /// revisit one track several times, but Canvas is not part of ordinary browse
@@ -373,6 +379,13 @@ fn remember_canvas(uri: &str, value: Option<Canvas>) {
     let Ok(mut cache) = CANVAS_CACHE.lock() else {
         return;
     };
+    let key_is_absent = !cache.contains_key(uri);
+    evict_oldest_for_fresh_key(
+        &mut cache,
+        CANVAS_CACHE_MAX,
+        key_is_absent,
+        |entry| entry.fetched_at,
+    );
     cache.insert(
         uri.to_owned(),
         CanvasCacheEntry {
@@ -380,16 +393,6 @@ fn remember_canvas(uri: &str, value: Option<Canvas>) {
             value,
         },
     );
-    while cache.len() > CANVAS_CACHE_MAX {
-        let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.fetched_at)
-            .map(|(uri, _)| uri.clone())
-        else {
-            break;
-        };
-        cache.remove(&oldest);
-    }
 }
 
 /// Explicit logout/session reset hook. Canvas is not persisted across users.
@@ -399,8 +402,35 @@ pub fn clear_canvas_cache() {
     }
 }
 
-#[derive(Default)]
+/// The one bounded-growth rule every browse cache shares: when a fresh key
+/// joins a map already at capacity, the stalest resident makes room. Only a
+/// genuinely new key can evict — refreshing an existing entry never touches
+/// anyone else — so the caller reports whether the key was absent.
+fn evict_oldest_for_fresh_key<K, V>(
+    entries: &mut HashMap<K, V>,
+    capacity: usize,
+    key_is_absent: bool,
+    fetched_at_of: impl Fn(&V) -> Instant,
+) where
+    K: Clone + Eq + std::hash::Hash,
+{
+    if !key_is_absent || entries.len() < capacity {
+        return;
+    }
+    let oldest = entries
+        .iter()
+        .min_by_key(|(_, entry)| fetched_at_of(entry))
+        .map(|(key, _)| key.clone());
+    if let Some(oldest) = oldest {
+        entries.remove(&oldest);
+    }
+}
+
+
 struct TrackFiles {
+    /// When the payload behind these ids was parsed. This is the stamp
+    /// [`FILE_IDS`] ages entries by, not a freshness signal.
+    fetched_at: Instant,
     files: Vec<FileId>,
     /// The recordings librespot may substitute for this one. A region-replaced
     /// track carries no files of its own and plays from one of these, so a
@@ -413,10 +443,18 @@ fn remember_track_files(id: &str, track: &Track) {
         return;
     }
     let entry = TrackFiles {
+        fetched_at: Instant::now(),
         files: track.files.values().copied().collect(),
         alternatives: track.alternatives.0.iter().map(id_of).collect(),
     };
     if let Ok(mut index) = FILE_IDS.write() {
+        let key_is_absent = !index.contains_key(id);
+        evict_oldest_for_fresh_key(
+            &mut index,
+            FILE_IDS_CAPACITY,
+            key_is_absent,
+            |entry| entry.fetched_at,
+        );
         index.insert(id.to_owned(), entry);
     }
 }
@@ -1886,28 +1924,6 @@ fn balanced_artist_release_page<'a>(
     page
 }
 
-async fn resolve_artist_release_page(
-    session: &Session,
-    groups: &[Vec<SpotifyUri>; 4],
-    release_types: &[String],
-    offset: usize,
-    limit: usize,
-) -> Result<spotify_playback_engine::protocol::ArtistReleasePage, String> {
-    let selected = selected_release_group_indices(release_types)?;
-    let total = selected
-        .iter()
-        .map(|&index| groups[index].len())
-        .sum::<usize>();
-    let limit = limit.clamp(1, MAX_ARTIST_RELEASE_PAGE);
-    let page: Vec<(usize, &SpotifyUri)> = selected
-        .iter()
-        .flat_map(|&index| groups[index].iter().map(move |uri| (index, uri)))
-        .skip(offset)
-        .take(limit)
-        .collect();
-    resolve_artist_release_entries(session, page, total, offset, limit).await
-}
-
 async fn resolve_initial_artist_release_page(
     session: &Session,
     groups: &[Vec<SpotifyUri>; 4],
@@ -2166,8 +2182,8 @@ async fn cached_songwriter_playlist(
     artist_id: &str,
     canonical_artist_name: &str,
 ) -> Option<SongwriterPlaylist> {
-    if let Ok(cache) = SONGWRITER_PLAYLIST_CACHE.lock() {
-        if let Some(value) = cache.get(artist_id) {
+    if let Ok(mut cache) = SONGWRITER_PLAYLIST_CACHE.lock() {
+        if let Some(value) = cache.get(artist_id, Instant::now()) {
             return value;
         }
     }
@@ -2268,20 +2284,6 @@ pub async fn artist_browse(
     })
 }
 
-pub async fn artist_releases_browse(
-    session: &Session,
-    id: &str,
-    release_types: &[String],
-    offset: usize,
-    limit: usize,
-) -> Result<spotify_playback_engine::protocol::ArtistReleasePage, String> {
-    let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
-        .map_err(|error| format!("invalid artist id: {error}"))?;
-    let artist: Artist = metadata_get(session, &uri, "artist").await?;
-    let groups = artist_release_groups(&artist);
-    resolve_artist_release_page(session, &groups, release_types, offset, limit).await
-}
-
 #[derive(Clone)]
 struct CatalogueReleaseSeed {
     header: spotify_playback_engine::protocol::AlbumBrowse,
@@ -2349,18 +2351,13 @@ impl CatalogueManifestCache {
     fn insert(&mut self, key: CatalogueManifestKey, releases: Arc<[SpotifyUri]>, now: Instant) {
         self.entries
             .retain(|_, entry| now.duration_since(entry.fetched_at) < CATALOGUE_MANIFEST_TTL);
-        if !self.entries.contains_key(&key)
-            && self.entries.len() >= CATALOGUE_MANIFEST_CACHE_CAPACITY
-        {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.fetched_at)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                self.entries.remove(&oldest);
-            }
-        }
+        let key_is_absent = !self.entries.contains_key(&key);
+        evict_oldest_for_fresh_key(
+            &mut self.entries,
+            CATALOGUE_MANIFEST_CACHE_CAPACITY,
+            key_is_absent,
+            |entry| entry.fetched_at,
+        );
         self.entries.insert(
             key,
             CatalogueManifestEntry {
@@ -3700,6 +3697,11 @@ const ARTIST_OVERVIEW_CACHE_CAPACITY: usize = 64;
 /// the engine owns one authenticated session and this cache disappears with
 /// that process. The capacity matches the existing artist-overview cache.
 const SONGWRITER_PLAYLIST_CACHE_CAPACITY: usize = ARTIST_OVERVIEW_CACHE_CAPACITY;
+/// Mirrors the artist-overview pairing: a real playlist survives a normal
+/// revisit window, while a failed discovery must not hammer search on every
+/// Back-and-forth either.
+const SONGWRITER_PLAYLIST_SUCCESS_TTL: Duration = Duration::from_secs(5 * 60);
+const SONGWRITER_PLAYLIST_FAILURE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct SongwriterPlaylistCacheEntry {
@@ -3713,31 +3715,39 @@ struct SongwriterPlaylistCache {
 }
 
 impl SongwriterPlaylistCache {
-    fn get(&self, artist_id: &str) -> Option<Option<SongwriterPlaylist>> {
-        self.entries.get(artist_id).map(|entry| entry.value.clone())
+    fn ttl(value: &Option<SongwriterPlaylist>) -> Duration {
+        if value.is_some() {
+            SONGWRITER_PLAYLIST_SUCCESS_TTL
+        } else {
+            SONGWRITER_PLAYLIST_FAILURE_TTL
+        }
     }
 
-    fn insert(
-        &mut self,
-        artist_id: String,
-        value: Option<SongwriterPlaylist>,
-        fetched_at: Instant,
-    ) {
-        if !self.entries.contains_key(&artist_id)
-            && self.entries.len() >= SONGWRITER_PLAYLIST_CACHE_CAPACITY
-        {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.fetched_at)
-                .map(|(artist_id, _)| artist_id.clone());
-            if let Some(oldest) = oldest {
-                self.entries.remove(&oldest);
-            }
+    /// Entries expire the same way the artist-overview ones do, so a stale
+    /// playlist hint cannot outlive its shelf life by resting unread.
+    fn get(&mut self, artist_id: &str, now: Instant) -> Option<Option<SongwriterPlaylist>> {
+        let entry = self.entries.get(artist_id)?;
+        if now.duration_since(entry.fetched_at) >= Self::ttl(&entry.value) {
+            self.entries.remove(artist_id);
+            return None;
         }
+        Some(entry.value.clone())
+    }
+
+    fn insert(&mut self, artist_id: String, value: Option<SongwriterPlaylist>, now: Instant) {
+        self.entries.retain(|_, entry| {
+            now.duration_since(entry.fetched_at) < Self::ttl(&entry.value)
+        });
+        let key_is_absent = !self.entries.contains_key(&artist_id);
+        evict_oldest_for_fresh_key(
+            &mut self.entries,
+            SONGWRITER_PLAYLIST_CACHE_CAPACITY,
+            key_is_absent,
+            |entry| entry.fetched_at,
+        );
         self.entries.insert(
             artist_id,
-            SongwriterPlaylistCacheEntry { fetched_at, value },
+            SongwriterPlaylistCacheEntry { fetched_at: now, value },
         );
     }
 }
@@ -3840,17 +3850,13 @@ impl ArtistOverviewCache {
     ) {
         self.entries
             .retain(|_, entry| now.duration_since(entry.fetched_at) < Self::ttl(&entry.value));
-        if !self.entries.contains_key(&key) && self.entries.len() >= ARTIST_OVERVIEW_CACHE_CAPACITY
-        {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.fetched_at)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                self.entries.remove(&oldest);
-            }
-        }
+        let key_is_absent = !self.entries.contains_key(&key);
+        evict_oldest_for_fresh_key(
+            &mut self.entries,
+            ARTIST_OVERVIEW_CACHE_CAPACITY,
+            key_is_absent,
+            |entry| entry.fetched_at,
+        );
         self.entries.insert(
             key,
             ArtistOverviewCacheEntry {
@@ -5585,7 +5591,7 @@ mod tests {
     }
 
     #[test]
-    fn songwriter_cache_remembers_positive_negative_and_capacity() {
+    fn songwriter_cache_caches_negatives_expires_them_and_stays_bounded() {
         let reference = PlaylistRef {
             id: "0123456789ABCDEFGHIJKL".to_owned(),
             uri: "spotify:user:spotify:playlist:0123456789ABCDEFGHIJKL".to_owned(),
@@ -5610,15 +5616,33 @@ mod tests {
         cache.insert("positive".to_owned(), Some(value.clone()), now);
         assert_eq!(
             cache
-                .get("positive")
+                .get("positive", now)
                 .and_then(|entry| entry)
                 .map(|entry| entry.tracks.len()),
             Some(1)
         );
+        assert!(
+            cache.get("positive", now + Duration::from_millis(1)).is_some(),
+            "a fresh success answers from the cache"
+        );
+        assert!(
+            cache
+                .get("positive", now + SONGWRITER_PLAYLIST_SUCCESS_TTL)
+                .is_none(),
+            "successes expire on the overview schedule"
+        );
         cache.insert("negative".to_owned(), None, now);
         assert!(
-            cache.get("negative").is_some_and(|entry| entry.is_none()),
+            cache
+                .get("negative", now + SONGWRITER_PLAYLIST_FAILURE_TTL - Duration::from_millis(1))
+                .is_some_and(|entry| entry.is_none()),
             "a miss is cached as a negative result"
+        );
+        assert!(
+            cache
+                .get("negative", now + SONGWRITER_PLAYLIST_FAILURE_TTL)
+                .is_none(),
+            "misses share the overview failure lifetime"
         );
 
         let mut bounded = SongwriterPlaylistCache::default();
@@ -5637,6 +5661,25 @@ mod tests {
         assert_eq!(bounded.entries.len(), SONGWRITER_PLAYLIST_CACHE_CAPACITY);
         assert!(!bounded.entries.contains_key("artist-0"));
         assert!(bounded.entries.contains_key("artist-new"));
+    }
+
+    /// The shared bounded-growth rule must never evict on refresh, and must
+    /// always sacrifice the stalest resident rather than an arbitrary one.
+    #[test]
+    fn eviction_rule_never_touches_a_refresh_and_drops_the_stalest_fresh_key() {
+        let now = Instant::now();
+        let mut entries: HashMap<String, Instant> = HashMap::new();
+        for index in 0..3usize {
+            entries.insert(index.to_string(), now + Duration::from_secs(index as u64));
+        }
+
+        evict_oldest_for_fresh_key(&mut entries, 3, false, |stamp| *stamp);
+        assert_eq!(entries.len(), 3, "refreshing an existing key evicts nothing");
+
+        evict_oldest_for_fresh_key(&mut entries, 3, true, |stamp| *stamp);
+        assert_eq!(entries.len(), 2);
+        assert!(!entries.contains_key("0"), "the stalest resident made room");
+        assert!(entries.contains_key("2"), "the freshest resident survived");
     }
 
     #[test]

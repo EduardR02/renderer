@@ -12,6 +12,7 @@ use librespot_audio::{AudioDecrypt, AudioFile, StreamLoaderController};
 use librespot_core::{cache::Cache, FileId, Session, SpotifyId, SpotifyUri};
 use librespot_metadata::audio::{AudioFileFormat, AudioFiles, AudioItem};
 use librespot_playback::decoder::{AudioDecoder, SymphoniaDecoder};
+use spotify_playback_engine::atomic::replace_file_atomically;
 use spotify_playback_engine::protocol::TrackWaveform;
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
@@ -150,22 +151,19 @@ impl WaveformService {
         let cache_directory = self.cache_directory.clone();
         let worker = self.worker.clone();
         let outcomes = self.outcomes.clone();
-        tokio::spawn(async move {
-            let result = run_job(
+        tokio::spawn(drive_job(
+            outcomes,
+            track_id.clone(),
+            generation,
+            run_job(
                 session,
                 cache,
                 cache_directory,
-                track_id.clone(),
+                track_id,
                 cancellation,
                 worker,
-            )
-            .await;
-            let _ = outcomes.send(WorkerOutcome {
-                track_id,
-                generation,
-                result,
-            });
-        });
+            ),
+        ));
     }
 
     /// Returns get-request ids that should immediately receive cancellation.
@@ -186,6 +184,27 @@ impl WaveformService {
         self.worker.close();
         self.jobs.cancel_all()
     }
+}
+
+/// Runs one decode job on a task of its own so a panic inside it becomes an
+/// observable [`WorkerOutcome`] failure instead of silently dropping the only
+/// sender and stranding the job book entry — and every queued request id
+/// waiting on it — forever.
+async fn drive_job(
+    outcomes: mpsc::UnboundedSender<WorkerOutcome>,
+    track_id: String,
+    generation: u64,
+    job: impl Future<Output = Result<TrackWaveform, String>> + Send + 'static,
+) {
+    let result = match tokio::spawn(job).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("waveform worker panicked: {error}")),
+    };
+    let _ = outcomes.send(WorkerOutcome {
+        track_id,
+        generation,
+        result,
+    });
 }
 
 async fn run_job(
@@ -627,45 +646,6 @@ fn write_artifact_atomic(path: &Path, duration_ms: u32, payload: &[u8]) -> Resul
     write_result
 }
 
-#[cfg(not(windows))]
-fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "Kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            flags: u32,
-        ) -> i32;
-    }
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_payload(duration_ms: u32, payload: &[u8]) -> Result<(), String> {
     let expected = bin_count(duration_ms)
         .checked_mul(4)
@@ -983,6 +963,37 @@ mod tests {
         assert!(worker.clone().try_acquire_owned().is_err());
         drop(first);
         assert!(worker.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_panicked_worker_still_answers_every_queued_request() {
+        // The regression: a worker panic used to drop the only outcome sender,
+        // so the job book entry leaked and every queued request id hung
+        // forever. drive_job must turn the JoinError into a failed outcome.
+        // The deliberate panic below unwinds through the process-global
+        // std::panic hook, which tests elsewhere in this binary install and
+        // restore around their own windows; take the shared crate test lock so
+        // this report never fires while another hook is half-installed.
+        let _guard = crate::tests::TEST_PANIC_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (outcomes, mut receiver) = mpsc::unbounded_channel();
+        drive_job(
+            outcomes,
+            "panicking-track".to_owned(),
+            3,
+            async {
+                panic!("the decoder task exploded");
+            },
+        )
+        .await;
+        let outcome = receiver.recv().await.expect("a panic must still produce an outcome");
+        assert_eq!(outcome.track_id, "panicking-track");
+        assert_eq!(outcome.generation, 3);
+        let error = outcome
+            .result
+            .expect_err("a panic must surface as a failed waveform response");
+        assert!(error.contains("panicked"), "unexpected error: {error}");
     }
 
     #[test]
