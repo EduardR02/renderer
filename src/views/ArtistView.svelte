@@ -808,7 +808,6 @@
           tracks={visibleSongwriter}
           playFrom={playSongwriter}
           showAlbum
-          showPlays
           disableWindowing
           queueContext={`playlist:${songwriter.id}`}
         />

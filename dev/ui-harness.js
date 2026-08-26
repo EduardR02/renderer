@@ -506,6 +506,10 @@ window.__TAURI_INTERNALS__ = {
         return clone(fixtures.songwriterPlaylist);
       case "browse_playlist":
         return clone(detailFor(args.id ?? args.playlistId));
+      case "browse_canvas":
+        return {
+          url: "https://res.cloudinary.com/demo/video/upload/ar_9:16,c_fill,w_720/samples/sea-turtle.mp4",
+        };
       case "get_app_settings":
       case "get_settings":
         return clone(settings);
@@ -759,6 +763,16 @@ Object.assign(window.__harness, {
   navigate: (name, id = null, param = null) => state.navigate(name, id, param),
   back: () => state.goBack(),
   forward: () => state.goForward(),
+  selectCanvasDemo: () => {
+    const track = playback.queue[playback.current_index];
+    if (track) {
+      track.cover_url =
+        "https://res.cloudinary.com/demo/video/upload/so_0,ar_1:1,c_fill,w_720/samples/sea-turtle.jpg";
+    }
+    settings.animated_canvas = true;
+    emit("settings", clone(settings));
+    emitState();
+  },
   openEditor: (trackId = playback.current_uri, playlistId = "p1") => {
     const track = findTrack(trackId);
     state.openTrackEditor(track, playlistId);

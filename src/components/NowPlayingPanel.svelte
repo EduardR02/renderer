@@ -28,7 +28,7 @@
   let canvasTrack = $state("");
   let canvasUrl = $state("");
   let canvasReady = $state(false);
-  let canvasOrientation = $state("");
+  let canvasStageRatio = $state(100);
   let canvasEl = $state(null);
   let pageVisible = $state(!document.hidden);
   let reducedMotion = $state(false);
@@ -66,7 +66,7 @@
     canvasTrack = key;
     canvasUrl = "";
     canvasReady = false;
-    canvasOrientation = "";
+    canvasStageRatio = 100;
     if (!shouldFetch) return;
     api.browseCanvas(key)
       .then((canvas) => {
@@ -103,18 +103,21 @@
   });
 
   function handleCanvasReady() {
-    /* Readiness carries the frame's true ratio: classify once, here, so CSS
-       only ever pins the long axis and the square sleeve never resizes. */
+    /* Readiness carries the frame's true dimensions: write the natural ratio
+       into --stage-open as a padding-top percentage against the rail width.
+       The box adopts the ratio and the video object-fits inside it, so the
+       source can never crop, and the square-to-ratio growth is what pushes
+       the blocks below down through normal flow. */
     const w = canvasEl?.videoWidth ?? 0;
     const h = canvasEl?.videoHeight ?? 0;
-    canvasOrientation = h > w ? "portrait" : w > h ? "landscape" : "";
+    if (w > 0 && h > 0) canvasStageRatio = (h / w) * 100;
     canvasReady = true;
   }
 
   function handleCanvasError() {
     canvasUrl = "";
     canvasReady = false;
-    canvasOrientation = "";
+    canvasStageRatio = 100;
   }
 
   /* Credits are content in this panel, not a destination, so they load with
@@ -168,7 +171,15 @@
          rather than from the palette, and it costs one composited layer. When
          the cover is missing, the generated tile supplies the same glow from
          the Rose Pine accents, so the block never looks empty. -->
-    <div class="np-stage">
+    <!-- The stage opens as the square cover at full rail width. When the
+         Canvas reports readiness, --stage-open reshapes the box to the
+         frame's real ratio and one calm timeline breathes it open, recedes
+         the cover beneath, and pours the video down over it. -->
+    <div
+      class="np-stage"
+      class:play={canvasReady}
+      style:--stage-open={`${canvasStageRatio.toFixed(4)}%`}
+    >
       <span class="np-glow" aria-hidden="true">
         <Cover src={current.cover_url} id={current.album_id || current.uri} name="" fill />
       </span>
@@ -178,15 +189,10 @@
           id={current.album_id || current.uri}
           name={current.album_name || current.name}
           fill
-          lg
-          raised
         />
         {#if canvasUrl && canvasTrack === canvasTrackKey}
           <video
             class="np-canvas"
-            class:portrait={canvasOrientation === "portrait"}
-            class:landscape={canvasOrientation === "landscape"}
-            class:canvasReady={canvasReady}
             bind:this={canvasEl}
             src={canvasUrl}
             muted
@@ -199,7 +205,7 @@
           ></video>
         {/if}
       </div>
-      </div>
+    </div>
     <div class="np-block np-identity">
       <h2>{current.name}</h2>
       <ArtistLinks

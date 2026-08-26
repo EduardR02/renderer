@@ -499,51 +499,90 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    content instead of from the palette. It is a static composited layer — no
    animation, no per-frame cost — and it degrades correctly: with no artwork
    the generated tile is a Rose Pine gradient, so the glow is still on-palette. */
-.np-stage { position: relative; flex: none; padding: var(--s1) var(--s4) var(--s5); }
+.np-stage {
+  /* Media-region geometry. At rest the region is the square cover; when the
+     Canvas video reports readiness the component writes the frame's real
+     ratio into --stage-open as a padding-top percentage. Percentages
+     interpolate, so the handoff tweens instead of snapping, and the taller
+     box moves every block below it in normal flow — the layout shift itself
+     is the choreography. */
+  --ease-open: cubic-bezier(0.32, 0.72, 0.08, 1);
+  position: relative; flex: none;
+}
 .np-glow {
-  position: absolute; z-index: 0; inset: var(--s4) var(--s5) var(--s6);
-  display: block; filter: blur(38px) saturate(1.5); opacity: 0.5;
-  transform: translateY(8px) scale(1.02);
+  position: absolute; z-index: 0; inset: -6% 7% 12%;
+  display: block; filter: blur(46px) saturate(1.5); opacity: 0.4;
+  transform: translateY(28px) scale(1.03);
   pointer-events: none;
 }
 .np-glow .art { box-shadow: none; border-radius: var(--r4); }
 .np-glow .art.gen::after { content: none; }
 @media (prefers-reduced-transparency: reduce) { .np-glow { display: none; } }
-.np-art { position: relative; z-index: 1; width: 100%; aspect-ratio: 1; --tile: 288px; }
+
+/* The ratio box: full rail width, no gutter. Height comes from the strut —
+   percentage padding resolves against the width, so the box is always exactly
+   width × ratio: the square cover until a video proves otherwise. The cover
+   is the backing print; the canvas and the grounding mat overlay it. */
+.np-art { position: relative; z-index: 1; overflow: hidden; --tile: 288px; }
+.np-art::before { content: ""; display: block; padding-top: 100%; }
+.np-stage.play .np-art::before {
+  padding-top: var(--stage-open);
+  transition: padding-top 1.15s var(--ease-open);
+}
+/* While the region is square the cover IS the stage at rest; once the box
+   outgrows the square, object-fit cover keeps it filling (a quiet zoom) while
+   the recede hands prominence to the video. Full bleed, so the tile chrome —
+   radius, ring, lift shadows — is deliberately stripped here. */
+.np-art .art {
+  position: absolute; inset: 0;
+  border-radius: 0; box-shadow: none;
+  filter: brightness(0.94) saturate(1.04);
+}
+.np-stage.play .np-art .art { animation: np-recede 1.2s var(--ease-open) both; }
+/* The Canvas, full rail width, sized by the box and never by itself: contain
+   means the source cannot crop even if a source's dimensions ever disagree
+   with the box. Hidden until live, so the cover owns the opening state. */
 .np-canvas {
-  /* Centered inside the square sleeve at the video's own ratio: auto size,
-     clamped to the frame, contained by object-fit. Nothing here resizes the
-     sleeve — a portrait loop simply reveals the cover beneath as side backing
-     wherever the frame is narrower than the square. */
-  position: absolute; z-index: 2; inset: 0;
-  display: block; margin: auto;
-  width: auto; height: auto;
-  max-width: 100%; max-height: 100%;
+  position: absolute; inset: 0; z-index: 2;
+  display: block; width: 100%; height: 100%;
   object-fit: contain; object-position: center;
-  border-radius: var(--r4);
   opacity: 0; pointer-events: none;
-  transform: translateZ(0);
-  contain: paint;
-  transition: opacity var(--d2) var(--ease);
 }
-/* Ratio classes come from videoWidth/videoHeight at readiness and pin the
-   long axis, so the max clamps resolve deterministically at any source size. */
-.np-canvas.portrait { height: 100%; }
-.np-canvas.landscape { width: 100%; }
-.np-canvas.canvasReady { opacity: 1; }
+.np-stage.play .np-canvas { animation: np-pour 1.3s cubic-bezier(0.3, 0.6, 0.1, 1) 0.18s both; }
+/* Grounding: hairline frame, a breath of top light, a seat at the bottom edge
+   before the identity block. Static — one composited layer, no motion. */
+.np-art::after {
+  content: ""; position: absolute; z-index: 3; inset: 0; pointer-events: none;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 14%),
+    linear-gradient(180deg, transparent 64%, rgba(4, 8, 9, 0.4) 100%);
+}
+/* Reveal timeline once the video is decodable: the box breathes open (1.15s)
+   → the canvas pours down out of the cover (1.3s, from 180ms) while the cover
+   recedes beneath it (1.2s). Every settled state is the base style and each
+   animation declares its own `from`, so an interrupted run simply arrives
+   finished. Dropping .play (error, track change) removes the transition with
+   the state, returning to the square cover in one step. */
+@keyframes np-pour {
+  from { opacity: 0; clip-path: inset(0 0 100% 0); transform: scale(1.045); }
+  40%  { opacity: 1; }
+  to   { opacity: 1; clip-path: inset(0 0 0 0); transform: scale(1); }
+}
+@keyframes np-recede {
+  from { filter: brightness(0.94) saturate(1.04); transform: scale(1); }
+  to   { filter: brightness(0.4) saturate(1.02); transform: scale(1.06); }
+}
 @media (prefers-reduced-motion: reduce) {
-  .np-canvas { transition: none; }
-}
-/* The sleeve casts its own colour rather than a neutral black. Two shadows:
-   one dark for the lift, one tinted and wider for the light. */
-.np-art .art.raised {
-  box-shadow:
-    var(--ring),
-    0 16px 36px -12px rgba(0, 0, 0, 0.85),
-    0 22px 54px -18px color-mix(in srgb, var(--tone-glow) 72%, transparent);
+  .np-stage.play .np-art::before { transition: none; }
+  .np-stage.play .np-art .art { animation: none; }
+  .np-stage.play .np-canvas { animation: none; opacity: 1; }
 }
 
 .np-block { flex: none; padding: 0 var(--s4); min-width: 0; }
+/* The full-bleed stage carries no bottom gutter, so the identity block
+   brings its own gap. */
+.np-identity { margin-top: var(--s5); }
 .np-identity h2 {
   font-family: var(--font-display); font-size: var(--t-23); font-weight: var(--w-bold);
   letter-spacing: -0.02em; line-height: 1.16; overflow-wrap: anywhere;
