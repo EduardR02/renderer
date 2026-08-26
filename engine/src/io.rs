@@ -229,7 +229,7 @@ fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Input, decode_request};
+    use super::{decode_request, Input};
     use spotify_playback_engine::protocol::Command;
 
     #[test]

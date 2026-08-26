@@ -473,8 +473,17 @@ export const library = $state([]);
  * a sentence explaining that there are none. Without this flag every cold
  * start showed "No playlists yet" for the length of the round trip, which is
  * an error message for a state that is not an error.
+ *
+ * `fresh` is the narrower claim: the current rows are the authoritative
+ * rootlist answer, not the cached disk snapshot that hydrates the first
+ * paint. Only the backend `library` event promotes it — and so does a
+ * completed play, whose recency this client just made authoritative itself.
+ * The cached `get_state` pull hydrates without promoting, and an actual
+ * logout or account switch demotes it until the next account's own event.
+ * Home's provisional shelves wait on `fresh`, so a stale snapshot can never
+ * mount listening-history rows that the fresh answer immediately reshuffles.
  */
-export const libraryState = $state({ loaded: false });
+export const libraryState = $state({ loaded: false, fresh: false });
 /**
  * The payload behind the current detail route, plus why there isn't one.
  *
@@ -678,6 +687,9 @@ function observeSearchSession(payload) {
       resetSearchForSession();
       resetPersonalizedDiscoveryForSession();
       clearPlaylistRecommendationsCache();
+      // The previous account's recency must not leak into the next session's
+      // Home: shelves stay hidden until the new account's own `library` event.
+      libraryState.fresh = false;
     }
   }
 
@@ -1260,7 +1272,7 @@ function activityValue(playlist) {
   return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY;
 }
 
-export function setLibrary(playlists) {
+export function setLibrary(playlists, { fresh = false } = {}) {
   const ordered = [...(playlists ?? [])];
   ordered.sort((left, right) => {
     const a = activityValue(left);
@@ -1273,6 +1285,9 @@ export function setLibrary(playlists) {
   // Sidebar and all library-derived views now share activity order even when
   // the first payload came from an older on-disk snapshot.
   libraryState.loaded = true;
+  // Freshness is opt-in: the cached get_state pull hydrates the grid through
+  // this same door without promoting itself to authoritative rootlist data.
+  if (fresh) libraryState.fresh = true;
 }
 
 /**
@@ -1289,7 +1304,13 @@ export function promotePlaylist(id, { played = false } = {}) {
   const playlist = library[index];
   const at = activityNow();
   playlist.last_activity = at;
-  if (played) playlist.last_played = at;
+  if (played) {
+    playlist.last_played = at;
+    // A completed play is itself recency authority: Home may show this
+    // action's shelf row immediately instead of waiting for the engine to
+    // echo a rootlist whose interesting part we already know.
+    libraryState.fresh = true;
+  }
   if (index === 0) return true;
   library.splice(index, 1);
   library.unshift(playlist);
@@ -1540,13 +1561,21 @@ export const api = {
       throw error;
     });
   },
-  playQueue: (queue, index, context = "") => {
+  /**
+   * `automaticStart` marks a queue start that must respect the playlist's
+   * skip preference: the engine begins at `index` only when that row is not
+   * excluded (the caller picks an included row; see PlaylistView) and then
+   * advances past excluded rows. Direct plays — a clicked row, a search hit —
+   * keep the default false and play exactly what was asked for.
+   */
+  playQueue: (queue, index, context = "", { automaticStart = false } = {}) => {
     clearLazyQueue();
     const source = String(context ?? "").trim();
     return invoke("play_queue", {
       queue: contextTracks(queue, source),
       index,
       context: source,
+      automaticStart,
     });
   },
   playQueueIndex: (index) => invoke("play_queue_index", { index }),
@@ -1595,6 +1624,12 @@ export const api = {
       playlistId,
       trackId,
       enabled: !!enabled,
+    }),
+  setPlaylistTrackExcluded: (playlistId, trackId, excluded) =>
+    invoke("set_playlist_track_excluded", {
+      playlistId,
+      trackId,
+      excluded: !!excluded,
     }),
   /**
    * `limit` applies to every section the server returns, not just the three we
@@ -1850,7 +1885,9 @@ export async function initEvents() {
     }
   }).catch(() => {});
   listen("session", (e) => applySession(e.payload)).catch(() => {});
-  listen("library", (e) => setLibrary(e.payload)).catch(() => {});
+  // The one authoritative rootlist answer; the only writer that promotes
+  // `libraryState.fresh` (a completed play may also, via promotePlaylist).
+  listen("library", (e) => setLibrary(e.payload, { fresh: true })).catch(() => {});
   // A mutation's refreshed summary patches the one library row it names;
   // full rootlist answers still arrive as `library`.
   listen("playlist_summary", (e) => applyPlaylistSummary(e.payload)).catch(() => {});

@@ -880,12 +880,9 @@ mod tests {
             audible_source_frames.first().copied(),
             Some(ms_to_frame(70) as usize)
         );
-        assert!(
-            audible_source_frames
-                .iter()
-                .all(|frame| *frame < ms_to_frame(90) as usize
-                    || *frame >= ms_to_frame(110) as usize)
-        );
+        assert!(audible_source_frames
+            .iter()
+            .all(|frame| *frame < ms_to_frame(90) as usize || *frame >= ms_to_frame(110) as usize));
         assert_eq!(audible_source_frames.last().copied(), Some(end - 1));
     }
 

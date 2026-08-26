@@ -410,10 +410,12 @@
     api.touchPlaylist(pl.id).catch(() => {});
   }
 
-  function playQueue(queue, index) {
+  function playQueue(queue, index, options = undefined) {
     // Do not promote or persist a failed play. This keeps `last_played`
     // exclusive to actual playback, rather than an attempted command.
-    return api.playQueue(queue, index, `playlist:${pl?.id ?? ""}`).then(() => {
+    // `options` is only ever `{ automaticStart: true }` from the header;
+    // a clicked row passes nothing and plays exactly what was clicked.
+    return api.playQueue(queue, index, `playlist:${pl?.id ?? ""}`, options).then(() => {
       markPlayed();
     });
   }
@@ -443,13 +445,45 @@
     return tracks.some((track) => track.uri === uri);
   });
 
+  /* ---------------- Skips ----------------
+     The playlist's local skip preference arrives on the browse payload as
+     `excluded_track_ids` and stays live in the detail store: TrackList patches
+     THIS array when a row menu toggles, so this Set, the marks on screen and
+     the header's idea of where to begin move together with no refetch. */
+  const excludedTrackIds = $derived(pl?.excluded_track_ids ?? null);
+
+  const skippedSet = $derived.by(
+    () => new Set((excludedTrackIds ?? []).map(String)),
+  );
+
+  /**
+   * Where AUTOMATIC playback may begin: the first row that is neither skipped
+   * nor unavailable. Direct plays never consult this — clicking a skipped row
+   * still plays that row, which is what makes the preference a preference.
+   */
+  const automaticStartIndex = $derived(
+    sortedTracks.findIndex(
+      (track) => !track.unavailable && !skippedSet.has(String(track.id)),
+    ),
+  );
+
+  /**
+   * Said once, calmly, beside the buttons when automatic playback has nowhere
+   * legal to start. Derived rather than set-and-cleared, so including a row
+   * again takes the sentence away without anyone remembering to.
+   */
+  const automaticStartBlocked = $derived(
+    pl && tracks.length > 0 && automaticStartIndex < 0
+      ? "Every song in this playlist is skipped or unavailable."
+      : "",
+  );
+
   /**
    * Play, or pause/resume what this playlist already started.
    *
-   * Restarting from track one when the playlist is already playing is the
-   * behaviour of a button that has not been told what is going on: the glyph
-   * says play while music from this very list is coming out of the speakers,
-   * and pressing it throws away the listener's position.
+   * Automatic starts begin at the first row the skip preference allows; a
+   * start with nowhere legal to begin does nothing here — the sentence beside
+   * the buttons explains why — and never falls through to an excluded row.
    */
   function playOrToggle() {
     if (playingThis) {
@@ -457,15 +491,15 @@
       return;
     }
     const queue = sortedTracks;
-    if (!queue.length) return;
-    playQueue(queue, 0).catch(() => {});
+    if (!queue.length || automaticStartIndex < 0) return;
+    playQueue(queue, automaticStartIndex, { automaticStart: true }).catch(() => {});
   }
 
   function shufflePlay() {
     const queue = sortedTracks;
-    if (!queue.length) return;
+    if (!queue.length || automaticStartIndex < 0) return;
     api.setShuffle(true).catch(() => {});
-    playQueue(queue, 0).catch(() => {});
+    playQueue(queue, automaticStartIndex, { automaticStart: true }).catch(() => {});
   }
 
   function closeMenu(returnFocus = false) {
@@ -720,6 +754,12 @@
           </div>
           {/if}
         </div>
+        {#if automaticStartBlocked}
+          <!-- Calm by design: grey type under the controls, not a red banner.
+               Nothing failed — the listener chose this, and including any row
+               again takes it away. -->
+          <p class="start-blocked" role="alert">{automaticStartBlocked}</p>
+        {/if}
       </div>
     </header>
 
@@ -734,6 +774,7 @@
           sortKey={sortState.key}
           sortDirection={sortState.direction}
           onSort={toggleSort}
+          excludedTrackIds={excludedTrackIds}
           onReorder={editable && ownOrderShown ? reorderTracks : null}
         />
       </div>

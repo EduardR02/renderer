@@ -102,7 +102,11 @@ fn move_op(from: usize, to: usize) -> p4::Op {
 /// the MOV wire's insert-before index over the pre-move list: moving down
 /// skips the slot the move itself vacates. Moving up needs no adjustment.
 fn insert_before_index(from: usize, to: usize) -> usize {
-    if to > from { to.saturating_add(1) } else { to }
+    if to > from {
+        to.saturating_add(1)
+    } else {
+        to
+    }
 }
 
 /// UPDATE_LIST_ATTRIBUTES op setting the playlist name.

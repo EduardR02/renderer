@@ -165,6 +165,8 @@
     appearsOnRetry = 0;
     busy = "";
     playError = "";
+    popularExpanded = false;
+    songwriterExpanded = false;
   });
 
   /* An overview may be refreshed independently of the catalogue payload. Do
@@ -361,10 +363,15 @@
   }
 
   /* Popular opens at five. Ten rows of a table before you reach the covers
-     buries the thing the page is actually for. */
+     buries the thing the page is actually for; expanding reveals up to ten,
+     never past it. Both views are prefix slices, so row indices stay aligned
+     with `top` and direct play needs no remapping. */
   const POPULAR_PREVIEW = 5;
+  const POPULAR_EXPANDED = 10;
   let popularExpanded = $state(false);
-  const visibleTop = $derived(popularExpanded ? top : top.slice(0, POPULAR_PREVIEW));
+  const visibleTop = $derived(
+    top.slice(0, popularExpanded ? POPULAR_EXPANDED : POPULAR_PREVIEW),
+  );
 
   function playTop(i) {
     if (top.length) api.playQueue(top, i, `artist:${artist?.id ?? ""}`).catch(() => {});
@@ -378,6 +385,50 @@
 
   function openArtistRadio() {
     if (artist?.id) navigate("radio", `artist:${artist.id}`);
+  }
+
+  /* ------------------------------------------------------- written by
+     The engine's verified songwriter playlist arrives whole inside the
+     overview — the playlist reference plus at most ten tracks, already in
+     the source order. This page adds nothing to it: no fetch of its own,
+     no skeleton, no count pill. A section the page cannot guarantee is a
+     section that must be able to simply not exist, so any payload without
+     an id or without rows erases it (`songwriter` is null) and the page
+     never notices.
+
+     `tracks_total` rides along only for the expanded CTA's count; it is
+     metadata about the FULL playlist, not a popularity figure for these
+     rows, and stays unknown when absent. */
+  const songwriter = $derived.by(() => {
+    const raw = overview?.songwriter_playlist ?? null;
+    const id = raw?.playlist?.id ?? "";
+    if (!id || !Array.isArray(raw.tracks) || !raw.tracks.length) return null;
+    const total = Number(raw.playlist.tracks_total);
+    return {
+      id,
+      tracks: raw.tracks.slice(0, POPULAR_EXPANDED),
+      total: Number.isFinite(total) ? Math.round(total) : 0,
+    };
+  });
+  /* Same rhythm as Popular: five rows, expansion reveals ten, and both are
+     prefix slices of one array so row indices need no remapping. Unlike
+     Popular there is no way back — the expanded state's single action is
+     leaving for the full playlist. */
+  let songwriterExpanded = $state(false);
+  const visibleSongwriter = $derived(
+    songwriter
+      ? songwriter.tracks.slice(0, songwriterExpanded ? POPULAR_EXPANDED : POPULAR_PREVIEW)
+      : [],
+  );
+  /* The count appended to "Open full playlist", and only that: known (>0)
+     and larger than what the rows could ever show. */
+  const songwriterTotal = $derived(
+    songwriter && songwriter.total > POPULAR_EXPANDED ? songwriter.total : 0,
+  );
+
+  function playSongwriter(i) {
+    if (!songwriter?.tracks.length) return;
+    api.playQueue(songwriter.tracks, i, `playlist:${songwriter.id}`).catch(() => {});
   }
 
   /* A shelf card knows an id and nothing else, so playing it costs one browse
@@ -685,15 +736,21 @@
       <div class="section">
         <div class="section-head">
           <h2 class="section-title">Popular</h2>
-          {#if top.length > POPULAR_PREVIEW}
-            <button class="link-more" onclick={() => (popularExpanded = !popularExpanded)}>
-              {popularExpanded ? "Show less" : `Show all ${top.length}`}
-            </button>
-          {/if}
         </div>
         <!-- Popular is a bounded section of a longer page, so it renders all
              rows and owns no shared-pane scroll/resize pipeline. -->
         <TrackList tracks={visibleTop} playFrom={playTop} showAlbum={false} showPlays disableWindowing queueContext={`artist:${artist?.id ?? ""}`} />
+        {#if top.length > POPULAR_PREVIEW}
+          <!-- The expander sits where the eye leaves row five, not across the
+               page in the header; aria-expanded keeps it honest to ATs. -->
+          <button
+            class="link-more popular-more"
+            aria-expanded={popularExpanded}
+            onclick={() => (popularExpanded = !popularExpanded)}
+          >
+            {popularExpanded ? "Show less" : "See more"}
+          </button>
+        {/if}
       </div>
     {/if}
 
@@ -824,6 +881,57 @@
             {@render playlistCard(playlist)}
           {/each}
         </div>
+      </section>
+    {/if}
+
+    {#if songwriter}
+      <!--
+        WRITTEN BY — the one playlist about this artist that could be VERIFIED:
+        titled exactly "Written by <name>" and owned by Spotify itself. The
+        engine proved both before sending it, so the page renders no badge, no
+        owner line and no count pill — quietness here is what verification
+        buys. It is also the one section with nothing to recover from: if the
+        proof failed upstream, `songwriter` is null and there is no section.
+
+        Rows are the playlist's own order — a tracklist, not a ranking — so
+        they play directly in playlist context, and the only expanded action
+        hands you to the whole thing.
+      -->
+      <section class="section" aria-labelledby="written-by-title">
+        <div class="section-head">
+          <h2 class="section-title" id="written-by-title">Written by</h2>
+        </div>
+        <!-- Bounded exactly like Popular: every row rendered, none windowed,
+             five at first. -->
+        <TrackList
+          tracks={visibleSongwriter}
+          playFrom={playSongwriter}
+          showAlbum
+          showPlays
+          disableWindowing
+          queueContext={`playlist:${songwriter.id}`}
+        />
+        {#if songwriterExpanded}
+          <!-- Expanded, the section's one action becomes the exit: the full
+               playlist, counted only when its size is known to outrun these
+               ten rows. There is deliberately no way back to five. -->
+          <button class="link-more popular-more" onclick={() => navigate("playlist", songwriter.id)}>
+            {songwriterTotal
+              ? `Open full playlist · ${NUMBER_FORMAT.format(songwriterTotal)} songs`
+              : "Open full playlist"}
+          </button>
+        {:else if songwriter.tracks.length > POPULAR_PREVIEW}
+          <!-- Collapsed, the same left-aligned slot Popular uses; hidden rows
+               are all it promises. aria-expanded keeps the state honest to
+               ATs even though this one never collapses back. -->
+          <button
+            class="link-more popular-more"
+            aria-expanded={songwriterExpanded}
+            onclick={() => (songwriterExpanded = true)}
+          >
+            See more
+          </button>
+        {/if}
       </section>
     {/if}
 
@@ -1052,7 +1160,7 @@
 
 
 
-    {#if !top.length && !hasReleases && !appearsOnCount && !popularReleases.length && !relatedArtists.length && !pick && !playlistShelves.artist.length && !playlistShelves.discovered.length}
+    {#if !top.length && !hasReleases && !appearsOnCount && !popularReleases.length && !relatedArtists.length && !pick && !playlistShelves.artist.length && !playlistShelves.discovered.length && !songwriter}
       <div class="empty">
         <p class="h">Nothing to show for this artist.</p>
         <p class="sub">The engine returned no popular songs or releases.</p>

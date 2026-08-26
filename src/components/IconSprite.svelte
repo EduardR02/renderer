@@ -49,5 +49,12 @@
      `evenodd` is what cuts the arrow out, so the row's own background shows
      through and the glyph stays correct on hover and on the playing row. -->
 <symbol id="i-cached" viewBox="0 0 24 24"><path fill="currentColor" fill-rule="evenodd" d="M12 2.6a9.4 9.4 0 1 0 0 18.8 9.4 9.4 0 0 0 0-18.8Zm1.3 4.6h-2.6v4.5H8.4L12 16.6l3.6-4.9h-2.3V7.2Z"/></symbol>
+<!-- The playlist-skip mark: a thin ring with one diagonal stroke through it.
+     Outlined, not filled, on purpose — it sits in the subtitle line as quiet
+     status next to the solid cached disc, and a filled prohibition sign there
+     would shout "blocked" about what is only a listening preference. Same
+     1.8 stroke as every other small outline glyph, so it holds its shape at
+     the 13px it renders at instead of going mushy. -->
+<symbol id="i-skipped" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M6.1 6.1 17.9 17.9"/></symbol>
 <symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M10.2 13.8a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7l-1.7 1.7"/><path d="M13.8 10.2a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.7-1.7"/></symbol>
 </defs></svg>

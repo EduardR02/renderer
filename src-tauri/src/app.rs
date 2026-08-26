@@ -231,6 +231,12 @@ pub struct PlaylistTracksEntry {
     /// Playlist4 revision hex; the Web API snapshot id.
     pub revision: String,
     pub tracks: Vec<Track>,
+    /// Playlist-local tracks skipped by automatic playback.
+    ///
+    /// Older cache files do not carry this field; missing data means no
+    /// exclusions, while fresh engine browses replace it authoritatively.
+    #[serde(default)]
+    pub excluded_track_ids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +541,7 @@ pub fn playlist_detail_from_cache(state: &AppState, entry: PlaylistTracksEntry) 
     PlaylistDetail {
         playlist,
         tracks: entry.tracks,
+        excluded_track_ids: entry.excluded_track_ids,
     }
 }
 
@@ -1071,6 +1078,7 @@ mod tests {
                     fetched_at: Some(id),
                     revision: String::new(),
                     tracks: vec![track("t")],
+                    excluded_track_ids: Vec::new(),
                 },
             );
         }
@@ -1086,6 +1094,7 @@ mod tests {
             fetched_at: Some(1),
             revision: "old".into(),
             tracks: vec![track("a")],
+            excluded_track_ids: Vec::new(),
         }];
         upsert_tracks_cache(
             &mut cache,
@@ -1094,6 +1103,7 @@ mod tests {
                 fetched_at: Some(2),
                 revision: "new".into(),
                 tracks: vec![track("b")],
+                excluded_track_ids: vec!["b".into()],
             },
         );
         assert_eq!(cache.len(), 1);
@@ -1109,12 +1119,14 @@ mod tests {
             fetched_at: Some(1),
             revision: "rev".into(),
             tracks: vec![track("t")],
+            excluded_track_ids: vec!["t".into()],
         };
         let detail = playlist_detail_from_cache(&state, entry);
         assert_eq!(detail.playlist.id, "p1");
         assert_eq!(detail.playlist.uri, "spotify:playlist:p1");
         assert_eq!(detail.playlist.snapshot_id, "rev");
         assert_eq!(detail.playlist.tracks_total, 1);
+        assert_eq!(detail.excluded_track_ids, vec!["t"]);
         assert_eq!(detail.tracks[0].id, "t");
     }
 
@@ -1130,6 +1142,7 @@ mod tests {
                 track_with_cover("b", "cover-a"),
                 track_with_cover("c", "cover-b"),
             ],
+            excluded_track_ids: Vec::new(),
         };
         let detail = playlist_detail_from_cache(&state, entry);
         assert_eq!(detail.playlist.cover_urls, vec!["cover-a", "cover-b"]);
@@ -1431,6 +1444,10 @@ mod tests {
         );
         assert!(track.artist_ids.iter().all(|id| id.is_empty()));
         assert_eq!(track.artist_id, "a1");
+        assert!(
+            loaded[0].excluded_track_ids.is_empty(),
+            "legacy detail caches default to no exclusions"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1449,6 +1466,7 @@ mod tests {
                 cached: true,
                 ..track("t")
             }],
+            excluded_track_ids: Vec::new(),
         }];
         save_tracks_cache(&dir, &entries);
         assert!(
@@ -1467,12 +1485,14 @@ mod tests {
             fetched_at: Some(42),
             revision: "rev".into(),
             tracks: vec![track("t")],
+            excluded_track_ids: vec!["t".into()],
         }];
         save_tracks_cache(&dir, &entries);
         let loaded = load_tracks_cache(&dir);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "p1");
         assert_eq!(loaded[0].revision, "rev");
+        assert_eq!(loaded[0].excluded_track_ids, vec!["t"]);
         assert_eq!(loaded[0].tracks[0].id, "t");
         let _ = std::fs::remove_dir_all(&dir);
     }

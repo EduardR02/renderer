@@ -319,6 +319,25 @@ impl Engine {
     ) -> Result<(), String> {
         self.track_edits.set_enabled(playlist_id, track_id, enabled)
     }
+    pub fn playlist_excluded_track_ids(&self, playlist_id: &str) -> Result<Vec<String>, String> {
+        self.track_edits.list_excluded_track_ids(playlist_id)
+    }
+
+    pub fn set_playlist_track_excluded(
+        &mut self,
+        playlist_id: &str,
+        track_id: &str,
+        excluded: bool,
+    ) -> Result<(), String> {
+        self.track_edits
+            .set_excluded(playlist_id, track_id, excluded)?;
+        // Exclusion changes never stop or reload the current track. They do
+        // change every future choice, including a pending shuffle/preload
+        // decision, so rebuild those cheap plans immediately.
+        self.rebuild_shuffle_pool();
+        self.preload_next();
+        Ok(())
+    }
 
     pub fn emit_state(&self) -> Result<(), String> {
         let current_uri = self
@@ -967,6 +986,7 @@ impl Engine {
             | Command::SaveTrackEdit { .. }
             | Command::DeleteTrackEdit { .. }
             | Command::SetPlaylistTrackEditEnabled { .. }
+            | Command::SetPlaylistTrackExcluded { .. }
             | Command::EditCreatePlaylist { .. }
             | Command::EditRenamePlaylist { .. }
             | Command::EditDeletePlaylist { .. }
@@ -978,7 +998,14 @@ impl Engine {
                 index,
                 position_ms,
                 context,
-            } => self.play_queue(queue, index, position_ms, context),
+                automatic_start,
+            } => self.play_queue_with_automatic_start(
+                queue,
+                index,
+                position_ms,
+                context,
+                automatic_start,
+            ),
             Command::RestoreQueue {
                 queue,
                 index,
@@ -1212,6 +1239,22 @@ impl Engine {
                     .resolve(&track.id, track.duration_ms, &track.context);
         }
     }
+    /// Eligibility is intentionally derived from the live row context and
+    /// store on every transition. Queue snapshots carry no exclusion bit, so
+    /// changing a preference immediately affects future choices without
+    /// rewriting or reloading the queue.
+    fn automatic_track_eligible(&self, index: usize) -> bool {
+        self.state.queue.get(index).is_some_and(|track| {
+            // Editor previews are a separate direct playback surface. Their
+            // source row may retain a playlist context, but playlist
+            // exclusions must never interfere with preview transport.
+            if self.preview_mode {
+                !track.unavailable
+            } else {
+                automatic_track_eligible(&self.track_edits, track)
+            }
+        })
+    }
 
     fn configure_current_audio_at_loop_pass(&mut self, position_ms: u32, loop_pass: u32) {
         let edit = self
@@ -1375,12 +1418,24 @@ impl Engine {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn play_queue(
+        &mut self,
+        queue: Vec<TrackRef>,
+        index: usize,
+        position_ms: u32,
+        context: String,
+    ) -> Result<bool, String> {
+        self.play_queue_with_automatic_start(queue, index, position_ms, context, false)
+    }
+
+    fn play_queue_with_automatic_start(
         &mut self,
         mut queue: Vec<TrackRef>,
         index: usize,
         position_ms: u32,
         context: String,
+        automatic_start: bool,
     ) -> Result<bool, String> {
         fill_queue_context(&mut queue, &context);
         self.resolve_queue_edits(&mut queue);
@@ -1391,6 +1446,7 @@ impl Engine {
             PositionSpace::Transport,
             false,
             0,
+            automatic_start,
         )
     }
 
@@ -1419,6 +1475,7 @@ impl Engine {
             PositionSpace::Source,
             true,
             preview_lease_id,
+            false,
         )
     }
     /// Installs queue rows whose `effective_edit` values are already final.
@@ -1432,9 +1489,15 @@ impl Engine {
         position_space: PositionSpace,
         preview: bool,
         preview_lease_id: u64,
+        automatic_start: bool,
     ) -> Result<bool, String> {
         Self::validate_queue(&queue, index)?;
-        let Some(playable_index) = first_available_from(&queue, index) else {
+        let candidate = if automatic_start {
+            first_automatic_wrapping(&queue, index, &self.track_edits)
+        } else {
+            first_available_from(&queue, index)
+        };
+        let Some(playable_index) = candidate else {
             // Do not tear down an installed preview queue when a replacement
             // cannot stop the current player.
             if preview || self.preview_mode {
@@ -1446,7 +1509,12 @@ impl Engine {
             } else {
                 self.leave_preview_mode();
             }
-            return self.install_empty_or_unavailable_queue(queue);
+            let result = self.install_empty_or_unavailable_queue(queue);
+            if automatic_start && result.is_ok() {
+                self.state.error =
+                    Some("no eligible tracks remain for automatic playback".to_owned());
+            }
+            return result;
         };
         if preview {
             self.preview_lease_id = preview_lease_id;
@@ -1721,7 +1789,10 @@ impl Engine {
             .ok_or_else(|| "the queue has no current track".to_owned())?;
         if let Some(index) = self.previous_index() {
             self.leave_preview_mode();
-            if self.state.shuffle && !self.shuffle_pool.contains(&current) {
+            if self.state.shuffle
+                && self.automatic_track_eligible(current)
+                && !self.shuffle_pool.contains(&current)
+            {
                 self.shuffle_pool.push(current);
             }
             self.state.current_index = Some(index);
@@ -1753,12 +1824,7 @@ impl Engine {
             return None;
         }
         while let Some(index) = self.history.pop() {
-            if self
-                .state
-                .queue
-                .get(index)
-                .is_some_and(|track| !track.unavailable)
-            {
+            if self.automatic_track_eligible(index) {
                 return Some(index);
             }
         }
@@ -1766,12 +1832,20 @@ impl Engine {
         if !self.state.shuffle {
             return (0..current)
                 .rev()
-                .find(|index| !self.state.queue[*index].unavailable);
+                .find(|index| self.automatic_track_eligible(*index));
         }
         None
     }
 
     fn advance(&mut self, at_end: bool) -> Result<bool, String> {
+        self.advance_with_current_skip(at_end, false)
+    }
+
+    fn advance_with_current_skip(
+        &mut self,
+        at_end: bool,
+        skip_current_for_repeat: bool,
+    ) -> Result<bool, String> {
         if at_end {
             // Flush delayed speed/cut output before changing configuration.
             // The queue itself remains live so the tail can drain audibly.
@@ -1782,7 +1856,7 @@ impl Engine {
             .state
             .current_index
             .ok_or_else(|| "the queue has no current track".to_owned())?;
-        let next = self.take_next_index(at_end);
+        let next = self.take_next_index_with_skip(at_end, skip_current_for_repeat);
         if self.preview_mode && next.is_some_and(|index| index != current) {
             self.leave_preview_mode();
         }
@@ -1937,7 +2011,8 @@ impl Engine {
             }
             Some(current) if index == current => {
                 let start = current.min(self.state.queue.len() - 1);
-                let replacement = first_available_wrapping(&self.state.queue, start);
+                let replacement =
+                    first_automatic_wrapping(&self.state.queue, start, &self.track_edits);
                 self.state.current_index = replacement;
                 self.state.duration_ms = replacement
                     .map(|replacement| self.state.queue[replacement].duration_ms)
@@ -1951,6 +2026,8 @@ impl Engine {
                     self.invalidate_audio_signals();
                     self.play_request_id = None;
                     self.current_needs_load = false;
+                    self.state.error =
+                        Some("no eligible tracks remain for automatic playback".to_owned());
                 }
             }
             Some(current) if index < current => self.state.current_index = Some(current - 1),
@@ -2047,9 +2124,14 @@ impl Engine {
         }
     }
 
-    fn take_next_index(&mut self, at_end: bool) -> Option<usize> {
+    fn take_next_index_with_skip(
+        &mut self,
+        at_end: bool,
+        skip_current_for_repeat: bool,
+    ) -> Option<usize> {
         let current = self.state.current_index?;
         if at_end
+            && !skip_current_for_repeat
             && self.state.repeat == RepeatMode::Track
             && self
                 .state
@@ -2057,6 +2139,8 @@ impl Engine {
                 .get(current)
                 .is_some_and(|track| !track.unavailable)
         {
+            // Repeat-one is a deliberate direct continuation: an exclusion
+            // toggled while this row is playing must not interrupt it.
             return Some(current);
         }
         if self.state.shuffle {
@@ -2064,18 +2148,18 @@ impl Engine {
                 self.rebuild_shuffle_pool();
             }
             while let Some(index) = self.shuffle_pool.pop() {
-                if self
-                    .state
-                    .queue
-                    .get(index)
-                    .is_some_and(|track| !track.unavailable)
-                {
+                if self.automatic_track_eligible(index) {
                     return Some(index);
                 }
             }
             return None;
         }
-        sequential_available_index(&self.state.queue, current, self.state.repeat)
+        sequential_automatic_index(
+            &self.state.queue,
+            current,
+            self.state.repeat,
+            &self.track_edits,
+        )
     }
 
     fn peek_next_index(&self) -> Option<usize> {
@@ -2087,6 +2171,8 @@ impl Engine {
                 .get(current)
                 .is_some_and(|track| !track.unavailable)
         {
+            // See `take_next_index_with_skip`: preload for repeat-one is
+            // allowed to point at the excluded current row.
             return Some(current);
         }
         if self.state.shuffle {
@@ -2094,22 +2180,38 @@ impl Engine {
                 self.state
                     .queue
                     .get(*index)
-                    .is_some_and(|track| !track.unavailable)
+                    .is_some_and(|_| self.automatic_track_eligible(*index))
             });
         }
-        sequential_available_index(&self.state.queue, current, self.state.repeat)
+        sequential_automatic_index(
+            &self.state.queue,
+            current,
+            self.state.repeat,
+            &self.track_edits,
+        )
     }
-
     fn rebuild_shuffle_pool(&mut self) {
         self.shuffle_pool.clear();
         if !self.state.shuffle {
             return;
         }
         let current = self.state.current_index;
-        self.shuffle_pool.extend(
-            (0..self.state.queue.len())
-                .filter(|index| Some(*index) != current && !self.state.queue[*index].unavailable),
-        );
+        let queue = &self.state.queue;
+        let track_edits = &self.track_edits;
+        let preview_mode = self.preview_mode;
+        for (index, track) in queue.iter().enumerate() {
+            if Some(index) == current {
+                continue;
+            }
+            let eligible = if preview_mode {
+                !track.unavailable
+            } else {
+                automatic_track_eligible(track_edits, track)
+            };
+            if eligible {
+                self.shuffle_pool.push(index);
+            }
+        }
         for index in (1..self.shuffle_pool.len()).rev() {
             let swap = (self.next_random() as usize) % (index + 1);
             self.shuffle_pool.swap(index, swap);
@@ -2288,6 +2390,15 @@ impl Engine {
                 if !clustered {
                     self.evict_track_audio_cache(track_id);
                 }
+                // A runtime failure is an automatic progression opportunity:
+                // continue with the next eligible row when one exists. The
+                // `skip_current_for_repeat` guard prevents repeat-one from
+                // retrying the same failed loader forever. With no candidate,
+                // the branch below simply leaves this failed row stopped.
+                if let Err(error) = self.advance_with_current_skip(false, true) {
+                    self.state.playing = false;
+                    self.state.error = Some(error);
+                }
                 true
             }
             PlayerEvent::Stopped {
@@ -2383,6 +2494,53 @@ fn playable_track_uri(track: &TrackRef) -> Result<SpotifyUri, String> {
     parse_track_uri(track)
 }
 
+fn automatic_playlist_id(context: &str) -> Option<&str> {
+    let playlist_id = context.strip_prefix("playlist:")?;
+    (!playlist_id.trim().is_empty()).then_some(playlist_id)
+}
+
+fn automatic_track_eligible(store: &TrackEditStore, track: &TrackRef) -> bool {
+    if track.unavailable {
+        return false;
+    }
+    let Some(playlist_id) = automatic_playlist_id(&track.context) else {
+        return true;
+    };
+    !store
+        .is_excluded(playlist_id, &track.id)
+        .is_ok_and(|excluded| excluded)
+}
+
+fn first_automatic_from(queue: &[TrackRef], start: usize, store: &TrackEditStore) -> Option<usize> {
+    (start..queue.len()).find(|index| automatic_track_eligible(store, &queue[*index]))
+}
+
+fn first_automatic_wrapping(
+    queue: &[TrackRef],
+    start: usize,
+    store: &TrackEditStore,
+) -> Option<usize> {
+    first_automatic_from(queue, start, store).or_else(|| {
+        (0..start.min(queue.len())).find(|index| automatic_track_eligible(store, &queue[*index]))
+    })
+}
+
+fn sequential_automatic_index(
+    queue: &[TrackRef],
+    current: usize,
+    repeat: RepeatMode,
+    store: &TrackEditStore,
+) -> Option<usize> {
+    first_automatic_from(queue, current.saturating_add(1), store).or_else(|| {
+        (repeat == RepeatMode::Context)
+            .then(|| {
+                (0..=current.min(queue.len().saturating_sub(1)))
+                    .find(|index| automatic_track_eligible(store, &queue[*index]))
+            })
+            .flatten()
+    })
+}
+
 fn first_available_from(queue: &[TrackRef], start: usize) -> Option<usize> {
     (start..queue.len()).find(|index| !queue[*index].unavailable)
 }
@@ -2392,6 +2550,7 @@ fn first_available_wrapping(queue: &[TrackRef], start: usize) -> Option<usize> {
         .or_else(|| (0..start.min(queue.len())).find(|index| !queue[*index].unavailable))
 }
 
+#[cfg(test)]
 fn sequential_available_index(
     queue: &[TrackRef],
     current: usize,
@@ -2444,16 +2603,21 @@ fn track_change_wait(last: Option<Instant>, now: Instant, interval: Duration) ->
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::{atomic::Ordering, Arc};
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    };
     use std::time::{Duration, Instant};
 
     use super::{
+        automatic_track_eligible, first_automatic_from, first_automatic_wrapping,
         first_available_from, first_available_wrapping, remap_current_index_after_move,
-        sequential_available_index, sequential_next_index, track_change_wait, with_preview_edit,
-        AudioSignal, AuthSignal, Engine, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX,
-        RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
-        UNAVAILABLE_BURST_WINDOW,
+        sequential_automatic_index, sequential_available_index, sequential_next_index,
+        track_change_wait, with_preview_edit, AudioSignal, AuthSignal, Engine, PlaybackState,
+        PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW,
+        TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW,
     };
+    use crate::customization::TrackEditStore;
     use crate::io::ProtocolWriter;
     use librespot_core::SpotifyUri;
     use librespot_playback::player::PlayerEvent;
@@ -2578,6 +2742,64 @@ mod tests {
             unavailable_reason: Some("not available in your country".to_owned()),
             ..TrackRef::default()
         }
+    }
+
+    struct TempStateDirectory(PathBuf);
+
+    impl TempStateDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "spotify-renderer-engine-exclusion-{}-{ordinal}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempStateDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn store_with_exclusions(exclusions: &[(&str, &str)]) -> (TempStateDirectory, TrackEditStore) {
+        let directory = TempStateDirectory::new();
+        let mut store = TrackEditStore::load(directory.path()).expect("empty edit store");
+        for &(playlist_id, track_id) in exclusions {
+            store
+                .set_excluded(playlist_id, track_id, true)
+                .expect("persist exclusion");
+        }
+        (directory, store)
+    }
+
+    fn contextual_track(id: &str, context: &str) -> TrackRef {
+        TrackRef {
+            id: id.to_owned(),
+            uri: format!("spotify:track:{id}"),
+            duration_ms: 180_000,
+            context: context.to_owned(),
+            ..TrackRef::default()
+        }
+    }
+
+    fn engine_with_queue(store: TrackEditStore, queue: Vec<TrackRef>, current: usize) -> Engine {
+        let (mut engine, _) = test_engine();
+        let duration_ms = queue[current].duration_ms;
+        engine.track_edits = store;
+        engine.state.queue = queue;
+        engine.state.current_index = Some(current);
+        engine.state.duration_ms = duration_ms;
+        engine.state.position_ms = 0;
+        engine.state.playing = true;
+        engine
     }
 
     #[test]
@@ -3021,6 +3243,311 @@ mod tests {
             sequential_available_index(&blocked, 0, RepeatMode::Context),
             None
         );
+    }
+
+    #[test]
+    fn automatic_start_skips_excluded_but_direct_play_and_index_accept_it() {
+        let excluded_id = "0abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track(excluded_id, "playlist:playlist"),
+            contextual_track("1abcdefghijklmnopqrstu", "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        drop(store);
+
+        let (mut automatic_engine, _) = test_engine_in(directory.path().to_path_buf());
+        assert!(
+            automatic_engine
+                .play_queue_with_automatic_start(
+                    queue.clone(),
+                    0,
+                    12_000,
+                    "playlist:playlist".to_owned(),
+                    true,
+                )
+                .is_err(),
+            "the capture engine has no player"
+        );
+        assert_eq!(
+            automatic_engine.state.current_index,
+            Some(1),
+            "automatic starts skip the excluded requested row"
+        );
+
+        let (mut direct_engine, _) = test_engine_in(directory.path().to_path_buf());
+        assert!(
+            direct_engine
+                .play_queue(queue.clone(), 0, 12_000, "playlist:playlist".to_owned())
+                .is_err(),
+            "the capture engine has no player"
+        );
+        assert_eq!(
+            direct_engine.state.current_index,
+            Some(0),
+            "direct queue playback accepts the excluded requested row"
+        );
+
+        let (mut index_engine, _) = test_engine_in(directory.path().to_path_buf());
+        index_engine.state.queue = queue;
+        index_engine.state.current_index = Some(1);
+        index_engine.state.duration_ms = 180_000;
+        assert!(
+            index_engine.play_queue_index(0).is_err(),
+            "the capture engine has no player"
+        );
+        assert_eq!(
+            index_engine.state.current_index,
+            Some(0),
+            "direct index playback accepts the excluded row"
+        );
+    }
+
+    #[test]
+    fn ordered_next_and_eof_skip_excluded_rows() {
+        let excluded_id = "1abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track("0abcdefghijklmnopqrstu", "playlist:playlist"),
+            contextual_track(excluded_id, "playlist:playlist"),
+            contextual_track("2abcdefghijklmnopqrstu", "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        let mut engine = engine_with_queue(store, queue, 0);
+        assert_eq!(
+            sequential_automatic_index(
+                &engine.state.queue,
+                0,
+                RepeatMode::Off,
+                &engine.track_edits,
+            ),
+            Some(2)
+        );
+
+        assert!(
+            engine.advance(false).is_err(),
+            "the capture engine has no player"
+        );
+        assert_eq!(
+            engine.state.current_index,
+            Some(2),
+            "Next skips excluded rows"
+        );
+
+        engine.state.current_index = Some(0);
+        engine.state.duration_ms = 180_000;
+        engine.state.position_ms = 0;
+        engine.state.playing = true;
+        engine.history.clear();
+        assert!(
+            engine.advance(true).is_err(),
+            "the capture engine has no player"
+        );
+        assert_eq!(
+            engine.state.current_index,
+            Some(2),
+            "natural EOF skips excluded rows"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn repeat_context_wraps_only_to_eligible_rows() {
+        let excluded_id = "0abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track(excluded_id, "playlist:playlist"),
+            contextual_track("1abcdefghijklmnopqrstu", "playlist:playlist"),
+            contextual_track("2abcdefghijklmnopqrstu", "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        let mut engine = engine_with_queue(store, queue, 2);
+        engine.state.repeat = RepeatMode::Context;
+
+        assert_eq!(
+            sequential_automatic_index(
+                &engine.state.queue,
+                2,
+                RepeatMode::Context,
+                &engine.track_edits,
+            ),
+            Some(1)
+        );
+        assert_eq!(engine.take_next_index_with_skip(false, false), Some(1));
+        drop(directory);
+    }
+
+    #[test]
+    fn shuffle_pool_excludes_playlist_preferences() {
+        let excluded_id = "1abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track("0abcdefghijklmnopqrstu", "playlist:playlist"),
+            contextual_track(excluded_id, "playlist:playlist"),
+            contextual_track("2abcdefghijklmnopqrstu", "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        let mut engine = engine_with_queue(store, queue, 0);
+        engine.state.shuffle = true;
+        engine.rebuild_shuffle_pool();
+
+        assert_eq!(
+            engine.shuffle_pool,
+            vec![2],
+            "shuffle only contains non-current eligible rows"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn previous_history_and_ordered_fallback_skip_excluded_rows() {
+        let excluded_id = "0abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track(excluded_id, "playlist:playlist"),
+            contextual_track("1abcdefghijklmnopqrstu", "playlist:playlist"),
+            contextual_track("2abcdefghijklmnopqrstu", "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        let mut engine = engine_with_queue(store, queue, 2);
+
+        // History is newest-first in the vector's pop order here: it first
+        // offers the excluded row, then the eligible earlier row.
+        engine.history = vec![1, 0];
+        assert_eq!(engine.previous_index(), Some(1));
+        engine.history.clear();
+        assert_eq!(
+            engine.previous_index(),
+            Some(1),
+            "ordered fallback also skips excluded rows"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn preload_peek_skips_excluded_rows() {
+        let excluded_id = "1abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track("0abcdefghijklmnopqrstu", "playlist:playlist"),
+            contextual_track(excluded_id, "playlist:playlist"),
+            contextual_track("2abcdefghijklmnopqrstu", "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        let engine = engine_with_queue(store, queue, 0);
+
+        assert_eq!(
+            engine.peek_next_index(),
+            Some(2),
+            "peek selects the same eligible target used by preload"
+        );
+        engine.preload_next();
+        drop(directory);
+    }
+
+    #[test]
+    fn repeat_one_continues_a_manually_started_excluded_current() {
+        let excluded_id = "0abcdefghijklmnopqrstu";
+        let queue = vec![contextual_track(excluded_id, "playlist:playlist")];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        let mut engine = engine_with_queue(store, queue, 0);
+        engine.state.repeat = RepeatMode::Track;
+
+        assert_eq!(
+            engine.take_next_index_with_skip(true, false),
+            Some(0),
+            "repeat-one preserves a manually started excluded current"
+        );
+        assert_eq!(engine.peek_next_index(), Some(0));
+        drop(directory);
+    }
+
+    #[test]
+    fn toggling_current_exclusion_does_not_stop_playback() {
+        let track_id = "0abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track(track_id, "playlist:playlist"),
+            contextual_track("1abcdefghijklmnopqrstu", "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = engine_with_queue(store, queue, 0);
+        engine.state.position_ms = 7_500;
+
+        assert_eq!(
+            engine.set_playlist_track_excluded("playlist", track_id, true),
+            Ok(())
+        );
+        assert_eq!(engine.state.current_index, Some(0));
+        assert!(engine.state.playing, "toggling a preference must not pause");
+        assert_eq!(engine.state.position_ms, 7_500);
+        assert!(
+            engine
+                .track_edit_status(track_id, Some("playlist"))
+                .excluded_from_automatic_playback
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn all_excluded_automatic_queues_have_no_target() {
+        let first = "0abcdefghijklmnopqrstu";
+        let second = "1abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track(first, "playlist:playlist"),
+            contextual_track(second, "playlist:playlist"),
+        ];
+        let (directory, store) =
+            store_with_exclusions(&[("playlist", first), ("playlist", second)]);
+        assert_eq!(first_automatic_from(&queue, 0, &store), None);
+        assert_eq!(first_automatic_wrapping(&queue, 1, &store), None);
+        assert_eq!(
+            sequential_automatic_index(&queue, 0, RepeatMode::Context, &store),
+            None
+        );
+        let mut engine = engine_with_queue(store, queue, 0);
+        engine.state.repeat = RepeatMode::Context;
+        assert_eq!(
+            engine.take_next_index_with_skip(false, false),
+            None,
+            "automatic progression has no target when every row is excluded"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn playlist_exclusions_are_isolated_from_album_and_other_playlists() {
+        let track_id = "0abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track(track_id, "playlist:one"),
+            contextual_track(track_id, "album:one"),
+            contextual_track(track_id, "playlist:two"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("one", track_id)]);
+
+        assert!(!automatic_track_eligible(&store, &queue[0]));
+        assert!(automatic_track_eligible(&store, &queue[1]));
+        assert!(automatic_track_eligible(&store, &queue[2]));
+        assert_eq!(first_automatic_from(&queue, 0, &store), Some(1));
+        drop(directory);
+    }
+
+    #[test]
+    fn restore_preserves_an_excluded_requested_row() {
+        let excluded_id = "0abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track(excluded_id, "playlist:playlist"),
+            contextual_track("1abcdefghijklmnopqrstu", "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        drop(store);
+        let (mut engine, _) = test_engine_in(directory.path().to_path_buf());
+
+        assert_eq!(
+            engine.restore_queue(queue, 0, 42_000, String::new(), 0, false, false),
+            Ok(true)
+        );
+        assert_eq!(
+            engine.state.current_index,
+            Some(0),
+            "restore is not automatic playback and keeps the requested row"
+        );
+        assert_eq!(engine.state.position_ms, 42_000);
+        assert!(engine.current_needs_load);
+        drop(directory);
     }
 
     #[test]

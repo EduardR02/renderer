@@ -12,9 +12,31 @@ use spotify_playback_engine::protocol::{
     ArtistCataloguePage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
     ArtistReleaseCounts, ArtistReleasePage, ArtistReleases, ArtistTopCity, CreditArtist,
     CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage, PlaylistBrowse,
-    PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, TrackCredits, TrackEdit,
-    TrackRef, TrackWaveform as EngineTrackWaveform,
+    PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse,
+    SongwriterPlaylist as EngineSongwriterPlaylist, TrackCredits, TrackEdit, TrackRef,
+    TrackWaveform as EngineTrackWaveform,
 };
+
+/// The verified songwriter playlist attached to an artist overview.
+///
+/// The playlist remains nested so the frontend can use the same navigation
+/// metadata as every other playlist surface, while `tracks` keeps the
+/// engine's official playlist order for direct row playback.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SongwriterPlaylist {
+    pub playlist: Playlist,
+    pub tracks: Vec<Track>,
+}
+
+impl From<EngineSongwriterPlaylist> for SongwriterPlaylist {
+    fn from(source: EngineSongwriterPlaylist) -> Self {
+        Self {
+            playlist: Playlist::from(&source.playlist),
+            tracks: source.tracks.into_iter().map(Track::from).collect(),
+        }
+    }
+}
 
 /// One playable track. Field-for-field identical to the engine's `TrackRef`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -338,6 +360,14 @@ pub struct PlaylistDetail {
     #[serde(flatten)]
     pub playlist: Playlist,
     pub tracks: Vec<Track>,
+    /// Track ids excluded from automatic playback for this playlist.
+    ///
+    /// This is playlist-local state supplied by the engine rather than a
+    /// property of an individual queue row. Keeping it beside the flattened
+    /// playlist payload lets cached detail responses round-trip it without
+    /// changing the library-list shape.
+    #[serde(default)]
+    pub excluded_track_ids: Vec<String>,
 }
 
 /// One container holding a track, as answered by `get_track_playlists`.
@@ -352,6 +382,7 @@ pub struct TrackPlaylistRef {
 impl From<PlaylistBrowse> for PlaylistDetail {
     fn from(browse: PlaylistBrowse) -> Self {
         let revision = browse.revision.unwrap_or_default();
+        let excluded_track_ids = browse.excluded_track_ids;
         let tracks: Vec<Track> = browse.tracks.into_iter().map(Track::from).collect();
         Self {
             playlist: Playlist {
@@ -382,6 +413,7 @@ impl From<PlaylistBrowse> for PlaylistDetail {
                 last_activity: None,
             },
             tracks,
+            excluded_track_ids,
         }
     }
 }
@@ -638,6 +670,7 @@ pub struct ArtistOverviewDetail {
     pub discovered_on: Vec<Playlist>,
     pub artist_playlists: Vec<Playlist>,
     pub artist_pick: Option<ArtistPickDetail>,
+    pub songwriter_playlist: Option<SongwriterPlaylist>,
 }
 
 /// The item pinned to the top of an artist's page, with the artist's note.
@@ -708,6 +741,7 @@ impl From<ArtistOverview> for ArtistOverviewDetail {
                 .map(Playlist::from)
                 .collect(),
             artist_pick: overview.artist_pick.as_ref().map(ArtistPickDetail::from),
+            songwriter_playlist: overview.songwriter_playlist.map(SongwriterPlaylist::from),
         }
     }
 }
@@ -953,6 +987,7 @@ mod tests {
             owner_name: String::new(),
             cover_url: None,
             tracks: covers.iter().map(|url| track(url).into()).collect(),
+            excluded_track_ids: Vec::new(),
         }
     }
 
@@ -1008,6 +1043,19 @@ mod tests {
         assert_eq!(detail.playlist.cover_urls, vec!["a", "b"]);
         assert_eq!(detail.playlist.snapshot_id, "rev-a");
         assert_eq!(detail.playlist.tracks_total, 2);
+        let mut excluded = browse("rev-excluded", &["a", "b"]);
+        excluded.excluded_track_ids = vec!["track-a".into(), "track-b".into()];
+        let detail = PlaylistDetail::from(excluded);
+        assert_eq!(
+            detail.excluded_track_ids,
+            vec!["track-a".to_owned(), "track-b".to_owned()]
+        );
+
+        let legacy: PlaylistDetail = serde_json::from_str(
+            r#"{"id":"p1","uri":"spotify:playlist:p1","name":"Mixtape","tracks":[]}"#,
+        )
+        .expect("detail caches without exclusions remain readable");
+        assert!(legacy.excluded_track_ids.is_empty());
 
         // A revision bump can replace exactly the tracks the old candidates
         // came from, so a browse never reuses them.
@@ -1180,6 +1228,7 @@ mod tests {
             discovered_on: Vec::new(),
             artist_playlists: Vec::new(),
             artist_pick: None,
+            songwriter_playlist: None,
         };
 
         let frontend = ArtistOverviewDetail::from(overview);
@@ -1196,6 +1245,96 @@ mod tests {
         assert_eq!(json["monthly_listeners"], 3_400);
         assert_eq!(json["popular_releases"][0]["name"], "Popular");
         assert_eq!(json["related_artists"][0]["name"], "Related");
+    }
+    #[test]
+    fn songwriter_playlist_defaults_when_missing_from_legacy_overview_json() {
+        let overview: ArtistOverviewDetail =
+            serde_json::from_str(r#"{"biography":"Legacy artist"}"#).unwrap();
+        assert!(overview.songwriter_playlist.is_none());
+
+        let empty: SongwriterPlaylist = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.playlist, Playlist::default());
+        assert!(empty.tracks.is_empty());
+    }
+
+    #[test]
+    fn songwriter_playlist_conversion_preserves_metadata_and_track_order() {
+        let source = EngineSongwriterPlaylist {
+            playlist: PlaylistRef {
+                id: "writers".into(),
+                uri: "spotify:playlist:writers".into(),
+                name: "Written by Artist".into(),
+                description: Some("Official writers playlist".into()),
+                owner_id: "spotify".into(),
+                owner_name: "Spotify".into(),
+                cover_url: Some("https://i.scdn.co/image/writers".into()),
+                track_count: Some(37),
+            },
+            tracks: (0..10)
+                .map(|index| TrackRef {
+                    id: format!("track-{index}"),
+                    uri: format!("spotify:track:track-{index}"),
+                    name: format!("Song {index}"),
+                    artist_names: vec!["Artist".into(), "Guest".into()],
+                    artist_ids: vec!["artist-id".into(), "guest-id".into()],
+                    artist_id: "artist-id".into(),
+                    album_id: format!("album-{index}"),
+                    album_name: format!("Album {index}"),
+                    cover_url: format!("cover-{index}"),
+                    ..TrackRef::default()
+                })
+                .collect(),
+        };
+        let overview = ArtistOverview {
+            songwriter_playlist: Some(source),
+            ..ArtistOverview::default()
+        };
+
+        let frontend = ArtistOverviewDetail::from(overview);
+        let songwriter = frontend.songwriter_playlist.expect("songwriter playlist");
+        assert_eq!(songwriter.playlist.id, "writers");
+        assert_eq!(songwriter.playlist.name, "Written by Artist");
+        assert_eq!(songwriter.playlist.owner, "Spotify");
+        assert_eq!(songwriter.playlist.owner_id, "spotify");
+        assert_eq!(
+            songwriter.playlist.cover_url,
+            "https://i.scdn.co/image/writers"
+        );
+        assert_eq!(songwriter.playlist.tracks_total, 37);
+        assert_eq!(
+            songwriter
+                .tracks
+                .iter()
+                .map(|track| track.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Song 0", "Song 1", "Song 2", "Song 3", "Song 4", "Song 5", "Song 6", "Song 7",
+                "Song 8", "Song 9",
+            ]
+        );
+        assert_eq!(songwriter.tracks[0].artist_names, vec!["Artist", "Guest"]);
+        assert_eq!(
+            songwriter.tracks[0].artist_ids,
+            vec!["artist-id", "guest-id"]
+        );
+        assert_eq!(songwriter.tracks[0].album_id, "album-0");
+        assert_eq!(songwriter.tracks[0].album_name, "Album 0");
+
+        let json = serde_json::to_value(ArtistOverviewDetail {
+            songwriter_playlist: Some(songwriter),
+            ..ArtistOverviewDetail::default()
+        })
+        .unwrap();
+        assert_eq!(json["songwriter_playlist"]["playlist"]["id"], "writers");
+        assert_eq!(json["songwriter_playlist"]["playlist"]["tracks_total"], 37);
+        assert_eq!(
+            json["songwriter_playlist"]["tracks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            10
+        );
+        assert_eq!(json["songwriter_playlist"]["tracks"][9]["name"], "Song 9");
     }
 
     #[test]

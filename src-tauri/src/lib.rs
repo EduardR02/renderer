@@ -96,6 +96,7 @@ pub fn run() {
             commands::save_track_edit,
             commands::delete_track_edit,
             commands::set_playlist_track_edit_enabled,
+            commands::set_playlist_track_excluded,
             commands::search,
             commands::browse_playlists,
             commands::browse_playlist,

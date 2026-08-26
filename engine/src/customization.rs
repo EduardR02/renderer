@@ -16,6 +16,10 @@ struct StoredEdits {
     version: u32,
     definitions: BTreeMap<String, StoredDefinition>,
     playlist_enablement: BTreeMap<String, BTreeSet<String>>,
+    /// Track ids that automatic playback skips for each playlist. This is
+    /// deliberately independent from edit definitions and their enablement:
+    /// exclusions remain meaningful even when a track has no custom edit.
+    excluded_track_ids: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -56,7 +60,7 @@ impl TrackEditStore {
         let path = state_directory.join(STORE_FILE);
         let data = match std::fs::read(&path) {
             Ok(bytes) => {
-                let data: StoredEdits = serde_json::from_slice(&bytes)
+                let mut data: StoredEdits = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
                 if data.version != STORE_VERSION {
                     return Err(format!(
@@ -72,6 +76,25 @@ impl TrackEditStore {
                         definition.loop_range,
                     )?;
                 }
+                for (playlist_id, track_ids) in &data.playlist_enablement {
+                    validate_identifier("playlist id", playlist_id)?;
+                    for track_id in track_ids {
+                        validate_identifier("track id", track_id)?;
+                    }
+                }
+                for (playlist_id, track_ids) in &data.excluded_track_ids {
+                    validate_identifier("playlist id", playlist_id)?;
+                    for track_id in track_ids {
+                        validate_identifier("track id", track_id)?;
+                    }
+                }
+                // Empty sets are not meaningful persisted state. Pruning
+                // them on load also keeps old hand-edited snapshots from
+                // growing entries that can never be queried.
+                data.playlist_enablement
+                    .retain(|_, tracks| !tracks.is_empty());
+                data.excluded_track_ids
+                    .retain(|_, tracks| !tracks.is_empty());
                 data
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => StoredEdits {
@@ -114,9 +137,14 @@ impl TrackEditStore {
             .map(|definition| definition.into_definition(track_id.to_owned()));
         let enabled = definition.is_some()
             && playlist_id.is_some_and(|playlist| self.is_enabled(playlist, track_id));
+        let excluded_from_automatic_playback = playlist_id.is_some_and(|playlist| {
+            self.is_excluded(playlist, track_id)
+                .is_ok_and(|excluded| excluded)
+        });
         TrackEditStatus {
             definition,
             enabled,
+            excluded_from_automatic_playback,
         }
     }
 
@@ -199,6 +227,61 @@ impl TrackEditStore {
         }
         if let Err(error) = self.persist() {
             self.data.playlist_enablement = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+    /// Returns whether a track is excluded from automatic playback in one
+    /// playlist. The query validates both identifiers so malformed requests
+    /// cannot accidentally address a different persisted entry.
+    pub fn is_excluded(&self, playlist_id: &str, track_id: &str) -> Result<bool, String> {
+        validate_identifier("playlist id", playlist_id)?;
+        validate_identifier("track id", track_id)?;
+        Ok(self
+            .data
+            .excluded_track_ids
+            .get(playlist_id)
+            .is_some_and(|tracks| tracks.contains(track_id)))
+    }
+
+    /// Lists excluded track ids in stable order for a playlist browse
+    /// response. A missing playlist has no exclusions.
+    pub fn list_excluded_track_ids(&self, playlist_id: &str) -> Result<Vec<String>, String> {
+        validate_identifier("playlist id", playlist_id)?;
+        Ok(self
+            .data
+            .excluded_track_ids
+            .get(playlist_id)
+            .map(|tracks| tracks.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    /// Persists one playlist exclusion atomically. Exclusions intentionally do
+    /// not require an edit definition and survive deleting one.
+    pub fn set_excluded(
+        &mut self,
+        playlist_id: &str,
+        track_id: &str,
+        excluded: bool,
+    ) -> Result<(), String> {
+        self.ensure_writable()?;
+        validate_identifier("playlist id", playlist_id)?;
+        validate_identifier("track id", track_id)?;
+        let previous = self.data.excluded_track_ids.clone();
+        if excluded {
+            self.data
+                .excluded_track_ids
+                .entry(playlist_id.to_owned())
+                .or_default()
+                .insert(track_id.to_owned());
+        } else if let Some(tracks) = self.data.excluded_track_ids.get_mut(playlist_id) {
+            tracks.remove(track_id);
+            if tracks.is_empty() {
+                self.data.excluded_track_ids.remove(playlist_id);
+            }
+        }
+        if let Err(error) = self.persist() {
+            self.data.excluded_track_ids = previous;
             return Err(error);
         }
         Ok(())
@@ -442,51 +525,43 @@ mod tests {
 
     #[test]
     fn validation_rejects_unsorted_overlap_and_out_of_bounds_ranges() {
-        assert!(
-            validate_definition(
-                "track",
-                10_000,
-                &[range(4_000, 6_000), range(2_000, 3_000)],
-                None
-            )
-            .is_err()
-        );
-        assert!(
-            validate_definition(
-                "track",
-                10_000,
-                &[range(2_000, 5_000), range(4_000, 6_000)],
-                None
-            )
-            .is_err()
-        );
+        assert!(validate_definition(
+            "track",
+            10_000,
+            &[range(4_000, 6_000), range(2_000, 3_000)],
+            None
+        )
+        .is_err());
+        assert!(validate_definition(
+            "track",
+            10_000,
+            &[range(2_000, 5_000), range(4_000, 6_000)],
+            None
+        )
+        .is_err());
         assert!(validate_definition("track", 10_000, &[range(2_000, 11_000)], None).is_err());
         assert!(
             validate_definition("track", 10_000, &[], Some(loop_range(5_000, 5_000, 2))).is_err()
         );
-        assert!(
-            validate_definition(
-                "track",
-                10_000,
-                &[range(2_000, 4_000)],
-                Some(loop_range(3_000, 6_000, 2))
-            )
-            .is_err()
-        );
+        assert!(validate_definition(
+            "track",
+            10_000,
+            &[range(2_000, 4_000)],
+            Some(loop_range(3_000, 6_000, 2))
+        )
+        .is_err());
     }
 
     #[test]
     fn validation_rejects_invalid_loop_play_counts() {
         for play_count in [0, 1, 33, u32::MAX] {
-            assert!(
-                validate_definition(
-                    "track",
-                    10_000,
-                    &[],
-                    Some(loop_range(2_000, 4_000, play_count)),
-                )
-                .is_err()
-            );
+            assert!(validate_definition(
+                "track",
+                10_000,
+                &[],
+                Some(loop_range(2_000, 4_000, play_count)),
+            )
+            .is_err());
         }
         assert!(
             validate_definition("track", 10_000, &[], Some(loop_range(2_000, 4_000, 2))).is_ok()
@@ -499,15 +574,13 @@ mod tests {
     #[test]
     fn validation_rejects_cuts_that_remove_the_entire_track() {
         assert!(validate_definition("track", 10_000, &[range(0, 10_000)], None).is_err());
-        assert!(
-            validate_definition(
-                "track",
-                10_000,
-                &[range(0, 4_000), range(4_000, 10_000)],
-                None,
-            )
-            .is_err()
-        );
+        assert!(validate_definition(
+            "track",
+            10_000,
+            &[range(0, 4_000), range(4_000, 10_000)],
+            None,
+        )
+        .is_err());
         assert!(validate_definition("track", 10_000, &[range(0, 9_999)], None).is_ok());
     }
 
@@ -625,20 +698,108 @@ mod tests {
             .save_definition("track".to_owned(), 10_000, vec![range(1_000, 2_000)], None)
             .unwrap_err();
         assert!(save_error.contains("read-only"));
-        assert!(
-            store
-                .set_enabled("playlist", "track", true)
-                .unwrap_err()
-                .contains("read-only")
-        );
-        assert!(
-            store
-                .delete_definition("track")
-                .unwrap_err()
-                .contains("read-only")
-        );
+        assert!(store
+            .set_enabled("playlist", "track", true)
+            .unwrap_err()
+            .contains("read-only"));
+        assert!(store
+            .delete_definition("track")
+            .unwrap_err()
+            .contains("read-only"));
         assert_eq!(std::fs::read(&path).unwrap(), corrupt);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn playlist_exclusions_round_trip_and_stay_independent() {
+        let root = std::env::temp_dir().join(format!(
+            "spotify-renderer-playlist-exclusion-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut store = TrackEditStore::load(&root).unwrap();
+        store.set_excluded("one", "track-a", true).unwrap();
+        store.set_excluded("two", "track-a", true).unwrap();
+        store.set_excluded("one", "track-b", true).unwrap();
+
+        assert!(store.is_excluded("one", "track-a").unwrap());
+        assert!(!store.is_excluded("two", "track-b").unwrap());
+        assert_eq!(
+            store.list_excluded_track_ids("one").unwrap(),
+            vec!["track-a".to_owned(), "track-b".to_owned()]
+        );
+        assert!(
+            store
+                .status("track-a", Some("one"))
+                .excluded_from_automatic_playback
+        );
+        assert!(
+            !store
+                .status("track-a", None)
+                .excluded_from_automatic_playback
+        );
+
+        let loaded = TrackEditStore::load(&root).unwrap();
+        assert_eq!(
+            loaded.list_excluded_track_ids("two").unwrap(),
+            vec!["track-a".to_owned()]
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(STORE_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            json["excluded_track_ids"]["one"],
+            serde_json::json!(["track-a", "track-b"])
+        );
+
+        let mut loaded = loaded;
+        loaded.set_excluded("one", "track-a", false).unwrap();
+        assert!(!loaded.is_excluded("one", "track-a").unwrap());
+        assert_eq!(
+            loaded.list_excluded_track_ids("one").unwrap(),
+            vec!["track-b".to_owned()]
+        );
+        loaded.set_excluded("one", "track-b", false).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(STORE_FILE)).unwrap()).unwrap();
+        assert!(json["excluded_track_ids"]
+            .as_object()
+            .is_some_and(|entries| !entries.contains_key("one")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_persisted_playlist_exclusion_identifiers_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "spotify-renderer-playlist-exclusion-invalid-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(STORE_FILE),
+            serde_json::json!({
+                "version": STORE_VERSION,
+                "definitions": {},
+                "playlist_enablement": {},
+                "excluded_track_ids": {"playlist": [""]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = match TrackEditStore::load(&root) {
+            Ok(_) => panic!("invalid persisted exclusion should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "track id cannot be empty");
         let _ = std::fs::remove_dir_all(root);
     }
 }

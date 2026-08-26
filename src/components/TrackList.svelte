@@ -27,6 +27,13 @@
     /** Off for short embedded lists (search), where column heads are noise. */
     showHead = true,
     playlistId = null,
+    /**
+     * The playlist's live skip list, passed BY REFERENCE from the detail
+     * store. Its presence alone turns the feature on: only a real playlist
+     * table has rows that can be skipped, so search results, albums and
+     * recommendation footers never grow a mark or a menu item.
+     */
+    excludedTrackIds = null,
     /** Compact source context copied onto tracks added to the queue. */
     queueContext = null,
     /** Playlist tables may give the added date its own column. */
@@ -52,6 +59,33 @@
   const queueSource = $derived(
     String(queueContext || (playlistId ? `playlist:${playlistId}` : "")).trim(),
   );
+
+  /* =====================================================================
+     PLAYLIST SKIPS
+
+     A per-playlist listening preference stored beside the track-edit data:
+     skipped rows keep their colour, their click and their play glyph, and
+     lose nothing but their place in AUTOMATIC playback — the header starts
+     elsewhere and Next/Previous/repeat/shuffle walk around them. Everything
+     here reads one shared array; nothing copies it.
+
+     `skippedIds` is rebuilt whenever the shared array mutates, which is how
+     an optimistic row-menu edit lights every mark in one frame without a
+     refetch — and how sort/filter/windowing stay correct for free, since the
+     class binds to the TRACK's id, never to its position.
+     ===================================================================== */
+  const skipsTracked = $derived(!!playlistId && Array.isArray(excludedTrackIds));
+  const skippedIds = $derived.by(
+    () => new Set(skipsTracked ? excludedTrackIds.map(String) : []),
+  );
+
+  /** One sentence everywhere the preference is explained. */
+  const SKIP_HELP =
+    "Skipped when this playlist advances. You can still play it directly.";
+
+  function rowSkipped(track) {
+    return !!track?.id && skippedIds.has(String(track.id));
+  }
 
   /* =====================================================================
      DRAG SOURCE / REORDER TARGET
@@ -280,6 +314,7 @@
     open: false, x: 0, top: null, bottom: null, maxH: 0,
     track: null, index: -1, copied: false, generation: 0,
     editDefined: false, editEnabled: false, editLoading: false, editError: "",
+    skipPending: false, skipError: "",
   });
   const picker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, track: null });
   /* Same shape and same placement rules as the playlist picker — a second
@@ -433,6 +468,8 @@
     menu.track = track;
     menu.index = i;
     menu.copied = false;
+    menu.skipPending = false;
+    menu.skipError = "";
     menu.editError = "";
     picker.open = false;
     artistPicker.open = false;
@@ -480,6 +517,42 @@
       if (menuTargetCurrent(generation, sourcePlaylist, track, index)) {
         menu.editLoading = false;
       }
+    }
+  }
+
+  /**
+   * The row-menu half of the skip preference.
+   *
+   * Optimistic on purpose: the shared id array is patched FIRST, so the mark
+   * on the row, the sr-only text and the header's next start row all move in
+   * the same frame as the click. A refused command puts the id back exactly
+   * where the edit took it from and says so inside the open menu — the store
+   * is the truth, and the list follows it, never the reverse. The item stays
+   * disabled while the command is in flight, which makes the preference read
+   * as deliberate rather than spammable.
+   */
+  async function toggleRowSkip() {
+    const track = menu.track;
+    if (!skipsTracked || !track?.id || !playlistId || menu.skipPending) return;
+    const id = String(track.id);
+    const exclude = !skippedIds.has(id);
+    const setPresent = (present) => {
+      const at = excludedTrackIds.findIndex((value) => String(value) === id);
+      if (present ? at === -1 : at !== -1) {
+        if (present) excludedTrackIds.push(id);
+        else excludedTrackIds.splice(at, 1);
+      }
+    };
+    menu.skipPending = true;
+    menu.skipError = "";
+    setPresent(exclude);
+    try {
+      await api.setPlaylistTrackExcluded(playlistId, id, exclude);
+    } catch (reason) {
+      setPresent(!exclude);
+      menu.skipError = String(reason || "Could not update this playlist.");
+    } finally {
+      menu.skipPending = false;
     }
   }
 
@@ -788,6 +861,7 @@
       class="tl-row"
       class:current={i === currentRow}
       class:unavailable={track.unavailable}
+      class:skipped={rowSkipped(track)}
       class:drag-source={rowIsSource(i)}
       data-i={i}
       style:transform={rowDragTransform(i)}
@@ -835,6 +909,17 @@
             <span class="t-cached" title="Downloaded — this plays from the local cache">
               <Icon name="cached" size={13} />
               <span class="sr-only">Downloaded</span>
+            </span>
+          {/if}
+          {#if rowSkipped(track)}
+            <!-- Same slot and manners as the cached mark, but neutral: this
+                 is not a fact about the file, it is a preference about
+                 ordering, so it stays grey and says so in words for readers
+                 who cannot see the ring. The tooltip repeats the menu's one
+                 sentence rather than inventing a second phrasing. -->
+            <span class="t-skip" title={SKIP_HELP}>
+              <Icon name="skipped" size={13} />
+              <span class="sr-only">Skipped during playlist playback</span>
             </span>
           {/if}
           <ArtistLinks
@@ -1042,6 +1127,25 @@
     {/if}
     {#if menu.editError}
       <p class="menu-error" role="alert">{menu.editError}</p>
+    {/if}
+    {#if skipsTracked && menu.track?.id}
+      <!-- The one playlist-local listening preference. It sits with the edit
+           cluster because both are "how this row behaves inside THIS list",
+           and it stays open on click so the label flipping over is the
+           acknowledgement — same reasoning as Copy link above. -->
+      <button
+        class="menu-item"
+        disabled={menu.skipPending}
+        title={SKIP_HELP}
+        onclick={toggleRowSkip}
+      >
+        {rowSkipped(menu.track)
+          ? "Include in playlist playback"
+          : "Skip during playlist playback"}
+      </button>
+    {/if}
+    {#if menu.skipError}
+      <p class="menu-error" role="alert">{menu.skipError}</p>
     {/if}
     {#if menu.track?.id}
       <button class="menu-item" onclick={() => { menu.open = false; navigate("radio", menu.track.id); }}>

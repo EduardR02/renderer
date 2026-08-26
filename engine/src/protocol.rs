@@ -38,10 +38,12 @@ pub struct TrackEditDefinition {
     pub edit: TrackEdit,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct TrackEditStatus {
     pub definition: Option<TrackEditDefinition>,
     pub enabled: bool,
+    pub excluded_from_automatic_playback: bool,
 }
 
 /// Canonical full-track waveform envelope at a fixed 1 ms bin interval.
@@ -159,6 +161,11 @@ pub enum Command {
         position_ms: u32,
         #[serde(default)]
         context: String,
+        /// When true, choose the first eligible row at or after `index`,
+        /// wrapping once. Header Play/Shuffle uses this automatic path;
+        /// direct row playback leaves it false.
+        #[serde(default)]
+        automatic_start: bool,
     },
     /// Installs a paused queue/playhead without asking librespot to load audio.
     /// Snapshot positions are in the compiled transport timeline and are
@@ -255,6 +262,13 @@ pub enum Command {
     },
     DeleteTrackEdit {
         track_id: String,
+    },
+    /// Skips or restores one track during automatic playback of a playlist.
+    /// This preference is independent of any persisted track edit.
+    SetPlaylistTrackExcluded {
+        playlist_id: String,
+        track_id: String,
+        excluded: bool,
     },
     SetPlaylistTrackEditEnabled {
         playlist_id: String,
@@ -664,6 +678,33 @@ pub struct PlaylistRef {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_count: Option<u32>,
 }
+/// The verified official playlist and the first playable rows shown on an
+/// artist's page. Track order is the playlist's source order; it is not a
+/// popularity ranking.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SongwriterPlaylist {
+    pub playlist: PlaylistRef,
+    pub tracks: Vec<TrackRef>,
+}
+
+impl Default for SongwriterPlaylist {
+    fn default() -> Self {
+        Self {
+            playlist: PlaylistRef {
+                id: String::new(),
+                uri: String::new(),
+                name: String::new(),
+                description: None,
+                owner_id: String::new(),
+                owner_name: String::new(),
+                cover_url: None,
+                track_count: None,
+            },
+            tracks: Vec::new(),
+        }
+    }
+}
 
 /// Payload of a successful [`Command::BrowsePlaylist`] response. `revision`
 /// is the playlist4 revision hex-encoded (the value Web API edits call the
@@ -683,6 +724,10 @@ pub struct PlaylistBrowse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
     pub tracks: Vec<TrackRef>,
+    /// Track ids skipped by automatic playback in this playlist. Direct row
+    /// playback remains available for every row, including these ids.
+    #[serde(default)]
+    pub excluded_track_ids: Vec<String>,
 }
 
 /// A playlist-like radio context. `tracks[0]` is always the first playable
@@ -861,6 +906,10 @@ pub struct ArtistOverview {
     /// Whatever the artist pinned to the top of their page — see [`ArtistPick`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artist_pick: Option<ArtistPick>,
+    /// The verified official Spotify `Written by <artist>` playlist, when it
+    /// was found and at least one track resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub songwriter_playlist: Option<SongwriterPlaylist>,
 }
 
 /// The item an artist pinned to the top of their page, and the note they
@@ -1064,10 +1113,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        normalize_canonical_playlist_description, sanitize_playlist_description, ArtistRef,
-        AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations, PlaylistRef,
-        PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse, StateEvent,
-        TrackRef,
+        normalize_canonical_playlist_description, sanitize_playlist_description, ArtistOverview,
+        ArtistRef, AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations,
+        PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
+        SongwriterPlaylist, StateEvent, TrackRef,
     };
 
     #[test]
@@ -1139,6 +1188,76 @@ mod tests {
         assert!(matches!(
             reorder.command,
             Command::EditReorderPlaylistTracks { from: 3, to: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn play_queue_automatic_start_defaults_false_and_accepts_true() {
+        let without_flag: Request = serde_json::from_value(json!({
+            "request_id": "request-play-automatic-default",
+            "type": "play_queue",
+            "queue": [{
+                "id": "0123456789ABCDEFGHIJKL",
+                "uri": "spotify:track:0123456789ABCDEFGHIJKL",
+                "duration_ms": 180000
+            }],
+            "index": 0,
+            "position_ms": 0,
+            "context": "playlist:playlist"
+        }))
+        .unwrap();
+        let Command::PlayQueue {
+            queue,
+            index,
+            position_ms,
+            context,
+            automatic_start,
+        } = without_flag.command
+        else {
+            panic!("play_queue must parse as its dedicated command");
+        };
+        assert_eq!(queue.len(), 1);
+        assert_eq!(index, 0);
+        assert_eq!(position_ms, 0);
+        assert_eq!(context, "playlist:playlist");
+        assert!(!automatic_start, "omitted flag defaults to direct playback");
+
+        let with_flag: Request = serde_json::from_value(json!({
+            "request_id": "request-play-automatic",
+            "type": "play_queue",
+            "queue": [],
+            "index": 0,
+            "position_ms": 0,
+            "automatic_start": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            with_flag.command,
+            Command::PlayQueue {
+                automatic_start: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn playlist_track_exclusion_command_deserializes_exact_fields() {
+        let request: Request = serde_json::from_value(json!({
+            "request_id": "request-exclusion",
+            "type": "set_playlist_track_excluded",
+            "playlist_id": "playlist-id",
+            "track_id": "track-id",
+            "excluded": true
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            request.command,
+            Command::SetPlaylistTrackExcluded {
+                playlist_id,
+                track_id,
+                excluded: true,
+            } if playlist_id == "playlist-id" && track_id == "track-id"
         ));
     }
 
@@ -1913,5 +2032,50 @@ mod tests {
         assert_eq!(response["data"]["interval_ms"], 1);
         assert_eq!(response["data"]["bin_count"], 3);
         assert_eq!(response["data"]["peaks_base64"], "AAD//w==");
+    }
+
+    #[test]
+    fn songwriter_playlist_is_optional_and_defaults_nested_fields() {
+        let legacy: ArtistOverview =
+            serde_json::from_value(json!({"biography": "Legacy artist"})).unwrap();
+        assert!(legacy.songwriter_playlist.is_none());
+        assert!(!serde_json::to_value(&legacy)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("songwriter_playlist"));
+
+        let empty: SongwriterPlaylist = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.playlist.id.is_empty());
+        assert!(empty.tracks.is_empty());
+
+        let payload = SongwriterPlaylist {
+            playlist: PlaylistRef {
+                id: "writers".to_owned(),
+                uri: "spotify:playlist:writers".to_owned(),
+                name: "Written by Artist".to_owned(),
+                description: Some("Official".to_owned()),
+                owner_id: "spotify".to_owned(),
+                owner_name: "Spotify".to_owned(),
+                cover_url: None,
+                track_count: Some(37),
+            },
+            tracks: vec![TrackRef {
+                id: "track".to_owned(),
+                uri: "spotify:track:track".to_owned(),
+                name: "Song".to_owned(),
+                ..TrackRef::default()
+            }],
+        };
+        let overview = ArtistOverview {
+            songwriter_playlist: Some(payload),
+            ..ArtistOverview::default()
+        };
+        let encoded = serde_json::to_value(overview).unwrap();
+        assert_eq!(
+            encoded["songwriter_playlist"]["playlist"]["owner_id"],
+            "spotify"
+        );
+        assert_eq!(encoded["songwriter_playlist"]["tracks"][0]["name"], "Song");
     }
 }

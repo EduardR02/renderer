@@ -28,6 +28,7 @@
   let canvasTrack = $state("");
   let canvasUrl = $state("");
   let canvasReady = $state(false);
+  let canvasOrientation = $state("");
   let canvasEl = $state(null);
   let pageVisible = $state(!document.hidden);
   let reducedMotion = $state(false);
@@ -65,6 +66,7 @@
     canvasTrack = key;
     canvasUrl = "";
     canvasReady = false;
+    canvasOrientation = "";
     if (!shouldFetch) return;
     api.browseCanvas(key)
       .then((canvas) => {
@@ -101,12 +103,18 @@
   });
 
   function handleCanvasReady() {
+    /* Readiness carries the frame's true ratio: classify once, here, so CSS
+       only ever pins the long axis and the square sleeve never resizes. */
+    const w = canvasEl?.videoWidth ?? 0;
+    const h = canvasEl?.videoHeight ?? 0;
+    canvasOrientation = h > w ? "portrait" : w > h ? "landscape" : "";
     canvasReady = true;
   }
 
   function handleCanvasError() {
     canvasUrl = "";
     canvasReady = false;
+    canvasOrientation = "";
   }
 
   /* Credits are content in this panel, not a destination, so they load with
@@ -176,6 +184,8 @@
         {#if canvasUrl && canvasTrack === canvasTrackKey}
           <video
             class="np-canvas"
+            class:portrait={canvasOrientation === "portrait"}
+            class:landscape={canvasOrientation === "landscape"}
             class:canvasReady={canvasReady}
             bind:this={canvasEl}
             src={canvasUrl}

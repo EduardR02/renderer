@@ -49,12 +49,12 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use http::{Method, Request};
 use librespot_core::cache::Cache;
 use librespot_core::error::ErrorKind;
 use librespot_core::{FileId, Session, SpotifyId, SpotifyUri};
-use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
+use librespot_metadata::{image::Images, Album, Artist, Metadata, Playlist, Track};
 use librespot_protocol::canvaz;
 use librespot_protocol::extended_metadata::{
     BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
@@ -64,9 +64,9 @@ use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 
 use spotify_playback_engine::protocol::{
-    AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity, Canvas,
-    CreditArtist, CreditRole, PlaylistRecommendations, PlaylistRef, RadioBrowse, TrackCredits,
-    TrackRef, sanitize_playlist_description,
+    sanitize_playlist_description, AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
+    ArtistTopCity, Canvas, CreditArtist, CreditRole, PlaylistRecommendations, PlaylistRef,
+    RadioBrowse, SongwriterPlaylist, TrackCredits, TrackRef,
 };
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
@@ -104,6 +104,8 @@ const BROWSE_BACKOFF_MAX_MS: u64 = 4_000;
 /// are clamped instead of refused.
 const MAX_PLAYLISTS: usize = 1000;
 const MAX_SEARCH_LIMIT: usize = 50;
+const SONGWRITER_TRACK_LIMIT: usize = 10;
+const SONGWRITER_QUERY_PREFIX: &str = "Written by ";
 
 // ---------------------------------------------------------------------------
 // metadata conversions
@@ -782,6 +784,34 @@ fn playlist_added_at(timestamp_ms: i64) -> Option<i64> {
     (timestamp_ms > 0).then_some(timestamp_ms)
 }
 
+/// Maps resolved track metadata back onto playlist items while preserving the
+/// source order and duplicates. Extended metadata itself deduplicates requests,
+/// so the playlist layer has to restore those source positions afterwards.
+fn playlist_tracks_from_resolved(
+    items: &[(SpotifyUri, Option<i64>)],
+    resolved: Vec<TrackRef>,
+) -> Vec<TrackRef> {
+    let by_uri: HashMap<String, TrackRef> = resolved
+        .into_iter()
+        .map(|track| (track.uri.clone(), track))
+        .collect();
+    items
+        .iter()
+        .filter_map(|(uri, added_at)| {
+            let mut track = by_uri.get(&uri_of(uri))?.clone();
+            track.added_at = *added_at;
+            Some(track)
+        })
+        .collect()
+}
+
+fn limited_playlist_items(
+    items: &[(SpotifyUri, Option<i64>)],
+    limit: usize,
+) -> Vec<(SpotifyUri, Option<i64>)> {
+    items.iter().take(limit).cloned().collect()
+}
+
 /// Resolves playlist items while preserving Spotify's item order and
 /// duplicates. Extended metadata intentionally deduplicates requests, so the
 /// playlist layer maps each item back onto its resolved metadata and attaches
@@ -791,18 +821,20 @@ async fn fetch_playlist_tracks(
     items: &[(SpotifyUri, Option<i64>)],
 ) -> Result<Vec<TrackRef>, String> {
     let resolved = fetch_tracks(session, items.iter().map(|(uri, _)| uri)).await?;
-    let by_uri: HashMap<String, TrackRef> = resolved
-        .into_iter()
-        .map(|track| (track.uri.clone(), track))
-        .collect();
-    Ok(items
-        .iter()
-        .filter_map(|(uri, added_at)| {
-            let mut track = by_uri.get(&uri_of(uri))?.clone();
-            track.added_at = *added_at;
-            Some(track)
-        })
-        .collect())
+    Ok(playlist_tracks_from_resolved(items, resolved))
+}
+
+/// Resolves only the first `limit` source items. This is used for compact
+/// artist-page shelves so a large playlist never causes a full-list metadata
+/// request merely to render ten rows.
+async fn fetch_playlist_tracks_limited(
+    session: &Session,
+    items: &[(SpotifyUri, Option<i64>)],
+    limit: usize,
+) -> Result<Vec<TrackRef>, String> {
+    let limited = limited_playlist_items(items, limit);
+    let resolved = fetch_tracks(session, limited.iter().map(|(uri, _)| uri)).await?;
+    Ok(playlist_tracks_from_resolved(&limited, resolved))
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,6 +1393,7 @@ pub async fn playlist_browse(
         owner_name,
         cover_url: playlist_attributes_cover(&playlist.attributes),
         tracks,
+        excluded_track_ids: Vec::new(),
     })
 }
 
@@ -1986,6 +2019,171 @@ fn merge_artist_overview(
     .then_some(overview)
 }
 
+/// Normalizes a playlist title for the official-title comparison. Spotify's
+/// search response has used several kinds of Unicode whitespace in the same
+/// title, so ASCII-only trimming or lowercasing would admit false negatives
+/// (or force a looser, unsafe comparison).
+fn normalize_playlist_title(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn songwriter_playlist_title(canonical_artist_name: &str) -> Option<String> {
+    let artist_name = canonical_artist_name.trim();
+    (!artist_name.is_empty()).then(|| format!("{SONGWRITER_QUERY_PREFIX}{artist_name}"))
+}
+
+/// Applies the search-side prefilter. Search owner data is never accepted as
+/// proof by itself: it only narrows candidates before the playlist metadata
+/// request below re-verifies the owner and title.
+fn official_songwriter_candidate(
+    playlists: &[PlaylistRef],
+    canonical_artist_name: &str,
+) -> Result<Option<PlaylistRef>, String> {
+    let Some(expected_title) = songwriter_playlist_title(canonical_artist_name) else {
+        return Ok(None);
+    };
+    let expected_title = normalize_playlist_title(&expected_title);
+    let mut seen_ids = HashSet::new();
+    let mut candidates = Vec::new();
+    for reference in playlists {
+        if reference.owner_id != "spotify"
+            || normalize_playlist_title(&reference.name) != expected_title
+        {
+            continue;
+        }
+        let Ok(uri) = SpotifyUri::from_uri(&reference.uri) else {
+            continue;
+        };
+        if !matches!(uri, SpotifyUri::Playlist { .. }) {
+            continue;
+        }
+        let id = id_of(&uri);
+        if id.is_empty() || !seen_ids.insert(id.clone()) {
+            continue;
+        }
+        let mut canonical = reference.clone();
+        canonical.id = id;
+        canonical.uri = uri_of(&uri);
+        candidates.push(canonical);
+    }
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.pop()),
+        count => Err(format!(
+            "found {count} exact official songwriter playlists; rejecting ambiguous result"
+        )),
+    }
+}
+
+fn official_playlist_owner(uri: &SpotifyUri) -> Option<&str> {
+    match uri {
+        SpotifyUri::Playlist {
+            user: Some(user), ..
+        } if user == "spotify" => Some(user),
+        _ => None,
+    }
+}
+
+/// Rebuilds a playlist reference from the authoritative metadata response.
+/// The search reference contributes only display metadata unavailable from
+/// playlist4 (currently the owner's display name); owner id, URI, title,
+/// description, cover, and count all come from the metadata payload.
+fn official_songwriter_playlist_ref(
+    playlist: &Playlist,
+    search_reference: &PlaylistRef,
+) -> Option<PlaylistRef> {
+    let owner_id = official_playlist_owner(&playlist.id)?.to_owned();
+    let id = id_of(&playlist.id);
+    let uri = uri_of(&playlist.id);
+    if id.is_empty() || uri.is_empty() {
+        return None;
+    }
+    Some(PlaylistRef {
+        id,
+        uri,
+        name: playlist.name().to_owned(),
+        description: playlist_description(&playlist.attributes.description),
+        owner_id: owner_id.clone(),
+        owner_name: if search_reference.owner_name.is_empty() {
+            owner_id.clone()
+        } else {
+            search_reference.owner_name.clone()
+        },
+        cover_url: playlist_attributes_cover(&playlist.attributes),
+        track_count: u32::try_from(playlist.length).ok(),
+    })
+}
+
+async fn discover_songwriter_playlist(
+    session: &Session,
+    canonical_artist_name: &str,
+) -> Result<Option<SongwriterPlaylist>, String> {
+    let Some(query) = songwriter_playlist_title(canonical_artist_name) else {
+        return Ok(None);
+    };
+    let search = search_browse(session, &query, MAX_SEARCH_LIMIT).await?;
+    let Some(candidate) = official_songwriter_candidate(&search.playlists, canonical_artist_name)?
+    else {
+        return Ok(None);
+    };
+    let candidate_uri = SpotifyUri::from_uri(&candidate.uri)
+        .map_err(|error| format!("invalid songwriter playlist URI: {error}"))?;
+    let playlist: Playlist = metadata_get(session, &candidate_uri, "songwriter playlist").await?;
+    let Some(reference) = official_songwriter_playlist_ref(&playlist, &candidate) else {
+        return Ok(None);
+    };
+    if normalize_playlist_title(&reference.name) != normalize_playlist_title(&query) {
+        return Ok(None);
+    }
+    let items: Vec<(SpotifyUri, Option<i64>)> = playlist
+        .contents
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                playlist_added_at(item.attributes.timestamp.as_timestamp_ms()),
+            )
+        })
+        .collect();
+    let mut tracks = fetch_playlist_tracks_limited(session, &items, SONGWRITER_TRACK_LIMIT).await?;
+    tracks.truncate(SONGWRITER_TRACK_LIMIT);
+    if tracks.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SongwriterPlaylist {
+        playlist: reference,
+        tracks,
+    }))
+}
+
+async fn cached_songwriter_playlist(
+    session: &Session,
+    artist_id: &str,
+    canonical_artist_name: &str,
+) -> Option<SongwriterPlaylist> {
+    if let Ok(cache) = SONGWRITER_PLAYLIST_CACHE.lock() {
+        if let Some(value) = cache.get(artist_id) {
+            return value;
+        }
+    }
+    let value = match discover_songwriter_playlist(session, canonical_artist_name).await {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("songwriter playlist unavailable for artist {artist_id}: {error}");
+            None
+        }
+    };
+    if let Ok(mut cache) = SONGWRITER_PLAYLIST_CACHE.lock() {
+        cache.insert(artist_id.to_owned(), value.clone(), Instant::now());
+    }
+    value
+}
+
 /// Artist portrait, top tracks, and the grouped release catalogue via the
 /// extended-metadata artist endpoint.
 ///
@@ -2003,10 +2201,13 @@ pub async fn artist_browse(
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
     let artist_uri = uri_of(&artist.id);
     let top_track_uris = artist.top_tracks.for_country(&session.country());
-    let (query_overview, visual_identity, top_tracks) = tokio::join!(
+    let groups = artist_release_groups(&artist);
+    let (query_overview, visual_identity, top_tracks, songwriter_playlist, page) = tokio::join!(
         cached_artist_overview(session, id, &artist_uri),
         artist_visual_identity(session, &uri),
         fetch_tracks(session, top_track_uris.iter()),
+        cached_songwriter_playlist(session, id, &artist.name),
+        resolve_initial_artist_release_page(session, &groups),
     );
     let visual_identity = visual_identity
         .inspect_err(|error| eprintln!("{error}"))
@@ -2029,11 +2230,13 @@ pub async fn artist_browse(
         }
     }
 
-    let groups = artist_release_groups(&artist);
-    let page = resolve_initial_artist_release_page(session, &groups).await?;
-    let overview =
+    let mut overview =
         merge_artist_overview(&artist, query_overview.as_ref(), visual_identity.as_ref());
-
+    if let Some(songwriter_playlist) = songwriter_playlist {
+        let overview = overview.get_or_insert_with(ArtistOverview::default);
+        overview.songwriter_playlist = Some(songwriter_playlist);
+    }
+    let page = page?;
     Ok(spotify_playback_engine::protocol::ArtistBrowse {
         id: id_of(&artist.id),
         uri: artist_uri,
@@ -3479,6 +3682,56 @@ const ARTIST_OVERVIEW_SUCCESS_TTL: Duration = Duration::from_secs(5 * 60);
 const ARTIST_OVERVIEW_FAILURE_TTL: Duration = Duration::from_secs(30);
 const ARTIST_OVERVIEW_CACHE_CAPACITY: usize = 64;
 
+/// Discovery is an optional page enhancement, but a revisit must not repeat
+/// its search and metadata work. Keep both hits and misses in process memory;
+/// the engine owns one authenticated session and this cache disappears with
+/// that process. The capacity matches the existing artist-overview cache.
+const SONGWRITER_PLAYLIST_CACHE_CAPACITY: usize = ARTIST_OVERVIEW_CACHE_CAPACITY;
+
+#[derive(Clone)]
+struct SongwriterPlaylistCacheEntry {
+    fetched_at: Instant,
+    value: Option<SongwriterPlaylist>,
+}
+
+#[derive(Default)]
+struct SongwriterPlaylistCache {
+    entries: HashMap<String, SongwriterPlaylistCacheEntry>,
+}
+
+impl SongwriterPlaylistCache {
+    fn get(&self, artist_id: &str) -> Option<Option<SongwriterPlaylist>> {
+        self.entries.get(artist_id).map(|entry| entry.value.clone())
+    }
+
+    fn insert(
+        &mut self,
+        artist_id: String,
+        value: Option<SongwriterPlaylist>,
+        fetched_at: Instant,
+    ) {
+        if !self.entries.contains_key(&artist_id)
+            && self.entries.len() >= SONGWRITER_PLAYLIST_CACHE_CAPACITY
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(artist_id, _)| artist_id.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            artist_id,
+            SongwriterPlaylistCacheEntry { fetched_at, value },
+        );
+    }
+}
+
+static SONGWRITER_PLAYLIST_CACHE: LazyLock<Mutex<SongwriterPlaylistCache>> =
+    LazyLock::new(|| Mutex::new(SongwriterPlaylistCache::default()));
+
 /// Persisted `queryArtistOverview` documents newest first. Each historical
 /// document keeps the exact variable shape it was captured with; GraphQL
 /// gateways are not required to ignore undeclared variables.
@@ -4053,6 +4306,7 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
             discovered_on,
             artist_playlists,
             artist_pick,
+            songwriter_playlist: None,
         },
         top_playcounts,
     })
@@ -4524,11 +4778,9 @@ mod tests {
             .expect("video canvas");
         assert_eq!(canvas.url, record.url);
         assert_eq!(canvas.canvas_type, "video_looping");
-        assert!(
-            parse_canvas_response(&response, "spotify:track:other")
-                .unwrap()
-                .is_none()
-        );
+        assert!(parse_canvas_response(&response, "spotify:track:other")
+            .unwrap()
+            .is_none());
     }
 
     fn file_id(byte: u8) -> FileId {
@@ -4640,11 +4892,9 @@ mod tests {
         assert!(url.ends_with(&"22".repeat(20)));
 
         let without_default = Images(vec![image(ImageSize::LARGE, 0x33)]);
-        assert!(
-            cover_url(&without_default)
-                .unwrap()
-                .ends_with(&"33".repeat(20))
-        );
+        assert!(cover_url(&without_default)
+            .unwrap()
+            .ends_with(&"33".repeat(20)));
         assert_eq!(cover_url(&Images::default()), None);
     }
 
@@ -4701,9 +4951,10 @@ mod tests {
             permanent_unavailability(&track, &policy).as_deref(),
             Some("no playable audio file")
         );
-        track.alternatives = Tracks(vec![
-            SpotifyUri::from_uri("spotify:track:3abcdefghijklmnopqrstu").unwrap(),
-        ]);
+        track.alternatives = Tracks(vec![SpotifyUri::from_uri(
+            "spotify:track:3abcdefghijklmnopqrstu",
+        )
+        .unwrap()]);
         assert_eq!(
             permanent_unavailability(&track, &policy),
             None,
@@ -4742,9 +4993,10 @@ mod tests {
             album,
             Vec::new(),
         );
-        track.alternatives = Tracks(vec![
-            SpotifyUri::from_uri("spotify:track:3abcdefghijklmnopqrstu").unwrap(),
-        ]);
+        track.alternatives = Tracks(vec![SpotifyUri::from_uri(
+            "spotify:track:3abcdefghijklmnopqrstu",
+        )
+        .unwrap()]);
         track.restrictions = librespot_metadata::restriction::Restrictions(vec![
             librespot_metadata::restriction::Restriction {
                 catalogues: librespot_metadata::restriction::RestrictionCatalogues(Vec::new()),
@@ -4839,13 +5091,11 @@ mod tests {
         assert_eq!(refs[0].owner_name, "");
         assert_eq!(refs[0].track_count, Some(42));
         // The base64 picture decodes to a 16-byte file id rendered as hex.
-        assert!(
-            refs[0]
-                .cover_url
-                .as_deref()
-                .unwrap()
-                .starts_with(COVER_BASE)
-        );
+        assert!(refs[0]
+            .cover_url
+            .as_deref()
+            .unwrap()
+            .starts_with(COVER_BASE));
         assert_eq!(
             refs[0].cover_url.as_deref().unwrap().len(),
             COVER_BASE.len() + 32
@@ -5180,6 +5430,204 @@ mod tests {
     }
 
     #[test]
+    fn songwriter_title_normalization_is_unicode_whitespace_and_case_aware() {
+        assert_eq!(
+            normalize_playlist_title(" \u{2003}Written\u{00a0}BY  BÉYONCÉ\u{202f} "),
+            "written by béyoncé"
+        );
+        assert_eq!(
+            songwriter_playlist_title("  BÉYONCÉ  ").as_deref(),
+            Some("Written by BÉYONCÉ")
+        );
+    }
+
+    #[test]
+    fn songwriter_candidates_fail_closed_on_owner_uri_and_ambiguity() {
+        let reference = |uri: &str, name: &str, owner_id: &str| PlaylistRef {
+            id: String::new(),
+            uri: uri.to_owned(),
+            name: name.to_owned(),
+            description: None,
+            owner_id: owner_id.to_owned(),
+            owner_name: String::new(),
+            cover_url: None,
+            track_count: None,
+        };
+        let official = reference(
+            "spotify:user:spotify:playlist:0123456789ABCDEFGHIJKL",
+            " Written\u{00a0}by  BEYONCÉ ",
+            "spotify",
+        );
+        let selected = official_songwriter_candidate(&[official.clone()], "Beyoncé")
+            .unwrap()
+            .expect("the exact official candidate");
+        assert_eq!(selected.id, "0123456789ABCDEFGHIJKL");
+        assert_eq!(
+            selected.uri,
+            "spotify:user:spotify:playlist:0123456789ABCDEFGHIJKL"
+        );
+
+        // Duplicate search rows for one playlist are one candidate, not an
+        // ambiguity.
+        let deduped =
+            official_songwriter_candidate(&[official.clone(), official.clone()], "Beyoncé")
+                .unwrap()
+                .expect("duplicate ids are deduplicated");
+        assert_eq!(deduped.id, selected.id);
+
+        let wrong_owner = reference(
+            "spotify:user:alice:playlist:0123456789ABCDEFGHIJKL",
+            "Written by Beyoncé",
+            "alice",
+        );
+        let malformed = reference(
+            "https://open.spotify.com/playlist/not-a-uri",
+            "Written by Beyoncé",
+            "spotify",
+        );
+        let wrong_kind = reference(
+            "spotify:album:0123456789ABCDEFGHIJKL",
+            "Written by Beyoncé",
+            "spotify",
+        );
+        assert!(
+            official_songwriter_candidate(&[wrong_owner, malformed, wrong_kind], "Beyoncé")
+                .unwrap()
+                .is_none(),
+            "owner, malformed URI, and non-playlist rows are rejected before metadata"
+        );
+
+        let second = reference(
+            "spotify:user:spotify:playlist:1123456789ABCDEFGHIJKL",
+            "Written by Beyoncé",
+            "spotify",
+        );
+        let error = official_songwriter_candidate(&[official, second], "Beyoncé").unwrap_err();
+        assert!(error.contains("ambiguous"));
+
+        assert_eq!(
+            official_playlist_owner(
+                &SpotifyUri::from_uri("spotify:user:spotify:playlist:0123456789ABCDEFGHIJKL")
+                    .unwrap()
+            ),
+            Some("spotify")
+        );
+        assert!(official_playlist_owner(
+            &SpotifyUri::from_uri("spotify:user:alice:playlist:0123456789ABCDEFGHIJKL").unwrap()
+        )
+        .is_none());
+        assert!(
+            SpotifyUri::from_uri("spotify:user:spotify:playlist:not-an-id").is_err(),
+            "malformed playlist ids never reach metadata verification"
+        );
+    }
+
+    #[test]
+    fn songwriter_track_limit_keeps_source_order_and_caps_at_ten() {
+        let ids = [
+            "2abcdefghijklmnopqrstu",
+            "3abcdefghijklmnopqrstu",
+            "4abcdefghijklmnopqrstu",
+            "5abcdefghijklmnopqrstu",
+            "6abcdefghijklmnopqrstu",
+            "7abcdefghijklmnopqrstu",
+            "0abcdefghijklmnopqrstu",
+            "0bcdefghijklmnopqrstuv",
+            "0cdefghijklmnopqrstuvw",
+            "0defghijklmnopqrstuvwx",
+            "0efghijklmnopqrstuvwxy",
+        ];
+        let items: Vec<(SpotifyUri, Option<i64>)> = ids
+            .iter()
+            .map(|id| {
+                (
+                    SpotifyUri::from_uri(&format!("spotify:track:{id}")).unwrap(),
+                    None,
+                )
+            })
+            .collect();
+        let resolved: Vec<TrackRef> = items
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(reverse_index, (uri, _))| TrackRef {
+                id: id_of(uri),
+                uri: uri_of(uri),
+                name: format!("Song {}", ids.len() - reverse_index - 1),
+                ..TrackRef::default()
+            })
+            .collect();
+        let limited = limited_playlist_items(&items, SONGWRITER_TRACK_LIMIT);
+        let tracks = playlist_tracks_from_resolved(&limited, resolved);
+        assert_eq!(tracks.len(), SONGWRITER_TRACK_LIMIT);
+        assert_eq!(
+            tracks
+                .iter()
+                .map(|track| track.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Song 0", "Song 1", "Song 2", "Song 3", "Song 4", "Song 5", "Song 6", "Song 7",
+                "Song 8", "Song 9",
+            ]
+        );
+    }
+
+    #[test]
+    fn songwriter_cache_remembers_positive_negative_and_capacity() {
+        let reference = PlaylistRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:user:spotify:playlist:0123456789ABCDEFGHIJKL".to_owned(),
+            name: "Written by Artist".to_owned(),
+            description: None,
+            owner_id: "spotify".to_owned(),
+            owner_name: "Spotify".to_owned(),
+            cover_url: None,
+            track_count: Some(1),
+        };
+        let value = SongwriterPlaylist {
+            playlist: reference,
+            tracks: vec![TrackRef {
+                id: "2abcdefghijklmnopqrstu".to_owned(),
+                uri: "spotify:track:2abcdefghijklmnopqrstu".to_owned(),
+                name: "Song".to_owned(),
+                ..TrackRef::default()
+            }],
+        };
+        let now = Instant::now();
+        let mut cache = SongwriterPlaylistCache::default();
+        cache.insert("positive".to_owned(), Some(value.clone()), now);
+        assert_eq!(
+            cache
+                .get("positive")
+                .and_then(|entry| entry)
+                .map(|entry| entry.tracks.len()),
+            Some(1)
+        );
+        cache.insert("negative".to_owned(), None, now);
+        assert!(
+            cache.get("negative").is_some_and(|entry| entry.is_none()),
+            "a miss is cached as a negative result"
+        );
+
+        let mut bounded = SongwriterPlaylistCache::default();
+        for index in 0..SONGWRITER_PLAYLIST_CACHE_CAPACITY {
+            bounded.insert(
+                format!("artist-{index}"),
+                None,
+                now + Duration::from_millis(index as u64),
+            );
+        }
+        bounded.insert(
+            "artist-new".to_owned(),
+            None,
+            now + Duration::from_millis(SONGWRITER_PLAYLIST_CACHE_CAPACITY as u64),
+        );
+        assert_eq!(bounded.entries.len(), SONGWRITER_PLAYLIST_CACHE_CAPACITY);
+        assert!(!bounded.entries.contains_key("artist-0"));
+        assert!(bounded.entries.contains_key("artist-new"));
+    }
+
+    #[test]
     fn track_credits_group_the_flat_contributor_list() {
         // Shaped after the official client's own consumption of
         // `queryTrackCreditsGroupedModal`: one flat list, one role per entry,
@@ -5356,13 +5804,11 @@ mod tests {
 
         // A kind this build has never heard of is not a card with no name in
         // it, and neither is a well-formed one with nothing to open.
-        assert!(
-            pinned(
-                "null",
-                r#"{"__typename": "PreRelease", "uri": "spotify:prerelease:x"}"#
-            )
-            .is_none()
-        );
+        assert!(pinned(
+            "null",
+            r#"{"__typename": "PreRelease", "uri": "spotify:prerelease:x"}"#
+        )
+        .is_none());
         assert!(pinned("null", r#"{"__typename": "Track", "name": "No id here"}"#).is_none());
         assert!(pinned("null", "null").is_none());
     }
@@ -5521,13 +5967,11 @@ mod tests {
     #[test]
     fn artist_overview_rotation_rejects_bad_hash_payload_then_accepts_sparse_artist() {
         let mut last_error = String::new();
-        assert!(
-            accept_artist_overview_attempt(
-                &mut last_error,
-                Ok(br#"{"errors":[{"message":"PersistedQueryNotFound"}]}"#.to_vec()),
-            )
-            .is_none()
-        );
+        assert!(accept_artist_overview_attempt(
+            &mut last_error,
+            Ok(br#"{"errors":[{"message":"PersistedQueryNotFound"}]}"#.to_vec()),
+        )
+        .is_none());
         assert!(last_error.contains("rejected"));
 
         let accepted = accept_artist_overview_attempt(
@@ -5743,14 +6187,12 @@ mod tests {
 
         let parsed: GetTrackCountsResponse =
             serde_json::from_str(r#"{"data": {"trackUnion": {"firstArtist": null}}}"#).unwrap();
-        assert!(
-            parsed
-                .data
-                .as_ref()
-                .and_then(|data| data.trackUnion.as_ref())
-                .and_then(|track| track.firstArtist.as_ref())
-                .is_none()
-        );
+        assert!(parsed
+            .data
+            .as_ref()
+            .and_then(|data| data.trackUnion.as_ref())
+            .and_then(|track| track.firstArtist.as_ref())
+            .is_none());
     }
 
     #[test]

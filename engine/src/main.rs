@@ -22,8 +22,7 @@ use librespot_core::cache::Cache;
 use spotify_playback_engine::protocol::{
     AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistReleasePage, Canvas, Command,
     LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
-    RadioBrowse, Response,
-    SearchBrowse, TrackCredits, TrackWaveform,
+    RadioBrowse, Response, SearchBrowse, TrackCredits, TrackWaveform,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -328,6 +327,20 @@ async fn run(
                                         &playlist_id,
                                         &track_id,
                                         enabled,
+                                    )
+                                    .map(|()| true);
+                                engine.send_response(&request_id, &result)?;
+                            }
+                            Command::SetPlaylistTrackExcluded {
+                                playlist_id,
+                                track_id,
+                                excluded,
+                            } => {
+                                let result = engine
+                                    .set_playlist_track_excluded(
+                                        &playlist_id,
+                                        &track_id,
+                                        excluded,
                                     )
                                     .map(|()| true);
                                 engine.send_response(&request_id, &result)?;
@@ -698,7 +711,15 @@ async fn run(
                         BrowseOutcome::Playlists { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_playlists", &result)?;
                         }
-                        BrowseOutcome::Playlist { request_id, result } => {
+                        BrowseOutcome::Playlist {
+                            request_id,
+                            result,
+                        } => {
+                            let result = result.and_then(|mut browse| {
+                                browse.excluded_track_ids =
+                                    engine.playlist_excluded_track_ids(&browse.id)?;
+                                Ok(browse)
+                            });
                             engine.send_browse_response(&request_id, "browse_playlist", &result)?;
                         }
                         BrowseOutcome::Radio { request_id, result } => {

@@ -6,6 +6,10 @@
  */
 
 const calls = [];
+
+// Every play_queue start, resolved: whether the caller asked for an automatic
+// (skip-aware) start, which row was requested, and which row actually began.
+const playQueueLog = [];
 window.__calls = calls;
 window.__clearCalls = () => {
   calls.length = 0;
@@ -97,6 +101,7 @@ fixtures.playlistDetail = {
   owner_id: "eduard",
   snapshot_id: "snap-1",
   tracks: makeTracks(12),
+  excluded_track_ids: [],
 };
 fixtures.longTrack = {
   ...makeTracks(1, 99)[0],
@@ -105,6 +110,81 @@ fixtures.longTrack = {
   album_name: "An Equally Long Album Name for Dense Player Surfaces",
   duration_ms: 900000,
 };
+
+/**
+ * The artist-page fixture. Quiet on purpose — a couple of releases and a
+ * short About are all the context the Written-by section needs — except for
+ * the verified songwriter playlist, which arrives exactly the way the engine
+ * sends it: titled "Written by <artist>", owned by user id `spotify`, TEN
+ * tracks in source order, while `tracks_total` reports the full 37 so the
+ * expanded CTA has a count to append. `setSongwriterPlaylist()` below swaps
+ * it out without touching anything else here.
+ */
+const songwriterPlaylist = {
+  playlist: {
+    id: "sw-written",
+    uri: "spotify:playlist:sw-written",
+    name: "Written by Artist 1",
+    description: "The official songwriting playlist, verified by ownership.",
+    owner: "Spotify",
+    owner_id: "spotify",
+    cover_url: "",
+    cover_urls: [],
+    collaborative: false,
+    tracks_total: 37,
+    snapshot_id: "snap-sw-written",
+    last_played: null,
+    last_activity: null,
+  },
+  tracks: makeTracks(10, 100),
+};
+fixtures.artist = {
+  id: "ar1",
+  uri: "spotify:artist:ar1",
+  name: "Artist 1",
+  cover_url: "",
+  top_tracks: makeTracks(10),
+  releases: {
+    albums: [
+      { id: "al0", uri: "spotify:album:al0", name: "Album 0", artist_names: ["Artist 1"], year: 2021, cover_url: "" },
+      { id: "al1", uri: "spotify:album:al1", name: "Album 1", artist_names: ["Artist 1"], year: 2018, cover_url: "" },
+    ],
+    singles: [],
+    compilations: [],
+    appears_on: [],
+  },
+  release_counts: { albums: 2, singles: 0, compilations: 0, appears_on: 0 },
+  releases_next_offset: null,
+  overview: {
+    biography: "A fixture artist: enough prose to draw the About card, nothing more.",
+    header_image_url: null,
+    biography_image_url: null,
+    popularity: 72,
+    followers: 1234567,
+    monthly_listeners: 9876543,
+    world_rank: 421,
+    top_cities: [],
+    popular_releases: [
+      { id: "al0", uri: "spotify:album:al0", name: "Album 0", artist_names: ["Artist 1"], year: 2021, cover_url: "" },
+      { id: "al1", uri: "spotify:album:al1", name: "Album 1", artist_names: ["Artist 1"], year: 2018, cover_url: "" },
+    ],
+    related_artists: [],
+    discovered_on: [],
+    artist_playlists: [],
+    artist_pick: null,
+    songwriter_playlist: clone(songwriterPlaylist),
+  },
+};
+
+/** The routes that read one cached artist payload — mirrors state.svelte.js. */
+const ARTIST_ROUTE_NAMES = [
+  "artist",
+  "discography",
+  "fans-also-like",
+  "appears-on",
+  "artist-playlists",
+  "discovered-on",
+];
 
 const now = Date.now();
 const H = 3600_000;
@@ -144,6 +224,42 @@ const playlistNames = new Map(fixtures.playlists.map((playlist) => [playlist.id,
 const memberships = new Map();
 for (const track of fixtures.playlistDetail.tracks) memberships.set(track.id, new Set(["p1"]));
 memberships.get("t0").add("liked");
+
+/**
+ * The playlist-local skip preference, mirrored onto every detail payload as
+ * `excluded_track_ids`, exactly like the engine's flattened browse answer.
+ * p1's list lives directly on the shared fixture so tests can read either.
+ */
+const playlistExclusions = new Map();
+
+function exclusionsFor(id) {
+  return id === "p1" ? fixtures.playlistDetail.excluded_track_ids : playlistExclusions.get(id);
+}
+
+function exclusionList(id) {
+  let list = exclusionsFor(id);
+  if (!list) {
+    list = [];
+    playlistExclusions.set(id, list);
+  }
+  return list;
+}
+
+function applyTrackExclusion(id, trackId, excluded) {
+  const wanted = String(trackId ?? "");
+  if (!wanted) return false;
+  const list = exclusionList(id);
+  const at = list.findIndex((value) => String(value) === wanted);
+  if (excluded && at === -1) {
+    list.push(wanted);
+    return true;
+  }
+  if (!excluded && at !== -1) {
+    list.splice(at, 1);
+    return true;
+  }
+  return false;
+}
 
 function editKey(trackId, playlistId = "p1") {
   return `${trackId}:${playlistId || "p1"}`;
@@ -186,6 +302,7 @@ function detailFor(id) {
     owner_id: "eduard",
     snapshot_id: `snap-${id}`,
     tracks,
+    excluded_track_ids: exclusionsFor(id) ?? [],
   };
 }
 
@@ -215,6 +332,25 @@ function refreshQueueEdits() {
     const { effective_edit: unused, ...withoutEdit } = entry;
     return withoutEdit;
   });
+}
+
+/**
+ * Harness stand-in for the engine's skip-aware start: walk forward from the
+ * requested row to the first included, available one. Only automatic starts
+ * consult exclusions — direct plays keep exactly the row they were handed.
+ */
+function automaticStartIndex(from, playlistId) {
+  const length = playback.queue.length;
+  if (!length) return 0;
+  const skipped = (exclusionsFor(playlistId) ?? []).map((value) => String(value));
+  for (let step = 0; step < length; step += 1) {
+    const at = (((from + step) % length) + length) % length;
+    const track = findTrack(playback.queue[at].uri);
+    if (!track || (!track.unavailable && !skipped.includes(String(track.id)))) return at;
+  }
+  // Nowhere legal to begin: the engine refuses to auto-start rather than fall
+  // through to a skipped row, so the requested index simply stands.
+  return from;
 }
 
 function waveformFor(trackId, durationMs) {
@@ -365,6 +501,8 @@ window.__TAURI_INTERNALS__ = {
         const ids = track ? [...(memberships.get(track.id) || [])] : [];
         return ids.map((id) => ({ id, name: id === "liked" ? "Liked Songs" : playlistNames.get(id) || id }));
       }
+      case "browse_artist":
+        return clone(fixtures.artist);
       case "browse_playlist":
         return clone(detailFor(args.id ?? args.playlistId));
       case "get_app_settings":
@@ -434,6 +572,13 @@ window.__TAURI_INTERNALS__ = {
       case "remove_playlist_tracks":
         updateMemberships(args, false);
         return null;
+      case "set_playlist_track_excluded": {
+        const id = playlistIdFrom(args);
+        applyTrackExclusion(id, args.trackId ?? args.track_id, Boolean(args.excluded));
+        // Refresh the open detail so row marks and the header note agree.
+        emit("playlist", clone(detailFor(id)));
+        return null;
+      }
       case "touch_playlist_activity":
         emit("playlist", clone(detailFor(args.id ?? args.playlistId)));
         return null;
@@ -496,7 +641,13 @@ window.__TAURI_INTERNALS__ = {
       case "play_queue": {
         const input = args.queue ?? args.tracks ?? args.uris;
         if (Array.isArray(input)) playback.queue = queueWithEdits(input.map(trackFromQueueItem));
-        setCurrent(Number(args.index ?? args.startIndex ?? 0));
+        const automaticStart = Boolean(args.automaticStart ?? args.automatic_start);
+        const requestedIndex = Number(args.index ?? args.startIndex ?? 0);
+        const startedIndex = automaticStart
+          ? automaticStartIndex(requestedIndex, String(args.context ?? "").replace(/^playlist:/, ""))
+          : requestedIndex;
+        playQueueLog.push({ automaticStart, requestedIndex, startedIndex });
+        setCurrent(startedIndex);
         playback.playing = true;
         playback.preview = false;
         emitState();
@@ -571,6 +722,7 @@ window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
 };
 window.__harness = {
   calls,
+  playQueueLog,
   fixtures,
   callbacks,
   listeners,
@@ -586,6 +738,16 @@ window.__harness = {
   emit,
   invoke: (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args),
   getState: () => clone(playback),
+  /** Deterministic skip controls for browser checks: patch the store,
+      refresh the open detail, and report the resulting ids. No timers. */
+  setExcluded: (trackIds, excluded = true, playlistId = "p1") => {
+    for (const trackId of Array.isArray(trackIds) ? trackIds : [trackIds]) {
+      applyTrackExclusion(playlistId, trackId, excluded);
+    }
+    emit("playlist", clone(detailFor(playlistId)));
+    return [...(exclusionsFor(playlistId) ?? [])];
+  },
+  getExcluded: (playlistId = "p1") => [...(exclusionsFor(playlistId) ?? [])],
 };
 
 await import("../src/styles/app.css");
@@ -614,7 +776,51 @@ Object.assign(window.__harness, {
     setCurrent(0, false);
     emitState();
   },
+  /**
+   * Swap the verified songwriter playlist on the artist fixture, then make
+   * the swap VISIBLE: `detail.artist` is cached per artist id, so an open
+   * artist page is left and re-entered to force one fresh browse. Called
+   * with no argument (or null) the section's data is gone — presence and
+   * absence are both deterministic states. A truthy argument restores the
+   * canonical ten-track payload.
+   */
+  setSongwriterPlaylist: (value = null) => {
+    fixtures.artist.overview.songwriter_playlist = value ? clone(songwriterPlaylist) : null;
+    if (ARTIST_ROUTE_NAMES.includes(state.route?.name)) state.navigate("library");
+    state.navigate("artist", fixtures.artist.id);
+    return clone(fixtures.artist.overview.songwriter_playlist);
+  },
   selectHistory: () => state.navigate("history"),
+  bootCachedLibrary: () => {
+    // Stage 1 of the cached-then-fresh boot: hydrate the grid from the cached
+    // get_state snapshot — including one extra recent row a real snapshot can
+    // carry — without marking the library fresh. Shelves stay hidden.
+    const stamp = Math.floor(Date.now() / 1000);
+    state.libraryState.loaded = true;
+    state.libraryState.fresh = false;
+    state.setLibrary([
+      {
+        id: "p-cached-recent",
+        name: "Cached Yesterday",
+        owner_id: "eduard",
+        tracks_total: 6,
+        last_played: stamp - 3600,
+        last_activity: stamp - 1800,
+      },
+      ...clone(fixtures.playlists),
+    ]);
+  },
+  emitFreshLibrary: () => {
+    // Stage 2: the authoritative `library` event. Omits the provisional row
+    // and carries the engine's own recency for p1; the event handler is the
+    // only writer that flips freshness back on, so final shelves mount once.
+    const stamp = Math.floor(Date.now() / 1000);
+    const [roadTrip, ...rest] = clone(fixtures.playlists);
+    emit("library", [
+      { ...roadTrip, last_played: stamp - 60, last_activity: stamp },
+      ...rest,
+    ]);
+  },
 });
 
 
@@ -622,6 +828,9 @@ state.libraryState.loaded = true;
 state.session.auth_state = "ready";
 state.session.username = "eduard";
 state.setLibrary(fixtures.playlists);
+// Default boot is final/fresh so ordinary UI tests exercise the settled Home,
+// shelves included. bootCachedLibrary() below rewinds to the staged boot.
+state.libraryState.fresh = true;
 
 mount(App, { target: document.getElementById("app") });
 state.navigate("playlist", "p1");

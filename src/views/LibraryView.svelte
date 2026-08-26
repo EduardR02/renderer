@@ -39,12 +39,19 @@
     });
   });
 
-  const recentlyPlayed = $derived.by(() =>
-    uniqueLibrary
+  /*
+   * Provisional shelves stay empty until the fresh rootlist lands. The cached
+   * snapshot can carry stale `last_played` rows; deriving shelves from it
+   * would mount a listening-history band that the fresh answer immediately
+   * reshuffles. Your library below renders from the same snapshot unwaited.
+   */
+  const recentlyPlayed = $derived.by(() => {
+    if (!libraryState.fresh) return [];
+    return uniqueLibrary
       .filter((playlist) => Number.isFinite(Number(playlist?.last_played)))
       .slice()
-      .sort((left, right) => Number(right.last_played) - Number(left.last_played)),
-  );
+      .sort((left, right) => Number(right.last_played) - Number(left.last_played));
+  });
 
   const CARD_MIN = 158;
   const CARD_GAP = 20;
@@ -68,11 +75,14 @@
     untrack(() => ensurePersonalizedDiscovery(library));
   });
 
-  const madeForYouCandidates = $derived.by(() =>
-    mergePersonalizedPlaylists(uniqueLibrary).filter(
+  /* Same gate: personalized cards join only once the rootlist is
+     authoritative, so the band mounts already final instead of refilling. */
+  const madeForYouCandidates = $derived.by(() => {
+    if (!libraryState.fresh) return [];
+    return mergePersonalizedPlaylists(uniqueLibrary).filter(
       (playlist) => !recentIds.has(playlist.id),
-    ),
-  );
+    );
+  });
   const madeForYouInitialCount = $derived(cardsPerRow * 2);
   const madeForYou = $derived(
     madeForYouCandidates.slice(0, madeForYouInitialCount),

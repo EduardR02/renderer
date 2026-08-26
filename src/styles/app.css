@@ -511,15 +511,29 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 @media (prefers-reduced-transparency: reduce) { .np-glow { display: none; } }
 .np-art { position: relative; z-index: 1; width: 100%; aspect-ratio: 1; --tile: 288px; }
 .np-canvas {
+  /* Centered inside the square sleeve at the video's own ratio: auto size,
+     clamped to the frame, contained by object-fit. Nothing here resizes the
+     sleeve — a portrait loop simply reveals the cover beneath as side backing
+     wherever the frame is narrower than the square. */
   position: absolute; z-index: 2; inset: 0;
-  display: block; width: 100%; height: 100%;
-  object-fit: cover; object-position: center;
+  display: block; margin: auto;
+  width: auto; height: auto;
+  max-width: 100%; max-height: 100%;
+  object-fit: contain; object-position: center;
   border-radius: var(--r4);
   opacity: 0; pointer-events: none;
   transform: translateZ(0);
   contain: paint;
+  transition: opacity var(--d2) var(--ease);
 }
+/* Ratio classes come from videoWidth/videoHeight at readiness and pin the
+   long axis, so the max clamps resolve deterministically at any source size. */
+.np-canvas.portrait { height: 100%; }
+.np-canvas.landscape { width: 100%; }
 .np-canvas.canvasReady { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .np-canvas { transition: none; }
+}
 /* The sleeve casts its own colour rather than a neutral black. Two shadows:
    one dark for the lift, one tinted and wider for the light. */
 .np-art .art.raised {
@@ -857,6 +871,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .link-more:hover { color: var(--accent); }
 
+/* Popular's expander lives under its own list, on the cursor path out of row
+   five — not across the page in the section header. */
+.popular-more { margin-top: var(--s3); }
+
 /* =====================================================================
    COVER ART — four tiers
    ===================================================================== */
@@ -1032,6 +1050,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .detail-meta .num { font-variant-numeric: tabular-nums; flex: none; }
 
 .actions { display: flex; align-items: center; gap: var(--s3); margin-top: var(--s5); flex-wrap: wrap; }
+
+/* Automatic playback with nowhere legal to begin — every row skipped or
+   unavailable. Said once beside the buttons, in grey type: nothing failed,
+   the listener arranged this, so an alarm would be the wrong register. */
+.start-blocked {
+  margin-top: var(--s3);
+  color: var(--fg-2);
+  font-family: var(--font-small);
+  font-size: var(--t-11);
+}
 .play-lg {
   display: grid; place-items: center; width: 48px; height: 48px; flex: none;
   border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
@@ -1255,6 +1283,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .c-idx .n { display: block; }
 .c-idx .go, .c-idx .eq { display: none; }
 .tl-row:hover .n { display: none; }
+/* A skipped row keeps its colour, its click and its glyph; the ONE quiet
+   change is the resting ordinal struck through — a line in a programme you
+   intend to sit out. It hides on hover (play glyph) and while playing
+   (equalizer) by the rules above, so it never competes with either, and the
+   current row's accent number simply keeps its strike with its colour. */
+.tl-row.skipped .n {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
 /* The glyph stays 12px, but the button fills its cell so the pointer does not
    have to find a 12px square in a 48px row. Negative margins keep the larger
    target from widening the column. */
@@ -1343,6 +1380,17 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: color var(--d1) var(--ease);
 }
 .tl-row:hover .t-cached { color: var(--rose-ink); }
+/* The skip mark shares the cached mark's slot, size and manners — same cell,
+   same 13px, same lift on hover — but stays NEUTRAL on purpose. Colour here
+   would read as a second fact-about-the-file competing with the rose disc,
+   when this is only a preference about ordering; grey at rest, one step up
+   under the pointer, exactly the step the ordinal above takes. */
+.t-skip {
+  display: grid; place-items: center; flex: none;
+  color: var(--fg-3);
+  transition: color var(--d1) var(--ease);
+}
+.tl-row:hover .t-skip { color: var(--fg-2); }
 /* Named for a screen reader, invisible to everyone else: the mark is the whole
    message and it has no text of its own. */
 .sr-only {

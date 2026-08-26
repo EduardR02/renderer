@@ -746,6 +746,7 @@ impl EngineClient {
         index: usize,
         position_ms: u32,
         context: &str,
+        automatic_start: bool,
     ) -> Result<(), String> {
         let result = self
             .request(
@@ -755,6 +756,7 @@ impl EngineClient {
                     "index": index,
                     "position_ms": position_ms,
                     "context": context,
+                    "automatic_start": automatic_start,
                 }),
             )
             .await
@@ -1173,6 +1175,24 @@ impl EngineClient {
                 "playlist_id": playlist_id,
                 "track_id": track_id,
                 "enabled": enabled,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn set_playlist_track_excluded(
+        &self,
+        playlist_id: &str,
+        track_id: &str,
+        excluded: bool,
+    ) -> Result<(), String> {
+        self.request(
+            "set_playlist_track_excluded",
+            json!({
+                "playlist_id": playlist_id,
+                "track_id": track_id,
+                "excluded": excluded,
             }),
         )
         .await
@@ -1996,6 +2016,7 @@ mod tests {
                 "queue": [{"uri": "spotify:track:abc"}],
                 "index": 0,
                 "position_ms": 12,
+                "automatic_start": true,
             }),
         );
         let value: Value = serde_json::from_str(&line).expect("request line is JSON");
@@ -2004,6 +2025,64 @@ mod tests {
         assert_eq!(value["queue"][0]["uri"], "spotify:track:abc");
         assert_eq!(value["index"], 0);
         assert_eq!(value["position_ms"], 12);
+        assert!(value["automatic_start"].as_bool().unwrap());
+        let request: spotify_playback_engine::protocol::Request =
+            serde_json::from_str(&line).expect("play queue request is valid protocol JSON");
+        let spotify_playback_engine::protocol::Command::PlayQueue {
+            automatic_start, ..
+        } = request.command
+        else {
+            panic!("play queue request must use its dedicated command");
+        };
+        assert!(automatic_start);
+
+        let legacy = build_line(
+            "legacy-play-queue",
+            "play_queue",
+            serde_json::json!({
+                "queue": [],
+                "index": 0,
+                "position_ms": 0,
+                "context": "",
+            }),
+        );
+        let spotify_playback_engine::protocol::Request {
+            command:
+                spotify_playback_engine::protocol::Command::PlayQueue {
+                    automatic_start, ..
+                },
+            ..
+        } = serde_json::from_str(&legacy).expect("legacy play queue remains valid")
+        else {
+            panic!("legacy play queue must deserialize as PlayQueue");
+        };
+        assert!(!automatic_start);
+    }
+
+    #[test]
+    fn playlist_exclusion_request_keeps_authoritative_wire_fields() {
+        let line = build_line(
+            "request-exclusion",
+            "set_playlist_track_excluded",
+            serde_json::json!({
+                "playlist_id": "playlist-1",
+                "track_id": "track-1",
+                "excluded": true,
+            }),
+        );
+        let request: spotify_playback_engine::protocol::Request =
+            serde_json::from_str(&line).expect("exclusion request is valid protocol JSON");
+        let spotify_playback_engine::protocol::Command::SetPlaylistTrackExcluded {
+            playlist_id,
+            track_id,
+            excluded,
+        } = request.command
+        else {
+            panic!("playlist exclusion request must use its dedicated command");
+        };
+        assert_eq!(playlist_id, "playlist-1");
+        assert_eq!(track_id, "track-1");
+        assert!(excluded);
     }
 
     #[test]

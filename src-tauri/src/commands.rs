@@ -85,14 +85,19 @@ pub async fn set_playback_speed(
     client.set_playback_speed(speed).await
 }
 
+/// `automatic_start` is optional so clients built before the preference
+/// existed keep direct-play semantics (`false`) when they omit it.
 #[tauri::command]
 pub async fn play_queue(
     client: State<'_, Arc<EngineClient>>,
     queue: Vec<Track>,
     index: usize,
     context: String,
+    automatic_start: Option<bool>,
 ) -> Result<(), String> {
-    client.play_queue(&queue, index, 0, &context).await
+    client
+        .play_queue(&queue, index, 0, &context, automatic_start.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
@@ -237,6 +242,18 @@ pub async fn set_playlist_track_edit_enabled(
 ) -> Result<(), String> {
     client
         .set_playlist_track_edit_enabled(&playlist_id, &track_id, enabled)
+        .await
+}
+
+#[tauri::command]
+pub async fn set_playlist_track_excluded(
+    client: State<'_, Arc<EngineClient>>,
+    playlist_id: String,
+    track_id: String,
+    excluded: bool,
+) -> Result<(), String> {
+    client
+        .set_playlist_track_excluded(&playlist_id, &track_id, excluded)
         .await
 }
 
@@ -854,7 +871,7 @@ pub async fn clear_cache(
         "audio" => {
             // A logged-out/not-yet-ready engine has no active audio handles;
             // failure to empty that already-empty queue is harmless.
-            let _ = client.play_queue(&[], 0, 0, "").await;
+            let _ = client.play_queue(&[], 0, 0, "", false).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             (engine_state_dir().join("audio"), &["cache-version"])
         }
@@ -1471,6 +1488,7 @@ async fn fetch_playlist(
                 fetched_at: Some(fetched_at),
                 revision: detail.playlist.snapshot_id.clone(),
                 tracks: detail.tracks.clone(),
+                excluded_track_ids: detail.excluded_track_ids.clone(),
             },
         );
         let should_persist_library = is_followed_playlist(&guard.playlists, id);
