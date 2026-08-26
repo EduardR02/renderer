@@ -573,10 +573,33 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   from { filter: brightness(0.94) saturate(1.04); transform: scale(1); }
   to   { filter: brightness(0.4) saturate(1.02); transform: scale(1.06); }
 }
+/* Settle timeline — the authoritative goodbye. The sleeve travels home along
+   the same rail it opened on, a shade quicker because exits should not
+   dawdle, while the cover steps forward out of its recede and the Canvas
+   drains back up the way it poured down, handing the frame back to the cover
+   as a crossfade rather than a cut. The component holds the video mounted
+   and paused through this and releases it when the motion reports done. */
+.np-stage.settle .np-art::before {
+  padding-top: 100%;
+  transition-duration: 1.05s;
+}
+.np-stage.settle .np-art .art { animation: np-forward 1.05s var(--ease-open) both; }
+.np-stage.settle .np-canvas { animation: np-drain 1.05s var(--ease-open) both; }
+@keyframes np-forward {
+  from { filter: brightness(0.4) saturate(1.02); transform: scale(1.06); }
+  to   { filter: brightness(0.94) saturate(1.04); transform: scale(1); }
+}
+@keyframes np-drain {
+  from { opacity: 1; clip-path: inset(0 0 0 0); transform: scale(1); }
+  45%  { opacity: 0.3; }
+  to   { opacity: 0; clip-path: inset(0 0 100% 0); transform: scale(1.02); }
+}
 @media (prefers-reduced-motion: reduce) {
   .np-stage.play .np-art::before { transition: none; }
   .np-stage.play .np-art .art { animation: none; }
   .np-stage.play .np-canvas { animation: none; opacity: 1; }
+  .np-stage.settle .np-art .art { animation: none; }
+  .np-stage.settle .np-canvas { animation: none; opacity: 0; }
 }
 
 .np-block { flex: none; padding: 0 var(--s4); min-width: 0; }

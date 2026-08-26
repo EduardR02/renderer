@@ -28,6 +28,7 @@
   let canvasUrl = $state("");
   let canvasReady = $state(false);
   let canvasStageRatio = $state(100);
+  let canvasRetiring = $state(false);
   let canvasEl = $state(null);
   let pageVisible = $state(!document.hidden);
   let reducedMotion = $state(false);
@@ -62,11 +63,13 @@
     const key = canvasTrackKey;
     const shouldFetch = Boolean(key && appSettings.animated_canvas && pageVisible && !reducedMotion);
     const generation = ++canvasGeneration;
-    /* Resource-policy changes are authoritative and clear immediately. A
-       track change is different: keep the current Canvas and its geometry
-       while the next request is in flight, then replace or collapse exactly
-       once when that request answers. */
+    /* Resource-policy changes are authoritative and clear immediately —
+       nothing is watching, so there is no handoff worth staging. A track
+       change is different: keep the current Canvas and its geometry while
+       the next request is in flight, then replace it, or retire it
+       gracefully, exactly once when that request answers. */
     if (!shouldFetch) {
+      canvasRetiring = false;
       canvasUrl = "";
       canvasReady = false;
       canvasStageRatio = 100;
@@ -76,18 +79,18 @@
       .then((canvas) => {
         if (generation !== canvasGeneration) return;
         if (!canvas?.url) {
-          canvasUrl = "";
-          canvasReady = false;
-          canvasStageRatio = 100;
+          retireCanvas();
           return;
         }
+        /* A newer positive supersedes a handoff already in motion: drop the
+           flag first, so the retiring motion's completion event finds a
+           source it is no longer allowed to clear. */
+        canvasRetiring = false;
         canvasUrl = canvas.url;
       })
       .catch(() => {
         if (generation !== canvasGeneration) return;
-        canvasUrl = "";
-        canvasReady = false;
-        canvasStageRatio = 100;
+        retireCanvas();
       });
   });
 
@@ -105,12 +108,16 @@
    * the record does is what the official client shows too.
    */
   const canvasPlaying = $derived(
-    Boolean(canvasUrl) && pageVisible && ui.windowFocused && playback.playing,
+    Boolean(canvasUrl) && !canvasRetiring && pageVisible && ui.windowFocused && playback.playing,
   );
 
   $effect(() => {
+    /* Keyed on the displayed source itself, not just the gates: replacing
+       the src while playback never stopped reloads the element and parks
+       it, so the replacement has to be started again explicitly. */
+    const url = canvasUrl;
     const video = canvasEl;
-    if (!video) return;
+    if (!video || !url) return;
     if (canvasPlaying) video.play().catch(() => {});
     else video.pause();
   });
@@ -125,12 +132,63 @@
     const h = canvasEl?.videoHeight ?? 0;
     if (w > 0 && h > 0) canvasStageRatio = (h / w) * 100;
     canvasReady = true;
+    /* Source replacement lands here too, with playback still running: the
+       effect above already restarted the swapped element, and this is the
+       moment a start can actually succeed, so re-arm it under exactly the
+       same gates. A redundant play() on a running element resolves quietly. */
+    if (!canvasRetiring && pageVisible && ui.windowFocused && playback.playing) {
+      canvasEl?.play()?.catch(() => {});
+    }
   }
 
-  function handleCanvasError() {
+  function handleCanvasError(event) {
+    /* Swapping the src aborts the previous load, and that abort surfaces
+       here as MEDIA_ERR_ABORTED — noise about a source already gone, not a
+       verdict on whatever is displayed now. */
+    if (event?.target?.error?.code === MediaError.MEDIA_ERR_ABORTED) return;
+    retireCanvas();
+  }
+
+  /**
+   * An authoritative null/error sends the displayed Canvas home without a
+   * snap: the frame stays mounted and paused while CSS carries it back —
+   * the sleeve contracts along the rail it opened on, the cover steps
+   * forward out of its recede, the video drains away — and the URL and the
+   * element are released only when that motion reports completion.
+   * Interrupting it (a newer positive, another track) drops the flag, so a
+   * stale completion event finds nothing it may clear.
+   */
+  function retireCanvas() {
+    if (canvasRetiring) return;
+    if (!canvasUrl || !canvasReady) {
+      /* Nothing was ever revealed: there is no motion to preserve. */
+      canvasUrl = "";
+      canvasReady = false;
+      canvasStageRatio = 100;
+      return;
+    }
+    canvasRetiring = true;
+  }
+
+  /** Completion, taken from the settle motion's own events — never a timer. */
+  function commitRetirement() {
+    if (!canvasRetiring) return;
+    canvasRetiring = false;
     canvasUrl = "";
     canvasReady = false;
     canvasStageRatio = 100;
+  }
+
+  /** The sleeve finishing its contraction is the end of the handoff. */
+  function handleStageSettled(event) {
+    if (event.propertyName === "padding-top" && event.pseudoElement === "::before") {
+      commitRetirement();
+    }
+  }
+
+  /** Fallback completion signal alongside the padding transition. */
+  function handleCanvasDrained(event) {
+    if (event.animationName === "np-drain") commitRetirement();
   }
 
   /* Credits are content in this panel, not a destination, so they load with
@@ -184,12 +242,13 @@
     <div
       class="np-stage"
       class:play={canvasReady}
+      class:settle={canvasRetiring}
       style:--stage-open={`${canvasStageRatio.toFixed(4)}%`}
     >
       <span class="np-glow" aria-hidden="true">
         <Cover src={current.cover_url} id={current.album_id || current.uri} name="" fill />
       </span>
-      <div class="np-art">
+      <div class="np-art" ontransitionend={handleStageSettled}>
         <Cover
           src={current.cover_url}
           id={current.album_id || current.uri}
@@ -209,6 +268,7 @@
             aria-label={`Canvas animation for ${current.name}`}
             oncanplay={handleCanvasReady}
             onerror={handleCanvasError}
+            onanimationend={handleCanvasDrained}
           ></video>
         {/if}
       </div>
