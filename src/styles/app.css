@@ -321,6 +321,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   width: 19px; height: 19px; flex: none; border-radius: var(--r1);
   background: linear-gradient(140deg, var(--foam) 0%, var(--rose) 100%);
   display: grid; place-items: center;
+  margin-top: 1px;
 }
 .nav-item {
   display: flex; align-items: center; gap: var(--s3);
@@ -356,7 +357,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .lib { display: flex; flex-direction: column; flex: 1; min-height: 0; margin-top: var(--s3); }
 .lib-head {
   display: flex; align-items: center; justify-content: space-between;
-  height: 24px; padding: 0 var(--s2); margin-bottom: var(--s1);
+  height: 28px; padding: 0 var(--s2); margin-bottom: var(--s1);
 }
 .lib-head .label {
   font-family: var(--font-small);
@@ -410,8 +411,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--r2); text-align: left;
   transition: background-color var(--d1) var(--ease);
 }
-.lib-row:hover { background: rgba(255, 255, 255, 0.045); }
-.lib-row.active { background: linear-gradient(90deg, var(--accent-wash), transparent 80%), var(--bg-3); }
+.lib-row.active { background: linear-gradient(90deg, var(--accent-wash), transparent 80%), var(--bg-3);
+  box-shadow: inset 2px 0 var(--accent); }
 .lib-row.active .lib-name { color: var(--fg); }
 .lib-name {
   font-size: var(--t-13); color: var(--fg-1);
@@ -428,6 +429,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    selects is the saved collection. Everything else selected is foam. */
 .lib-row.liked-row.active {
   background: linear-gradient(90deg, var(--saved-wash), transparent 80%), var(--bg-3);
+  /* The rail stays with the row: the nav and every library selection carry
+     the same inset bar, so "selected" is one shape everywhere in the rail —
+     and this one row's bar is warm because its wash is. */
+  box-shadow: inset 2px 0 var(--rose-ink);
 }
 .liked-row { margin-bottom: var(--s2); }
 .liked-row + .lib-row { position: relative; }
@@ -594,6 +599,20 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 
 .np-block { flex: none; padding: 0 var(--s4); min-width: 0; }
+/* A track change swaps the whole identity stack — the sleeve above already
+   hands the frame over through np-recede/np-forward, so the text arriving
+   dead-still under a dissolving cover read as two clocks. One quiet fade-up
+   a step (no slide distance to read as motion, no stagger to time) puts the
+   copy on the same beat as the artwork. `both` so first paint of a track
+   starts from the from-frame, and the album button is on the list because it
+   sits between two animated blocks and would otherwise pop. */
+.np-block, .np-album { animation: np-swap-in 360ms var(--ease) both; }
+@keyframes np-swap-in {
+  from { opacity: 0; transform: translateY(4px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .np-block, .np-album { animation: none; }
+}
 .np-identity h2 {
   font-family: var(--font-display); font-size: var(--t-23); font-weight: var(--w-bold);
   letter-spacing: -0.02em; line-height: 1.16; overflow-wrap: anywhere;
@@ -608,7 +627,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .np-meta {
   display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
-  margin-top: var(--s3); color: var(--fg-2);
+  margin-top: var(--s4); color: var(--fg-2);
   font-family: var(--font-small); font-size: var(--t-12);
 }
 .np-dot { width: 3px; height: 3px; border-radius: 50%; background: var(--fg-3); flex: none; }
@@ -793,10 +812,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 .topbar-title {
   display: flex; align-items: center; gap: var(--s3);
-  min-width: 0; opacity: 0;
-  transition: opacity var(--d2) var(--ease);
+  min-width: 0; opacity: 0; transform: translateY(3px);
+  transition: opacity var(--d2) var(--ease), transform var(--d2) var(--ease);
 }
-.topbar.scrolled .topbar-title { opacity: 1; }
+.topbar.scrolled .topbar-title { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  .topbar-title { transform: none; }
+}
 .topbar-title .t {
   font-family: var(--font-display); font-size: var(--t-15); font-weight: var(--w-bold);
   letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -804,16 +826,19 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .topbar-play {
   display: grid; place-items: center; width: 28px; height: 28px; flex: none;
   border-radius: var(--rf); background: var(--accent); color: var(--accent-ink);
+  transition: background-color var(--d1) var(--ease);
 }
+.topbar-play:hover { background: var(--accent-hi); }
 
 /* The field fills its grid track, which is where the sizing now lives. */
 .searchbox {
   display: flex; align-items: center; gap: var(--s2); min-width: 0;
   width: 100%; height: 32px; padding: 0 var(--s3);
   border-radius: var(--r2); background: var(--bg-2);
-  border: 1px solid transparent; color: var(--fg-2);
+  border: 1px solid var(--line); color: var(--fg-2);
   transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
+.searchbox:hover:not(:focus-within) { border-color: var(--line-2); }
 .searchbox:focus-within { border-color: var(--foam); background: var(--bg-3); }
 .searchbox input {
   flex: 1; min-width: 0; height: 100%; border: 0; background: none;
@@ -833,6 +858,30 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   font-size: var(--t-32); font-weight: var(--w-bold); letter-spacing: -0.022em;
   line-height: 1.15;
 }
+
+/* The shared back link for pages that are rooms off another page — the
+   artist's discography and collections, the track editor. One object instead
+   of four local ones: a chevron, a name, a quiet hover that lifts to full ink.
+   It sits where the eye re-enters the page, so the name it carries is the
+   context the Back button in the topbar cannot give. */
+.page-back {
+  display: inline-flex; align-items: center; gap: var(--s2);
+  min-height: 32px; margin-left: calc(var(--s3) * -1); padding: 0 var(--s3) 0 var(--s2);
+  border-radius: var(--r2);
+  color: var(--fg-2); font-size: var(--t-12);
+  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+}
+.page-back:hover { color: var(--fg); background: rgba(255, 255, 255, 0.05); }
+.page-back svg { flex: none; }
+
+/* The rhythm for a page whose header is type only: back link, title, and any
+   sub-line set as one block, so every such page breathes the same. The
+   record-detail heroes (.detail-head) keep their own larger geometry. */
+.page-head {
+  padding: var(--s3) 0 var(--s6);
+}
+.page-head .page-title { margin: 0; }
+.page-head .sub { margin: var(--s2) 0 0; }
 /* The one caps treatment for FIELD labels, defined once so every one of them
    in the app is literally the same object: 11px, 600, 0.12em, neutral. Colour
    is not what makes a field label a label — tracking and weight are. */
@@ -1019,16 +1068,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    single biggest reason the app is not monotone: every playlist, album and
    collection opens a different colour, and none of them came from the palette.
 
-   It used to be a palette tint at 20% alpha over near-black. Two things were
-   wrong with that. It was far too weak to register as colour at all, and —
-   because the tone was chosen by hashing the id into a two-entry list — half
-   of everything came out rose, and rose at 20% over #121212 is arithmetically
-   #3d2d2c. Brown. Not a taste failure; a compositing one.
-
-   So the stops are OPAQUE and the colour arrives pre-mixed. `--tone-wash` is a
+   The stops are OPAQUE and the colour arrives pre-mixed. `--tone-wash` is a
    real dark colour at a fixed lightness (see covertone.svelte.js), so the top
-   of the page is as strong as Spotify's and the bottom lands exactly on the
-   pane so the join is invisible.
+   of the page is as strong as Spotify's — and the bottom DISSOLVES into the
+   pane rather than landing on it: a ramp that ends exactly at --bg-1 leaves
+   a hard horizontal seam, so the last stop fades to transparent instead and
+   the colour goes out the way light does, with no edge to catch on.
    ===================================================================== */
 .wash {
   position: relative;
@@ -1041,15 +1086,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      container — invisible behind overflow-x:hidden, but real. */
   inset: calc(var(--topbar-h) * -1) 0 auto;
   height: 460px;
-  /* Four stops, not two. A straight two-stop ramp over 460px reads as a
-     gradient *effect*; a fast fall through a deeper shade and then a long tail
-     reads as light on a surface, which is what the eye is expecting here. */
+  /* Fast fall through a deeper shade, a long tail, then a dissolve. A straight
+     two-stop ramp reads as a gradient *effect*; this reads as light on a
+     surface — and the transparent close means no seam where the wash stops. */
   background: linear-gradient(
     180deg,
     var(--tone-wash) 0%,
     var(--tone-wash-deep) 30%,
     color-mix(in srgb, var(--tone-wash-deep) 42%, var(--bg-1)) 58%,
-    var(--bg-1) 100%
+    color-mix(in srgb, var(--bg-1) 88%, transparent) 82%,
+    transparent 100%
   );
   pointer-events: none;
 }
@@ -1630,14 +1676,20 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   height: var(--player-h); padding: 0 var(--s5);
   background: var(--bg-bar);
   border-radius: var(--r-panel);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
 }
 
 .p-now { display: flex; align-items: center; gap: var(--s3); min-width: 0; }
 /* 48px in CSS as well as on the element: the slot exists before the art does */
 .p-art { width: 48px; height: 48px; --tile: 48px; flex: none; }
-.p-art-btn { width: 48px; height: 48px; flex: none; border-radius: var(--r1); line-height: 0; }
+.p-art-btn { width: 48px; height: 48px; flex: none; border-radius: var(--r2); line-height: 0;
+  transition: filter var(--d1) var(--ease), transform var(--d1) var(--ease); }
+.p-art-btn:hover { filter: brightness(1.12); }
+.p-art-btn:active { transform: scale(0.97); }
 .p-meta { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
-.p-title { font-size: var(--t-13); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.p-title { font-size: var(--t-13); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: color var(--d1) var(--ease); }
+.p-title:hover { color: var(--accent); }
 .p-artists {
   font-family: var(--font-small); font-size: var(--t-11); color: var(--fg-2);
   text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1646,18 +1698,17 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .p-artists:hover { color: var(--fg); }
 .p-now.idle .p-title { color: var(--fg-2); }
 .p-now.idle .p-artists { color: var(--fg-3); }
-
 /* Standard arrangement kept: transport centred, seek rail beneath it. */
 .p-center { display: flex; flex-direction: column; align-items: center; gap: var(--s2); min-width: 0; }
 .transport { display: flex; align-items: center; gap: var(--s6); flex: none; }
 .ctl {
   position: relative; display: grid; place-items: center; flex: none;
-  width: 24px; height: 24px;        /* fixed slot: the icon may fail, the row may not */
-  color: var(--fg-1);
-  transition: color var(--d1) var(--ease), transform var(--d1) var(--ease);
+  width: 28px; height: 28px;        /* fixed slot: the icon may fail, the row may not */
+  border-radius: var(--rf); color: var(--fg-1);
+  transition: color var(--d1) var(--ease), transform var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.ctl:hover { color: var(--fg); }
-.ctl:active { transform: scale(0.92); }
+.ctl:hover { color: var(--fg); background: rgba(255, 255, 255, 0.06); }
+.ctl:active { transform: scale(0.94); }
 .ctl.on { color: var(--accent); }
 .ctl.on::after {
   content: ""; position: absolute; bottom: -6px; left: 50%; margin-left: -1.5px;
@@ -1689,7 +1740,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .p-seek { display: flex; align-items: center; gap: var(--s3); width: 100%; min-width: 0; }
 .p-time {
   font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-med);
-  color: var(--fg-2); width: 40px; flex: none;
+  color: var(--fg-2); min-width: 40px; flex: none;
 }
 .p-time.l { text-align: right; }
 .p-time.r { text-align: left; }
@@ -1727,7 +1778,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: opacity var(--d1) var(--ease);
 }
 .seek-tip.visible { opacity: 1; visibility: visible; }
-
 /* Right cluster: given real room (panel padding 20px + 8px gutter = 28px
    clear of the window edge) and an icon sized like the rest of the bar. */
 .p-right { display: flex; align-items: center; justify-content: flex-end; gap: var(--s3); min-width: 0; }
@@ -1743,6 +1793,22 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
 .dot.warn { background: var(--danger); }
+@media (max-width: 1179px) {
+  /* Below the 1180 step-down the bar loses 56px of window for every column
+     it keeps. The transport's 24px gaps are generous at full width and the
+     first thing to feel cramped at 940; --s4 keeps the buttons apart without
+     pushing the seek rail under the side clusters. Declared after the base
+     rules on purpose: equal specificity, so source order decides. */
+  .transport { gap: var(--s4); }
+}
+@media (max-width: 760px) {
+  /* The bar's floor. The seek rail cannot give more room — it is already the
+     flexible track between two fixed columns — so the volume rail is what
+     leaves: it is the one control here with an equivalent (the OS volume,
+     and the mute click beside it). Keeping the icon and dropping only the
+     rail keeps the habit and the mute affordance intact. */
+  .vol { display: none; }
+}
 
 /* =====================================================================
    MENU
@@ -1921,13 +1987,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   overflow: hidden; overflow-wrap: anywhere;
 }
 .credits-title-copy p {
-  margin-top: 2px; color: var(--fg-2); font-size: var(--t-12);
+  margin-top: 2px; color: var(--fg-1); font-size: var(--t-12);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
 .credits-tools {
   display: flex; align-items: center; justify-content: space-between; gap: var(--s4);
-  flex: none; padding: 0 var(--s6) var(--s4);
+  flex: none; padding: var(--s3) var(--s6) var(--s4);
 }
 .credits-summary {
   display: flex; align-items: center; gap: var(--s2); min-width: 0;
@@ -2104,9 +2170,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* =====================================================================
    SETTINGS
    ===================================================================== */
-.settings-intro { padding: var(--s3) 0 0; }
+.settings-intro { padding: var(--s4) 0 0; }
 .set { max-width: 720px; }
-.set-group { margin-top: var(--s6); }
+.set-group { margin-top: var(--s7); }
 /* A group heading is a hairline with a short accent lead-in rather than a
    full-width rule in grey: it names the group and tints the page at the same
    time, which is most of what stops a settings screen reading as a form. */
@@ -2171,6 +2237,33 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 /* the control cell: fixed-size widgets, right-aligned, never squeezed */
 .set-ctl { display: flex; align-items: center; justify-content: flex-end; gap: var(--s3); flex: none; }
+
+/* The drawn checkbox, shared by Settings and any other boolean row: a raised
+   field at rest, the foam fill with the ink glyph when checked. 16px box,
+   18px hit target via padding on the row's own label — the control is small
+   on purpose, but never smaller than a pointer can land on. */
+.set-check {
+  appearance: none;
+  display: grid; place-items: center;
+  width: 18px; height: 18px; margin: 0;
+  border: 1px solid var(--line-2); border-radius: var(--r1);
+  background: var(--bg-2);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+  transition: background-color var(--d1) var(--ease), border-color var(--d1) var(--ease);
+}
+.set-check:hover:enabled { border-color: var(--fg-3); background: var(--bg-3); }
+.set-check:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.set-check:checked::before {
+  content: "";
+  width: 10px; height: 10px;
+  background: var(--accent-ink);
+  clip-path: polygon(13% 50%, 0 63%, 37% 100%, 100% 16%, 87% 3%, 37% 72%);
+}
+.set-check:disabled { cursor: default; opacity: 0.45; }
 
 /* --------------------------------------------------------------- listbox
    Replaces the one native <select>, which rendered as a light OS widget with
@@ -2458,12 +2551,31 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .page.bleed { padding-top: 0; }
 
 /* Login is an empty state with one action, not a modal card: same left-aligned
-   column as every other page so signing in does not feel like a different app. */
+   column as every other page so signing in does not feel like a different app.
+   The mark is the signature gradient's one other appearance — the brand mark
+   above the title, carrying the same cool-to-warm the seek rail draws. */
 .login-mark {
   display: grid; place-items: center; width: 44px; height: 44px; flex: none;
-  border-radius: var(--r2); color: var(--accent-ink);
+  border-radius: var(--r3); color: var(--accent-ink);
   background: linear-gradient(140deg, var(--foam) 0%, var(--rose) 100%);
-  margin-bottom: var(--s5);
+  box-shadow: 0 10px 26px -10px color-mix(in srgb, var(--rose) 55%, transparent);
+  margin-bottom: var(--s4);
+}
+/* The waiting line is a status, not an error: a quiet pulse on the dot says
+   the core is working without a spinner or a timer-driven animation. Static
+   under prefers-reduced-motion. */
+.login-wait::before {
+  content: ""; display: inline-block; width: 6px; height: 6px;
+  margin-right: var(--s2); border-radius: var(--rf);
+  background: var(--foam); vertical-align: 1px;
+  animation: login-pulse 1.6s var(--ease) infinite;
+}
+@keyframes login-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-wait::before { animation: none; }
 }
 
 /* =====================================================================

@@ -674,7 +674,7 @@
 </script>
 
 <section class="view page edit-page">
-  <button class="edit-back" onclick={goBack}><Icon name="back" size={14} />Back</button>
+  <button class="page-back" onclick={goBack}><Icon name="back" size={14} />Back</button>
   {#if !track}
     <div class="empty-state"><h1>Track unavailable</h1><p>Open the editor from a track’s menu.</p></div>
   {:else}
@@ -786,13 +786,6 @@
 
 <style>
 .edit-page { max-width: 1240px; margin-inline: auto; }
-.edit-back {
-  display: inline-flex; align-items: center; gap: 7px; min-height: 32px;
-  margin-bottom: var(--s3); padding: 0 var(--s3) 0 var(--s2);
-  border-radius: var(--r2); color: var(--fg-2); font-size: var(--t-12);
-  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
-}
-.edit-back:hover { color: var(--fg); background: rgba(255, 255, 255, 0.05); }
 /* Same left-aligned quiet column as every other empty state — centring it
    would dress a missing track up as a modal event. */
 .empty-state { max-width: 560px; padding: var(--s7) 0; color: var(--fg-2); font-size: var(--t-13); }

@@ -383,6 +383,32 @@
     top.slice(0, popularExpanded ? POPULAR_EXPANDED : POPULAR_PREVIEW),
   );
 
+  /* ----------------------------------------------------- in-place growth
+     Every TrackList opts out of browser scroll anchoring (its rows declare
+     overflow-anchor:none), so when Popular expands the shared `.scroll`
+     often has no eligible anchor left above the growth inside the viewport
+     band. The engine then grabs something BELOW the inserted rows — the
+     expander, the next section — and holds THAT still, dragging the whole
+     page above it down by exactly the added height. An expand here is
+     deliberate in-place growth: rows appear only below, so the correct
+     frame is "scrollTop does not change". Freeze the offset at click time
+     and re-assert it inside the same paint the growth lands in; collapsed,
+     symmetric. */
+  let popularSectionEl = $state(null);
+  let songwriterSectionEl = $state(null);
+
+  function toggleExpand(scrollHost, mutate) {
+    const sc = scrollHost?.closest(".scroll") ?? null;
+    const frozen = sc ? sc.scrollTop : 0;
+    mutate();
+    if (!sc) return;
+    requestAnimationFrame(() => {
+      if (!sc.isConnected) return;
+      const wanted = Math.min(frozen, sc.scrollHeight - sc.clientHeight);
+      if (Math.abs(sc.scrollTop - wanted) >= 1) sc.scrollTop = wanted;
+    });
+  }
+
   function playTop(i) {
     if (top.length) api.playQueue(top, i, `artist:${artist?.id ?? ""}`).catch(() => {});
   }
@@ -785,7 +811,7 @@
     </div>
 
     {#if top.length}
-      <div class="section">
+      <div class="section" bind:this={popularSectionEl}>
         <div class="section-head">
           <h2 class="section-title">Popular</h2>
         </div>
@@ -798,7 +824,7 @@
           <button
             class="link-more popular-more"
             aria-expanded={popularExpanded}
-            onclick={() => (popularExpanded = !popularExpanded)}
+            onclick={() => toggleExpand(popularSectionEl, () => (popularExpanded = !popularExpanded))}
           >
             {popularExpanded ? "Show less" : "See more"}
           </button>
@@ -814,7 +840,7 @@
         The rows stay in playlist source order and direct playback carries the
         playlist context.
       -->
-      <section class="section written-by" aria-labelledby="written-by-title">
+      <section class="section written-by" aria-labelledby="written-by-title" bind:this={songwriterSectionEl}>
         <div class="section-head">
           <h2 class="section-title" id="written-by-title">Written by</h2>
         </div>
@@ -844,7 +870,7 @@
               <button
                 class="link-more popular-more"
                 aria-expanded={false}
-                onclick={() => (songwriterExpanded = true)}
+                onclick={() => toggleExpand(songwriterSectionEl, () => (songwriterExpanded = true))}
               >
                 See more
               </button>

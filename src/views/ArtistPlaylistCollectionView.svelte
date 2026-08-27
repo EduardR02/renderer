@@ -15,10 +15,11 @@
   const collections = $derived(artistPlaylistCollections(overview));
   const discovered = $derived(route.name === "discovered-on");
   const title = $derived(discovered ? "Discovered on" : "Artist playlists");
-  const playlists = $derived(discovered ? collections.discovered : collections.artist);
+  /* The artist's own tone, soft: these collection pages are rooms off the
+     artist's page, and they share its colour the way the playlist and album
+     pages share their record's. */
+  const tone = $derived(coverTone(artist?.cover_url || "", artist?.id || ""));
 
-  let busy = $state({ id: "" });
-  let error = $state("");
   let loadedRoute = "";
 
   $effect(() => {
@@ -44,7 +45,13 @@
 
 </script>
 
-{#snippet playlistCard(playlist)}
+<section
+  class="view page aux-page wash soft"
+  style:--tone-wash={tone.wash}
+  style:--tone-wash-deep={tone.washDeep}
+  style:--tone-glow={tone.glow}
+>
+  {#snippet playlistCard(playlist)}
   {@const tone = coverTone(playlist.cover_url || playlist.cover_urls?.[0] || "", playlist.id)}
   <div class="card" style:--tone-glow={tone.glow}>
     <div class="card-art">
@@ -78,10 +85,9 @@
   </div>
 {/snippet}
 
-<section class="view page aux-page">
   {#if artist}
     <header class="aux-head">
-      <button class="aux-back" onclick={() => navigateArtist(artist.id, artist.name)}>
+      <button class="page-back" onclick={() => navigateArtist(artist.id, artist.name)}>
         <Icon name="back" size={13} />{artist.name}
       </button>
       <div class="aux-title-row">
@@ -122,11 +128,6 @@
 <style>
   .aux-page { padding-top: var(--s5); }
   .aux-head { padding: var(--s2) 0 var(--s6); }
-  .aux-back {
-    display: inline-flex; align-items: center; gap: var(--s2);
-    color: var(--fg-2); font-size: var(--t-12);
-  }
-  .aux-back:hover { color: var(--fg); }
   .aux-title-row { display: flex; align-items: baseline; gap: var(--s3); margin-top: var(--s3); }
   .aux-grid { grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); }
 </style>

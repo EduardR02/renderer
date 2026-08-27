@@ -9,10 +9,14 @@
   import { coverTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
-
   const artist = $derived(detail.artist);
   const counts = $derived(artist?.release_counts ?? {});
   const appearsOnCount = $derived(counts.appears_on ?? 0);
+  /* One page of the artist's orbit, so it wears the artist's own tone — soft,
+     like Fans also like and the playlist collections — instead of the flat
+     ground every other page opens with. */
+  const tone = $derived(coverTone(artist?.cover_url || "", artist?.id || ""));
+
   const APPEARS_ON_TYPES = ["appears_on"];
 
   let busy = $state({ id: "" });
@@ -62,10 +66,15 @@
 
 </script>
 
-<section class="view page aux-page appears-page">
+<section
+  class="view page aux-page appears-page wash soft"
+  style:--tone-wash={tone.wash}
+  style:--tone-wash-deep={tone.washDeep}
+  style:--tone-glow={tone.glow}
+>
   {#if artist}
     <header class="aux-head">
-      <button class="aux-back" onclick={() => navigateArtist(artist.id, artist.name)}>
+      <button class="page-back" onclick={() => navigateArtist(artist.id, artist.name)}>
         <Icon name="back" size={13} />{artist.name}
       </button>
       <div class="aux-title-row">
@@ -154,11 +163,6 @@
 <style>
   .aux-page { padding-top: var(--s5); }
   .aux-head { padding: var(--s2) 0 var(--s6); }
-  .aux-back {
-    display: inline-flex; align-items: center; gap: var(--s2);
-    color: var(--fg-2); font-size: var(--t-12);
-  }
-  .aux-back:hover { color: var(--fg); }
   .aux-title-row { display: flex; align-items: baseline; gap: var(--s3); margin-top: var(--s3); }
   .appears-grid { grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); }
   .aux-foot { display: flex; justify-content: center; min-height: 56px; padding-top: var(--s6); }

@@ -21,18 +21,17 @@
   style:--tone-wash-deep={TONE.washDeep}
   style:--tone-glow={TONE.glow}
 >
-  <div style="padding:var(--s7) 0 var(--s2)">
+  <div class="page-head">
     <span class="login-mark"><Icon name="note" size={20} /></span>
     <span class="tag">Spotify Renderer</span>
     <h1 class="page-title">Sign in to start listening</h1>
-  </div>
-
-  <div class="empty">
     <p class="sub">
       Authorisation opens in your browser. Nothing is stored here but the
       session the core hands back.
     </p>
+  </div>
 
+  <div class="empty">
     <div class="actions">
       <button class="btn-accent" disabled={!playback.auth_url} onclick={openAuthUrl}>
         <Icon name="login" size={15} />Log in with Spotify
@@ -41,7 +40,7 @@
     </div>
 
     {#if !playback.auth_url}
-      <p class="sub" style="margin-top:var(--s4)">Waiting for Spotify sign-in to be ready…</p>
+      <p class="sub login-wait" style="margin-top:var(--s4)">Waiting for Spotify sign-in to be ready…</p>
     {/if}
     {#if session.error}
       <p class="sub" style="margin-top:var(--s2); color:var(--danger)">{session.error}</p>

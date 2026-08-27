@@ -6,15 +6,19 @@
 
   /* This is deliberately a projection of the artist response, not a browse
      surface. The artist page already paid for the related-artist payload, so
-     opening See all must not issue a second request. */
+     opening See all must not issue a second request. But it is still a page,
+     so it wears the artist's own tone — soft, like the other pages whose
+     subject is a person's orbit rather than one record. */
   const artist = $derived(detail.artist);
   const relatedArtists = $derived(artist?.overview?.related_artists ?? []);
+  const tone = $derived(coverTone(artist?.cover_url || "", artist?.id || ""));
 </script>
 
-<section class="view page aux-page">
+<section class="view page aux-page wash soft" style:--tone-wash={tone.wash} style:--tone-wash-deep={tone.washDeep} style:--tone-glow={tone.glow}>
+
   {#if artist}
     <header class="aux-head">
-      <button class="aux-back" onclick={() => navigateArtist(artist.id, artist.name)}>
+      <button class="page-back" onclick={() => navigateArtist(artist.id, artist.name)}>
         <Icon name="back" size={13} />{artist.name}
       </button>
       <div class="aux-title-row">
@@ -72,12 +76,6 @@
 
 <style>
   .aux-page { padding-top: var(--s5); }
-  .aux-head { padding: var(--s2) 0 var(--s6); }
-  .aux-back {
-    display: inline-flex; align-items: center; gap: var(--s2);
-    color: var(--fg-2); font-size: var(--t-12);
-  }
-  .aux-back:hover { color: var(--fg); }
   .aux-title-row { display: flex; align-items: baseline; gap: var(--s3); margin-top: var(--s3); }
   .aux-grid { grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); }
   .artist-card { width: 100%; }

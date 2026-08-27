@@ -127,10 +127,21 @@
        into --stage-open as a padding-top percentage against the rail width.
        The box adopts the ratio and the video object-fits inside it, so the
        source can never crop, and the square-to-ratio growth is what pushes
-       the blocks below down through normal flow. */
+       the blocks below down through normal flow.
+       The target lands on whole device pixels: a fractional final height
+       (522.667 css px is 653.3 physical at 125% Windows scaling) makes the
+       video layer's texture re-round every frame of the ease's slow crawl,
+       and the contain-fit width — a function of that snapped height —
+       shimmered sideways while the sleeve's own edges never moved. An integer
+       target stops the last frames from flipping between pixel counts. */
     const w = canvasEl?.videoWidth ?? 0;
     const h = canvasEl?.videoHeight ?? 0;
-    if (w > 0 && h > 0) canvasStageRatio = (h / w) * 100;
+    const rail = canvasEl?.clientWidth ?? 0;
+    if (w > 0 && h > 0 && rail > 0) {
+      const dpr = window.devicePixelRatio || 1;
+      const snapped = Math.round(((h / w) * rail * dpr)) / dpr;
+      canvasStageRatio = (snapped / rail) * 100;
+    }
     canvasReady = true;
     /* Source replacement lands here too, with playback still running: the
        effect above already restarted the swapped element, and this is the
@@ -273,6 +284,7 @@
         {/if}
       </div>
     </div>
+  {#key current?.id}
     <div class="np-block np-identity">
       <h2>{current.name}</h2>
       <ArtistLinks
@@ -368,6 +380,7 @@
         </button>
       </section>
     {/if}
+  {/key}
   {:else}
     <div class="np-empty">
       <p>Nothing playing</p>

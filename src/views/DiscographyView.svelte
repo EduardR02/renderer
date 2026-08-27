@@ -15,6 +15,7 @@
   import { GROUPS, releaseKind, createCataloguePaging, sentinelLoader } from "../lib/discography.svelte.js";
   import { observeStuck } from "../lib/sticky.js";
   import { formatTotal } from "../lib/time.js";
+  import { coverTone } from "../lib/covertone.svelte.js";
 
   /**
    * The whole discography, read end to end.
@@ -34,11 +35,13 @@
    */
   const artist = $derived(detail.artist);
   const counts = $derived(artist?.release_counts ?? {});
+  /* The reader is a room off the artist's page, so it takes the artist's own
+     tone — soft, like the other sub-pages — instead of a flat ground. */
+  const tone = $derived(coverTone(artist?.cover_url || "", artist?.id || ""));
 
   const releaseTotal = $derived(
     GROUPS[0].types.reduce((sum, type) => sum + (counts[type] ?? 0), 0),
   );
-
   /** Empty groups are not offered: a dead tab is a worse answer than no tab. */
   const segments = $derived(
     GROUPS.filter((g) => g.id === "all" || (counts[g.id] ?? 0) > 0).map((g) => ({
@@ -145,10 +148,15 @@
   }
 </script>
 
-<section class="view page dx-page">
+<section
+  class="view page dx-page wash soft"
+  style:--tone-wash={tone.wash}
+  style:--tone-wash-deep={tone.washDeep}
+  style:--tone-glow={tone.glow}
+>
   {#if artist}
     <header class="dx-title-block">
-      <button class="dx-back" onclick={() => navigateArtist(artist.id, artist.name)}>
+      <button class="page-back" onclick={() => navigateArtist(artist.id, artist.name)}>
         <Icon name="back" size={13} />{artist.name}
       </button>
       <div class="dx-title-row">
@@ -328,14 +336,6 @@
 <style>
   .dx-page { padding-top: var(--s5); }
   .dx-title-block { padding-bottom: var(--s4); }
-  /* Back to the artist, named. A discography belongs to somebody, and the
-     bare chevron in the topbar does not say who. */
-  .dx-back {
-    display: inline-flex; align-items: center; gap: var(--s2);
-    color: var(--fg-2); font-size: var(--t-12);
-    transition: color var(--d1) var(--ease);
-  }
-  .dx-back:hover { color: var(--accent); }
   .dx-title-row {
     display: flex; align-items: baseline; gap: var(--s3);
     margin-top: var(--s2);
