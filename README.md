@@ -1,13 +1,27 @@
 # Renderer
 
 A desktop Spotify client for Windows. I built it because the official app used
-more CPU than I want a music player to use.
+more CPU than I want a music player to use. My computer has a liquid-cooled
+Ryzen 9 5950X, and the native desktop app would constantly boost it to 80 °C.
+WTF? Literal benchmarks that use all cores at max don't go that high. A music
+player is constantly open, and randomly spinning my CPU to absurd temps is
+insane, so I had to make this. It's worse if you have open-back headphones,
+because you need your PC to be as silent as possible — every time I started a
+song in the normal Spotify app it would spin my fans and distract me.
 
 <p align="center">
   <img src="docs/library.png" alt="A playlist open in Renderer" width="900">
   <br><br>
   <img src="docs/now-playing.png" alt="The now playing panel" width="900">
 </p>
+
+## Install
+
+Grab the setup from [Releases](../../releases) and run it. It's an ordinary
+Windows install wizard, nothing unusual. You need a Spotify Premium account;
+the app opens a Spotify login in your browser on first launch.
+
+If you'd rather build it yourself, see [Building](#building).
 
 ## Not affiliated with Spotify
 
@@ -32,9 +46,9 @@ seemed fun:
 - Listening history, kept locally.
 - A mark on tracks that are already in the local audio cache.
 
-Canvas works, but only if you have video enabled in the real Spotify app — it's
+Canvas works, but only if you have it enabled in the real Spotify app — it's
 an account setting on their servers, not a local one, and their backend returns
-nothing at all while it's off.
+nothing at all while it's off (in that case you still get the album cover of course).
 
 ## Building
 
@@ -51,9 +65,9 @@ bun tauri build
 `bun tauri dev` for development. Checks are `cargo test -p renderer-engine`,
 `cargo test -p renderer`, and `bun run build`.
 
-First launch opens a Spotify login in your browser. Credentials go to Spotify,
-never through this app. What's stored locally is the token they hand back, under
-`%LOCALAPPDATA%\SpotifyRenderer` with the audio cache, covers and history.
+Credentials go to Spotify, never through this app. What's stored locally is the
+token they hand back, under `%LOCALAPPDATA%\SpotifyRenderer` along with the audio
+cache, covers and history.
 
 ## How it works
 
@@ -76,12 +90,13 @@ than this file if you want to change something.
 ### The resampling problem
 
 librespot's rodio backend has a resampling bug that shows up on Windows. Spotify
-decodes at 44.1 kHz and Windows usually runs its output at 48, so everything gets
+decodes at 44.1 kHz and Windows usually runs its output at 48 kHz, so everything gets
 resampled on the way out. rodio does that with linear interpolation, and it also
 rebuilds its converter mid-stream, leaking a fraction of a frame each time it
 does. At the packet sizes Spotify's Vorbis actually produces that came to
-+0.4882% on rate, measured offline and again on hardware. Everything plays
-slightly fast and slightly sharp.
++0.4882% more output frames than there should be, measured offline and then
+again on hardware. Extra frames at a fixed device rate means the audio is
+stretched, so everything plays slightly slow and slightly flat.
 
 Both halves needed replacing. There's a polyphase windowed-sinc resampler that
 tracks position as an exact rational, so the output frame count is determined to
@@ -93,8 +108,7 @@ numbers are pinned by tests.
 
 ## On the code
 
-Nearly all of it was written by AI agents. That was the method, not an accident —
-what got built, how it was structured, and what counted as good enough were
+Nearly all of it was written by AI agents. What got built, how it was structured, and what counted as good enough were
 decided deliberately and enforced, and a fair amount of it was thrown out and
 redone when it wasn't right.
 
