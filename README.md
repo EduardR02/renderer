@@ -37,8 +37,10 @@ No audio, metadata or artwork ships with this repository.
 ## Features
 
 Mostly a normal client: playlists, albums, artist pages, search, queue, credits,
-radio. Some extra things I added because we control playback here and they
-seemed fun:
+radio. Without the bloat the real app has accumulated, though — no podcasts, no
+audiobooks, no AI DJ, no home feed of things you didn't ask for. Just music.
+
+Some extra things I added because we control playback here and they seemed fun:
 
 - Cut a section out of a song, or loop an exact range. Set per playlist, edited
   in a waveform view.
