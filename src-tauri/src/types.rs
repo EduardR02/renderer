@@ -1,13 +1,13 @@
 //! Shared serde types for the Tauri <-> frontend contract.
 //!
 //! Field names are the exact JSON keys the frontend consumes; they mirror
-//! the engine's protocol payloads (see `spotify_playback_engine::protocol`)
+//! the engine's protocol payloads (see `renderer_engine::protocol`)
 //! so the engine's line-JSON state and browse messages deserialize straight
 //! into these types.
 
 use serde::{Deserialize, Serialize};
 
-use spotify_playback_engine::protocol::{
+use renderer_engine::protocol::{
     normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
     ArtistCataloguePage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
     ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist,
@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn history_item_conversion_preserves_the_flat_snapshot_contract() {
         let item = EngineHistoryItem {
-            row: spotify_playback_engine::protocol::HistoryRow {
+            row: renderer_engine::protocol::HistoryRow {
                 track_id: "track-1".into(),
                 started_at: 1_725_000_123_456,
                 ms_played: 91_000,

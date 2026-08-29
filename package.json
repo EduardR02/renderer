@@ -1,12 +1,12 @@
 {
-  "name": "spotify-renderer",
+  "name": "renderer",
   "version": "0.1.0",
-  "description": "Spotify renderer desktop app (Tauri 2 + Svelte 5)",
+  "description": "Personal desktop music client for Spotify (Tauri 2 + Svelte 5)",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:engine": "cargo build --release -p spotify-playback-engine",
+    "build:engine": "cargo build --release -p renderer-engine",
     "preview": "vite preview",
     "tauri": "tauri"
   },

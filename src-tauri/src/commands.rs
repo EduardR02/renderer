@@ -107,8 +107,8 @@ pub async fn play_queue(
 pub async fn preview_track_edit(
     client: State<'_, Arc<EngineClient>>,
     track: Track,
-    cuts: Vec<spotify_playback_engine::protocol::TimeRange>,
-    loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
+    cuts: Vec<renderer_engine::protocol::TimeRange>,
+    loop_range: Option<renderer_engine::protocol::LoopRange>,
     position_ms: u32,
     preview_lease_id: u64,
 ) -> Result<(), String> {
@@ -209,7 +209,7 @@ pub async fn get_track_edit(
     client: State<'_, Arc<EngineClient>>,
     track_id: String,
     playlist_id: Option<String>,
-) -> Result<spotify_playback_engine::protocol::TrackEditStatus, String> {
+) -> Result<renderer_engine::protocol::TrackEditStatus, String> {
     client
         .track_edit_status(&track_id, playlist_id.as_deref())
         .await
@@ -220,9 +220,9 @@ pub async fn save_track_edit(
     client: State<'_, Arc<EngineClient>>,
     track_id: String,
     duration_ms: u32,
-    cuts: Vec<spotify_playback_engine::protocol::TimeRange>,
-    loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
-) -> Result<spotify_playback_engine::protocol::TrackEditDefinition, String> {
+    cuts: Vec<renderer_engine::protocol::TimeRange>,
+    loop_range: Option<renderer_engine::protocol::LoopRange>,
+) -> Result<renderer_engine::protocol::TrackEditDefinition, String> {
     client
         .save_track_edit(&track_id, duration_ms, &cuts, loop_range)
         .await
@@ -454,7 +454,7 @@ pub async fn browse_track_credits(
 pub async fn browse_canvas(
     client: State<'_, Arc<EngineClient>>,
     id: String,
-) -> Result<Option<spotify_playback_engine::protocol::Canvas>, String> {
+) -> Result<Option<renderer_engine::protocol::Canvas>, String> {
     client.browse_canvas(&id).await
 }
 

@@ -80,8 +80,8 @@ fn run_controls(
     receiver: std::sync::mpsc::Receiver<Update>,
 ) {
     let config = PlatformConfig {
-        dbus_name: "spotify-renderer",
-        display_name: "Spotify Renderer",
+        dbus_name: "renderer",
+        display_name: "Renderer",
         hwnd: Some(hwnd as *mut std::ffi::c_void),
     };
     let mut controls = match MediaControls::new(config) {

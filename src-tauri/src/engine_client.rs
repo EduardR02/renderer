@@ -1,4 +1,4 @@
-//! Line-JSON protocol client for the `SpotifyPlaybackEngine` subprocess.
+//! Line-JSON protocol client for the `PlaybackEngine` subprocess.
 //!
 //! Owns the engine's stdin/stdout pipes, serializes requests with
 //! incrementing request ids, routes replies back through tokio oneshots, and
@@ -583,7 +583,7 @@ impl EngineClient {
     /// process is currently running.
     fn spawn_engine(self: &Arc<Self>) -> Result<(), String> {
         let exe = locate_engine().ok_or_else(|| {
-            "SpotifyPlaybackEngine.exe not found (set SPOTIFY_ENGINE_PATH)".to_owned()
+            "PlaybackEngine.exe not found (set SPOTIFY_ENGINE_PATH)".to_owned()
         })?;
         std::fs::create_dir_all(&self.state_dir)
             .map_err(|error| format!("could not create engine state dir: {error}"))?;
@@ -818,8 +818,8 @@ impl EngineClient {
     pub async fn preview_track_edit(
         &self,
         track: &Track,
-        cuts: &[spotify_playback_engine::protocol::TimeRange],
-        loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
+        cuts: &[renderer_engine::protocol::TimeRange],
+        loop_range: Option<renderer_engine::protocol::LoopRange>,
         position_ms: u32,
         preview_lease_id: u64,
     ) -> Result<(), String> {
@@ -968,7 +968,7 @@ impl EngineClient {
 
     pub async fn get_history(
         &self,
-    ) -> Result<Vec<spotify_playback_engine::protocol::HistoryItem>, String> {
+    ) -> Result<Vec<renderer_engine::protocol::HistoryItem>, String> {
         let reply = self.request("get_history", Value::Null).await?;
         parse_data(reply, "get_history")
     }
@@ -980,7 +980,7 @@ impl EngineClient {
     pub async fn get_track_waveform(
         &self,
         track_id: &str,
-    ) -> Result<spotify_playback_engine::protocol::TrackWaveform, String> {
+    ) -> Result<renderer_engine::protocol::TrackWaveform, String> {
         let reply = self
             .request("get_track_waveform", json!({"track_id": track_id}))
             .await?;
@@ -1049,7 +1049,7 @@ impl EngineClient {
     pub async fn browse_playlists(
         &self,
         length: usize,
-    ) -> Result<Vec<spotify_playback_engine::protocol::PlaylistRef>, String> {
+    ) -> Result<Vec<renderer_engine::protocol::PlaylistRef>, String> {
         let reply = self
             .request("browse_playlists", json!({"length": length}))
             .await?;
@@ -1059,7 +1059,7 @@ impl EngineClient {
     pub async fn browse_playlist(
         &self,
         id: &str,
-    ) -> Result<spotify_playback_engine::protocol::PlaylistBrowse, String> {
+    ) -> Result<renderer_engine::protocol::PlaylistBrowse, String> {
         let reply = self.request("browse_playlist", json!({"id": id})).await?;
         parse_data(reply, "browse_playlist")
     }
@@ -1067,7 +1067,7 @@ impl EngineClient {
     pub async fn browse_radio(
         &self,
         id: &str,
-    ) -> Result<spotify_playback_engine::protocol::RadioBrowse, String> {
+    ) -> Result<renderer_engine::protocol::RadioBrowse, String> {
         let reply = self.request("browse_radio", json!({"id": id})).await?;
         parse_data(reply, "browse_radio")
     }
@@ -1075,7 +1075,7 @@ impl EngineClient {
     pub async fn browse_playlist_recommendations(
         &self,
         id: &str,
-    ) -> Result<spotify_playback_engine::protocol::PlaylistRecommendations, String> {
+    ) -> Result<renderer_engine::protocol::PlaylistRecommendations, String> {
         let reply = self
             .request("browse_playlist_recommendations", json!({"id": id}))
             .await?;
@@ -1085,7 +1085,7 @@ impl EngineClient {
     pub async fn browse_album(
         &self,
         id: &str,
-    ) -> Result<spotify_playback_engine::protocol::AlbumBrowse, String> {
+    ) -> Result<renderer_engine::protocol::AlbumBrowse, String> {
         let reply = self.request("browse_album", json!({"id": id})).await?;
         parse_data(reply, "browse_album")
     }
@@ -1093,7 +1093,7 @@ impl EngineClient {
     pub async fn browse_artist(
         &self,
         id: &str,
-    ) -> Result<spotify_playback_engine::protocol::ArtistBrowse, String> {
+    ) -> Result<renderer_engine::protocol::ArtistBrowse, String> {
         let reply = self.request("browse_artist", json!({"id": id})).await?;
         parse_data(reply, "browse_artist")
     }
@@ -1102,7 +1102,7 @@ impl EngineClient {
         &self,
         id: &str,
         name: &str,
-    ) -> Result<Option<spotify_playback_engine::protocol::SongwriterPlaylist>, String> {
+    ) -> Result<Option<renderer_engine::protocol::SongwriterPlaylist>, String> {
         let reply = self
             .request("browse_artist_songwriter", json!({"id": id, "name": name}))
             .await?;
@@ -1115,7 +1115,7 @@ impl EngineClient {
         release_types: &[String],
         offset: usize,
         limit: usize,
-    ) -> Result<spotify_playback_engine::protocol::ArtistCataloguePage, String> {
+    ) -> Result<renderer_engine::protocol::ArtistCataloguePage, String> {
         let reply = self
             .request(
                 "browse_artist_catalogue",
@@ -1128,7 +1128,7 @@ impl EngineClient {
     pub async fn browse_liked_songs(
         &self,
         cursor: Option<&str>,
-    ) -> Result<spotify_playback_engine::protocol::LikedSongsPage, String> {
+    ) -> Result<renderer_engine::protocol::LikedSongsPage, String> {
         let reply = self
             .request("browse_liked_songs", json!({"cursor": cursor}))
             .await?;
@@ -1140,7 +1140,7 @@ impl EngineClient {
     pub async fn browse_liked_uris(
         &self,
         cursor: Option<&str>,
-    ) -> Result<spotify_playback_engine::protocol::LikedUrisPage, String> {
+    ) -> Result<renderer_engine::protocol::LikedUrisPage, String> {
         let reply = self
             .request("browse_liked_uris", json!({"cursor": cursor}))
             .await?;
@@ -1150,7 +1150,7 @@ impl EngineClient {
     pub async fn browse_track_credits(
         &self,
         id: &str,
-    ) -> Result<spotify_playback_engine::protocol::TrackCredits, String> {
+    ) -> Result<renderer_engine::protocol::TrackCredits, String> {
         let reply = self
             .request("browse_track_credits", json!({"id": id}))
             .await?;
@@ -1160,7 +1160,7 @@ impl EngineClient {
     pub async fn browse_canvas(
         &self,
         id: &str,
-    ) -> Result<Option<spotify_playback_engine::protocol::Canvas>, String> {
+    ) -> Result<Option<renderer_engine::protocol::Canvas>, String> {
         let reply = self.request("browse_canvas", json!({"id": id})).await?;
         parse_data(reply, "browse_canvas")
     }
@@ -1169,7 +1169,7 @@ impl EngineClient {
         &self,
         track_id: &str,
         playlist_id: Option<&str>,
-    ) -> Result<spotify_playback_engine::protocol::TrackEditStatus, String> {
+    ) -> Result<renderer_engine::protocol::TrackEditStatus, String> {
         let reply = self
             .request(
                 "get_track_edit",
@@ -1183,9 +1183,9 @@ impl EngineClient {
         &self,
         track_id: &str,
         duration_ms: u32,
-        cuts: &[spotify_playback_engine::protocol::TimeRange],
-        loop_range: Option<spotify_playback_engine::protocol::LoopRange>,
-    ) -> Result<spotify_playback_engine::protocol::TrackEditDefinition, String> {
+        cuts: &[renderer_engine::protocol::TimeRange],
+        loop_range: Option<renderer_engine::protocol::LoopRange>,
+    ) -> Result<renderer_engine::protocol::TrackEditDefinition, String> {
         let reply = self
             .request(
                 "save_track_edit",
@@ -1246,7 +1246,7 @@ impl EngineClient {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<spotify_playback_engine::protocol::SearchBrowse, String> {
+    ) -> Result<renderer_engine::protocol::SearchBrowse, String> {
         let reply = self
             .request("browse_search", json!({"query": query, "limit": limit}))
             .await?;
@@ -1256,7 +1256,7 @@ impl EngineClient {
     pub async fn create_playlist(
         &self,
         name: &str,
-    ) -> Result<spotify_playback_engine::protocol::PlaylistRef, String> {
+    ) -> Result<renderer_engine::protocol::PlaylistRef, String> {
         let reply = self
             .request("edit_create_playlist", json!({"name": name}))
             .await?;
@@ -1747,17 +1747,17 @@ fn locate_engine() -> Option<PathBuf> {
     }
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     // Bundled next to the app executable.
-    let sibling = exe_dir.join("SpotifyPlaybackEngine.exe");
+    let sibling = exe_dir.join("PlaybackEngine.exe");
     if sibling.is_file() {
         return Some(sibling);
     }
     // Workspace builds use the same target directory as the bundler resource:
-    // <repo>/target/release/SpotifyPlaybackEngine.exe. Do not fall back to an
+    // <repo>/target/release/PlaybackEngine.exe. Do not fall back to an
     // engine-local target tree; that would create a second artifact contract.
     let workspace_release = exe_dir
         .parent()?
         .join("release")
-        .join("SpotifyPlaybackEngine.exe");
+        .join("PlaybackEngine.exe");
     workspace_release.is_file().then_some(workspace_release)
 }
 
@@ -1823,11 +1823,11 @@ mod tests {
             "get_track_waveform",
             json!({"track_id": "0123456789ABCDEFGHIJKL"}),
         );
-        let request: spotify_playback_engine::protocol::Request =
+        let request: renderer_engine::protocol::Request =
             serde_json::from_str(&line).unwrap();
         assert!(matches!(
             request.command,
-            spotify_playback_engine::protocol::Command::GetTrackWaveform { track_id }
+            renderer_engine::protocol::Command::GetTrackWaveform { track_id }
                 if track_id == "0123456789ABCDEFGHIJKL"
         ));
     }
@@ -1840,11 +1840,11 @@ mod tests {
             duration_ms: 240_000,
             ..Track::default()
         };
-        let cuts = vec![spotify_playback_engine::protocol::TimeRange {
+        let cuts = vec![renderer_engine::protocol::TimeRange {
             start_ms: 1_000,
             end_ms: 2_500,
         }];
-        let loop_range = Some(spotify_playback_engine::protocol::LoopRange {
+        let loop_range = Some(renderer_engine::protocol::LoopRange {
             start_ms: 5_000,
             end_ms: 9_000,
             play_count: 2,
@@ -1860,9 +1860,9 @@ mod tests {
                 "preview_lease_id": 17,
             }),
         );
-        let request: spotify_playback_engine::protocol::Request =
+        let request: renderer_engine::protocol::Request =
             serde_json::from_str(&line).unwrap();
-        let spotify_playback_engine::protocol::Command::PreviewTrackEdit {
+        let renderer_engine::protocol::Command::PreviewTrackEdit {
             track,
             cuts,
             loop_range,
@@ -1894,9 +1894,9 @@ mod tests {
                 "resume_playing": true,
             }),
         );
-        let request: spotify_playback_engine::protocol::Request =
+        let request: renderer_engine::protocol::Request =
             serde_json::from_str(&line).unwrap();
-        let spotify_playback_engine::protocol::Command::RestoreQueue {
+        let renderer_engine::protocol::Command::RestoreQueue {
             only_if_preview,
             preview_lease_id,
             resume_playing,
@@ -1911,7 +1911,7 @@ mod tests {
     }
     #[test]
     fn waveform_response_payload_is_typed_at_the_client_boundary() {
-        let waveform: spotify_playback_engine::protocol::TrackWaveform = parse_data(
+        let waveform: renderer_engine::protocol::TrackWaveform = parse_data(
             EngineReply {
                 ok: true,
                 error: None,
@@ -2067,9 +2067,9 @@ mod tests {
         assert_eq!(value["index"], 0);
         assert_eq!(value["position_ms"], 12);
         assert!(value["automatic_start"].as_bool().unwrap());
-        let request: spotify_playback_engine::protocol::Request =
+        let request: renderer_engine::protocol::Request =
             serde_json::from_str(&line).expect("play queue request is valid protocol JSON");
-        let spotify_playback_engine::protocol::Command::PlayQueue {
+        let renderer_engine::protocol::Command::PlayQueue {
             automatic_start, ..
         } = request.command
         else {
@@ -2087,9 +2087,9 @@ mod tests {
                 "context": "",
             }),
         );
-        let spotify_playback_engine::protocol::Request {
+        let renderer_engine::protocol::Request {
             command:
-                spotify_playback_engine::protocol::Command::PlayQueue {
+                renderer_engine::protocol::Command::PlayQueue {
                     automatic_start, ..
                 },
             ..
@@ -2111,9 +2111,9 @@ mod tests {
                 "excluded": true,
             }),
         );
-        let request: spotify_playback_engine::protocol::Request =
+        let request: renderer_engine::protocol::Request =
             serde_json::from_str(&line).expect("exclusion request is valid protocol JSON");
-        let spotify_playback_engine::protocol::Command::SetPlaylistTrackExcluded {
+        let renderer_engine::protocol::Command::SetPlaylistTrackExcluded {
             playlist_id,
             track_id,
             excluded,
@@ -2576,18 +2576,18 @@ mod tests {
         for candidate in [
             root.join("target")
                 .join("debug")
-                .join("SpotifyPlaybackEngine.exe"),
+                .join("PlaybackEngine.exe"),
             root.join("target")
                 .join("release")
-                .join("SpotifyPlaybackEngine.exe"),
+                .join("PlaybackEngine.exe"),
             root.join("engine")
                 .join("target")
                 .join("debug")
-                .join("SpotifyPlaybackEngine.exe"),
+                .join("PlaybackEngine.exe"),
             root.join("engine")
                 .join("target")
                 .join("release")
-                .join("SpotifyPlaybackEngine.exe"),
+                .join("PlaybackEngine.exe"),
         ] {
             if candidate.is_file() {
                 return Some(candidate);
@@ -2603,13 +2603,13 @@ mod tests {
     async fn engine_client_round_trips_over_the_line_protocol() {
         let Some(exe) = find_engine() else {
             eprintln!(
-                "skipping: SpotifyPlaybackEngine.exe is not built \
-                 (run `cargo build -p spotify-playback-engine`)"
+                "skipping: PlaybackEngine.exe is not built \
+                 (run `cargo build -p renderer-engine`)"
             );
             return;
         };
         let state_dir = std::env::temp_dir().join(format!(
-            "spotify-renderer-engine-test-{}",
+            "renderer-engine-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&state_dir);

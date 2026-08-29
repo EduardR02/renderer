@@ -1,12 +1,12 @@
 [package]
-name = "spotify-playback-engine"
+name = "renderer-engine"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 publish = false
 
 [[bin]]
-name = "SpotifyPlaybackEngine"
+name = "PlaybackEngine"
 path = "src/main.rs"
 
 [dependencies]

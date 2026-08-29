@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use spotify_playback_engine::protocol::Request;
+use renderer_engine::protocol::Request;
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
@@ -230,7 +230,7 @@ fn protocol_output() -> io::Result<Box<dyn Write + Send>> {
 #[cfg(test)]
 mod tests {
     use super::{decode_request, Input};
-    use spotify_playback_engine::protocol::Command;
+    use renderer_engine::protocol::Command;
 
     #[test]
     fn valid_requests_decode_directly() {

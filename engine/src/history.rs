@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use spotify_playback_engine::atomic::replace_file_atomically;
-use spotify_playback_engine::protocol::{HistoryItem, HistoryRow, TrackRef};
+use renderer_engine::atomic::replace_file_atomically;
+use renderer_engine::protocol::{HistoryItem, HistoryRow, TrackRef};
 
 const HISTORY_FILE: &str = "listening_history.json";
 const HISTORY_VERSION: u32 = 1;
@@ -509,14 +509,14 @@ fn write_snapshot_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spotify_playback_engine::protocol::{TimeRange, TrackEdit};
+    use renderer_engine::protocol::{TimeRange, TrackEdit};
     use std::time::Duration;
 
     fn scratch() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "spotify-renderer-history-test-{}-{}-{ordinal}",
+            "renderer-history-test-{}-{}-{ordinal}",
             std::process::id(),
             now_millis()
         ))

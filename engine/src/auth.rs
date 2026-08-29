@@ -27,7 +27,7 @@ const OAUTH_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:5588/login";
 const OAUTH_SCOPES: &[&str] = &["streaming", "user-read-private"];
 const OAUTH_SUCCESS_MESSAGE: &str =
-    "SpotifyPlaybackEngine is authenticated. You can close this browser tab.";
+    "PlaybackEngine is authenticated. You can close this browser tab.";
 /// An abandoned login attempt (browser never redirected) must not wedge the
 /// engine in `Authenticating` forever; after this long the flow fails and the
 /// engine returns to `NeedsLogin` with a fresh URL.

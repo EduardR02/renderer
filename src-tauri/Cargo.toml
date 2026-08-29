@@ -1,5 +1,5 @@
 [package]
-name = "spotify-renderer"
+name = "renderer"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "spotify_renderer_lib"
+name = "renderer_lib"
 # Desktop-only: `main.rs` links this as a plain Rust library. The scaffold's
 # `staticlib`/`cdylib` outputs exist for mobile and FFI consumers, and cost a
 # 142 MB static archive plus its link time on every build for nothing here.
@@ -32,7 +32,7 @@ tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-t
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "system-proxy"] }
 sha1 = "0.10"
 souvlaki = "0.8"
-spotify-playback-engine = { path = "../engine" }
+renderer-engine = { path = "../engine" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.44", features = ["Foundation", "Media", "Win32_Foundation", "Win32_System_WinRT"] }

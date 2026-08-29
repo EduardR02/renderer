@@ -19,7 +19,7 @@ use engine::{AuthSignal, Engine, PlayerSignal};
 use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
-use spotify_playback_engine::protocol::{
+use renderer_engine::protocol::{
     AlbumBrowse, ArtistBrowse, ArtistCataloguePage, Canvas, Command,
     LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
     RadioBrowse, Response, SearchBrowse, SongwriterPlaylist, TrackCredits, TrackWaveform,
@@ -149,14 +149,14 @@ fn main() -> ExitCode {
         match parse_arguments(std::env::args_os().skip(1).collect()) {
             Ok(arguments) => arguments,
             Err(error) => {
-                eprintln!("SpotifyPlaybackEngine: {error}");
+                eprintln!("PlaybackEngine: {error}");
                 return ExitCode::from(2);
             }
         };
     let writer = match ProtocolWriter::capture_stdout() {
         Ok(writer) => writer,
         Err(error) => {
-            eprintln!("SpotifyPlaybackEngine: could not capture protocol output: {error}");
+            eprintln!("PlaybackEngine: could not capture protocol output: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -172,7 +172,7 @@ fn main() -> ExitCode {
         match create_state(&state_directory, audio_cache_limit_bytes) {
             Ok(state) => state,
             Err(error) => {
-                eprintln!("SpotifyPlaybackEngine: {error}");
+                eprintln!("PlaybackEngine: {error}");
                 return ExitCode::FAILURE;
             }
         };
@@ -182,7 +182,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("SpotifyPlaybackEngine: could not start async runtime: {error}");
+            eprintln!("PlaybackEngine: could not start async runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -198,7 +198,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("SpotifyPlaybackEngine: {error}");
+            eprintln!("PlaybackEngine: {error}");
             ExitCode::FAILURE
         }
     }
@@ -876,7 +876,7 @@ fn parse_arguments(
         index += 2;
     }
     let state_directory = state_directory.ok_or_else(|| {
-        "usage: SpotifyPlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned()
+        "usage: PlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned()
     })?;
     Ok((
         state_directory,

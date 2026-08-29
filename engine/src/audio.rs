@@ -139,7 +139,7 @@ use librespot_playback::config::AudioFormat;
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
-use spotify_playback_engine::protocol::TrackEdit;
+use renderer_engine::protocol::TrackEdit;
 use tokio::sync::mpsc;
 
 use crate::resample::Resampler;

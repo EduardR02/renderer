@@ -45,7 +45,7 @@ use protobuf::Message;
 use protocol::playlist4_external as p4;
 use serde::Deserialize;
 
-use spotify_playback_engine::protocol::PlaylistRef;
+use renderer_engine::protocol::PlaylistRef;
 
 // ---------------------------------------------------------------------------
 // pure op builders (unit-tested)
@@ -172,7 +172,7 @@ fn change_info(session: &Session) -> p4::ChangeInfo {
     info.timestamp = Some(i64::try_from(now).unwrap_or(i64::MAX));
     let mut source = p4::SourceInfo::new();
     source.set_client(p4::source_info::Client::CLIENT);
-    source.app = Some("spotify-renderer".to_owned());
+    source.app = Some("renderer".to_owned());
     info.source = protobuf::MessageField::some(source);
     info
 }

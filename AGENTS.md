@@ -16,8 +16,8 @@ Performance matters because a music player runs continuously. Wasted CPU, memory
 Common checks:
 
 ```text
-cargo test -p spotify-playback-engine
-cargo test -p spotify-renderer
+cargo test -p renderer-engine
+cargo test -p renderer
 bun run build
 bun tauri build
 ```

@@ -19,7 +19,7 @@ use crate::customization::{validate_definition, EditTimeline, TrackEditStore};
 use crate::history::ListeningHistory;
 use crate::io::ProtocolWriter;
 use serde::Serialize;
-use spotify_playback_engine::protocol::{
+use renderer_engine::protocol::{
     AuthState, BrowseResponse, Command, HistoryItem, LoopRange, PositionEvent, RepeatMode,
     Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus, TrackRef,
 };
@@ -2621,7 +2621,7 @@ mod tests {
     use crate::io::ProtocolWriter;
     use librespot_core::SpotifyUri;
     use librespot_playback::player::PlayerEvent;
-    use spotify_playback_engine::protocol::{
+    use renderer_engine::protocol::{
         LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef,
     };
 
@@ -2666,7 +2666,7 @@ mod tests {
     fn playback_state(duration_ms: u32) -> PlaybackState {
         PlaybackState {
             ready: true,
-            auth_state: spotify_playback_engine::protocol::AuthState::Ready,
+            auth_state: renderer_engine::protocol::AuthState::Ready,
             auth_url: None,
             playing: false,
             position_ms: 0,
@@ -2718,7 +2718,7 @@ mod tests {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "spotify-renderer-engine-preview-history-{}-{ordinal}",
+            "renderer-engine-preview-history-{}-{ordinal}",
             std::process::id()
         ))
     }
@@ -2751,7 +2751,7 @@ mod tests {
             static NEXT: AtomicU32 = AtomicU32::new(0);
             let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "spotify-renderer-engine-exclusion-{}-{ordinal}",
+                "renderer-engine-exclusion-{}-{ordinal}",
                 std::process::id()
             ));
             let _ = std::fs::remove_dir_all(&path);
@@ -3013,7 +3013,7 @@ mod tests {
             with_preview_edit(track.clone(), cuts.clone(), loop_range).expect("valid draft");
         assert_eq!(
             preview.effective_edit,
-            Some(spotify_playback_engine::protocol::TrackEdit {
+            Some(renderer_engine::protocol::TrackEdit {
                 cuts: cuts.clone(),
                 loop_range,
             })
@@ -3642,7 +3642,7 @@ mod tests {
     fn loop_marker_reloads_when_decoder_eof_arrived_first() {
         let mut engine = playing_engine();
         engine.state.playing = true;
-        engine.state.queue[0].effective_edit = Some(spotify_playback_engine::protocol::TrackEdit {
+        engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
             cuts: Vec::new(),
             loop_range: Some(loop_range(1_500, 2_000, 2)),
         });
@@ -3667,7 +3667,7 @@ mod tests {
     fn loop_eof_after_an_audible_marker_does_not_wait_for_a_second_marker() {
         let mut engine = playing_engine();
         engine.state.playing = true;
-        engine.state.queue[0].effective_edit = Some(spotify_playback_engine::protocol::TrackEdit {
+        engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
             cuts: Vec::new(),
             loop_range: Some(loop_range(900, 1_000, 2)),
         });
@@ -3747,7 +3747,7 @@ mod tests {
             engine.state.duration_ms = 100_000;
             engine.state.queue[0].duration_ms = 100_000;
             engine.state.queue[0].effective_edit =
-                Some(spotify_playback_engine::protocol::TrackEdit {
+                Some(renderer_engine::protocol::TrackEdit {
                     cuts: Vec::new(),
                     loop_range: Some(loop_range(20_000, 40_000, 3)),
                 });
@@ -3772,7 +3772,7 @@ mod tests {
             engine.state.duration_ms = 100_000;
             engine.state.queue[0].duration_ms = 100_000;
             engine.state.queue[0].effective_edit =
-                Some(spotify_playback_engine::protocol::TrackEdit {
+                Some(renderer_engine::protocol::TrackEdit {
                     cuts: Vec::new(),
                     loop_range: Some(loop_range(20_000, 40_000, play_count)),
                 });
@@ -3800,7 +3800,7 @@ mod tests {
     #[test]
     fn stale_loop_marker_from_replaced_audio_is_ignored() {
         let mut engine = playing_engine();
-        engine.state.queue[0].effective_edit = Some(spotify_playback_engine::protocol::TrackEdit {
+        engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
             cuts: Vec::new(),
             loop_range: Some(loop_range(20_000, 40_000, 2)),
         });
@@ -4248,7 +4248,7 @@ mod tests {
     #[test]
     fn restore_maps_the_compiled_snapshot_after_resolving_live_edits() {
         let root = std::env::temp_dir().join(format!(
-            "spotify-renderer-compiled-restore-test-{}-{}",
+            "renderer-compiled-restore-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4518,7 +4518,7 @@ mod tests {
 
         assert!(engine.logout().expect("logout succeeds"));
         assert!(
-            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin
+            engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin
         );
         assert!(!engine.state.ready);
         assert!(!engine.state.playing);
@@ -4565,7 +4565,7 @@ mod tests {
         assert!(!fixture.credentials_exist());
         assert!(engine.logout().expect("second logout is a no-op"));
         assert!(
-            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin
+            engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin
         );
     }
 
@@ -4576,7 +4576,7 @@ mod tests {
         engine.start_authentication(sender);
         assert!(!engine.auth_running, "no implicit flow may start");
         assert!(
-            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin
+            engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin
         );
         assert!(engine.state.auth_url.is_some());
 
@@ -4595,20 +4595,20 @@ mod tests {
     #[test]
     fn login_is_a_noop_while_a_session_is_live() {
         let mut engine = playing_engine(); // ready with a player-less state
-        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Ready;
+        engine.state.auth_state = renderer_engine::protocol::AuthState::Ready;
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine
             .login(&sender)
             .expect("login no-ops when authenticated"));
         assert!(!engine.auth_running);
-        assert!(engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Ready);
+        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::Ready);
     }
 
     #[test]
     fn login_is_a_noop_while_a_flow_is_already_running() {
         let mut engine = test_engine().0;
         engine.auth_running = true;
-        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
+        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?running".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine
@@ -4628,7 +4628,7 @@ mod tests {
         assert!(!engine.normalisation.load(Ordering::Acquire));
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         engine.auth_running = true;
-        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
+        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
 
         assert!(engine.set_normalisation(true, &sender));
         assert!(engine.normalisation.load(Ordering::Acquire));
@@ -4656,7 +4656,7 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         assert_eq!(
             engine.state.auth_state,
-            spotify_playback_engine::protocol::AuthState::NeedsLogin,
+            renderer_engine::protocol::AuthState::NeedsLogin,
             "the login flow itself must not be disturbed"
         );
     }
@@ -4676,7 +4676,7 @@ mod tests {
             "the flow must use the published URL"
         );
         assert!(
-            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating
+            engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating
         );
         assert!(engine.auth_running);
         assert_eq!(engine.state.auth_url.as_deref(), Some(published.as_str()));
@@ -4686,13 +4686,13 @@ mod tests {
     #[test]
     fn begin_login_flow_prepares_a_fresh_attempt_when_none_is_pending() {
         let mut engine = test_engine().0;
-        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::NeedsLogin;
+        engine.state.auth_state = renderer_engine::protocol::AuthState::NeedsLogin;
         let pending = engine.begin_login_flow().expect("flow begins");
         assert!(pending
             .auth_url
             .starts_with("https://accounts.spotify.com/authorize?"));
         assert!(
-            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::Authenticating
+            engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating
         );
         assert_eq!(
             engine.state.auth_url.as_deref(),
@@ -4703,7 +4703,7 @@ mod tests {
     #[test]
     fn failed_auth_signal_returns_to_needs_login_with_a_fresh_url() {
         let mut engine = test_engine().0;
-        engine.state.auth_state = spotify_playback_engine::protocol::AuthState::Authenticating;
+        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?first".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         assert!(engine.on_auth_signal(
@@ -4714,7 +4714,7 @@ mod tests {
             sender,
         ));
         assert!(
-            engine.state.auth_state == spotify_playback_engine::protocol::AuthState::NeedsLogin
+            engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin
         );
         assert!(!engine.state.ready);
         assert!(!engine.auth_running);

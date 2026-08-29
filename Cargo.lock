@@ -3962,6 +3962,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "renderer"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "renderer-engine",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha1",
+ "souvlaki",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
+ "tokio",
+ "windows 0.44.0",
+]
+
+[[package]]
+name = "renderer-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "cpal",
+ "env_logger",
+ "futures-util",
+ "http",
+ "librespot-audio",
+ "librespot-core",
+ "librespot-metadata",
+ "librespot-playback",
+ "librespot-protocol",
+ "oauth2",
+ "protobuf",
+ "protobuf-json-mapping",
+ "reqwest 0.12.28",
+ "rodio",
+ "serde",
+ "serde_json",
+ "symphonia",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4619,53 +4666,6 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
-]
-
-[[package]]
-name = "spotify-playback-engine"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "cpal",
- "env_logger",
- "futures-util",
- "http",
- "librespot-audio",
- "librespot-core",
- "librespot-metadata",
- "librespot-playback",
- "librespot-protocol",
- "oauth2",
- "protobuf",
- "protobuf-json-mapping",
- "reqwest 0.12.28",
- "rodio",
- "serde",
- "serde_json",
- "symphonia",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "spotify-renderer"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha1",
- "souvlaki",
- "spotify-playback-engine",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-opener",
- "tauri-plugin-single-instance",
- "tokio",
- "windows 0.44.0",
 ]
 
 [[package]]

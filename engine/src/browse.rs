@@ -63,7 +63,7 @@ use librespot_protocol::extension_kind::ExtensionKind;
 use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 
-use spotify_playback_engine::protocol::{
+use renderer_engine::protocol::{
     sanitize_playlist_description, AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
     ArtistTopCity, Canvas, CreditArtist, CreditRole, PlaylistRecommendations, PlaylistRef,
     RadioBrowse, SongwriterPlaylist, TrackCredits, TrackRef,
@@ -1399,7 +1399,7 @@ async fn metadata_get<T: Metadata>(
 pub async fn playlist_browse(
     session: &Session,
     id: &str,
-) -> Result<spotify_playback_engine::protocol::PlaylistBrowse, String> {
+) -> Result<renderer_engine::protocol::PlaylistBrowse, String> {
     let uri = playlist_uri(id)?;
     let playlist: Playlist = metadata_get(session, &uri, "playlist").await?;
     let (owner_id, owner_name) = match &playlist.id {
@@ -1421,7 +1421,7 @@ pub async fn playlist_browse(
         })
         .collect();
     let tracks = fetch_playlist_tracks(session, &items).await?;
-    Ok(spotify_playback_engine::protocol::PlaylistBrowse {
+    Ok(renderer_engine::protocol::PlaylistBrowse {
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
         name: playlist.name().to_owned(),
@@ -1454,7 +1454,7 @@ fn playlist_attributes_cover(
 pub async fn album_browse(
     session: &Session,
     id: &str,
-) -> Result<spotify_playback_engine::protocol::AlbumBrowse, String> {
+) -> Result<renderer_engine::protocol::AlbumBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:album:{id}"))
         .map_err(|error| format!("invalid album id: {error}"))?;
     let album: Album = metadata_get(session, &uri, "album").await?;
@@ -1464,7 +1464,7 @@ pub async fn album_browse(
         Ok(counts) => apply_playcounts(&mut tracks, &counts),
         Err(error) => eprintln!("album play counts unavailable: {error}"),
     }
-    Ok(spotify_playback_engine::protocol::AlbumBrowse {
+    Ok(renderer_engine::protocol::AlbumBrowse {
         id: id_of(&album.id),
         uri: uri_of(&album.id),
         name: album.name.clone(),
@@ -1869,13 +1869,13 @@ async fn resolve_artist_release_entries(
     total: usize,
     offset: usize,
     limit: usize,
-) -> Result<spotify_playback_engine::protocol::ArtistReleasePage, String> {
+) -> Result<renderer_engine::protocol::ArtistReleasePage, String> {
     let resolved = fetch_albums(session, page.iter().map(|(_, uri)| *uri)).await?;
     let by_id: HashMap<&str, &AlbumRef> = resolved
         .iter()
         .map(|album| (album.id.as_str(), album))
         .collect();
-    let mut releases = spotify_playback_engine::protocol::ArtistReleases::default();
+    let mut releases = renderer_engine::protocol::ArtistReleases::default();
     for (group, uri) in page {
         let Some(album) = by_id.get(id_of(uri).as_str()).map(|album| (*album).clone()) else {
             continue;
@@ -1888,7 +1888,7 @@ async fn resolve_artist_release_entries(
         }
     }
     let end = offset.saturating_add(limit).min(total);
-    Ok(spotify_playback_engine::protocol::ArtistReleasePage {
+    Ok(renderer_engine::protocol::ArtistReleasePage {
         releases,
         total,
         next_offset: (end < total).then_some(end),
@@ -1927,7 +1927,7 @@ fn balanced_artist_release_page<'a>(
 async fn resolve_initial_artist_release_page(
     session: &Session,
     groups: &[Vec<SpotifyUri>; 4],
-) -> Result<spotify_playback_engine::protocol::ArtistReleasePage, String> {
+) -> Result<renderer_engine::protocol::ArtistReleasePage, String> {
     let total = groups.iter().map(|group| group.len()).sum::<usize>();
     let limit = INITIAL_ARTIST_RELEASES.min(MAX_ARTIST_RELEASE_PAGE);
     let page = balanced_artist_release_page(groups, limit);
@@ -2229,7 +2229,7 @@ pub async fn artist_songwriter_browse(
 pub async fn artist_browse(
     session: &Session,
     id: &str,
-) -> Result<spotify_playback_engine::protocol::ArtistBrowse, String> {
+) -> Result<renderer_engine::protocol::ArtistBrowse, String> {
     let uri = SpotifyUri::from_uri(&format!("spotify:artist:{id}"))
         .map_err(|error| format!("invalid artist id: {error}"))?;
     let artist: Artist = metadata_get(session, &uri, "artist").await?;
@@ -2266,14 +2266,14 @@ pub async fn artist_browse(
     let overview =
         merge_artist_overview(&artist, query_overview.as_ref(), visual_identity.as_ref());
     let page = page?;
-    Ok(spotify_playback_engine::protocol::ArtistBrowse {
+    Ok(renderer_engine::protocol::ArtistBrowse {
         id: id_of(&artist.id),
         uri: artist_uri,
         name: artist.name.clone(),
         portrait_url: artist_portrait(&artist),
         top_tracks,
         releases: page.releases,
-        release_counts: spotify_playback_engine::protocol::ArtistReleaseCounts {
+        release_counts: renderer_engine::protocol::ArtistReleaseCounts {
             albums: groups[0].len(),
             singles: groups[1].len(),
             compilations: groups[2].len(),
@@ -2286,7 +2286,7 @@ pub async fn artist_browse(
 
 #[derive(Clone)]
 struct CatalogueReleaseSeed {
-    header: spotify_playback_engine::protocol::AlbumBrowse,
+    header: renderer_engine::protocol::AlbumBrowse,
     track_uris: Vec<SpotifyUri>,
 }
 
@@ -2298,7 +2298,7 @@ fn parse_catalogue_release_payload(
     let uri = SpotifyUri::from_uri(entity_uri).ok()?;
     let album = Album::parse(&message, &uri).ok()?;
     Some(CatalogueReleaseSeed {
-        header: spotify_playback_engine::protocol::AlbumBrowse {
+        header: renderer_engine::protocol::AlbumBrowse {
             id: id_of(&album.id),
             uri: uri_of(&album.id),
             name: album.name.clone(),
@@ -2738,7 +2738,7 @@ pub async fn artist_catalogue_browse(
     release_types: &[String],
     offset: usize,
     limit: usize,
-) -> Result<spotify_playback_engine::protocol::ArtistCataloguePage, String> {
+) -> Result<renderer_engine::protocol::ArtistCataloguePage, String> {
     let selected = if release_types.is_empty() {
         vec![0, 1, 2]
     } else {
@@ -2787,7 +2787,7 @@ pub async fn artist_catalogue_browse(
         }
         complete.push(release.header);
     }
-    Ok(spotify_playback_engine::protocol::ArtistCataloguePage {
+    Ok(renderer_engine::protocol::ArtistCataloguePage {
         releases: complete,
         total,
         next_offset: (end < total).then_some(end),
@@ -2823,7 +2823,7 @@ fn context_page_next_cursor(
 pub async fn liked_songs_browse(
     session: &Session,
     cursor: Option<&str>,
-) -> Result<spotify_playback_engine::protocol::LikedSongsPage, String> {
+) -> Result<renderer_engine::protocol::LikedSongsPage, String> {
     let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
         let payload = session
             .spclient()
@@ -2856,7 +2856,7 @@ pub async fn liked_songs_browse(
         (uris, next_cursor)
     };
     let tracks = fetch_tracks(session, uris.iter()).await?;
-    Ok(spotify_playback_engine::protocol::LikedSongsPage {
+    Ok(renderer_engine::protocol::LikedSongsPage {
         tracks,
         next_cursor,
     })
@@ -2871,7 +2871,7 @@ pub async fn liked_songs_browse(
 pub async fn liked_song_uris_browse(
     session: &Session,
     cursor: Option<&str>,
-) -> Result<spotify_playback_engine::protocol::LikedUrisPage, String> {
+) -> Result<renderer_engine::protocol::LikedUrisPage, String> {
     let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
         let payload = session
             .spclient()
@@ -2903,7 +2903,7 @@ pub async fn liked_song_uris_browse(
         let next_cursor = context.pages.iter().find_map(context_page_next_cursor);
         (uris, next_cursor)
     };
-    Ok(spotify_playback_engine::protocol::LikedUrisPage {
+    Ok(renderer_engine::protocol::LikedUrisPage {
         uris: uris.iter().map(uri_of).collect(),
         next_cursor,
     })
@@ -4705,7 +4705,7 @@ pub async fn search_browse(
     session: &Session,
     query: &str,
     limit: usize,
-) -> Result<spotify_playback_engine::protocol::SearchBrowse, String> {
+) -> Result<renderer_engine::protocol::SearchBrowse, String> {
     if query.trim().is_empty() {
         return Err("search query must not be empty".to_owned());
     }
@@ -4721,7 +4721,7 @@ pub async fn search_browse(
         };
         let parsed: SearchDesktopResponse = serde_json::from_slice(&payload)
             .map_err(|error| format!("unparseable search response: {error}"))?;
-        return Ok(spotify_playback_engine::protocol::SearchBrowse {
+        return Ok(renderer_engine::protocol::SearchBrowse {
             tracks: parsed
                 .data
                 .searchV2
@@ -5279,7 +5279,7 @@ mod tests {
             }
         }"#;
         let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        let converted = spotify_playback_engine::protocol::SearchBrowse {
+        let converted = renderer_engine::protocol::SearchBrowse {
             tracks: parsed
                 .data
                 .searchV2
@@ -6342,7 +6342,7 @@ mod tests {
     #[test]
     fn mixed_catalogue_is_sorted_before_pagination_with_stable_year_ties() {
         let seed = |name: &str, year| CatalogueReleaseSeed {
-            header: spotify_playback_engine::protocol::AlbumBrowse {
+            header: renderer_engine::protocol::AlbumBrowse {
                 name: name.to_owned(),
                 year,
                 ..Default::default()

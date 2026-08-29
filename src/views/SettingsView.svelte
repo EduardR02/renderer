@@ -244,7 +244,7 @@
       <div class="set-row">
         <div>
           <div class="k">Launch at login</div>
-          <div class="d">Starts Spotify Renderer when you sign in to Windows.</div>
+          <div class="d">Starts Renderer when you sign in to Windows.</div>
           {#if settingErrors.launchAtLogin}<div class="inline-error" role="alert">{settingErrors.launchAtLogin}</div>{/if}
         </div>
         <div class="set-ctl">

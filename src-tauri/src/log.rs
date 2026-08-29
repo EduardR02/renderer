@@ -3,7 +3,7 @@
 //! The app previously logged nowhere: engine lifecycle events (spawn, exit,
 //! ready, error, retry) and library failures went to stderr, which is
 //! invisible in a GUI launch. This module appends timestamped lines to
-//! `%LOCALAPPDATA%\SpotifyRenderer\logs\spotify_renderer.log` with plain
+//! `%LOCALAPPDATA%\SpotifyRenderer\logs\renderer.log` with plain
 //! `std::fs` — no dependencies, no async, safe to call from the engine
 //! reader thread. Timestamps are UTC, matching the engine's own log
 //! (`playback_engine.log`), so the two files line up for diagnosis.
@@ -19,16 +19,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// no-op.
 static LOG_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// Rolls `spotify_renderer.log` once past this size, keeping one previous
+/// Rolls `renderer.log` once past this size, keeping one previous
 /// generation — the same policy as the engine's own log.
 const APP_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Opens `logs/spotify_renderer.log` under the given directory for appends,
+/// Opens `logs/renderer.log` under the given directory for appends,
 /// rolling an oversized previous run aside first. Idempotent; the last call
 /// wins (tests point it at a scratch dir).
 pub fn init(logs_dir: PathBuf) {
     let _ = std::fs::create_dir_all(&logs_dir);
-    let path = logs_dir.join("spotify_renderer.log");
+    let path = logs_dir.join("renderer.log");
     // Registering the path before rotating lets the roll itself be logged
     // into the fresh file.
     *LOG_FILE.lock().expect("app log lock") = Some(path.clone());
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn append_writes_timestamped_lines_to_the_configured_file() {
         let dir = std::env::temp_dir().join(format!(
-            "spotify-renderer-log-test-{}-{}",
+            "renderer-log-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -161,7 +161,7 @@ mod tests {
         info("engine spawned (pid 123)");
         warn("engine exited; respawning in 2s");
         let contents =
-            std::fs::read_to_string(dir.join("spotify_renderer.log")).expect("log file written");
+            std::fs::read_to_string(dir.join("renderer.log")).expect("log file written");
         // Other tests (the engine round-trip) may append to the configured
         // log concurrently, so assert presence, not an exact line count.
         assert!(
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn init_rolls_an_oversized_previous_log_aside() {
         let dir = std::env::temp_dir().join(format!(
-            "spotify-renderer-log-roll-{}-{}",
+            "renderer-log-roll-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -190,7 +190,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("spotify_renderer.log");
+        let path = dir.join("renderer.log");
         std::fs::write(&path, vec![b'x'; APP_LOG_MAX_BYTES as usize]).unwrap();
 
         init(dir.clone());

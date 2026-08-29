@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use spotify_playback_engine::protocol::normalize_canonical_playlist_description;
+use renderer_engine::protocol::normalize_canonical_playlist_description;
 
 use crate::types::{
     align_artist_ids, cover_urls_from_tracks, forget_cached_audio, CacheStats, CacheUsage,
@@ -320,7 +320,7 @@ pub fn clear_playback_snapshot() -> Result<(), String> {
 }
 
 /// Diagnostic logs: `%LOCALAPPDATA%\SpotifyRenderer\logs` — the app's own
-/// `spotify_renderer.log` and the engine's `playback_engine.log`.
+/// `renderer.log` and the engine's `playback_engine.log`.
 pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
 }
@@ -909,7 +909,7 @@ mod tests {
 
     #[test]
     fn membership_round_trips_through_the_disk_format() {
-        let dir = std::env::temp_dir().join(format!("spotify-renderer-membership-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("renderer-membership-{}", now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         let entries = vec![
             membership("p1", "rev1", &["spotify:track:a", "spotify:track:b"]),
@@ -951,7 +951,7 @@ mod tests {
     #[test]
     fn playback_snapshot_round_trips_and_replaces_atomically() {
         let dir = std::env::temp_dir().join(format!(
-            "spotify-renderer-playback-state-{}-{}",
+            "renderer-playback-state-{}-{}",
             std::process::id(),
             now_secs()
         ));
@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn malformed_or_unknown_playback_snapshots_are_ignored() {
         let dir = std::env::temp_dir().join(format!(
-            "spotify-renderer-bad-playback-state-{}-{}",
+            "renderer-bad-playback-state-{}-{}",
             std::process::id(),
             now_secs()
         ));
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn a_library_cache_written_before_cover_urls_existed_still_loads() {
-        let dir = std::env::temp_dir().join(format!("spotify-renderer-old-cache-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("renderer-old-cache-{}", now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("playlist_list.json"),
@@ -1328,7 +1328,7 @@ mod tests {
     }
     #[test]
     fn local_activity_stamps_survive_a_save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("spotify-renderer-lru-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("renderer-lru-{}", now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         save_playlist_list(
             &dir,
@@ -1357,7 +1357,7 @@ mod tests {
     #[test]
     fn playlist_cache_save_replaces_an_existing_snapshot() {
         let dir = std::env::temp_dir().join(format!(
-            "spotify-renderer-cache-replace-{}-{}",
+            "renderer-cache-replace-{}-{}",
             std::process::id(),
             now_secs()
         ));
@@ -1385,7 +1385,7 @@ mod tests {
 
     #[test]
     fn cache_usage_totals_files_recursively_and_skips_bookkeeping() {
-        let dir = std::env::temp_dir().join(format!("spotify-renderer-usage-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("renderer-usage-{}", now_secs()));
         let shard = dir.join("ab");
         std::fs::create_dir_all(&shard).unwrap();
         // The audio cache shape: a layout marker beside sharded song files.
@@ -1405,7 +1405,7 @@ mod tests {
     #[test]
     fn clearing_a_cache_keeps_only_explicit_bookkeeping() {
         let dir = std::env::temp_dir().join(format!(
-            "spotify-renderer-clear-{}-{}",
+            "renderer-clear-{}-{}",
             std::process::id(),
             now_secs()
         ));
@@ -1424,7 +1424,7 @@ mod tests {
 
     #[test]
     fn a_tracks_cache_written_before_artist_ids_loads_with_aligned_lists() {
-        let dir = std::env::temp_dir().join(format!("spotify-renderer-old-tracks-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("renderer-old-tracks-{}", now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("playlist_tracks_cache.json"),
@@ -1456,7 +1456,7 @@ mod tests {
     /// claim about a directory this cache does not own, so it is dropped.
     #[test]
     fn a_tracks_cache_never_restores_a_download_mark() {
-        let dir = std::env::temp_dir().join(format!("spotify-renderer-cached-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("renderer-cached-{}", now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         let entries = vec![PlaylistTracksEntry {
             id: "p1".into(),
@@ -1478,7 +1478,7 @@ mod tests {
 
     #[test]
     fn tracks_cache_round_trips_through_the_disk_format() {
-        let dir = std::env::temp_dir().join(format!("spotify-renderer-test-{}", now_secs()));
+        let dir = std::env::temp_dir().join(format!("renderer-test-{}", now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         let entries = vec![PlaylistTracksEntry {
             id: "p1".into(),

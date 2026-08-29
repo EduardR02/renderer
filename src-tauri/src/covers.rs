@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn cover_writes_replace_atomically_without_leaving_temp_files() {
         let dir = std::env::temp_dir().join(format!(
-            "spotify-renderer-cover-write-{}-{}",
+            "renderer-cover-write-{}-{}",
             std::process::id(),
             now_secs()
         ));

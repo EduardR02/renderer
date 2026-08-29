@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "spotify-renderer",
+  "productName": "renderer",
   "version": "0.1.0",
-  "identifier": "com.spotifyrenderer.app",
+  "identifier": "com.renderer.app",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Spotify Renderer",
+        "title": "Renderer",
         "visible": false,
         "width": 1200,
         "height": 800,
@@ -37,7 +37,7 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../target/release/SpotifyPlaybackEngine.exe": "SpotifyPlaybackEngine.exe"
+      "../target/release/PlaybackEngine.exe": "PlaybackEngine.exe"
     }
   }
 }

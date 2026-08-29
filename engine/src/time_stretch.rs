@@ -1,5 +1,5 @@
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
-use spotify_playback_engine::protocol::{TimeRange, TrackEdit};
+use renderer_engine::protocol::{TimeRange, TrackEdit};
 
 const CHANNELS: usize = NUM_CHANNELS as usize;
 /// OLA analysis window (Chromium AudioRendererAlgorithm: 20 ms).
@@ -622,7 +622,7 @@ fn similarity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spotify_playback_engine::protocol::LoopRange;
+    use renderer_engine::protocol::LoopRange;
 
     fn stereo_tone(frames: usize, frequency: f32, right_scale: f32) -> Vec<f32> {
         let mut samples = Vec::with_capacity(frames * CHANNELS);

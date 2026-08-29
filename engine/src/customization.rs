@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use spotify_playback_engine::atomic::replace_file_atomically;
-use spotify_playback_engine::protocol::{
+use renderer_engine::atomic::replace_file_atomically;
+use renderer_engine::protocol::{
     LoopRange, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
 };
 
@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn only_an_enabled_playlist_context_resolves_an_edit() {
         let root = std::env::temp_dir().join(format!(
-            "spotify-renderer-track-edit-test-{}-{}",
+            "renderer-track-edit-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn unreadable_snapshot_fails_closed_without_destroying_it() {
         let root = std::env::temp_dir().join(format!(
-            "spotify-renderer-track-edit-corrupt-test-{}-{}",
+            "renderer-track-edit-corrupt-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -676,7 +676,7 @@ mod tests {
     #[test]
     fn playlist_exclusions_round_trip_and_stay_independent() {
         let root = std::env::temp_dir().join(format!(
-            "spotify-renderer-playlist-exclusion-test-{}-{}",
+            "renderer-playlist-exclusion-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn invalid_persisted_playlist_exclusion_identifiers_fail_closed() {
         let root = std::env::temp_dir().join(format!(
-            "spotify-renderer-playlist-exclusion-invalid-test-{}-{}",
+            "renderer-playlist-exclusion-invalid-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
