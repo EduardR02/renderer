@@ -1,102 +1,46 @@
 # Renderer
 
-A desktop music client for Windows that plays Spotify through your own Premium
-account.
-
-I wrote it because the official desktop app kept my CPU busy in a way a music
-player has no business doing. A music player runs all day in the background, so
-that cost is paid continuously — it isn't the kind of thing you stop noticing.
-Mainstream clients have to serve a very broad set of goals; this one doesn't. It
-only has to suit one person, which means it can leave out the parts I never use
-and spend the effort on playback quality, responsiveness and the interface
-instead.
+A desktop Spotify client for Windows. I built it because the official app used
+more CPU than I want a music player to use.
 
 <p align="center">
   <img src="docs/library.png" alt="A playlist open in Renderer" width="900">
+  <br><br>
+  <img src="docs/now-playing.png" alt="The now playing panel" width="900">
 </p>
 
 ## Not affiliated with Spotify
 
-This is an unofficial third-party client. It has no connection to Spotify AB and
-is not authorized or endorsed by them. "Spotify" is a trademark of Spotify AB,
-used here only to say what this program connects to.
+This is an unofficial client, with no connection to Spotify AB. "Spotify" is
+their trademark and is used here only to say what this connects to.
 
 Running an unofficial client very likely breaks Spotify's Terms of Use. This one
-authenticates as a desktop client and calls internal endpoints that aren't part
-of the public Web API, so using it puts your account at risk of suspension. It
-needs your own Premium account and gives you no access to anything you aren't
-already paying for. Your call, your risk — and I'm not a lawyer, so this isn't
-legal advice.
+authenticates as a desktop client and uses internal endpoints that aren't part of
+the public Web API, so it can get your account suspended. It needs your own
+Premium account and gives you nothing you aren't already paying for. Your call.
+No audio, metadata or artwork ships with this repository.
 
-No audio, metadata or artwork is distributed with this repository.
+## Features
 
-## How it's built
+Mostly a normal client: playlists, albums, artist pages, search, queue, credits,
+radio. Some extra things I added because we control playback here and they
+seemed fun:
 
-Two processes. The playback engine in `engine/` wraps
-[librespot](https://github.com/librespot-org/librespot) and owns everything to do
-with sound; the Tauri 2 shell in `src-tauri/` supervises that process, holds the
-caches, and serves a Svelte 5 frontend from `src/`. Audio living in its own
-process is the point of the split: nothing the interface does can interrupt
-playback, and if the engine ever dies the shell restarts it and restores the
-queue where it left off.
+- Cut a section out of a song, or loop an exact range. Set per playlist, edited
+  in a waveform view.
+- Playback speed from 0.5× to 2×, pitch preserving.
+- Listening history, kept locally.
+- A mark on tracks that are already in the local audio cache.
 
-The part I'd point at first is the audio path. librespot decodes; everything
-after that is ours, and it had to be. Spotify's audio arrives at 44.1 kHz and
-Windows almost always runs its output at 48, so every sample gets resampled on
-the way out. The stock rodio backend does that with linear interpolation, and
-rebuilds its converter mid-stream — each rebuild leaking a fraction of a frame.
-With the packet sizes Spotify's Vorbis actually produces that measured **+0.49%
-on rate**, offline and again on real hardware: the whole library playing very
-slightly fast, and slightly sharp, forever.
-
-Fixing it took two things, and only doing one wasn't enough. First, a
-windowed-sinc polyphase resampler that tracks position as an exact rational, so
-the output frame count is determined to the frame no matter where packet
-boundaries fall. Second, having the sink report the device's rate rather than
-44.1 kHz, which sends rodio's own converters down their pass-through branch so
-they stop resampling on top of the result. Reconstruction error now measures
-about −116 dB at 10 kHz, under 16-bit resolution and well beneath what the codec
-itself leaves behind. Both figures are pinned by tests, because this is the kind
-of error that ships easily and hides in plain hearing.
-
-## What it does that the official client doesn't
-
-**Per-track edit regions.** Cut a section out of a song, or loop an exact range,
-and it plays that way from then on. Enabled per playlist, off by default, edited
-in a waveform view.
-
-**Pitch-preserving speed**, from 0.5× to 2× in 0.05 steps, using WSOLA. It's
-strictly bypassed at 1.0× — the sample pipeline isn't merely set to a no-op, it
-isn't constructed at all — so the ordinary listening path stays bit-exact.
-
-**Local listening history**, one row per play, with filtering and sorting. It's
-recorded here and stays here.
-
-**Downloaded-track marks**, showing which songs are already in the local audio
-cache and will cost no network to play.
-
-Beyond that it's a normal client: playlists, albums, artist pages with bios and
-monthly listeners, search, queue, credits, radio.
-
-### Canvas
-
-Canvas — the short looping video some tracks have — is gated **per account on
-Spotify's servers**, not locally. Their backend returns nothing at all while that
-account preference is off, for every client including the official one, so the
-toggle in this app can only ever turn Canvas off. If it isn't showing, enable
-video in Spotify's own settings first. This cost me an evening; it's written down
-so it doesn't cost you one.
-
-<p align="center">
-  <img src="docs/now-playing.png" alt="The now playing panel with a Canvas video" width="900">
-</p>
+Canvas works, but only if you have video enabled in the real Spotify app — it's
+an account setting on their servers, not a local one, and their backend returns
+nothing at all while it's off.
 
 ## Building
 
-You'll need a [Rust toolchain](https://rustup.rs) and [Bun](https://bun.sh).
-Nothing else — `cargo` fetches and compiles every dependency itself, which is why
-the build directory ends up several GB. It's all generated; `cargo clean` takes
-it back.
+You need [Rust](https://rustup.rs) and [Bun](https://bun.sh). Cargo compiles
+every dependency from source, so the build directory ends up several GB; it's
+all generated, and `cargo clean` takes it back.
 
 ```bash
 bun install
@@ -104,44 +48,60 @@ bun run build:engine
 bun tauri build
 ```
 
-For development, `bun tauri dev`. To run the checks:
-
-```bash
-cargo test -p renderer-engine
-cargo test -p renderer
-bun run build
-```
+`bun tauri dev` for development. Checks are `cargo test -p renderer-engine`,
+`cargo test -p renderer`, and `bun run build`.
 
 First launch opens a Spotify login in your browser. Credentials go to Spotify,
-never through this app; what's stored locally is the token it hands back, under
-`%LOCALAPPDATA%\SpotifyRenderer` along with the audio cache, covers and history.
+never through this app. What's stored locally is the token they hand back, under
+`%LOCALAPPDATA%\SpotifyRenderer` with the audio cache, covers and history.
 
-## Layout
+## How it works
 
-| Path         | What's in it                                                 |
-| ------------ | ------------------------------------------------------------ |
-| `engine/`    | Playback engine: librespot, audio pipeline, browse, history   |
-| `src-tauri/` | Tauri shell: engine supervision, caches, commands             |
-| `src/`       | Svelte 5 frontend                                             |
-| `dev/`       | Scratch harnesses, not part of the build                      |
+Two processes. `engine/` wraps [librespot](https://github.com/librespot-org/librespot)
+and handles everything to do with sound. The Tauri shell in `src-tauri/`
+supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
+Audio being in its own process means the interface can't interrupt playback, and
+if the engine dies the shell restarts it and puts the queue back.
 
-`AGENTS.md` describes the conventions the code is written to, and is the better
-starting point than this file if you intend to change anything.
+| Path         | What's in it                                                |
+| ------------ | ----------------------------------------------------------- |
+| `engine/`    | Playback engine: librespot, audio pipeline, browse, history  |
+| `src-tauri/` | Tauri shell: engine supervision, caches, commands            |
+| `src/`       | Svelte 5 frontend                                            |
+| `dev/`       | Scratch harnesses, not part of the build                     |
 
-## Scope
+`AGENTS.md` has the conventions the code follows, and is a better starting point
+than this file if you want to change something.
 
-This is a personal project that happens to be public. It's built for one
-person's machine and one person's taste, I make no promises about it working on
-yours, and I'm not looking to take it in directions I wouldn't use myself. Fork
-it freely — that's what the license is for.
+### The resampling problem
 
-## Thanks
+librespot's rodio backend has a resampling bug that shows up on Windows. Spotify
+decodes at 44.1 kHz and Windows usually runs its output at 48, so everything gets
+resampled on the way out. rodio does that with linear interpolation, and it also
+rebuilds its converter mid-stream, leaking a fraction of a frame each time it
+does. At the packet sizes Spotify's Vorbis actually produces that came to
++0.4882% on rate, measured offline and again on hardware. Everything plays
+slightly fast and slightly sharp.
 
-To [librespot](https://github.com/librespot-org/librespot), without which none of
-this would exist. It's used unmodified, as a normal dependency; everything custom
-here is built on the extension points it already exposes.
+Both halves needed replacing. There's a polyphase windowed-sinc resampler that
+tracks position as an exact rational, so the output frame count is determined to
+the frame regardless of where packet boundaries land, and the sink reports the
+device's rate rather than 44.1 kHz, which sends rodio's own converters down their
+pass-through path so they stop resampling the result a second time. Linear
+interpolation measured −15 dB error at 10 kHz; this measures −116 dB. Both
+numbers are pinned by tests.
+
+## On the code
+
+Nearly all of it was written by AI agents. That was the method, not an accident —
+what got built, how it was structured, and what counted as good enough were
+decided deliberately and enforced, and a fair amount of it was thrown out and
+redone when it wasn't right.
+
+Which also means it's an easy codebase to extend. If Spotify is missing something
+you want, point an agent at this and ask.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). That covers the code in this repository and nothing
-belonging to Spotify AB.
+MIT, see [LICENSE](LICENSE). Covers the code here and nothing belonging to
+Spotify AB.
