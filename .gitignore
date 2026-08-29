@@ -14,3 +14,10 @@ node_modules/
 # App-owned runtime state (lives under %LOCALAPPDATA%\SpotifyRenderer)
 *.dat
 *.log
+
+# Tooling and editor config, local to whoever is working on it
+.claude/
+.vscode/
+
+# Agent verification screenshots, kept out of history
+.shots/
