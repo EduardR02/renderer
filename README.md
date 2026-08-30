@@ -71,8 +71,11 @@ you occasionally need the real app for.
 
 Windows only, and you need Spotify Premium.
 
-No lossless. librespot can't select FLAC — its format picker only goes up to
-320 kbps Ogg Vorbis. I compared the two and couldn't tell them apart.
+No lossless. Spotify doesn't offer it to this client at all — track metadata
+comes back listing AAC 24 and Ogg Vorbis 96/160/320 and nothing else, so there
+is no FLAC file to select. Getting at it would mean impersonating their client
+far more thoroughly than this does. I compared 320 kbps against lossless in the
+official app and couldn't tell them apart.
 
 Liked Songs is read-only. You can browse and play it, but liking and unliking
 has to happen in the Spotify app. Adding it needs another API surface and I

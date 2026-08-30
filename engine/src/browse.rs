@@ -156,7 +156,16 @@ fn playlist_description(value: &str) -> Option<String> {
 /// `FLAC_FLAC`, so the selector can never match it — but whether the server
 /// offers a FLAC file at all is a separate, account- and client-gated
 /// question, and it decides whether patching that selection would achieve
-/// anything. One line, first resolved track, no per-track cost.
+/// anything.
+///
+/// Answered, and the answer is no: every track logged so far comes back with
+/// `AAC_24, OGG_VORBIS_96, OGG_VORBIS_160, OGG_VORBIS_320` and no FLAC entry.
+/// The file is not withheld from the selector, it is not in the metadata at
+/// all, so patching librespot's preference lists would achieve nothing. Reaching
+/// lossless means presenting as a client Spotify serves it to, which is a much
+/// deeper impersonation than this does anywhere else.
+///
+/// One line, first resolved track, no per-track cost.
 fn log_available_formats_once(track: &Track) {
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| {
