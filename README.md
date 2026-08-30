@@ -37,19 +37,21 @@ No audio, metadata or artwork ships with this repository.
 ## Features
 
 Mostly a normal client: playlists, albums, artist pages, search, queue, credits,
-radio. The difference is what isn't in them. An artist page gives you the
-discography, the popular tracks, the bio and the listener numbers — not merch,
-not concert tickets, not a row of things to buy. There are no podcasts, no
-audiobooks, no AI DJ, no home feed of stuff you didn't ask for. Just music, and
-only the parts of it you actually came for.
+radio.
 
-Audio is 320 kbps and gapless. Media keys work while the app is unfocused, and
-it registers with Windows so it shows up in Quick Settings and on the lock
-screen. Played tracks are cached, so replaying them costs no network. It can
-launch at login, minimized if you want. Playlists are fully editable — create,
-rename, delete, add, remove, reorder, drag and drop.
+The pages only contain the music parts. An artist page has the discography,
+popular tracks, bio, monthly listeners and top cities. No merch, no concert
+tickets. There are no podcasts or audiobooks anywhere, no AI DJ, and no home
+feed.
 
-Some extra things I added because we control playback here and they seemed fun:
+Audio is 320 kbps and gapless. Media keys work when the app isn't focused, and
+it shows up in Windows Quick Settings and on the lock screen. Played tracks are
+cached, so replaying them uses no network. It can launch at login, minimized if
+you want. Playlists can be created, renamed, deleted and reordered, and tracks
+added or removed by drag and drop. Settings has an audio cache size limit and a
+volume normalisation toggle.
+
+Some extra things I added because we control playback here:
 
 - Cut a section out of a song, or loop an exact range. Set per playlist, edited
   in a waveform view.
@@ -66,12 +68,11 @@ nothing at all while it's off (in that case you still get the album cover of cou
 Windows only, and you need Spotify Premium.
 
 Liked Songs is read-only. You can browse and play it, but liking and unliking
-has to happen in the real Spotify app. Adding it means pulling in another API
-surface, and I decided that tradeoff wasn't worth it for now.
+has to happen in the Spotify app. Adding it needs another API surface and I
+didn't want that tradeoff yet.
 
-There's no Spotify Connect, so you can't control other devices from here or push
-playback to them. I don't use it, and it's a lot of surface area for something I
-never touch.
+No Spotify Connect. You can't control other devices from here or send playback
+to them. I don't use it.
 
 ## Building
 
@@ -94,13 +95,10 @@ cache, covers and history.
 
 ## How it works
 
-Staying cheap to run is the whole reason this exists, so it's the thing most of
-the design decisions answer to. A music player is open all day and mostly idle,
-and idle should cost approximately nothing: no polling, no work per frame, no
-re-rendering lists nobody is looking at. The playhead moves on a transform so it
-stays on the compositor instead of forcing layout every tick. Long lists are
-virtualized. The engine sends scalar position heartbeats rather than whole-state
-updates. None of that is clever, it's just the stuff you have to actually do.
+It has to be cheap to run while sitting open all day, so a few things follow
+from that. The playhead is animated with a transform instead of a width, so it
+doesn't force layout on every tick. Long lists are virtualized. The engine sends
+a small position update on each heartbeat rather than the whole state.
 
 Two processes. `engine/` wraps [librespot](https://github.com/librespot-org/librespot)
 and handles everything to do with sound. The Tauri shell in `src-tauri/`
@@ -108,13 +106,10 @@ supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
 Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
 
-Tauri and a web frontend probably look like the wrong choice for something whose
-point is efficiency. It was picked for iteration speed: the interface is the part
-that needed the most trying things out, and matching the layouts I wanted was far
-faster in HTML and CSS than in any native toolkit. Now that it's basically
-finished, moving the frontend to something lower-level would be a fairly
-mechanical job to hand to agents — but it's already light enough that I'd rather
-keep the flexibility, since I keep thinking of small things I want to add.
+Tauri and a web frontend are an odd pick for this. I used them because the UI
+needed the most iteration and HTML and CSS were much faster to work in.
+Rewriting the frontend lower-level would be straightforward to hand to agents
+now, but it's already light enough that I'd rather keep it easy to change.
 
 | Path         | What's in it                                                |
 | ------------ | ----------------------------------------------------------- |
@@ -147,12 +142,11 @@ numbers are pinned by tests.
 
 ## On the code
 
-Nearly all of it was written by AI agents. What got built, how it was structured, and what counted as good enough were
-decided deliberately and enforced, and a fair amount of it was thrown out and
-redone when it wasn't right.
+Nearly all of it was written by AI agents. The decisions about what to build and
+how weren't left to them, and plenty of it got thrown out and redone.
 
-Which also means it's an easy codebase to extend. If Spotify is missing something
-you want, point an agent at this and ask.
+It's an easy codebase to extend. If Spotify is missing something you want, point
+an agent at it.
 
 ## License
 
