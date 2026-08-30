@@ -37,8 +37,17 @@ No audio, metadata or artwork ships with this repository.
 ## Features
 
 Mostly a normal client: playlists, albums, artist pages, search, queue, credits,
-radio. Without the bloat the real app has accumulated, though — no podcasts, no
-audiobooks, no AI DJ, no home feed of things you didn't ask for. Just music.
+radio. The difference is what isn't in them. An artist page gives you the
+discography, the popular tracks, the bio and the listener numbers — not merch,
+not concert tickets, not a row of things to buy. There are no podcasts, no
+audiobooks, no AI DJ, no home feed of stuff you didn't ask for. Just music, and
+only the parts of it you actually came for.
+
+Audio is 320 kbps and gapless. Media keys work while the app is unfocused, and
+it registers with Windows so it shows up in Quick Settings and on the lock
+screen. Played tracks are cached, so replaying them costs no network. It can
+launch at login, minimized if you want. Playlists are fully editable — create,
+rename, delete, add, remove, reorder, drag and drop.
 
 Some extra things I added because we control playback here and they seemed fun:
 
@@ -51,6 +60,18 @@ Some extra things I added because we control playback here and they seemed fun:
 Canvas works, but only if you have it enabled in the real Spotify app — it's
 an account setting on their servers, not a local one, and their backend returns
 nothing at all while it's off (in that case you still get the album cover of course).
+
+## Limitations
+
+Windows only, and you need Spotify Premium.
+
+Liked Songs is read-only. You can browse and play it, but liking and unliking
+has to happen in the real Spotify app. Adding it means pulling in another API
+surface, and I decided that tradeoff wasn't worth it for now.
+
+There's no Spotify Connect, so you can't control other devices from here or push
+playback to them. I don't use it, and it's a lot of surface area for something I
+never touch.
 
 ## Building
 
@@ -73,11 +94,27 @@ cache, covers and history.
 
 ## How it works
 
+Staying cheap to run is the whole reason this exists, so it's the thing most of
+the design decisions answer to. A music player is open all day and mostly idle,
+and idle should cost approximately nothing: no polling, no work per frame, no
+re-rendering lists nobody is looking at. The playhead moves on a transform so it
+stays on the compositor instead of forcing layout every tick. Long lists are
+virtualized. The engine sends scalar position heartbeats rather than whole-state
+updates. None of that is clever, it's just the stuff you have to actually do.
+
 Two processes. `engine/` wraps [librespot](https://github.com/librespot-org/librespot)
 and handles everything to do with sound. The Tauri shell in `src-tauri/`
 supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
 Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
+
+Tauri and a web frontend probably look like the wrong choice for something whose
+point is efficiency. It was picked for iteration speed: the interface is the part
+that needed the most trying things out, and matching the layouts I wanted was far
+faster in HTML and CSS than in any native toolkit. Now that it's basically
+finished, moving the frontend to something lower-level would be a fairly
+mechanical job to hand to agents — but it's already light enough that I'd rather
+keep the flexibility, since I keep thinking of small things I want to add.
 
 | Path         | What's in it                                                |
 | ------------ | ----------------------------------------------------------- |
