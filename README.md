@@ -65,7 +65,14 @@ nothing at all while it's off (in that case you still get the album cover of cou
 
 ## Limitations
 
+This isn't meant to replace the Spotify app. It's a daily player, with enough
+discovery in it that you don't have to leave for that, but there will be things
+you occasionally need the real app for.
+
 Windows only, and you need Spotify Premium.
+
+No lossless. librespot can't select FLAC — its format picker only goes up to
+320 kbps Ogg Vorbis. I compared the two and couldn't tell them apart.
 
 Liked Songs is read-only. You can browse and play it, but liking and unliking
 has to happen in the Spotify app. Adding it needs another API surface and I
