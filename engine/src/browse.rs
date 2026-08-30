@@ -158,12 +158,14 @@ fn playlist_description(value: &str) -> Option<String> {
 /// question, and it decides whether patching that selection would achieve
 /// anything.
 ///
-/// Answered, and the answer is no: every track logged so far comes back with
-/// `AAC_24, OGG_VORBIS_96, OGG_VORBIS_160, OGG_VORBIS_320` and no FLAC entry.
-/// The file is not withheld from the selector, it is not in the metadata at
-/// all, so patching librespot's preference lists would achieve nothing. Reaching
-/// lossless means presenting as a client Spotify serves it to, which is a much
-/// deeper impersonation than this does anywhere else.
+/// Answered for *this* client, and the answer is no: every track logged so far
+/// comes back with `AAC_24, OGG_VORBIS_96, OGG_VORBIS_160, OGG_VORBIS_320` and
+/// no FLAC entry. The file plainly exists — the official app plays lossless —
+/// but it is not withheld from the selector so much as absent from the metadata
+/// we are served, so patching librespot's preference lists would achieve
+/// nothing. Reaching it means presenting as a client Spotify serves it to,
+/// which is a far deeper impersonation than this does anywhere else, and may
+/// not be reachable at all.
 ///
 /// One line, first resolved track, no per-track cost.
 fn log_available_formats_once(track: &Track) {

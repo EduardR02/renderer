@@ -71,11 +71,15 @@ you occasionally need the real app for.
 
 Windows only, and you need Spotify Premium.
 
-No lossless. Spotify doesn't offer it to this client at all — track metadata
-comes back listing AAC 24 and Ogg Vorbis 96/160/320 and nothing else, so there
-is no FLAC file to select. Getting at it would mean impersonating their client
-far more thoroughly than this does. I compared 320 kbps against lossless in the
-official app and couldn't tell them apart.
+No lossless. Spotify has it and the official app plays it, but this client isn't
+offered it — the track metadata we get back lists AAC 24 and Ogg Vorbis
+96/160/320 and no FLAC. It's gated on presenting as a client they serve it to,
+which would take far heavier reverse engineering than anything else here, if
+it's reachable at all.
+
+It doesn't matter much in practice. 320 kbps Vorbis and lossless aren't
+something people reliably pick apart in a blind ABX test. There's a difference
+on paper, but not at a level that affects listening.
 
 Liked Songs is read-only. You can browse and play it, but liking and unliking
 has to happen in the Spotify app. Adding it needs another API surface and I
