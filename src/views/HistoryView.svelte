@@ -487,7 +487,7 @@
     flex: none; display: grid; place-items: center;
     width: 20px; height: 20px; border-radius: 50%; color: var(--fg-3);
   }
-  .history-filter-clear:hover { color: var(--fg); background: rgba(255, 255, 255, 0.08); }
+  .history-filter-clear:hover { color: var(--fg); background: var(--hover-3); }
   .history-sort-control { flex: none; }
   .history-sort-control :global(.sel-btn) { height: 32px; min-width: 138px; }
 
@@ -516,7 +516,7 @@
     border-radius: var(--r2); text-align: left;
     transition: background-color var(--d1) var(--ease);
   }
-  .hi-main:hover { background: rgba(255, 255, 255, 0.045); }
+  .hi-main:hover { background: var(--hover); }
 
   /* The replay affordance lives on the art: on hover (or keyboard focus) the
      sleeve dims under a scrim and the play glyph surfaces. Opacity only —

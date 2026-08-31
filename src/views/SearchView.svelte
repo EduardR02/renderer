@@ -20,21 +20,45 @@
   const empty = $derived(!tracks.length && !albums.length && !playlists.length && !artists.length);
   const visibleTracks = $derived(tracks.slice(0, 5));
 
-  /* Top result: an artist beats an album beats a song. Whatever the query
-     names exactly is almost always one of those, in that order. */
+  /* Top result: Spotify's own cross-kind ranking, not "whichever artist
+     happened to come back first". Ranking by kind was answering a different
+     question than the one typed — `top 50` returned Ariana Grande, `OK
+     Computer` returned Radiohead rather than the record, and `Bohemian
+     Rhapsody` returned Queen rather than the song. The engine reads the
+     ranking out of the same searchDesktop response the groups come from; see
+     `search_top_ref` in browse.rs.
+
+     `sub` is the credit line under the name. An artist has none: the kind
+     line already says everything a portrait and a name do not. */
+  const TOP_LABEL = { track: "Song", album: "Album", artist: "Artist", playlist: "Playlist" };
   const top = $derived.by(() => {
-    /* `sub` is the credit line, empty for an artist — the kind already says it */
-    if (artists[0]) return { kind: "Artist", ...artists[0], sub: "" };
-    if (albums[0]) return { kind: "Album", ...albums[0], sub: albums[0].artist_names.join(", ") };
-    if (tracks[0]) return { kind: "Song", ...tracks[0], sub: tracks[0].artist_names.join(", ") };
-    return null;
+    const hit = search.results?.top;
+    if (!hit) return null;
+    /* A playlist names its OWNER here, not its description. Everywhere else a
+       playlist's own words are the most useful second line, but this line is
+       one line in a 320px column: "Dein tägliches Update zu den aktuell am…"
+       is not an answer, and "Spotify" is exactly the fact that separates the
+       official Discover Weekly from someone's copy of it. */
+    const sub =
+      hit.kind === "artist"
+        ? ""
+        : hit.kind === "playlist"
+          ? hit.owner || playlistSubtitle(hit)
+          : (hit.artist_names ?? []).join(", ");
+    return { ...hit, label: TOP_LABEL[hit.kind] ?? "Result", sub };
   });
 
   function openTop() {
     if (!top) return;
-    if (top.kind === "Artist") navigateArtist(top.id, top.name);
-    else if (top.kind === "Album") navigate("album", top.id);
-    else api.playQueue(tracks, 0, "search").catch(() => {});
+    if (top.kind === "artist") return navigateArtist(top.id, top.name);
+    if (top.kind === "album") return navigate("album", top.id);
+    if (top.kind === "playlist") return navigate("playlist", top.id);
+    /* A song opens by playing. Start the queue at the ranked track's own
+       position when the Songs list contains it, so what plays next is the
+       rest of the list rather than a one-track queue that stops dead. */
+    const at = tracks.findIndex((t) => t.id === top.id);
+    const queue = at >= 0 ? tracks : [top];
+    api.playQueue(queue, Math.max(at, 0), "search").catch(() => {});
   }
 
   function playTrack(i) {
@@ -190,7 +214,7 @@
          the request takes, which is the idle cost this app exists to avoid.
          ================================================================= -->
     <div class="search-split" aria-busy="true" aria-label="Searching">
-      <div>
+      <div class="split-top">
         <div class="section-head"><h2 class="section-title">Top result</h2></div>
         <div class="top-result sk-top">
           <span class="skeleton" style="width:92px;height:92px;border-radius:var(--r3)"></span>
@@ -200,7 +224,7 @@
           </span>
         </div>
       </div>
-      <div>
+      <div class="split-songs">
         <div class="section-head"><h2 class="section-title">Songs</h2></div>
         <div class="tl" style="--cols:28px 36px minmax(0,1fr) 52px 28px">
           {#each SKELETON_ROWS as _, i (i)}
@@ -259,32 +283,38 @@
   {:else}
     <div class="search-split">
       {#if top}
-        {@const topTone = coverTone(top.cover_url, top.id)}
-        <div>
+        {@const topTone = coverTone(top.cover_url || top.cover_urls?.[0] || "", top.id)}
+        <div class="split-top">
           <div class="section-head"><h2 class="section-title">Top result</h2></div>
           <!-- The one big coloured object on a results page. Search has no
                subject of its own to take a header wash from, but the top
                result IS a subject, so the panel around it takes that record's
                colour rather than being the fourth grey rectangle on screen. -->
-          <button class="top-result" style:--tone-wash={topTone.wash} onclick={openTop}>
+          <button
+            class="top-result"
+            style:--tone-wash={topTone.wash}
+            style:--tone-glow={topTone.glow}
+            onclick={openTop}
+          >
             <Cover
               src={top.cover_url}
+              srcs={top.cover_urls ?? []}
               id={top.id}
               name={top.name}
               size={92}
               lg
-              circle={top.kind === "Artist"}
+              circle={top.kind === "artist"}
             />
             <span style="min-width:0">
               <span class="tr-name">{top.name}</span>
-              <span class="tr-sub">{top.sub ? `${top.kind} / ${top.sub}` : top.kind}</span>
+              <span class="tr-sub">{top.sub ? `${top.label} / ${top.sub}` : top.label}</span>
             </span>
           </button>
         </div>
       {/if}
 
       {#if tracks.length}
-        <div>
+        <div class="split-songs">
           <div class="section-head">
             <h2 class="section-title">Songs</h2>
             {#if tracks.length > 5}

@@ -49,12 +49,12 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use http::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use http::{Method, Request};
 use librespot_core::cache::Cache;
 use librespot_core::error::ErrorKind;
 use librespot_core::{FileId, Session, SpotifyId, SpotifyUri};
-use librespot_metadata::{image::Images, Album, Artist, Metadata, Playlist, Track};
+use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
 use librespot_protocol::canvaz;
 use librespot_protocol::extended_metadata::{
     BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
@@ -64,9 +64,9 @@ use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 
 use renderer_engine::protocol::{
-    sanitize_playlist_description, AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
-    ArtistTopCity, Canvas, CreditArtist, CreditRole, PlaylistRecommendations, PlaylistRef,
-    RadioBrowse, SongwriterPlaylist, TrackCredits, TrackRef,
+    AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity, Canvas,
+    CreditArtist, CreditRole, PlaylistRecommendations, PlaylistRef, RadioBrowse,
+    SongwriterPlaylist, TrackCredits, TrackRef, sanitize_playlist_description,
 };
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
@@ -391,12 +391,9 @@ fn remember_canvas(uri: &str, value: Option<Canvas>) {
         return;
     };
     let key_is_absent = !cache.contains_key(uri);
-    evict_oldest_for_fresh_key(
-        &mut cache,
-        CANVAS_CACHE_MAX,
-        key_is_absent,
-        |entry| entry.fetched_at,
-    );
+    evict_oldest_for_fresh_key(&mut cache, CANVAS_CACHE_MAX, key_is_absent, |entry| {
+        entry.fetched_at
+    });
     cache.insert(
         uri.to_owned(),
         CanvasCacheEntry {
@@ -437,7 +434,6 @@ fn evict_oldest_for_fresh_key<K, V>(
     }
 }
 
-
 struct TrackFiles {
     /// When the payload behind these ids was parsed. This is the stamp
     /// [`FILE_IDS`] ages entries by, not a freshness signal.
@@ -460,12 +456,9 @@ fn remember_track_files(id: &str, track: &Track) {
     };
     if let Ok(mut index) = FILE_IDS.write() {
         let key_is_absent = !index.contains_key(id);
-        evict_oldest_for_fresh_key(
-            &mut index,
-            FILE_IDS_CAPACITY,
-            key_is_absent,
-            |entry| entry.fetched_at,
-        );
+        evict_oldest_for_fresh_key(&mut index, FILE_IDS_CAPACITY, key_is_absent, |entry| {
+            entry.fetched_at
+        });
         index.insert(id.to_owned(), entry);
     }
 }
@@ -2221,12 +2214,7 @@ pub async fn artist_songwriter_browse(
     if artist_id.trim().is_empty() {
         return Ok(None);
     }
-    Ok(cached_songwriter_playlist(
-        session,
-        artist_id,
-        canonical_artist_name,
-    )
-    .await)
+    Ok(cached_songwriter_playlist(session, artist_id, canonical_artist_name).await)
 }
 
 /// Artist portrait, top tracks, and the grouped release catalogue via the
@@ -3195,6 +3183,8 @@ struct SearchDesktopData {
 #[allow(non_snake_case)] // GraphQL schema field names
 struct SearchV2Json {
     #[serde(default)]
+    topResultsV2: SearchTopSectionJson,
+    #[serde(default)]
     tracksV2: SearchTrackSectionJson,
     #[serde(default)]
     albumsV2: SearchAlbumSectionJson,
@@ -3202,6 +3192,43 @@ struct SearchV2Json {
     artists: SearchArtistSectionJson,
     #[serde(default)]
     playlists: Option<SearchPlaylistSectionJson>,
+}
+
+/// The cross-kind ranking. `numberOfTopResults` in the request variables is
+/// what asks for it, so it has been arriving in every response all along.
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // GraphQL schema field names
+struct SearchTopSectionJson {
+    #[serde(default)]
+    itemsV2: Vec<SearchTopItemJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchTopItemJson {
+    #[serde(default)]
+    item: Option<SearchTopWrapperJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchTopWrapperJson {
+    #[serde(default)]
+    data: Option<SearchTopDataJson>,
+}
+
+/// One ranked hit, discriminated by its own `__typename`. The payloads are
+/// the same shapes the per-kind sections carry, so they reuse the same
+/// structs and the same `*_ref_from_hit` mappers.
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum SearchTopDataJson {
+    Track(SearchTrackHitJson),
+    Album(SearchAlbumHitJson),
+    Artist(SearchArtistHitJson),
+    Playlist(SearchPlaylistHitJson),
+    /// Podcasts, episodes, audiobooks and users rank here too. The app has
+    /// nowhere to send them, so they are skipped and the next hit is tried.
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Default, Deserialize)]
@@ -3618,6 +3645,62 @@ fn playlist_ref_from_hit(hit: &SearchPlaylistHitJson) -> PlaylistRef {
             .and_then(|content| parse_count(content.totalCount.as_ref())),
     }
 }
+/// Drops repeats of an id, keeping the first and the service's ordering.
+///
+/// The per-kind sections can carry one entity twice: a live `OK Computer`
+/// search returns the same album id in two album slots. A grid that draws the
+/// same record twice is wrong on its own terms, and it also throws in the view
+/// — the card grids are keyed by id, and Svelte refuses a duplicate key — so
+/// the whole results page fails to render on nothing worse than a repeated
+/// row. Fixed here, where the id is the identity, rather than per view.
+fn dedupe_by_id<T>(items: Vec<T>, id: impl Fn(&T) -> &str) -> Vec<T> {
+    let mut seen = HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| seen.insert(id(item).to_owned()))
+        .collect()
+}
+
+/// The highest-ranked hit this app can actually open.
+///
+/// Walks the ranking in order rather than taking `[0]`, so a query whose best
+/// answer is a podcast still yields the best *playable* answer underneath it
+/// instead of nothing. A hit missing an id or a name is skipped for the same
+/// reason: a top result that cannot be opened or named is not a result.
+fn search_top_ref(section: &SearchTopSectionJson) -> Option<renderer_engine::protocol::SearchTopRef> {
+    use renderer_engine::protocol::SearchTopRef;
+    section
+        .itemsV2
+        .iter()
+        .filter_map(|entry| entry.item.as_ref()?.data.as_ref())
+        .find_map(|data| {
+            let (top, id, name) = match data {
+                SearchTopDataJson::Track(hit) => {
+                    let reference = track_ref_from_hit(hit);
+                    let (id, name) = (reference.id.clone(), reference.name.clone());
+                    (SearchTopRef::Track(reference), id, name)
+                }
+                SearchTopDataJson::Album(hit) => {
+                    let reference = album_ref_from_hit(hit);
+                    let (id, name) = (reference.id.clone(), reference.name.clone());
+                    (SearchTopRef::Album(reference), id, name)
+                }
+                SearchTopDataJson::Artist(hit) => {
+                    let reference = artist_ref_from_hit(hit);
+                    let (id, name) = (reference.id.clone(), reference.name.clone());
+                    (SearchTopRef::Artist(reference), id, name)
+                }
+                SearchTopDataJson::Playlist(hit) => {
+                    let reference = playlist_ref_from_hit(hit);
+                    let (id, name) = (reference.id.clone(), reference.name.clone());
+                    (SearchTopRef::Playlist(reference), id, name)
+                }
+                SearchTopDataJson::Unsupported => return None,
+            };
+            (!id.is_empty() && !name.is_empty()).then_some(top)
+        })
+}
+
 fn overview_playlist_ref(item: &SearchPlaylistWrapperJson) -> Option<PlaylistRef> {
     let hit = item.data.as_ref()?;
     if hit.typename.as_deref() != Some("Playlist") {
@@ -3746,9 +3829,8 @@ impl SongwriterPlaylistCache {
     }
 
     fn insert(&mut self, artist_id: String, value: Option<SongwriterPlaylist>, now: Instant) {
-        self.entries.retain(|_, entry| {
-            now.duration_since(entry.fetched_at) < Self::ttl(&entry.value)
-        });
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.fetched_at) < Self::ttl(&entry.value));
         let key_is_absent = !self.entries.contains_key(&artist_id);
         evict_oldest_for_fresh_key(
             &mut self.entries,
@@ -3758,7 +3840,10 @@ impl SongwriterPlaylistCache {
         );
         self.entries.insert(
             artist_id,
-            SongwriterPlaylistCacheEntry { fetched_at: now, value },
+            SongwriterPlaylistCacheEntry {
+                fetched_at: now,
+                value,
+            },
         );
     }
 }
@@ -4733,6 +4818,7 @@ pub async fn search_browse(
         let parsed: SearchDesktopResponse = serde_json::from_slice(&payload)
             .map_err(|error| format!("unparseable search response: {error}"))?;
         return Ok(renderer_engine::protocol::SearchBrowse {
+            top: search_top_ref(&parsed.data.searchV2.topResultsV2),
             tracks: parsed
                 .data
                 .searchV2
@@ -4741,33 +4827,42 @@ pub async fn search_browse(
                 .iter()
                 .map(|wrapper| track_ref_from_hit(&wrapper.item.data))
                 .collect(),
-            albums: parsed
-                .data
-                .searchV2
-                .albumsV2
-                .items
-                .iter()
-                .map(|wrapper| album_ref_from_hit(&wrapper.data))
-                .collect(),
-            artists: parsed
-                .data
-                .searchV2
-                .artists
-                .items
-                .iter()
-                .map(|wrapper| artist_ref_from_hit(&wrapper.data))
-                .collect(),
-            playlists: parsed
-                .data
-                .searchV2
-                .playlists
-                .as_ref()
-                .and_then(|section| section.items.as_deref())
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|wrapper| wrapper.data.as_ref())
-                .map(playlist_ref_from_hit)
-                .collect(),
+            albums: dedupe_by_id(
+                parsed
+                    .data
+                    .searchV2
+                    .albumsV2
+                    .items
+                    .iter()
+                    .map(|wrapper| album_ref_from_hit(&wrapper.data))
+                    .collect(),
+                |album| album.id.as_str(),
+            ),
+            artists: dedupe_by_id(
+                parsed
+                    .data
+                    .searchV2
+                    .artists
+                    .items
+                    .iter()
+                    .map(|wrapper| artist_ref_from_hit(&wrapper.data))
+                    .collect(),
+                |artist| artist.id.as_str(),
+            ),
+            playlists: dedupe_by_id(
+                parsed
+                    .data
+                    .searchV2
+                    .playlists
+                    .as_ref()
+                    .and_then(|section| section.items.as_deref())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|wrapper| wrapper.data.as_ref())
+                    .map(playlist_ref_from_hit)
+                    .collect(),
+                |playlist| playlist.id.as_str(),
+            ),
         });
     }
     Err(format!(
@@ -4807,9 +4902,11 @@ mod tests {
             .expect("video canvas");
         assert_eq!(canvas.url, record.url);
         assert_eq!(canvas.canvas_type, "video_looping");
-        assert!(parse_canvas_response(&response, "spotify:track:other")
-            .unwrap()
-            .is_none());
+        assert!(
+            parse_canvas_response(&response, "spotify:track:other")
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn file_id(byte: u8) -> FileId {
@@ -4921,9 +5018,11 @@ mod tests {
         assert!(url.ends_with(&"22".repeat(20)));
 
         let without_default = Images(vec![image(ImageSize::LARGE, 0x33)]);
-        assert!(cover_url(&without_default)
-            .unwrap()
-            .ends_with(&"33".repeat(20)));
+        assert!(
+            cover_url(&without_default)
+                .unwrap()
+                .ends_with(&"33".repeat(20))
+        );
         assert_eq!(cover_url(&Images::default()), None);
     }
 
@@ -4980,10 +5079,9 @@ mod tests {
             permanent_unavailability(&track, &policy).as_deref(),
             Some("no playable audio file")
         );
-        track.alternatives = Tracks(vec![SpotifyUri::from_uri(
-            "spotify:track:3abcdefghijklmnopqrstu",
-        )
-        .unwrap()]);
+        track.alternatives = Tracks(vec![
+            SpotifyUri::from_uri("spotify:track:3abcdefghijklmnopqrstu").unwrap(),
+        ]);
         assert_eq!(
             permanent_unavailability(&track, &policy),
             None,
@@ -5022,10 +5120,9 @@ mod tests {
             album,
             Vec::new(),
         );
-        track.alternatives = Tracks(vec![SpotifyUri::from_uri(
-            "spotify:track:3abcdefghijklmnopqrstu",
-        )
-        .unwrap()]);
+        track.alternatives = Tracks(vec![
+            SpotifyUri::from_uri("spotify:track:3abcdefghijklmnopqrstu").unwrap(),
+        ]);
         track.restrictions = librespot_metadata::restriction::Restrictions(vec![
             librespot_metadata::restriction::Restriction {
                 catalogues: librespot_metadata::restriction::RestrictionCatalogues(Vec::new()),
@@ -5120,11 +5217,13 @@ mod tests {
         assert_eq!(refs[0].owner_name, "");
         assert_eq!(refs[0].track_count, Some(42));
         // The base64 picture decodes to a 16-byte file id rendered as hex.
-        assert!(refs[0]
-            .cover_url
-            .as_deref()
-            .unwrap()
-            .starts_with(COVER_BASE));
+        assert!(
+            refs[0]
+                .cover_url
+                .as_deref()
+                .unwrap()
+                .starts_with(COVER_BASE)
+        );
         assert_eq!(
             refs[0].cover_url.as_deref().unwrap().len(),
             COVER_BASE.len() + 32
@@ -5239,6 +5338,84 @@ mod tests {
         assert!(refs.is_empty());
     }
 
+    /// The whole point of reading `topResultsV2` rather than "first artist":
+    /// a query whose best answer is a playlist must come back as that playlist,
+    /// even when the response also carries artists. Verified against a live
+    /// `top 50` response, which ranks "Top 50 – Deutschland" first and an
+    /// unrelated artist somewhere in the artists section.
+    #[test]
+    fn search_desktop_top_result_takes_the_cross_kind_ranking() {
+        let body = r#"{
+            "data": {
+                "searchV2": {
+                    "topResultsV2": {
+                        "itemsV2": [{
+                            "item": {
+                                "__typename": "PlaylistResponseWrapper",
+                                "data": {
+                                    "__typename": "Playlist",
+                                    "uri": "spotify:playlist:1abcdefghijklmnopqrstu",
+                                    "name": "Top 50 - Deutschland",
+                                    "ownerV2": {"data": {"name": "Spotify", "username": "spotify"}}
+                                }
+                            }
+                        }]
+                    },
+                    "artists": {"items": [{"data": {
+                        "__typename": "Artist",
+                        "uri": "spotify:artist:0123456789ABCDEFGHIJKL",
+                        "profile": {"name": "Some Artist"}
+                    }}]}
+                }
+            }
+        }"#;
+        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        let top = search_top_ref(&parsed.data.searchV2.topResultsV2).expect("a top result");
+        match top {
+            renderer_engine::protocol::SearchTopRef::Playlist(playlist) => {
+                assert_eq!(playlist.name, "Top 50 - Deutschland");
+                assert_eq!(playlist.id, "1abcdefghijklmnopqrstu");
+            }
+            other => panic!("expected the ranked playlist, got {other:?}"),
+        }
+    }
+
+    /// Podcasts and users outrank playable things often enough that taking
+    /// `[0]` blindly would leave the panel empty. The walk skips what the app
+    /// cannot open and keeps going.
+    #[test]
+    fn search_desktop_top_result_skips_kinds_with_nowhere_to_go() {
+        let body = r#"{
+            "data": {
+                "searchV2": {
+                    "topResultsV2": {
+                        "itemsV2": [
+                            {"item": {"data": {"__typename": "Podcast", "uri": "spotify:show:2abcdefghijklmnopqrstu", "name": "A Show"}}},
+                            {"item": {"data": {"__typename": "Artist", "uri": "spotify:artist:0123456789ABCDEFGHIJKL", "profile": {"name": "Real Answer"}}}}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        let top = search_top_ref(&parsed.data.searchV2.topResultsV2).expect("a top result");
+        match top {
+            renderer_engine::protocol::SearchTopRef::Artist(artist) => {
+                assert_eq!(artist.name, "Real Answer");
+            }
+            other => panic!("expected the artist under the podcast, got {other:?}"),
+        }
+    }
+
+    /// A response with the section renamed or absent degrades to no top
+    /// result, never an error: the groups below it are still a useful page.
+    #[test]
+    fn search_desktop_top_result_absent_is_not_an_error() {
+        let parsed: SearchDesktopResponse =
+            serde_json::from_str(r#"{"data": {"searchV2": {}}}"#).unwrap();
+        assert!(search_top_ref(&parsed.data.searchV2.topResultsV2).is_none());
+    }
+
     #[test]
     fn search_desktop_json_maps_tracks_albums_and_artists() {
         let body = r#"{
@@ -5291,6 +5468,7 @@ mod tests {
         }"#;
         let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
         let converted = renderer_engine::protocol::SearchBrowse {
+            top: search_top_ref(&parsed.data.searchV2.topResultsV2),
             tracks: parsed
                 .data
                 .searchV2
@@ -5541,10 +5719,13 @@ mod tests {
             ),
             Some("spotify")
         );
-        assert!(official_playlist_owner(
-            &SpotifyUri::from_uri("spotify:user:alice:playlist:0123456789ABCDEFGHIJKL").unwrap()
-        )
-        .is_none());
+        assert!(
+            official_playlist_owner(
+                &SpotifyUri::from_uri("spotify:user:alice:playlist:0123456789ABCDEFGHIJKL")
+                    .unwrap()
+            )
+            .is_none()
+        );
         assert!(
             SpotifyUri::from_uri("spotify:user:spotify:playlist:not-an-id").is_err(),
             "malformed playlist ids never reach metadata verification"
@@ -5633,7 +5814,9 @@ mod tests {
             Some(1)
         );
         assert!(
-            cache.get("positive", now + Duration::from_millis(1)).is_some(),
+            cache
+                .get("positive", now + Duration::from_millis(1))
+                .is_some(),
             "a fresh success answers from the cache"
         );
         assert!(
@@ -5645,7 +5828,10 @@ mod tests {
         cache.insert("negative".to_owned(), None, now);
         assert!(
             cache
-                .get("negative", now + SONGWRITER_PLAYLIST_FAILURE_TTL - Duration::from_millis(1))
+                .get(
+                    "negative",
+                    now + SONGWRITER_PLAYLIST_FAILURE_TTL - Duration::from_millis(1)
+                )
                 .is_some_and(|entry| entry.is_none()),
             "a miss is cached as a negative result"
         );
@@ -5685,7 +5871,11 @@ mod tests {
         }
 
         evict_oldest_for_fresh_key(&mut entries, 3, false, |stamp| *stamp);
-        assert_eq!(entries.len(), 3, "refreshing an existing key evicts nothing");
+        assert_eq!(
+            entries.len(),
+            3,
+            "refreshing an existing key evicts nothing"
+        );
 
         evict_oldest_for_fresh_key(&mut entries, 3, true, |stamp| *stamp);
         assert_eq!(entries.len(), 2);
@@ -5870,11 +6060,13 @@ mod tests {
 
         // A kind this build has never heard of is not a card with no name in
         // it, and neither is a well-formed one with nothing to open.
-        assert!(pinned(
-            "null",
-            r#"{"__typename": "PreRelease", "uri": "spotify:prerelease:x"}"#
-        )
-        .is_none());
+        assert!(
+            pinned(
+                "null",
+                r#"{"__typename": "PreRelease", "uri": "spotify:prerelease:x"}"#
+            )
+            .is_none()
+        );
         assert!(pinned("null", r#"{"__typename": "Track", "name": "No id here"}"#).is_none());
         assert!(pinned("null", "null").is_none());
     }
@@ -6033,11 +6225,13 @@ mod tests {
     #[test]
     fn artist_overview_rotation_rejects_bad_hash_payload_then_accepts_sparse_artist() {
         let mut last_error = String::new();
-        assert!(accept_artist_overview_attempt(
-            &mut last_error,
-            Ok(br#"{"errors":[{"message":"PersistedQueryNotFound"}]}"#.to_vec()),
-        )
-        .is_none());
+        assert!(
+            accept_artist_overview_attempt(
+                &mut last_error,
+                Ok(br#"{"errors":[{"message":"PersistedQueryNotFound"}]}"#.to_vec()),
+            )
+            .is_none()
+        );
         assert!(last_error.contains("rejected"));
 
         let accepted = accept_artist_overview_attempt(
@@ -6253,12 +6447,14 @@ mod tests {
 
         let parsed: GetTrackCountsResponse =
             serde_json::from_str(r#"{"data": {"trackUnion": {"firstArtist": null}}}"#).unwrap();
-        assert!(parsed
-            .data
-            .as_ref()
-            .and_then(|data| data.trackUnion.as_ref())
-            .and_then(|track| track.firstArtist.as_ref())
-            .is_none());
+        assert!(
+            parsed
+                .data
+                .as_ref()
+                .and_then(|data| data.trackUnion.as_ref())
+                .and_then(|track| track.firstArtist.as_ref())
+                .is_none()
+        );
     }
 
     #[test]

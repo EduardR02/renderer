@@ -144,6 +144,21 @@
   --line-2: rgba(255, 255, 255, 0.11);
   --ring:   inset 0 0 0 1px rgba(255, 255, 255, 0.07); /* art edge      */
 
+  /* --- Hover plates: one gesture, three sizes -------------------------
+     A hover tint is read as an AREA of light, so one alpha cannot serve a
+     240px nav row and a 16px close mark: at the row's strength the mark does
+     not register at all. Strength therefore scales inversely with the target,
+     and this app has exactly three sizes of target.
+
+     These replaced eight hand-tuned alphas that had drifted apart one surface
+     at a time — three different values for "a wide row plate", two for "a 30px
+     round button". No one of them was visibly wrong on its own, which is
+     exactly why they diverged, and why the app read very slightly less
+     deliberate under the pointer than it does standing still. */
+  --hover:   rgba(255, 255, 255, 0.05);  /* rows, nav items, wide plates    */
+  --hover-2: rgba(255, 255, 255, 0.07);  /* 22-32px round icon buttons      */
+  --hover-3: rgba(255, 255, 255, 0.10);  /* 16-18px clear / close marks     */
+
   /* --- Type. Windows-first: Segoe UI Variable has optical size axes,
          so headings and body get genuinely different letterforms
          for zero bytes. ------------------------------------------------ */
@@ -330,7 +345,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .nav-item svg { flex: none; opacity: 0.8; }
-.nav-item:hover { color: var(--fg); background: rgba(255, 255, 255, 0.04); }
+.nav-item:hover { color: var(--fg); background: var(--hover); }
 /* Selected nav: an accent wash over the raised step rather than the raised
    step alone, plus the existing rail. Colour now carries the state; the
    luminance change is only the support. */
@@ -379,7 +394,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: grid; place-items: center; width: 22px; height: 22px; flex: none;
   border-radius: var(--rf); color: var(--fg-2);
 }
-.lib-filter-close:hover { color: var(--fg); background: rgba(255, 255, 255, 0.06); }
+.lib-filter-close:hover { color: var(--fg); background: var(--hover-2); }
 .lib-filter-empty {
   padding: var(--s5) var(--s3); color: var(--fg-2); text-align: center;
   font-family: var(--font-small); font-size: var(--t-11);
@@ -537,12 +552,23 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   filter: brightness(0.94) saturate(1.04);
 }
 .np-stage.play .np-art .art { animation: np-recede 1.2s var(--ease-open) both; }
-/* The Canvas is sized by the inset sleeve, never by itself. `contain` is a
-   second no-crop guarantee if source metadata and decoded frames disagree. */
+/* The Canvas takes the sleeve's WIDTH and its own height, once, and never
+   moves again — the growing sleeve only uncovers more of it.
+
+   It used to be `inset: 0` + `object-fit: contain`, which made the painted
+   picture a function of the box's animating height: contain letterboxes to
+   min(boxW, boxH x ratio), so while the sleeve grew from square to 16:9 the
+   picture swept 129px wider and its left edge travelled 69px inward. Worse,
+   that sweep was fighting `np-pour`'s own scale on a different curve, so the
+   width was not even monotonic — 59 direction reversals across one open.
+   That oscillation is what read as the sideways shimmy; it was never the
+   one-pixel rounding a previous pass went looking for.
+   Width-led with height auto, the element box equals the source's natural
+   frame exactly, so `object-fit` has nothing left to decide and the raster is
+   identical on every frame of the open. */
 .np-canvas {
-  position: absolute; inset: 0; z-index: 2;
-  display: block; width: 100%; height: 100%;
-  object-fit: contain; object-position: center;
+  position: absolute; top: 0; left: 0; z-index: 2;
+  display: block; width: 100%; height: auto;
   border-radius: inherit;
   opacity: 0; pointer-events: none;
 }
@@ -560,10 +586,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* Reveal timeline once the video is decodable: the inset sleeve breathes open
    while Canvas pours down and the cover recedes. Track changes keep `.play`
    and the current geometry while their next Canvas request is pending. */
+/* Vertical only. The zoom-out that used to settle this had a different curve
+   from the sleeve's, so the two disagreed about the picture's width every
+   frame; a wipe has no horizontal component to disagree about. */
 @keyframes np-pour {
-  from { opacity: 0; clip-path: inset(0 0 100% 0); transform: scale(1.045); }
+  from { opacity: 0; clip-path: inset(0 0 100% 0); }
   40%  { opacity: 1; }
-  to   { opacity: 1; clip-path: inset(0 0 0 0); transform: scale(1); }
+  to   { opacity: 1; clip-path: inset(0 0 0 0); }
 }
 @keyframes np-recede {
   from { filter: brightness(0.94) saturate(1.04); transform: scale(1); }
@@ -586,9 +615,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   to   { filter: brightness(0.94) saturate(1.04); transform: scale(1); }
 }
 @keyframes np-drain {
-  from { opacity: 1; clip-path: inset(0 0 0 0); transform: scale(1); }
+  from { opacity: 1; clip-path: inset(0 0 0 0); }
   45%  { opacity: 0.3; }
-  to   { opacity: 0; clip-path: inset(0 0 100% 0); transform: scale(1.02); }
+  to   { opacity: 0; clip-path: inset(0 0 100% 0); }
 }
 @media (prefers-reduced-motion: reduce) {
   .np-stage.play .np-art::before { transition: none; }
@@ -643,7 +672,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   color: var(--fg-1); text-align: left;
   transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
-.np-album:hover:not(:disabled) { background: rgba(255, 255, 255, 0.05); color: var(--fg); }
+.np-album:hover:not(:disabled) { background: var(--hover); color: var(--fg); }
 .np-album:disabled { opacity: 1; }
 .np-album-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .np-album-name {
@@ -714,7 +743,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   padding: var(--s2); border-radius: var(--r2); text-align: left;
   transition: background-color var(--d1) var(--ease);
 }
-.np-next:hover { background: rgba(255, 255, 255, 0.05); }
+.np-next:hover { background: var(--hover); }
 .np-next-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .np-next-copy strong, .np-next-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .np-next-copy strong { font-size: var(--t-12); font-weight: var(--w-med); }
@@ -807,7 +836,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--rf); color: var(--fg-1);
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.round:hover:not(:disabled) { color: var(--fg); background: rgba(255, 255, 255, 0.07); }
+.round:hover:not(:disabled) { color: var(--fg); background: var(--hover-2); }
 .round:disabled { color: var(--fg-3); }
 
 .topbar-title {
@@ -871,7 +900,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   color: var(--fg-2); font-size: var(--t-12);
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.page-back:hover { color: var(--fg); background: rgba(255, 255, 255, 0.05); }
+.page-back:hover { color: var(--fg); background: var(--hover); }
 .page-back svg { flex: none; }
 
 /* The rhythm for a page whose header is type only: back link, title, and any
@@ -1200,7 +1229,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   font-size: var(--t-12); color: var(--fg-1); white-space: nowrap;
   transition: color var(--d1) var(--ease), border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.btn-ghost:hover:not(:disabled) { color: var(--fg); border-color: rgba(255, 255, 255, 0.2); background: rgba(255, 255, 255, 0.04); }
+.btn-ghost:hover:not(:disabled) { color: var(--fg); border-color: rgba(255, 255, 255, 0.2); background: var(--hover); }
 /* Destructive, but not alarming at rest: neutral until the pointer is on it,
    then unmistakably love. A row of permanently red "Clear" buttons in Settings
    reads as an error state rather than as a set of available actions. */
@@ -1226,7 +1255,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--rf); color: var(--fg-2);
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.btn-icon:hover { color: var(--fg); background: rgba(255, 255, 255, 0.06); }
+.btn-icon:hover { color: var(--fg); background: var(--hover-2); }
 .btn-icon.on { color: var(--accent); }
 /* A toggle that is ON is foam (interactive state); a thing that is SAVED is
    rose. They are different facts and used to share one class.
@@ -1352,7 +1381,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--r2);
   transition: background-color var(--d1) var(--ease);
 }
-.tl-row:hover { background: rgba(255, 255, 255, 0.045); }
+.tl-row:hover { background: var(--hover); }
 .tl-row.unavailable { cursor: default; }
 .tl-row.unavailable > :not(.c-more):not(.q-actions) { opacity: 0.42; }
 .tl-row.unavailable:hover { background: transparent; }
@@ -1364,7 +1393,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   background: linear-gradient(90deg, var(--accent-wash), transparent 46%);
   box-shadow: inset 2px 0 var(--accent);
 }
-.tl-row.current:hover { background: linear-gradient(90deg, var(--accent-wash), transparent 46%), rgba(255, 255, 255, 0.045); }
+.tl-row.current:hover { background: linear-gradient(90deg, var(--accent-wash), transparent 46%), var(--hover); }
 .tl-row.current .t-name { color: var(--accent); }
 .tl-row.current .c-idx { color: var(--accent); }
 
@@ -1539,7 +1568,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .tl-row:hover .q-actions button, .q-actions button:focus-visible { opacity: 1; }
 .tl-row:hover .q-actions button:disabled { opacity: 0.28; }
-.q-actions button:hover:not(:disabled) { color: var(--fg); background: rgba(255, 255, 255, 0.07); }
+.q-actions button:hover:not(:disabled) { color: var(--fg); background: var(--hover-2); }
 .q-actions button.danger:hover:not(:disabled) { color: var(--danger); }
 
 /* Skeletons: static, never a shimmer. A shimmer animates for exactly as long
@@ -1657,7 +1686,20 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   font-size: var(--t-13); color: var(--fg);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.card-copy:hover .card-name { color: var(--fg); text-decoration-color: var(--line-2); }
+/* The copy under a tile is its OWN control — a separate button from the
+   invisible one over the artwork — and it was the only clickable text in the
+   app that did nothing under the pointer. The rule here was `color: var(--fg)`,
+   which is the colour it already is, plus a `text-decoration-color` with no
+   `text-decoration-line` for it to colour: two declarations, no effect.
+   The underline is the same one the credits sheet uses to mark a linked name,
+   at the hairline's strength — visible only where the pointer is, so a grid of
+   forty tiles is exactly as quiet at rest as it was. */
+.card-copy:hover .card-name {
+  text-decoration: underline;
+  text-decoration-color: var(--line-2);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
 .card-sub {
   font-family: var(--font-small);
   font-size: var(--t-11); color: var(--fg-2);
@@ -1707,7 +1749,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--rf); color: var(--fg-1);
   transition: color var(--d1) var(--ease), transform var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.ctl:hover { color: var(--fg); background: rgba(255, 255, 255, 0.06); }
+.ctl:hover { color: var(--fg); background: var(--hover-2); }
 .ctl:active { transform: scale(0.94); }
 .ctl.on { color: var(--accent); }
 .ctl.on::after {
@@ -1746,9 +1788,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .p-time.r { text-align: left; }
 .rail-hit { position: relative; flex: 1; min-width: 0; height: 12px;
   display: flex; align-items: center; cursor: pointer; }
+/* Thickens under the pointer on the COMPOSITOR. This used to transition
+   `height` 3px→5px, which is the same disease the fill above was built to
+   avoid — a layout pass per frame on the one control that is under the
+   pointer most often in the whole app. The box stays 3px, so the resting
+   state (the one on screen 99% of the time) keeps its exact round caps, and
+   the hover stretches it; on a 5px bar the stretched caps are not resolvable. */
 .rail { position: relative; width: 100%; height: 3px; border-radius: var(--rf);
   background: rgba(255, 255, 255, 0.13); overflow: hidden;
-  transition: height var(--d1) var(--ease); }
+  transition: transform var(--d1) var(--ease); }
 /* scaleX on the fill is composited — no layout on every playhead tick.
    The gradient is painted at the rail's full width and then scaled, so the
    progress bar warms from foam toward rose as the track plays: the one place
@@ -1762,7 +1810,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   box-shadow: 0 2px 6px rgba(0,0,0,.5); opacity: 0;
   transition: opacity var(--d1) var(--ease);
 }
-.rail-hit:hover .rail, .rail-hit:focus-visible .rail { height: 5px; }
+.rail-hit:hover .rail, .rail-hit:focus-visible .rail { transform: scaleY(1.667); }
 .rail-hit:hover .rail-knob, .rail-hit:focus-visible .rail-knob { opacity: 1; }
 .seek-tip {
   position: absolute;
@@ -2020,7 +2068,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: grid; place-items: center; width: 18px; height: 18px; flex: none;
   border-radius: 50%; color: var(--fg-3);
 }
-.credits-filter-clear:hover { color: var(--fg); background: rgba(255, 255, 255, 0.08); }
+.credits-filter-clear:hover { color: var(--fg); background: var(--hover-3); }
 
 .credits-body {
   flex: 1; min-height: 200px; padding: 0 var(--s6) var(--s5);
@@ -2237,6 +2285,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 /* the control cell: fixed-size widgets, right-aligned, never squeezed */
 .set-ctl { display: flex; align-items: center; justify-content: flex-end; gap: var(--s3); flex: none; }
+/* An 18px checkbox belongs to the LABEL, not to the paragraph under it. On a
+   row whose helper text runs to three lines, centring the box on the whole
+   block parked it 19px below the words it answers, floating in the middle of
+   the description — the smaller the control, the further adrift it looks.
+   Pinning it to the first line's box puts it back on its own title.
+   Only the small controls: a 34px listbox or a 32px button beside a two-line
+   block is a block beside a block, and centring is what makes those a pair. */
+.set-ctl:has(> .set-check) { align-self: start; min-height: calc(var(--t-13) * 1.45); }
 
 /* The drawn checkbox, shared by Settings and any other boolean row: a raised
    field at rest, the foam fill with the ink glyph when checked. 16px box,
@@ -2390,7 +2446,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   font-size: var(--t-12); color: var(--fg-2); white-space: nowrap;
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.seg-btn:hover { color: var(--fg); background: rgba(255, 255, 255, 0.05); }
+.seg-btn:hover { color: var(--fg); background: var(--hover); }
 /* Selected: a raised chip lit from the top in foam. Not a solid foam fill —
    this control sits above a list whose playing row is already foam-washed, and
    two saturated foam objects in one column makes neither of them the answer. */
@@ -2413,12 +2469,27 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .chip .x { color: var(--fg-3); display: grid; place-items: center; width: 16px; height: 16px; flex: none; border-radius: 50%; }
-.chip .x:hover { color: var(--fg); background: rgba(255, 255, 255, 0.1); }
+.chip .x:hover { color: var(--fg); background: var(--hover-3); }
 
-/* Top result beside the song list. Collapses to one column when the pane is
-   too narrow to give the songs a usable width. */
-.search-split { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: var(--s6); align-items: start; }
-@media (max-width: 1080px) { .search-split { grid-template-columns: minmax(0, 1fr); } }
+/* Top result beside the song list, and the song list wins every argument.
+
+   This was a grid of `minmax(0, 340px) minmax(0, 1fr)` with a viewport media
+   query to collapse it. Both halves were wrong. The 1fr track has a zero
+   minimum, so the panel held its full 340px while the songs starved — titles
+   and artists ellipsed to "Ky…", "To…", "Lun…" — and the media query asked
+   the WINDOW how wide it was when the thing being squeezed is the PANE, which
+   is the window less a 240px sidebar, a 336px now-playing rail and gutters.
+   A 1278px window with the rail open leaves the pane under 700px and never
+   trips a 1080px query.
+
+   Flex wrapping answers both at once and asks nothing about the viewport: the
+   two columns sit side by side while their basis widths both fit, and the
+   moment they do not, the top result takes a full-width line of its own above
+   the songs. The songs column carries all the text, so it gets the larger
+   basis and is the only one allowed to grow. */
+.search-split { display: flex; flex-wrap: wrap; gap: var(--s6); align-items: flex-start; }
+.split-top { flex: 0 1 320px; min-width: 0; }
+.split-songs { flex: 1 1 440px; min-width: 0; }
 
 .top-result {
   display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s4);
@@ -2430,20 +2501,45 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
     linear-gradient(155deg,
       color-mix(in srgb, var(--tone-wash, var(--bg-2)) 76%, var(--bg-2)),
       var(--bg-2) 78%);
-  transition: filter var(--d1) var(--ease);
+  transition: transform var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
   text-align: left; width: 100%;
 }
-.top-result:hover { filter: brightness(1.28); }
+/* The same gesture a card makes, for the same reason — this is a record, and
+   the light under it is the record's own colour rather than a black shadow.
+   It used to be `filter: brightness(1.28)`, and a filter cannot tell a tinted
+   panel from a photograph: it lifted the panel and bleached a quarter of the
+   contrast out of the cover sitting on it, which is the one thing on the page
+   that must not change when you point at it. */
+.top-result:hover {
+  transform: translateY(-2px);
+  box-shadow:
+    0 18px 30px -18px rgba(0, 0, 0, 0.9),
+    0 16px 40px -10px color-mix(in srgb, var(--tone-glow) 58%, transparent);
+}
+/* The light arriving underneath is the affordance; the 2px lift is only what
+   makes it look lit from the front. Reduced motion keeps the first and drops
+   the second — here and on the tiles, which have made this move since before
+   the guard existed. */
+@media (prefers-reduced-motion: reduce) {
+  .top-result:hover, .card:hover { transform: none; }
+}
 /* The panel's own loading frame: same box, no tone, and inert. Its
    placeholders step UP a shade rather than down — at the raised grey they
    would be the same colour as the panel and the box would read as empty. */
 .sk-top { background: var(--bg-2); cursor: default; }
 .sk-top .skeleton { background: var(--bg-3); }
 .top-result:focus-visible { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 45%, transparent); }
+/* Two lines, then ellipsis — not one line, then ellipsis.
+   The name is the entire answer this panel gives, and now that the answer can
+   be a playlist ("Top 50 – Deutschland", "Today's Top Hits") rather than only
+   an artist, one 20px line in a 320px column ellipses most real names into the
+   same uselessness the Songs column was suffering from. Nothing below moves
+   when it takes the second line: the panel shares a flex line with a 280px
+   song list that is always the taller of the two. */
 .top-result .tr-name {
-  display: block;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
   font-family: var(--font-display); font-size: var(--t-20); font-weight: var(--w-bold);
-  letter-spacing: -0.015em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  letter-spacing: -0.015em; line-height: 1.2; overflow: hidden; overflow-wrap: anywhere;
 }
 .top-result .tr-sub {
   display: block; font-size: var(--t-12); color: var(--fg-2); margin-top: var(--s1);

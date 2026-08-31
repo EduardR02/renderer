@@ -12,7 +12,7 @@ use renderer_engine::protocol::{
     ArtistCataloguePage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
     ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist,
     CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage, PlaylistBrowse,
-    PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse,
+    PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, SearchTopRef,
     SongwriterPlaylist as EngineSongwriterPlaylist, TrackCredits, TrackEdit, TrackRef,
     TrackWaveform as EngineTrackWaveform,
 };
@@ -757,9 +757,34 @@ impl From<ArtistBrowse> for ArtistDetail {
     }
 }
 
+/// The one best answer to a query, of whatever kind. Serialized internally
+/// tagged, so the frontend reads `top.kind` and then the entity's own fields
+/// off the same object.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SearchTop {
+    Track(Track),
+    Album(Album),
+    Artist(Artist),
+    Playlist(Playlist),
+}
+
+impl From<SearchTopRef> for SearchTop {
+    fn from(top: SearchTopRef) -> Self {
+        match top {
+            SearchTopRef::Track(reference) => Self::Track(Track::from(reference)),
+            SearchTopRef::Album(reference) => Self::Album(Album::from(reference)),
+            SearchTopRef::Artist(reference) => Self::Artist(Artist::from(reference)),
+            SearchTopRef::Playlist(reference) => Self::Playlist(Playlist::from(&reference)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SearchResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<SearchTop>,
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
     pub artists: Vec<Artist>,
@@ -770,6 +795,7 @@ pub struct SearchResult {
 impl From<SearchBrowse> for SearchResult {
     fn from(browse: SearchBrowse) -> Self {
         Self {
+            top: browse.top.map(SearchTop::from),
             tracks: browse.tracks.into_iter().map(Track::from).collect(),
             albums: browse.albums.into_iter().map(Album::from).collect(),
             artists: browse.artists.into_iter().map(Artist::from).collect(),

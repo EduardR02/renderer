@@ -1024,10 +1024,34 @@ pub struct Canvas {
     pub canvas_type: String,
 }
 
+/// The single best answer to a query, whatever kind of thing it turns out
+/// to be.
+///
+/// The four result groups are each ranked only *within* their own kind, so
+/// "the first artist" answers a question nobody asked: a search for `top 50`
+/// has no artist worth naming, and `Bohemian Rhapsody` is a song. The
+/// `searchDesktop` response already carries a cross-kind ranking in
+/// `topResultsV2` — the same one the official client puts in this slot — and
+/// it costs nothing, because it travels in the response we were already
+/// asking for.
+///
+/// Kinds this app has no destination for (podcasts, episodes, users) are
+/// dropped rather than shown, so the field is an `Option`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SearchTopRef {
+    Track(TrackRef),
+    Album(AlbumRef),
+    Artist(ArtistRef),
+    Playlist(PlaylistRef),
+}
+
 /// Payload of a successful [`Command::BrowseSearch`] response.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SearchBrowse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<SearchTopRef>,
     pub tracks: Vec<TrackRef>,
     pub albums: Vec<AlbumRef>,
     pub artists: Vec<ArtistRef>,
@@ -1731,6 +1755,7 @@ mod tests {
             albums: Vec::new(),
             artists: Vec::new(),
             playlists: playlists.clone(),
+            ..SearchBrowse::default()
         };
 
         let success = serde_json::to_value(BrowseResponse {

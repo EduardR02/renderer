@@ -125,23 +125,17 @@
   function handleCanvasReady() {
     /* Readiness carries the frame's true dimensions: write the natural ratio
        into --stage-open as a padding-top percentage against the rail width.
-       The box adopts the ratio and the video object-fits inside it, so the
-       source can never crop, and the square-to-ratio growth is what pushes
+       The box adopts the ratio and the square-to-ratio growth is what pushes
        the blocks below down through normal flow.
-       The target lands on whole device pixels: a fractional final height
-       (522.667 css px is 653.3 physical at 125% Windows scaling) makes the
-       video layer's texture re-round every frame of the ease's slow crawl,
-       and the contain-fit width — a function of that snapped height —
-       shimmered sideways while the sleeve's own edges never moved. An integer
-       target stops the last frames from flipping between pixel counts. */
+       The ratio is used raw. An earlier pass snapped this target to whole
+       device pixels to chase the sideways shimmy; the shimmy was the video's
+       `object-fit: contain` width tracking the animating height, which the
+       stylesheet now removes, and snapping actively hurts here — the video is
+       width-led, so its natural height is what the sleeve must end on, and a
+       rounded target would leave a sliver of backing showing under it. */
     const w = canvasEl?.videoWidth ?? 0;
     const h = canvasEl?.videoHeight ?? 0;
-    const rail = canvasEl?.clientWidth ?? 0;
-    if (w > 0 && h > 0 && rail > 0) {
-      const dpr = window.devicePixelRatio || 1;
-      const snapped = Math.round(((h / w) * rail * dpr)) / dpr;
-      canvasStageRatio = (snapped / rail) * 100;
-    }
+    if (w > 0 && h > 0) canvasStageRatio = (h / w) * 100;
     canvasReady = true;
     /* Source replacement lands here too, with playback still running: the
        effect above already restarted the swapped element, and this is the
