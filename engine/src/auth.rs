@@ -2,13 +2,13 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
+use librespot_core::Session;
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
-use librespot_core::Session;
 use librespot_playback::config::{
     AudioFormat, Bitrate, NormalisationMethod, NormalisationType, PlayerConfig, VolumeCtrl,
 };
@@ -359,12 +359,12 @@ fn volume_to_percent(volume: u16) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_oauth_code, mixer_config, oauth_listener_addr, player_config, prepare_oauth,
-        OAUTH_REDIRECT_URI,
+        OAUTH_REDIRECT_URI, extract_oauth_code, mixer_config, oauth_listener_addr, player_config,
+        prepare_oauth,
     };
     use librespot_playback::config::VolumeCtrl;
-    use librespot_playback::mixer::softmixer::SoftMixer;
     use librespot_playback::mixer::Mixer;
+    use librespot_playback::mixer::softmixer::SoftMixer;
 
     #[test]
     fn mixer_uses_the_same_cubic_sixty_db_curve_as_the_sink() {

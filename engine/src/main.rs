@@ -20,9 +20,9 @@ use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use renderer_engine::protocol::{
-    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, Canvas, Command,
-    LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
-    RadioBrowse, Response, SearchBrowse, SongwriterPlaylist, TrackCredits, TrackWaveform,
+    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, Canvas, Command, LikedSongsPage, LikedUrisPage,
+    PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, Response, SearchBrowse,
+    SongwriterPlaylist, TrackCredits, TrackWaveform,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;

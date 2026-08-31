@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
 use renderer_engine::atomic::replace_file_atomically;
 use renderer_engine::protocol::{HistoryItem, HistoryRow, TrackRef};
+use serde::{Deserialize, Serialize};
 
 const HISTORY_FILE: &str = "listening_history.json";
 const HISTORY_VERSION: u32 = 1;
@@ -505,7 +505,6 @@ fn write_snapshot_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,8 +672,7 @@ mod tests {
             loop {
                 let caught_up = {
                     let core = history.lock_core();
-                    !core.worker_running
-                        && core.written_generation == core.requested_generation
+                    !core.worker_running && core.written_generation == core.requested_generation
                 };
                 if caught_up {
                     break;

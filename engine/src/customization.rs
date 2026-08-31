@@ -488,43 +488,51 @@ mod tests {
 
     #[test]
     fn validation_rejects_unsorted_overlap_and_out_of_bounds_ranges() {
-        assert!(validate_definition(
-            "track",
-            10_000,
-            &[range(4_000, 6_000), range(2_000, 3_000)],
-            None
-        )
-        .is_err());
-        assert!(validate_definition(
-            "track",
-            10_000,
-            &[range(2_000, 5_000), range(4_000, 6_000)],
-            None
-        )
-        .is_err());
+        assert!(
+            validate_definition(
+                "track",
+                10_000,
+                &[range(4_000, 6_000), range(2_000, 3_000)],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate_definition(
+                "track",
+                10_000,
+                &[range(2_000, 5_000), range(4_000, 6_000)],
+                None
+            )
+            .is_err()
+        );
         assert!(validate_definition("track", 10_000, &[range(2_000, 11_000)], None).is_err());
         assert!(
             validate_definition("track", 10_000, &[], Some(loop_range(5_000, 5_000, 2))).is_err()
         );
-        assert!(validate_definition(
-            "track",
-            10_000,
-            &[range(2_000, 4_000)],
-            Some(loop_range(3_000, 6_000, 2))
-        )
-        .is_err());
+        assert!(
+            validate_definition(
+                "track",
+                10_000,
+                &[range(2_000, 4_000)],
+                Some(loop_range(3_000, 6_000, 2))
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn validation_rejects_invalid_loop_play_counts() {
         for play_count in [0, 1, 33, u32::MAX] {
-            assert!(validate_definition(
-                "track",
-                10_000,
-                &[],
-                Some(loop_range(2_000, 4_000, play_count)),
-            )
-            .is_err());
+            assert!(
+                validate_definition(
+                    "track",
+                    10_000,
+                    &[],
+                    Some(loop_range(2_000, 4_000, play_count)),
+                )
+                .is_err()
+            );
         }
         assert!(
             validate_definition("track", 10_000, &[], Some(loop_range(2_000, 4_000, 2))).is_ok()
@@ -537,13 +545,15 @@ mod tests {
     #[test]
     fn validation_rejects_cuts_that_remove_the_entire_track() {
         assert!(validate_definition("track", 10_000, &[range(0, 10_000)], None).is_err());
-        assert!(validate_definition(
-            "track",
-            10_000,
-            &[range(0, 4_000), range(4_000, 10_000)],
-            None,
-        )
-        .is_err());
+        assert!(
+            validate_definition(
+                "track",
+                10_000,
+                &[range(0, 4_000), range(4_000, 10_000)],
+                None,
+            )
+            .is_err()
+        );
         assert!(validate_definition("track", 10_000, &[range(0, 9_999)], None).is_ok());
     }
 
@@ -661,14 +671,18 @@ mod tests {
             .save_definition("track".to_owned(), 10_000, vec![range(1_000, 2_000)], None)
             .unwrap_err();
         assert!(save_error.contains("read-only"));
-        assert!(store
-            .set_enabled("playlist", "track", true)
-            .unwrap_err()
-            .contains("read-only"));
-        assert!(store
-            .delete_definition("track")
-            .unwrap_err()
-            .contains("read-only"));
+        assert!(
+            store
+                .set_enabled("playlist", "track", true)
+                .unwrap_err()
+                .contains("read-only")
+        );
+        assert!(
+            store
+                .delete_definition("track")
+                .unwrap_err()
+                .contains("read-only")
+        );
         assert_eq!(std::fs::read(&path).unwrap(), corrupt);
 
         let _ = std::fs::remove_dir_all(root);
@@ -728,9 +742,11 @@ mod tests {
         loaded.set_excluded("one", "track-b", false).unwrap();
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join(STORE_FILE)).unwrap()).unwrap();
-        assert!(json["excluded_track_ids"]
-            .as_object()
-            .is_some_and(|entries| !entries.contains_key("one")));
+        assert!(
+            json["excluded_track_ids"]
+                .as_object()
+                .is_some_and(|entries| !entries.contains_key("one"))
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

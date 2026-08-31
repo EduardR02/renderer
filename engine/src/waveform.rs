@@ -2,21 +2,21 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use librespot_audio::{AudioDecrypt, AudioFile, StreamLoaderController};
-use librespot_core::{cache::Cache, FileId, Session, SpotifyId, SpotifyUri};
+use librespot_core::{FileId, Session, SpotifyId, SpotifyUri, cache::Cache};
 use librespot_metadata::audio::{AudioFileFormat, AudioFiles, AudioItem};
 use librespot_playback::decoder::{AudioDecoder, SymphoniaDecoder};
 use renderer_engine::atomic::replace_file_atomically;
 use renderer_engine::protocol::TrackWaveform;
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 
 const SAMPLE_RATE: u64 = 44_100;
 const CHANNELS: usize = 2;
@@ -890,11 +890,12 @@ mod tests {
         let scratch = ScratchDir::new();
         let file_id = FileId::from_raw(&[0xab; 20]);
         let path = cache_path(&scratch.0, file_id).unwrap();
-        assert!(path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("abababab"));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("abababab")
+        );
         let mut envelope = Envelope::new(20).unwrap();
         envelope.push_interleaved_stereo(&[-1.0, 1.0]).unwrap();
         let payload = envelope.finish();
@@ -943,9 +944,10 @@ mod tests {
         let (first_generation, first_cancel) = jobs
             .join_or_insert("track", "request-1".to_owned())
             .unwrap();
-        assert!(jobs
-            .join_or_insert("track", "request-2".to_owned())
-            .is_none());
+        assert!(
+            jobs.join_or_insert("track", "request-2".to_owned())
+                .is_none()
+        );
         assert_eq!(jobs.cancel("track"), ["request-1", "request-2"]);
         assert!(first_cancel.load(Ordering::Acquire));
         let (second_generation, _) = jobs
@@ -978,16 +980,14 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (outcomes, mut receiver) = mpsc::unbounded_channel();
-        drive_job(
-            outcomes,
-            "panicking-track".to_owned(),
-            3,
-            async {
-                panic!("the decoder task exploded");
-            },
-        )
+        drive_job(outcomes, "panicking-track".to_owned(), 3, async {
+            panic!("the decoder task exploded");
+        })
         .await;
-        let outcome = receiver.recv().await.expect("a panic must still produce an outcome");
+        let outcome = receiver
+            .recv()
+            .await
+            .expect("a panic must still produce an outcome");
         assert_eq!(outcome.track_id, "panicking-track");
         assert_eq!(outcome.generation, 3);
         let error = outcome

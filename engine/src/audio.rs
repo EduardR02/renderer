@@ -1009,27 +1009,26 @@ impl Sink for RodioSink {
         // buffers; only the ring's own packet copy allocates.
         self.pipeline_scratch.clear();
         self.resampler_scratch.clear();
-        let (final_in_pipeline_scratch, loop_to_ms) =
-            match processing.pipeline.as_mut() {
-                Some(pipeline) => {
-                    let loop_to_ms = pipeline.process(&samples_f32, &mut self.pipeline_scratch);
-                    match processing.resampler.as_mut() {
-                        Some(resampler) => {
-                            resampler.process(&self.pipeline_scratch, &mut self.resampler_scratch);
-                            (false, loop_to_ms)
-                        }
-                        None => (true, loop_to_ms),
+        let (final_in_pipeline_scratch, loop_to_ms) = match processing.pipeline.as_mut() {
+            Some(pipeline) => {
+                let loop_to_ms = pipeline.process(&samples_f32, &mut self.pipeline_scratch);
+                match processing.resampler.as_mut() {
+                    Some(resampler) => {
+                        resampler.process(&self.pipeline_scratch, &mut self.resampler_scratch);
+                        (false, loop_to_ms)
                     }
+                    None => (true, loop_to_ms),
                 }
-                None => {
-                    processing
-                        .resampler
-                        .as_mut()
-                        .expect("bypass case returned above")
-                        .process(&samples_f32, &mut self.resampler_scratch);
-                    (false, None)
-                }
-            };
+            }
+            None => {
+                processing
+                    .resampler
+                    .as_mut()
+                    .expect("bypass case returned above")
+                    .process(&samples_f32, &mut self.resampler_scratch);
+                (false, None)
+            }
+        };
         drop(processing);
         let queued = if final_in_pipeline_scratch {
             &self.pipeline_scratch[..]

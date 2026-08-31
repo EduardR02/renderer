@@ -1,28 +1,28 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use librespot_core::cache::Cache;
 use librespot_core::SpotifyUri;
+use librespot_core::cache::Cache;
 use librespot_metadata::Metadata;
-use librespot_playback::mixer::{softmixer::SoftMixer, Mixer};
+use librespot_playback::mixer::{Mixer, softmixer::SoftMixer};
 use librespot_playback::player::{Player, PlayerEvent};
 use tokio::sync::mpsc;
 
 use crate::audio::AudioSignal;
 use crate::auth::{
-    complete_oauth, connect_cached, create_playback, percent_to_volume, prepare_oauth, PendingAuth,
-    PlaybackHandles,
+    PendingAuth, PlaybackHandles, complete_oauth, connect_cached, create_playback,
+    percent_to_volume, prepare_oauth,
 };
-use crate::customization::{validate_definition, EditTimeline, TrackEditStore};
+use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
 use crate::io::ProtocolWriter;
-use serde::Serialize;
 use renderer_engine::protocol::{
     AuthState, BrowseResponse, Command, HistoryItem, LoopRange, PositionEvent, RepeatMode,
     Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus, TrackRef,
 };
+use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
 /// restart window (OnPrevious in app.cpp) so both sides agree.
@@ -100,9 +100,10 @@ pub struct Engine {
     /// Process-local owner of the installed editor preview. Zero means that
     /// no preview lease is active.
     preview_lease_id: u64,
-    /// Playback intent captured when an authenticated session dies. A normal
-    /// app startup restore never sets this; only an unexpected reconnect may
-    /// resume automatically.
+    /// Playback intent captured when an authenticated session dies. While
+    /// true, cached reauthentication keeps the old player alive until the
+    /// replacement handles are ready; normal startup and paused reconnects
+    /// remain cold.
     resume_after_reconnect: bool,
     position_anchor: Option<(u32, Instant)>,
     /// When the last command-driven track change (PlayQueue/Next/Previous)
@@ -492,9 +493,9 @@ impl Engine {
     /// Returns whether the engine's state changed and should be emitted.
     ///
     /// The failure this recovers from is silent by construction — see
-    /// [`RECONNECT_BACKOFF_MIN`]. Reconnecting also re-arms `Ready`, so the
-    /// frontend's existing "not ready" handling covers the gap without needing
-    /// to know a reconnect happened.
+    /// [`RECONNECT_BACKOFF_MIN`]. An active player remains logically playing
+    /// during the reconnect so its projected playhead and listening row reach
+    /// the handover without an artificial gap.
     pub fn tick_session_health(&mut self, sender: &mpsc::UnboundedSender<AuthSignal>) -> bool {
         if self.auth_running {
             return false;
@@ -512,16 +513,13 @@ impl Engine {
 
         let now = Instant::now();
         let Some(due) = self.next_reconnect else {
-            // First tick that sees the corpse: schedule, and tell the frontend
-            // playback is down rather than letting loads fail one by one.
+            // First sight of the corpse schedules the reconnect. Preserve an
+            // active queue's playback intent: the old player may still have
+            // buffered audio, and its playhead remains the best handover
+            // position until replacement handles exist.
             self.next_reconnect = Some(now + self.reconnect_backoff);
-            self.resume_after_reconnect = self.state.playing;
+            self.resume_after_reconnect = self.state.playing && self.state.current_index.is_some();
             self.state.ready = false;
-            self.state.playing = false;
-            // The active history timer is wall-clock based. Stop it at the
-            // first observed disconnect so reconnect backoff is not counted as
-            // audible listening before shutdown_playback finalizes the row.
-            self.pause_listening();
             self.state.error = Some("the Spotify connection dropped; reconnecting".to_owned());
             eprintln!("Spotify session went invalid; reconnecting");
             return true;
@@ -532,18 +530,18 @@ impl Engine {
 
         self.reconnect_backoff = (self.reconnect_backoff * 2).min(RECONNECT_BACKOFF_MAX);
         self.next_reconnect = Some(now + self.reconnect_backoff);
-        // `start_authentication` tears down the dead player and session, bumps
-        // the generation so their in-flight events are ignored, and reconnects
-        // from cached credentials.
-        self.start_authentication(sender.clone());
+        // Reauthentication bumps the generation before its asynchronous work,
+        // making every event from the preserved player stale. Paused and
+        // queue-less reconnects take the normal cold teardown path.
+        self.start_cached_authentication(sender.clone(), self.resume_after_reconnect);
         true
     }
 
     /// Enables or disables track-gain volume normalisation.
     ///
     /// A live change constructs only a new player against the existing
-    /// authenticated session. Authentication in flight shares the atomic
-    /// preference and therefore builds its first player with the latest value.
+    /// authenticated session. While playback is unavailable, the atomic
+    /// preference is consumed by the authentication already in flight.
     pub fn set_normalisation(
         &mut self,
         enabled: bool,
@@ -551,6 +549,9 @@ impl Engine {
     ) -> bool {
         if self.normalisation.swap(enabled, Ordering::AcqRel) == enabled {
             return false;
+        }
+        if !self.state.ready {
+            return true;
         }
         let Some(session) = self.session.clone() else {
             return true;
@@ -570,17 +571,18 @@ impl Engine {
     }
 
     pub fn start_authentication(&mut self, sender: mpsc::UnboundedSender<AuthSignal>) {
+        self.start_cached_authentication(sender, false);
+    }
+
+    fn start_cached_authentication(
+        &mut self,
+        sender: mpsc::UnboundedSender<AuthSignal>,
+        preserve_active_playback: bool,
+    ) {
         if self.auth_running {
             return;
         }
-        self.shutdown_playback();
-        self.auth_running = true;
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        self.state.ready = false;
-        self.state.auth_state = AuthState::Authenticating;
-        self.state.playing = false;
-        self.state.error = None;
+        let generation = self.begin_cached_authentication(preserve_active_playback);
         if self.cache.credentials().is_none() {
             // No cached credentials: wait for an explicit login command so the
             // UI can present the authorize URL (a browser flow must never be
@@ -596,6 +598,25 @@ impl Engine {
             let result = connect_cached(cache, temporary_directory, normalisation).await;
             let _ = sender.send(AuthSignal::Complete { generation, result });
         });
+    }
+
+    /// Applies the synchronous half of cached authentication. Split from the
+    /// task spawn so the two teardown modes remain an explicit state
+    /// transition and can be tested without connecting to Spotify.
+    fn begin_cached_authentication(&mut self, preserve_active_playback: bool) -> u64 {
+        if !preserve_active_playback {
+            self.resume_after_reconnect = false;
+            self.shutdown_playback();
+        }
+        self.auth_running = true;
+        self.generation = self.generation.wrapping_add(1);
+        self.state.ready = false;
+        self.state.auth_state = AuthState::Authenticating;
+        if !preserve_active_playback {
+            self.state.playing = false;
+        }
+        self.state.error = None;
+        self.generation
     }
 
     /// Transitions to `NeedsLogin`: tears down playback, clears the playback
@@ -724,6 +745,9 @@ impl Engine {
                         let had_queue = self.state.current_index.is_some();
                         let restored_volume = self.state.volume;
                         let resume = had_queue && self.resume_after_reconnect;
+                        if self.resume_after_reconnect {
+                            self.stop_playback_for_reconnect_handover();
+                        }
                         self.resume_after_reconnect = false;
                         self.state.ready = true;
                         self.state.auth_state = AuthState::Ready;
@@ -771,9 +795,7 @@ impl Engine {
                 normalisation,
                 result,
             } => {
-                if generation != self.generation
-                    || self.normalisation.load(Ordering::Acquire) != normalisation
-                {
+                if !self.player_rebuild_is_current(generation, normalisation) {
                     return false;
                 }
                 let handles = match result {
@@ -809,6 +831,11 @@ impl Engine {
                 true
             }
         }
+    }
+    fn player_rebuild_is_current(&self, generation: u64, normalisation: bool) -> bool {
+        self.state.ready
+            && generation == self.generation
+            && self.normalisation.load(Ordering::Acquire) == normalisation
     }
 
     fn forward_player_events(
@@ -2428,6 +2455,18 @@ impl Engine {
 
     fn shutdown_playback(&mut self) {
         self.finalize_listening(false);
+        self.stop_playback_handles();
+    }
+
+    /// Projects the logical playhead to the exact replacement instant, then
+    /// stops the old generation without finalizing its uninterrupted
+    /// listening-history row.
+    fn stop_playback_for_reconnect_handover(&mut self) {
+        self.tick_position();
+        self.stop_playback_handles();
+    }
+
+    fn stop_playback_handles(&mut self) {
         if let Some(player) = self.player.take() {
             player.stop();
         }
@@ -2604,26 +2643,24 @@ fn track_change_wait(last: Option<Instant>, now: Instant, interval: Duration) ->
 mod tests {
     use std::path::PathBuf;
     use std::sync::{
-        atomic::{AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicU32, Ordering},
     };
     use std::time::{Duration, Instant};
 
     use super::{
-        automatic_track_eligible, first_automatic_from, first_automatic_wrapping,
-        first_available_from, first_available_wrapping, remap_current_index_after_move,
-        sequential_automatic_index, sequential_available_index, sequential_next_index,
-        track_change_wait, with_preview_edit, AudioSignal, AuthSignal, Engine, PlaybackState,
-        PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW,
-        TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW,
+        AudioSignal, AuthSignal, Engine, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX,
+        RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
+        UNAVAILABLE_BURST_WINDOW, automatic_track_eligible, first_automatic_from,
+        first_automatic_wrapping, first_available_from, first_available_wrapping,
+        remap_current_index_after_move, sequential_automatic_index, sequential_available_index,
+        sequential_next_index, track_change_wait, with_preview_edit,
     };
     use crate::customization::TrackEditStore;
     use crate::io::ProtocolWriter;
     use librespot_core::SpotifyUri;
     use librespot_playback::player::PlayerEvent;
-    use renderer_engine::protocol::{
-        LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef,
-    };
+    use renderer_engine::protocol::{LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
 
     fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
         test_engine_in(PathBuf::new())
@@ -3094,9 +3131,11 @@ mod tests {
     fn repeated_preview_updates_keep_history_empty_through_pause_and_eof() {
         let (mut engine, root) = history_playing_engine();
         let track = engine.state.queue[0].clone();
-        assert!(engine
-            .preview_track_edit(track.clone(), vec![range(1_000, 2_000)], None, 5_000, 1)
-            .is_err());
+        assert!(
+            engine
+                .preview_track_edit(track.clone(), vec![range(1_000, 2_000)], None, 5_000, 1)
+                .is_err()
+        );
         assert!(engine.preview_mode);
 
         engine.play_request_id = Some(8);
@@ -3114,9 +3153,11 @@ mod tests {
             position_ms: 6_000,
         }));
 
-        assert!(engine
-            .preview_track_edit(track, vec![range(3_000, 4_000)], None, 7_000, 2)
-            .is_err());
+        assert!(
+            engine
+                .preview_track_edit(track, vec![range(3_000, 4_000)], None, 7_000, 2)
+                .is_err()
+        );
         assert!(engine.preview_mode);
         engine.play_request_id = Some(9);
         assert!(engine.on_player_event(PlayerEvent::Playing {
@@ -3138,9 +3179,11 @@ mod tests {
     fn normal_queue_replacement_leaves_preview_without_persisting_it() {
         let (mut engine, root) = history_playing_engine();
         let preview_track = engine.state.queue[0].clone();
-        assert!(engine
-            .preview_track_edit(preview_track, vec![range(1_000, 2_000)], None, 5_000, 1)
-            .is_err());
+        assert!(
+            engine
+                .preview_track_edit(preview_track, vec![range(1_000, 2_000)], None, 5_000, 1)
+                .is_err()
+        );
         assert!(engine.preview_mode);
 
         let normal_track = TrackRef {
@@ -3746,11 +3789,10 @@ mod tests {
             let mut engine = playing_engine();
             engine.state.duration_ms = 100_000;
             engine.state.queue[0].duration_ms = 100_000;
-            engine.state.queue[0].effective_edit =
-                Some(renderer_engine::protocol::TrackEdit {
-                    cuts: Vec::new(),
-                    loop_range: Some(loop_range(20_000, 40_000, 3)),
-                });
+            engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
+                cuts: Vec::new(),
+                loop_range: Some(loop_range(20_000, 40_000, 3)),
+            });
             engine.state.position_ms = position_ms;
             engine.reset_loop_pass_for_position(position_ms);
 
@@ -3771,11 +3813,10 @@ mod tests {
             let mut engine = playing_engine();
             engine.state.duration_ms = 100_000;
             engine.state.queue[0].duration_ms = 100_000;
-            engine.state.queue[0].effective_edit =
-                Some(renderer_engine::protocol::TrackEdit {
-                    cuts: Vec::new(),
-                    loop_range: Some(loop_range(20_000, 40_000, play_count)),
-                });
+            engine.state.queue[0].effective_edit = Some(renderer_engine::protocol::TrackEdit {
+                cuts: Vec::new(),
+                loop_range: Some(loop_range(20_000, 40_000, play_count)),
+            });
             engine.state.playing = true;
             engine.current_needs_load = true;
             let mut markers = 0;
@@ -3892,50 +3933,113 @@ mod tests {
         assert!(engine.state.playing);
     }
 
-    /// A dead session invalidated by librespot is otherwise silent, so the
-    /// heartbeat has to be the thing that notices. It must also not turn a
-    /// Spotify outage into a reconnect storm at heartbeat rate.
+    /// The first invalid-session tick must not create the audible stall: an
+    /// active queue keeps projecting until replacement handles are ready.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_session_librespot_invalidated_is_noticed_and_reconnected_with_backoff() {
+    async fn active_session_reconnect_preserves_playback_until_handover() {
         let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.position_anchor = Some((10_000, Instant::now() - Duration::from_secs(2)));
+        engine.play_request_id = Some(7);
         let session = librespot_core::Session::new(librespot_core::SessionConfig::default(), None);
-        // Exactly what librespot does to itself when the access point drops.
         session.shutdown();
-        assert!(session.is_invalid());
         engine.session = Some(session);
-        engine.state.ready = true;
         let generation = engine.generation;
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-
-        // First sight of the corpse reports it, rather than letting the user
-        // discover it one failed track at a time.
-        assert!(engine.tick_session_health(&sender));
-        assert!(!engine.state.ready);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         assert!(
-            engine
-                .state
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("reconnecting")),
-            "the dropped connection must be surfaced, got {:?}",
-            engine.state.error
+            engine.player_rebuild_is_current(generation, false),
+            "a rebuild started while the session was ready is initially current"
+        );
+
+        assert!(engine.tick_session_health(&sender));
+        assert!(
+            !engine.player_rebuild_is_current(generation, false),
+            "a queued rebuild on the dead session must be rejected during backoff"
+        );
+        assert!(!engine.state.ready);
+        assert!(engine.state.playing, "the logical transport must not blip");
+        assert!(engine.resume_after_reconnect);
+        assert!(
+            engine.tick_position(),
+            "the dead session does not freeze projection"
+        );
+        assert!(
+            (11_900..12_500).contains(&engine.state.position_ms),
+            "position must still project from the pre-drop anchor: {}",
+            engine.state.position_ms
         );
         assert_eq!(
             engine.generation, generation,
-            "the first tick schedules a reconnect; it does not fire one"
+            "scheduling alone does not stale events"
+        );
+        assert!(engine.set_normalisation(true, &sender));
+        assert!(
+            receiver.try_recv().is_err(),
+            "backoff must not rebuild a player on the dead session"
         );
 
-        // Heartbeats before the backoff expires must not attempt anything.
+        // Exercise the synchronous transition used when the reconnect becomes
+        // due without spawning a network task.
+        let reconnect_generation = engine.begin_cached_authentication(true);
+        assert_ne!(reconnect_generation, generation);
+        assert!(engine.auth_running);
+        assert!(engine.state.playing);
+        assert!(
+            engine.session.is_some(),
+            "old handles survive authentication"
+        );
+        assert!(engine.set_normalisation(false, &sender));
+        assert!(
+            receiver.try_recv().is_err(),
+            "authentication must consume the shared preference without a competing rebuild"
+        );
+        assert!(!engine.on_player_signal(PlayerSignal::Event {
+            generation,
+            event: PlayerEvent::Playing {
+                play_request_id: 7,
+                track_id: track_uri(),
+                position_ms: 1,
+            },
+        }));
+
+        let before_handover = engine.state.position_ms;
+        engine.stop_playback_for_reconnect_handover();
+        assert!(engine.state.position_ms >= before_handover);
+        assert!(
+            engine.state.playing,
+            "handover preserves captured resume intent"
+        );
+        assert!(
+            engine.session.is_none(),
+            "the old session is stopped at handover"
+        );
+    }
+
+    /// Paused reconnects retain the existing cold teardown and exponential
+    /// retry schedule; no cached credentials means the normal login state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn paused_session_reconnect_remains_cold_and_uses_backoff() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        let session = librespot_core::Session::new(librespot_core::SessionConfig::default(), None);
+        session.shutdown();
+        engine.session = Some(session);
+        let generation = engine.generation;
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(engine.tick_session_health(&sender));
+        assert!(!engine.resume_after_reconnect);
         assert!(!engine.tick_session_health(&sender));
         assert_eq!(engine.generation, generation);
 
-        // Once it is due, the reconnect runs. `start_authentication` bumps the
-        // generation so the dead session's in-flight events are ignored.
         engine.next_reconnect = Some(Instant::now() - Duration::from_millis(1));
         assert!(engine.tick_session_health(&sender));
-        assert_ne!(engine.generation, generation, "the reconnect must fire");
-
-        // ...and the wait grows, so an outage is not hammered every 2 s.
+        assert_ne!(engine.generation, generation, "the due reconnect must fire");
+        assert!(!engine.auth_running, "no implicit OAuth flow may start");
+        assert!(!engine.state.playing);
+        assert!(engine.state.current_index.is_none());
+        assert!(engine.session.is_none());
         assert!(engine.reconnect_backoff > RECONNECT_BACKOFF_MIN);
         assert!(engine.reconnect_backoff <= RECONNECT_BACKOFF_MAX);
     }
@@ -4191,15 +4295,18 @@ mod tests {
             .seek_transport(u32::MAX)
             .expect("seek clamps at compiled EOF");
         assert_eq!(engine.state.position_ms, 10_000);
-        assert!(!engine.state.queue[0]
-            .effective_edit
-            .as_ref()
-            .unwrap()
-            .cuts
-            .iter()
-            .any(|cut| {
-                cut.start_ms <= engine.state.position_ms && engine.state.position_ms < cut.end_ms
-            }));
+        assert!(
+            !engine.state.queue[0]
+                .effective_edit
+                .as_ref()
+                .unwrap()
+                .cuts
+                .iter()
+                .any(|cut| {
+                    cut.start_ms <= engine.state.position_ms
+                        && engine.state.position_ms < cut.end_ms
+                })
+        );
     }
 
     #[test]
@@ -4517,9 +4624,7 @@ mod tests {
         engine.state.playing = true;
 
         assert!(engine.logout().expect("logout succeeds"));
-        assert!(
-            engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin
-        );
+        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin);
         assert!(!engine.state.ready);
         assert!(!engine.state.playing);
         assert!(engine.state.current_index.is_none());
@@ -4564,21 +4669,26 @@ mod tests {
         assert!(engine.logout().expect("first logout"));
         assert!(!fixture.credentials_exist());
         assert!(engine.logout().expect("second logout is a no-op"));
-        assert!(
-            engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin
-        );
+        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin);
     }
 
     #[test]
     fn startup_without_cached_credentials_enters_needs_login_without_a_flow() {
         let (mut engine, buffer) = test_engine(); // cache has no credentials
+        // Even if restored state carries stale play intent, normal startup is
+        // deliberately cold rather than using reconnect preservation.
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.resume_after_reconnect = true;
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         engine.start_authentication(sender);
         assert!(!engine.auth_running, "no implicit flow may start");
-        assert!(
-            engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin
-        );
+        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin);
         assert!(engine.state.auth_url.is_some());
+        assert!(!engine.state.playing);
+        assert!(engine.state.current_index.is_none());
+        assert!(engine.state.queue.is_empty());
+        assert!(!engine.resume_after_reconnect);
 
         engine.emit_state().expect("state emits");
         let line = {
@@ -4587,9 +4697,11 @@ mod tests {
         };
         let value: serde_json::Value = serde_json::from_slice(&line).expect("state json");
         assert_eq!(value["auth_state"], "needs_login");
-        assert!(value["auth_url"]
-            .as_str()
-            .is_some_and(|url| { url.starts_with("https://accounts.spotify.com/authorize?") }));
+        assert!(
+            value["auth_url"]
+                .as_str()
+                .is_some_and(|url| { url.starts_with("https://accounts.spotify.com/authorize?") })
+        );
     }
 
     #[test]
@@ -4597,9 +4709,11 @@ mod tests {
         let mut engine = playing_engine(); // ready with a player-less state
         engine.state.auth_state = renderer_engine::protocol::AuthState::Ready;
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        assert!(engine
-            .login(&sender)
-            .expect("login no-ops when authenticated"));
+        assert!(
+            engine
+                .login(&sender)
+                .expect("login no-ops when authenticated")
+        );
         assert!(!engine.auth_running);
         assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::Ready);
     }
@@ -4611,9 +4725,11 @@ mod tests {
         engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
         engine.state.auth_url = Some("https://accounts.spotify.com/authorize?running".to_owned());
         let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        assert!(engine
-            .login(&sender)
-            .expect("login no-ops while authenticating"));
+        assert!(
+            engine
+                .login(&sender)
+                .expect("login no-ops while authenticating")
+        );
         assert!(engine.auth_running);
         assert_eq!(
             engine.state.auth_url.as_deref(),
@@ -4622,13 +4738,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalisation_change_during_auth_updates_shared_preference_without_reconnect() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn normalisation_change_during_auth_updates_shared_preference_without_reconnect() {
         let mut engine = test_engine().0;
         assert!(!engine.normalisation.load(Ordering::Acquire));
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let stale_session =
+            librespot_core::Session::new(librespot_core::SessionConfig::default(), None);
+        stale_session.shutdown();
+        engine.session = Some(stale_session);
+        engine.state.ready = false;
         engine.auth_running = true;
         engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
+        let generation = engine.generation;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(engine.set_normalisation(true, &sender));
         assert!(engine.normalisation.load(Ordering::Acquire));
@@ -4636,9 +4758,13 @@ mod tests {
             engine.auth_running,
             "the existing authentication keeps running"
         );
+        assert_eq!(
+            engine.generation, generation,
+            "changing the pending preference must not stale authentication"
+        );
         assert!(
             receiver.try_recv().is_err(),
-            "no reconnect or parallel player build is scheduled without a live session"
+            "an unavailable session must not start a competing player rebuild"
         );
         assert!(
             !engine.tick_session_health(&sender),
@@ -4675,9 +4801,7 @@ mod tests {
             pending.auth_url, published,
             "the flow must use the published URL"
         );
-        assert!(
-            engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating
-        );
+        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating);
         assert!(engine.auth_running);
         assert_eq!(engine.state.auth_url.as_deref(), Some(published.as_str()));
         assert!(engine.pending_auth.is_none());
@@ -4688,12 +4812,12 @@ mod tests {
         let mut engine = test_engine().0;
         engine.state.auth_state = renderer_engine::protocol::AuthState::NeedsLogin;
         let pending = engine.begin_login_flow().expect("flow begins");
-        assert!(pending
-            .auth_url
-            .starts_with("https://accounts.spotify.com/authorize?"));
         assert!(
-            engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating
+            pending
+                .auth_url
+                .starts_with("https://accounts.spotify.com/authorize?")
         );
+        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating);
         assert_eq!(
             engine.state.auth_url.as_deref(),
             Some(pending.auth_url.as_str())
@@ -4713,9 +4837,7 @@ mod tests {
             },
             sender,
         ));
-        assert!(
-            engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin
-        );
+        assert!(engine.state.auth_state == renderer_engine::protocol::AuthState::NeedsLogin);
         assert!(!engine.state.ready);
         assert!(!engine.auth_running);
         let retry_url = engine.state.auth_url.clone().expect("retry url published");
@@ -4723,11 +4845,13 @@ mod tests {
             retry_url, "https://accounts.spotify.com/authorize?first",
             "a retry must regenerate the URL"
         );
-        assert!(engine
-            .state
-            .error
-            .as_deref()
-            .is_some_and(|error| { error.contains("Spotify authentication failed") }));
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("Spotify authentication failed") })
+        );
     }
 
     #[test]
