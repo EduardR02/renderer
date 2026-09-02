@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::AudioSignal;
 use crate::auth::{
-    PendingAuth, PlaybackHandles, complete_oauth, connect_cached, create_playback,
+    AuthFailure, PendingAuth, PlaybackHandles, complete_oauth, connect_cached, create_playback,
     percent_to_volume, prepare_oauth,
 };
 use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
@@ -125,6 +125,10 @@ pub struct Engine {
     /// [`Engine::tick_session_health`].
     next_reconnect: Option<Instant>,
     reconnect_backoff: Duration,
+    /// Set when a cached-auth attempt failed on transport rather than refusal.
+    /// It shuts its own session down, so there is no dead session for the
+    /// health tick to find, and "no session" already means the pre-auth state.
+    awaiting_transport_retry: bool,
     shuffle_pool: Vec<usize>,
     /// Queue navigation history used by Previous; local listening rows live
     /// in `listening_history`.
@@ -196,7 +200,7 @@ enum PositionSpace {
 pub enum AuthSignal {
     Complete {
         generation: u64,
-        result: Result<PlaybackHandles, String>,
+        result: Result<PlaybackHandles, AuthFailure>,
     },
     PlayerRebuilt {
         generation: u64,
@@ -262,6 +266,7 @@ impl Engine {
             recent_unavailable: VecDeque::new(),
             next_reconnect: None,
             reconnect_backoff: RECONNECT_BACKOFF_MIN,
+            awaiting_transport_retry: false,
             shuffle_pool: Vec::new(),
             history: Vec::new(),
             listening_history: ListeningHistory::new(history_root),
@@ -504,7 +509,11 @@ impl Engine {
             .session
             .as_ref()
             .is_some_and(librespot_core::Session::is_invalid);
-        if !dead {
+        // A cached-auth attempt that failed on transport shut its session down
+        // and left only the armed retry, so there is no corpse to notice. That
+        // is the same outage as a dead session and recovers the same way.
+        let retry_armed = self.awaiting_transport_retry && self.next_reconnect.is_some();
+        if !dead && !retry_armed {
             // A healthy session ends any backoff a previous outage built up.
             self.next_reconnect = None;
             self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
@@ -636,6 +645,8 @@ impl Engine {
         self.preview_mode = false;
         self.preview_lease_id = 0;
         self.resume_after_reconnect = false;
+        self.next_reconnect = None;
+        self.awaiting_transport_retry = false;
         self.shuffle_pool.clear();
         self.history.clear();
         self.state.error = None;
@@ -672,7 +683,10 @@ impl Engine {
         let normalisation = Arc::clone(&self.normalisation);
         tokio::spawn(async move {
             let result = complete_oauth(cache, temporary_directory, pending, normalisation).await;
-            let _ = auth_sender.send(AuthSignal::Complete { generation, result });
+            let _ = auth_sender.send(AuthSignal::Complete {
+                generation,
+                result: result.map_err(AuthFailure::Rejected),
+            });
         });
         Ok(true)
     }
@@ -779,13 +793,33 @@ impl Engine {
                         }
                         self.next_reconnect = None;
                         self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
+                        self.awaiting_transport_retry = false;
                         Self::forward_player_events(handles.events, generation, player_sender);
                         true
                     }
-                    Err(error) => {
-                        eprintln!("Spotify playback authentication failed: {error}");
-                        self.enter_needs_login();
-                        self.state.error = Some(error);
+                    Err(failure) => {
+                        eprintln!("Spotify playback authentication failed: {failure}");
+                        match failure {
+                            AuthFailure::Rejected(message) => {
+                                self.enter_needs_login();
+                                self.state.error = Some(message);
+                            }
+                            AuthFailure::Unreachable(message) => {
+                                // The credentials are fine, the network is not.
+                                // Keep both them and the queue and arm another
+                                // attempt: resuming from sleep regularly beats
+                                // Windows' resolver to the first connect, and
+                                // answering that with a login prompt discards a
+                                // session that was never refused.
+                                self.state.ready = false;
+                                self.state.auth_state = AuthState::Authenticating;
+                                self.state.error = Some(message);
+                                self.reconnect_backoff =
+                                    (self.reconnect_backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                                self.next_reconnect = Some(Instant::now() + self.reconnect_backoff);
+                                self.awaiting_transport_retry = true;
+                            }
+                        }
                         true
                     }
                 }
@@ -2649,7 +2683,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        AudioSignal, AuthSignal, Engine, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX,
+        AudioSignal, AuthFailure, AuthSignal, Engine, PlaybackState, PlayerSignal,
+        RECONNECT_BACKOFF_MAX,
         RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
         UNAVAILABLE_BURST_WINDOW, automatic_track_eligible, first_automatic_from,
         first_automatic_wrapping, first_available_from, first_available_wrapping,
@@ -4833,7 +4868,9 @@ mod tests {
         assert!(engine.on_auth_signal(
             AuthSignal::Complete {
                 generation: engine.generation,
-                result: Err("Spotify authentication failed: test".to_owned()),
+                result: Err(AuthFailure::Rejected(
+                    "Spotify authentication failed: test".to_owned(),
+                )),
             },
             sender,
         ));
@@ -4852,6 +4889,66 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| { error.contains("Spotify authentication failed") })
         );
+    }
+
+    /// Waking from sleep reaches the first connect before Windows has a
+    /// resolver, and librespot reports that as a plain `Unknown` error around
+    /// `no such host is known`. Answering it with a login prompt threw away a
+    /// session that Spotify had never refused — the credentials were still
+    /// good, which is why restarting the app signed the user straight back in.
+    #[test]
+    fn an_unreachable_spotify_keeps_the_session_and_arms_a_retry() {
+        let mut engine = test_engine().0;
+        engine.state = playback_state(180_000);
+        engine.state.ready = false;
+        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(engine.on_auth_signal(
+            AuthSignal::Complete {
+                generation: engine.generation,
+                result: Err(AuthFailure::Unreachable(
+                    "could not reach Spotify: no such host is known".to_owned(),
+                )),
+            },
+            sender,
+        ));
+
+        assert!(
+            engine.state.auth_state == renderer_engine::protocol::AuthState::Authenticating,
+            "a network failure must not present as a logged-out session"
+        );
+        assert!(engine.state.auth_url.is_none(), "no login is being asked for");
+        assert!(!engine.state.ready);
+        assert_eq!(
+            engine.state.current_index,
+            Some(0),
+            "the queue survives an outage"
+        );
+        assert!(
+            engine.next_reconnect.is_some(),
+            "another attempt must be armed, or nothing would retry"
+        );
+        assert!(engine.reconnect_backoff > RECONNECT_BACKOFF_MIN);
+    }
+
+    /// The retry above leaves no session behind, so the health tick cannot look
+    /// for a dead one; it has to notice the armed retry instead.
+    #[test]
+    fn the_health_tick_retries_when_only_a_retry_is_armed() {
+        let mut engine = test_engine().0;
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        engine.session = None;
+        engine.next_reconnect = Some(Instant::now() - Duration::from_millis(1));
+
+        engine.awaiting_transport_retry = true;
+        let generation = engine.generation;
+        assert!(
+            engine.tick_session_health(&sender),
+            "a due retry with no session must still fire"
+        );
+        assert_ne!(engine.generation, generation, "the attempt actually started");
+        assert!(engine.reconnect_backoff > RECONNECT_BACKOFF_MIN);
     }
 
     #[test]

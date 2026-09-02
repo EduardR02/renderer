@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -75,26 +76,77 @@ pub fn prepare_oauth() -> Result<PendingAuth, String> {
     })
 }
 
+/// Why a cached-credential connection did not produce a session.
+///
+/// The distinction decides whether the user is asked to log in again. Waking
+/// from sleep reaches `session.connect` before Windows has a working resolver,
+/// which fails with `no such host is known (os error 11001)` — a fact about the
+/// network, not the credentials. Treating that as a rejection logged the user
+/// out of an account that was never actually refused, and restarting the app
+/// signed them straight back in with the same cached credentials.
+#[derive(Debug)]
+pub enum AuthFailure {
+    /// Spotify refused these credentials. They will not start working again,
+    /// so a fresh login is the only way forward.
+    Rejected(String),
+    /// Spotify could not be reached: no resolver, no route, a timeout, or an
+    /// outage on their side. The credentials are untouched and worth retrying.
+    Unreachable(String),
+}
+
+impl AuthFailure {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Rejected(message) | Self::Unreachable(message) => message,
+        }
+    }
+}
+
+impl fmt::Display for AuthFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Only an explicit refusal from Spotify invalidates the credentials. Every
+/// other kind — including `Unknown`, which is where librespot puts a wrapped
+/// `io::Error` such as a DNS failure — is a transport problem, and answering it
+/// with a login prompt would be wrong. Misclassifying in this direction costs a
+/// retry; misclassifying the other way costs the user their session.
+fn classify_connect_error(error: &librespot_core::Error) -> AuthFailure {
+    use librespot_core::error::ErrorKind;
+    match error.kind {
+        ErrorKind::Unauthenticated | ErrorKind::PermissionDenied => {
+            AuthFailure::Rejected(format!("cached Spotify credentials were rejected: {error}"))
+        }
+        _ => AuthFailure::Unreachable(format!("could not reach Spotify: {error}")),
+    }
+}
+
 /// Connects with the cached credentials (if any) and creates playback. Fails
-/// when no credentials are cached or they are rejected; the caller decides
-/// whether that means `NeedsLogin` (the flow is never started implicitly).
+/// when no credentials are cached, they are rejected, or Spotify cannot be
+/// reached; the caller decides which of those means `NeedsLogin` (the flow is
+/// never started implicitly).
 pub async fn connect_cached(
     cache: Cache,
     temporary_directory: PathBuf,
     normalisation: Arc<AtomicBool>,
-) -> Result<PlaybackHandles, String> {
-    let credentials = cache
-        .credentials()
-        .ok_or_else(|| "no cached Spotify credentials".to_owned())?;
+) -> Result<PlaybackHandles, AuthFailure> {
+    let credentials = cache.credentials().ok_or_else(|| {
+        AuthFailure::Rejected("no cached Spotify credentials".to_owned())
+    })?;
     let mut session_config = SessionConfig::default();
     session_config.tmp_dir = temporary_directory;
     let session = Session::new(session_config, Some(cache.clone()));
     match session.connect(credentials, false).await {
-        Ok(()) => create_playback_latest(session, cache, normalisation).await,
+        Ok(()) => create_playback_latest(session, cache, normalisation)
+            .await
+            .map_err(AuthFailure::Rejected),
         Err(error) => {
-            eprintln!("cached Spotify credentials were rejected: {error}");
+            let failure = classify_connect_error(&error);
+            eprintln!("{failure}");
             session.shutdown();
-            Err(format!("cached Spotify credentials were rejected: {error}"))
+            Err(failure)
         }
     }
 }
