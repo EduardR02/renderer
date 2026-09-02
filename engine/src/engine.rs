@@ -136,13 +136,12 @@ pub struct Engine {
     listening_history: ListeningHistory,
     random_state: u64,
     generation: u64,
-    /// A seek is mid-transition (the player was paused by [`Engine::seek_source`]).
-    /// While set, the transient pause event from the seek is suppressed, and
-    /// a stale Playing event cannot override the seek's requested play/pause
-    /// intent.
+    /// A seek issued while playing is mid-transition: [`Engine::seek_source`]
+    /// pauses librespot, seeks, and plays again, and this suppresses the
+    /// transient Paused in the middle so the UI does not blip. Only a playing
+    /// seek arms it, because only a playing seek has a Playing event coming
+    /// that can disarm it again.
     seek_in_flight: bool,
-    /// Whether the seek that set `seek_in_flight` was issued while playing.
-    seek_should_play: bool,
     /// The customization revision expected by loop-boundary signals. Markers
     /// can remain queued in the audio callback after a track/config change, so
     /// delivery must be tied to the pipeline that produced them.
@@ -273,7 +272,6 @@ impl Engine {
             random_state,
             generation: 0,
             seek_in_flight: false,
-            seek_should_play: false,
             // No marker produced before this engine was constructed belongs
             // to its first queue, even when the process-wide audio revision
             // was already advanced by an earlier player instance.
@@ -759,8 +757,16 @@ impl Engine {
                         let had_queue = self.state.current_index.is_some();
                         let restored_volume = self.state.volume;
                         let resume = had_queue && self.resume_after_reconnect;
+                        // Whatever the previous generation still owns goes away
+                        // before the replacement is installed. Assigning over a
+                        // live player would leave it feeding the audio device
+                        // while every transport command reached its
+                        // replacement: audible playback that pause, seek and
+                        // next no longer touch, until the app is restarted.
                         if self.resume_after_reconnect {
                             self.stop_playback_for_reconnect_handover();
+                        } else {
+                            self.shutdown_playback();
                         }
                         self.resume_after_reconnect = false;
                         self.state.ready = true;
@@ -1596,7 +1602,6 @@ impl Engine {
             PositionSpace::Source => self.update_position(position_ms),
             PositionSpace::Transport => self.update_transport_position(position_ms),
         }
-        self.state.playing = true;
         self.state.error = None;
         self.history.clear();
         self.rebuild_shuffle_pool();
@@ -1668,7 +1673,6 @@ impl Engine {
         self.rebuild_shuffle_pool();
         self.play_request_id = None;
         self.seek_in_flight = false;
-        self.seek_should_play = false;
         self.loop_decoder_eof = false;
         self.loop_jump_pending = false;
         self.reset_loop_pass_for_position(self.state.position_ms);
@@ -1723,7 +1727,6 @@ impl Engine {
         self.state.current_index = Some(index);
         self.state.duration_ms = duration_ms;
         self.update_transport_position(0);
-        self.state.playing = true;
         self.state.error = None;
         self.rebuild_shuffle_pool();
         self.last_track_change = Some(Instant::now());
@@ -1735,17 +1738,14 @@ impl Engine {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
-        // A user play supersedes an in-flight seek transition. Keep the
-        // guard until its Playing event arrives so a queued Paused event from
-        // the seek cannot briefly undo the optimistic play.
-        if self.seek_in_flight {
-            self.seek_should_play = true;
-        }
-        if self.loop_decoder_eof
+        let was_playing = self.state.playing;
+        // There is no live load to resume when one is pending, has failed, or
+        // has run off the end of the track, so those all start a fresh one.
+        let reload = self.loop_decoder_eof
             || self.current_needs_load
             || self.loading_failed
-            || (self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms)
-        {
+            || (self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms);
+        if reload {
             if !self.loading_failed && !self.current_needs_load {
                 self.update_transport_position(0);
             }
@@ -1756,6 +1756,17 @@ impl Engine {
         self.state.playing = true;
         self.update_position(self.state.position_ms);
         self.state.error = None;
+        // Transport commands are otherwise invisible in the log: a resume
+        // prints nothing, and neither does a load librespot satisfies from the
+        // track it already holds. A session where the engine and librespot
+        // disagreed about `playing` could not be told apart afterwards from one
+        // where no command ever arrived, because neither left a record.
+        eprintln!(
+            "transport: play at {} ms (engine was {}); librespot told to {}",
+            self.state.position_ms,
+            if was_playing { "playing" } else { "paused" },
+            if reload { "load" } else { "resume" },
+        );
         Ok(true)
     }
 
@@ -1763,21 +1774,38 @@ impl Engine {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
-        // A user pause supersedes any in-flight seek transition: its own
-        // Paused event must be delivered, not suppressed.
+        let was_playing = self.state.playing;
+        // The engine may not call itself paused before librespot has been told
+        // to stop, so the command goes out first and a failure to reach the
+        // player aborts the transition rather than declaring a pause that never
+        // happened. This used to be skipped whenever a load was pending or had
+        // failed, on the theory that pause is invalid in the state librespot is
+        // then in — but `current_needs_load` records an intent to load, not
+        // that librespot stopped, and the two come apart the instant anything
+        // sets the flag while audio is still running. librespot makes the
+        // unconditional call safe from every direction: it clears the pending
+        // start of a Loading player (precisely what a pause during a load
+        // should do), is idempotent and silent on an already paused one, and
+        // costs one log line and no state change on a stopped or finished one.
+        // Skipping it costs audio that keeps playing with no transport control
+        // left that can reach it.
+        self.player()?.pause();
+        // Only now, with the stop actually issued: a user pause supersedes any
+        // in-flight seek transition, so its own Paused event must be delivered
+        // rather than suppressed.
         self.seek_in_flight = false;
-        self.seek_should_play = false;
-        // `Unavailable` and a decoder EOF stop the current loader below, so
-        // a later pause must not send `pause` to librespot's terminal
-        // Loading/EndOfTrack state. Play will issue a fresh load when
-        // requested.
-        if !self.loading_failed && !self.current_needs_load && !self.loop_decoder_eof {
-            self.player()?.pause();
-        }
         self.state.playing = false;
         self.update_position(self.state.position_ms);
         self.pause_listening();
         self.state.error = None;
+        // See the note in `play`. A pause arriving at an already paused engine
+        // is the specific signature of a stale UI, and it used to leave no
+        // trace at all.
+        eprintln!(
+            "transport: pause at {} ms (engine was {})",
+            self.state.position_ms,
+            if was_playing { "playing" } else { "paused" },
+        );
         Ok(true)
     }
 
@@ -1827,8 +1855,12 @@ impl Engine {
         // Capture the intent before pausing: a paused seek must remain paused,
         // while a playing seek resumes at the target without a UI blip.
         let was_playing = self.state.playing;
-        self.seek_in_flight = true;
-        self.seek_should_play = was_playing;
+        // Only a playing seek has a transition to hold open. A paused seek's
+        // pause is silent (librespot sends no Paused event when it is already
+        // paused) and no play follows it, so arming the guard here would leave
+        // it set for the rest of the queue — swallowing every genuine Paused
+        // and inverting the next genuine Playing into a pause.
+        self.seek_in_flight = was_playing;
         let player = self.player()?;
         player.pause();
         player.seek(position);
@@ -1931,10 +1963,18 @@ impl Engine {
                 self.state.duration_ms = self.state.queue[index].duration_ms;
                 self.update_transport_position(0);
                 self.state.error = None;
+                // A track change carries the transport intent across, exactly
+                // as `previous` does: a paused queue does not start playing
+                // because the user skipped or a track failed, and a playing one
+                // does not fall silent. Loading with a fixed `true` made the
+                // engine call itself paused while librespot played the new
+                // track, leaving the two to be reconciled by whichever event
+                // happened to arrive next.
+                let start_playing = self.state.playing;
                 if at_end {
-                    self.load_current_after_natural_boundary(true)?;
+                    self.load_current_after_natural_boundary(start_playing)?;
                 } else {
-                    self.load_current(true)?;
+                    self.load_current(start_playing)?;
                 }
             }
             None => {
@@ -1947,6 +1987,7 @@ impl Engine {
                 }
                 self.state.playing = false;
                 self.update_position(self.state.duration_ms);
+                eprintln!("transport: no eligible track follows queue index {current}; stopping");
             }
         }
         Ok(true)
@@ -2162,12 +2203,17 @@ impl Engine {
             .and_then(|next| playable_track_uri(&self.state.queue[next]).ok());
         self.play_request_id = None;
         self.seek_in_flight = false;
-        self.seek_should_play = false;
         self.loop_decoder_eof = false;
         self.loop_jump_pending = false;
         let player = Arc::clone(self.player()?);
         self.loading_failed = false;
         self.current_needs_load = false;
+        // What the engine reports and what it asks librespot for are one
+        // statement, made once, here. Callers used to set `playing` beside the
+        // call, which let the two say different things — a track change loading
+        // with a hardcoded `true` while the engine still called itself paused,
+        // with nothing but the next incoming event to settle the argument.
+        self.state.playing = start_playing;
         self.note_track_change(Instant::now());
         player.load(uri, start_playing, position_ms);
         if let Some(uri) = next_uri {
@@ -2315,22 +2361,17 @@ impl Engine {
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
                 // A playing seek's play() completed: its transient pause is
-                // over. A stale Playing event after a paused seek must not
-                // turn that seek into an optimistic unpause.
-                let suppress_playing = self.seek_in_flight && !self.seek_should_play;
+                // over.
                 self.seek_in_flight = false;
-                self.seek_should_play = false;
                 self.loading_failed = false;
                 self.loop_jump_pending = false;
                 self.clear_unavailable_burst();
-                if !suppress_playing {
-                    if let Some(index) = self.state.current_index {
-                        if let Some(track) = self.state.queue.get(index).cloned() {
-                            self.start_listening(&track);
-                        }
+                if let Some(index) = self.state.current_index {
+                    if let Some(track) = self.state.queue.get(index).cloned() {
+                        self.start_listening(&track);
                     }
                 }
-                self.state.playing = !suppress_playing;
+                self.state.playing = true;
                 self.update_position(position_ms);
                 self.state.error = None;
                 true
@@ -2428,10 +2469,12 @@ impl Engine {
             } if self.is_current_event(play_request_id, &track_id) => {
                 let clustered = self.unavailable_is_clustered(Instant::now());
                 self.seek_in_flight = false;
-                self.seek_should_play = false;
                 self.loading_failed = true;
                 self.finalize_listening(false);
-                self.state.playing = false;
+                // `state.playing` is left alone deliberately: it is the intent
+                // the skip below has to carry onto the replacement track. The
+                // two branches of that skip both settle it — a successor loads
+                // with this intent, and an exhausted queue stops.
                 self.state.error = Some(format!("Spotify track is unavailable: {track_id}"));
 
                 // librespot leaves the failed loader in PlayerState::Loading
@@ -2469,6 +2512,23 @@ impl Engine {
                 self.state.playing = false;
                 self.finalize_listening(false);
                 true
+            }
+            // Every arm above is gated on `is_current_event`, so a transport
+            // event landing here is one the engine refused: its play request or
+            // its current row no longer describes what librespot is doing. That
+            // is the difference between "the engine went deaf to its player"
+            // and "no command ever arrived", which the log could not previously
+            // tell apart — both look like silence.
+            event @ (PlayerEvent::Playing { .. }
+            | PlayerEvent::Paused { .. }
+            | PlayerEvent::EndOfTrack { .. }
+            | PlayerEvent::Stopped { .. }
+            | PlayerEvent::Unavailable { .. }) => {
+                eprintln!(
+                    "transport: ignored {event:?}; engine holds play request {:?}",
+                    self.play_request_id
+                );
+                false
             }
             _ => false,
         }
@@ -2512,7 +2572,6 @@ impl Engine {
         self.loop_jump_pending = false;
         self.loop_pass = 1;
         self.seek_in_flight = false;
-        self.seek_should_play = false;
         self.recent_track_changes.clear();
         self.recent_unavailable.clear();
         self.mixer = None;
@@ -2678,23 +2737,27 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     };
     use std::time::{Duration, Instant};
 
     use super::{
-        AudioSignal, AuthFailure, AuthSignal, Engine, PlaybackState, PlayerSignal,
-        RECONNECT_BACKOFF_MAX,
-        RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
-        UNAVAILABLE_BURST_WINDOW, automatic_track_eligible, first_automatic_from,
-        first_automatic_wrapping, first_available_from, first_available_wrapping,
-        remap_current_index_after_move, sequential_automatic_index, sequential_available_index,
-        sequential_next_index, track_change_wait, with_preview_edit,
+        AudioSignal, AuthFailure, AuthSignal, Engine, PlaybackHandles, PlaybackState, PlayerSignal,
+        RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW,
+        TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW, automatic_track_eligible,
+        first_automatic_from, first_automatic_wrapping, first_available_from,
+        first_available_wrapping, remap_current_index_after_move, sequential_automatic_index,
+        sequential_available_index, sequential_next_index, track_change_wait, with_preview_edit,
     };
     use crate::customization::TrackEditStore;
     use crate::io::ProtocolWriter;
     use librespot_core::SpotifyUri;
-    use librespot_playback::player::PlayerEvent;
+    use librespot_playback::audio_backend::{Sink, SinkResult};
+    use librespot_playback::config::PlayerConfig;
+    use librespot_playback::convert::Converter;
+    use librespot_playback::decoder::AudioPacket;
+    use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume, softmixer::SoftMixer};
+    use librespot_playback::player::{Player, PlayerEvent};
     use renderer_engine::protocol::{LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
 
     fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
@@ -2721,6 +2784,81 @@ mod tests {
             ),
             buffer,
         )
+    }
+
+    /// Watches one librespot player from the outside. The sink is destroyed
+    /// with the player thread, so its liveness is the observable form of "that
+    /// player is really gone" rather than "the engine no longer names it".
+    struct SinkProbe {
+        alive: Arc<AtomicBool>,
+    }
+
+    struct ProbeSink {
+        alive: Arc<AtomicBool>,
+    }
+
+    impl SinkProbe {
+        fn new() -> Self {
+            Self {
+                alive: Arc::new(AtomicBool::new(true)),
+            }
+        }
+
+        fn sink(&self) -> ProbeSink {
+            ProbeSink {
+                alive: Arc::clone(&self.alive),
+            }
+        }
+
+        fn is_alive(&self) -> bool {
+            self.alive.load(Ordering::Acquire)
+        }
+    }
+
+    impl Sink for ProbeSink {
+        fn start(&mut self) -> SinkResult<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> SinkResult<()> {
+            Ok(())
+        }
+
+        fn write(&mut self, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for ProbeSink {
+        fn drop(&mut self) {
+            self.alive.store(false, Ordering::Release);
+        }
+    }
+
+    /// A real librespot player with no audio device behind it, so the lifetime
+    /// under test is librespot's own: the thread ends when the last `Arc` goes,
+    /// and `Drop for Player` joins it before returning.
+    fn probe_player(probe: &SinkProbe) -> (Arc<Player>, librespot_core::Session) {
+        let session = librespot_core::Session::new(librespot_core::SessionConfig::default(), None);
+        let sink = probe.sink();
+        let player = Player::new(
+            PlayerConfig::default(),
+            session.clone(),
+            Box::new(NoOpVolume),
+            move || Box::new(sink),
+        );
+        (player, session)
+    }
+
+    fn playback_handles(player: Arc<Player>, session: librespot_core::Session) -> PlaybackHandles {
+        let events = player.get_player_event_channel();
+        PlaybackHandles {
+            player,
+            events,
+            mixer: Arc::new(SoftMixer::open(MixerConfig::default()).expect("software mixer")),
+            session,
+            volume_percent: 50,
+        }
     }
 
     fn track_ref() -> TrackRef {
@@ -2756,6 +2894,17 @@ mod tests {
         }
     }
 
+    fn two_track_state() -> PlaybackState {
+        let mut state = playback_state(240_000);
+        state.queue.push(TrackRef {
+            id: "0123456789ABCDEFGHIJKM".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKM".to_owned(),
+            duration_ms: 180_000,
+            ..TrackRef::default()
+        });
+        state
+    }
+
     fn edited_playback_state(
         duration_ms: u32,
         cuts: Vec<TimeRange>,
@@ -2785,6 +2934,19 @@ mod tests {
         engine.state = playback_state(240_000);
         engine.play_request_id = Some(7);
         engine
+    }
+
+    /// A playing engine holding a real librespot player. Transport commands
+    /// then reach a live command channel instead of failing on a missing
+    /// player, which is what makes the pause and seek paths reachable at all.
+    /// The probe is returned so the caller keeps the sink alive.
+    fn engine_with_player() -> (Engine, SinkProbe) {
+        let probe = SinkProbe::new();
+        let (player, session) = probe_player(&probe);
+        let mut engine = playing_engine();
+        engine.player = Some(player);
+        engine.session = Some(session);
+        (engine, probe)
     }
     fn preview_history_root() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3162,14 +3324,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn repeated_preview_updates_keep_history_empty_through_pause_and_eof() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_preview_updates_keep_history_empty_through_pause_and_eof() {
         let (mut engine, root) = history_playing_engine();
+        let probe = SinkProbe::new();
+        let (player, session) = probe_player(&probe);
+        engine.player = Some(player);
+        engine.session = Some(session);
         let track = engine.state.queue[0].clone();
         assert!(
             engine
                 .preview_track_edit(track.clone(), vec![range(1_000, 2_000)], None, 5_000, 1)
-                .is_err()
+                .is_ok()
         );
         assert!(engine.preview_mode);
 
@@ -3179,7 +3345,6 @@ mod tests {
             track_id: track_uri(),
             position_ms: 5_000,
         }));
-        engine.current_needs_load = true;
         assert_eq!(engine.pause(), Ok(true));
         engine.play_request_id = Some(8);
         assert!(engine.on_player_event(PlayerEvent::Playing {
@@ -3191,7 +3356,7 @@ mod tests {
         assert!(
             engine
                 .preview_track_edit(track, vec![range(3_000, 4_000)], None, 7_000, 2)
-                .is_err()
+                .is_ok()
         );
         assert!(engine.preview_mode);
         engine.play_request_id = Some(9);
@@ -3674,29 +3839,38 @@ mod tests {
         assert_eq!(engine.state.position_ms, 8_000);
     }
 
-    #[test]
-    fn paused_seek_ignores_a_stale_playing_event() {
-        let mut engine = playing_engine();
+    /// A paused seek issues no play, so nothing will ever arrive to disarm a
+    /// guard set here. Leaving one armed made the engine deaf for the rest of
+    /// the queue: every genuine Paused was swallowed and the next genuine
+    /// Playing was inverted into a pause with no listening row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_paused_seek_leaves_no_guard_behind() {
+        let (mut engine, _probe) = engine_with_player();
         let uri = track_uri();
         engine.state.playing = false;
-        engine.seek_in_flight = true;
-        engine.seek_should_play = false;
 
-        assert!(!engine.on_player_event(PlayerEvent::Paused {
+        assert_eq!(engine.seek_transport(41_000), Ok(true));
+        assert!(
+            !engine.seek_in_flight,
+            "a paused seek has nothing in flight"
+        );
+
+        assert!(engine.on_player_event(PlayerEvent::Playing {
             play_request_id: 7,
             track_id: uri.clone(),
             position_ms: 41_000,
         }));
-        assert!(!engine.state.playing, "the seek pause remains paused");
+        assert!(
+            engine.state.playing,
+            "a genuine Playing event is believed, not inverted"
+        );
 
-        assert!(engine.on_player_event(PlayerEvent::Playing {
+        assert!(engine.on_player_event(PlayerEvent::Paused {
             play_request_id: 7,
             track_id: uri,
             position_ms: 42_000,
         }));
-        assert!(!engine.state.playing, "a paused seek must not unpause");
-        assert!(!engine.seek_in_flight);
-        assert!(!engine.seek_should_play);
+        assert!(!engine.state.playing, "a genuine Paused event is delivered");
     }
 
     #[test]
@@ -3704,7 +3878,6 @@ mod tests {
         let mut engine = playing_engine();
         let uri = track_uri();
         engine.seek_in_flight = true;
-        engine.seek_should_play = true;
 
         assert!(engine.on_player_event(PlayerEvent::Playing {
             play_request_id: 7,
@@ -3714,6 +3887,101 @@ mod tests {
         assert!(engine.state.playing);
         assert_eq!(engine.state.position_ms, 42_000);
         assert!(!engine.seek_in_flight);
+    }
+
+    /// The three load flags that used to suppress the librespot pause, each on
+    /// its own. They say "a load is pending, has failed, or ran off the end" —
+    /// none of them says librespot stopped, and when that inference was wrong
+    /// the audio kept playing while the engine, and therefore the UI, was
+    /// certain it had stopped. Nothing afterwards reconciled the two, so the
+    /// only way out was a restart. A pause now performs the stop before it
+    /// reports one, and fails outright when it cannot reach the player.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pause_is_reported_only_once_librespot_has_been_told_to_stop() {
+        let arms: [(&str, fn(&mut Engine)); 3] = [
+            ("a pending load", |engine| engine.current_needs_load = true),
+            ("a failed load", |engine| engine.loading_failed = true),
+            ("a decoder EOF", |engine| engine.loop_decoder_eof = true),
+        ];
+
+        for (arm, set_flag) in arms {
+            let mut unreachable = playing_engine();
+            unreachable.state.playing = true;
+            set_flag(&mut unreachable);
+            assert!(
+                unreachable.pause().is_err(),
+                "{arm}: a pause with no player to command must fail"
+            );
+            assert!(
+                unreachable.state.playing,
+                "{arm}: the engine must not report a pause it never performed"
+            );
+
+            let (mut engine, _probe) = engine_with_player();
+            engine.state.playing = true;
+            set_flag(&mut engine);
+            assert_eq!(
+                engine.pause(),
+                Ok(true),
+                "{arm}: the pause reaches the player instead of being skipped"
+            );
+            assert!(!engine.state.playing, "{arm}");
+        }
+    }
+
+    /// A track change carries the transport intent across, the way `previous`
+    /// always has. Loading with a fixed `true` started audible playback the
+    /// engine still called paused, and left the disagreement to be settled by
+    /// whichever player event happened to arrive next.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_track_change_carries_the_transport_intent_across() {
+        let (mut paused, _paused_probe) = engine_with_player();
+        paused.state = two_track_state();
+        paused.state.playing = false;
+        assert_eq!(paused.advance(false), Ok(true));
+        assert_eq!(paused.state.current_index, Some(1));
+        assert!(
+            !paused.state.playing,
+            "skipping ahead in a paused queue must not start playback"
+        );
+
+        let (mut playing, _playing_probe) = engine_with_player();
+        playing.state = two_track_state();
+        playing.state.playing = true;
+        assert_eq!(playing.advance(false), Ok(true));
+        assert_eq!(playing.state.current_index, Some(1));
+        assert!(playing.state.playing);
+    }
+
+    /// The same rule under a runtime failure: skipping past an unavailable
+    /// track resumes a queue that was playing and leaves a paused one paused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_track_hands_its_transport_intent_to_the_replacement() {
+        let (mut playing, _playing_probe) = engine_with_player();
+        playing.state = two_track_state();
+        playing.state.playing = true;
+        assert!(playing.on_player_event(PlayerEvent::Unavailable {
+            play_request_id: 7,
+            track_id: track_uri(),
+        }));
+        assert_eq!(playing.state.current_index, Some(1));
+        assert!(
+            playing.state.playing,
+            "a failure mid-playback continues with the next track"
+        );
+
+        let (mut paused, _paused_probe) = engine_with_player();
+        paused.state = two_track_state();
+        paused.state.playing = false;
+        assert!(paused.on_player_event(PlayerEvent::Unavailable {
+            play_request_id: 7,
+            track_id: track_uri(),
+        }));
+        assert_eq!(paused.state.current_index, Some(1));
+        assert!(
+            !paused.state.playing,
+            "a load that failed while paused must not start the replacement"
+        );
     }
 
     #[test]
@@ -4048,6 +4316,126 @@ mod tests {
         assert!(
             engine.session.is_none(),
             "the old session is stopped at handover"
+        );
+    }
+
+    /// The whole point of the preserved handover is that the overlap ends the
+    /// instant the replacement arrives. An old player left alive would keep
+    /// feeding the audio device while pause, next and seek all reached the new
+    /// one — audible playback no transport control can touch, until the app is
+    /// restarted. Assert the old handles are gone, not merely forgotten.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserved_handover_leaves_exactly_one_live_player() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.play_request_id = Some(7);
+
+        let old_sink = SinkProbe::new();
+        let (old_player, old_session) = probe_player(&old_sink);
+        let old_player_handle = Arc::downgrade(&old_player);
+        engine.player = Some(old_player);
+        engine.session = Some(old_session.clone());
+        old_session.shutdown();
+
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            engine.tick_session_health(&auth_sender),
+            "the invalid session is noticed"
+        );
+        assert!(engine.resume_after_reconnect);
+        let generation = engine.begin_cached_authentication(true);
+        assert!(
+            old_player_handle.upgrade().is_some(),
+            "the old player plays on while the replacement is built"
+        );
+
+        let new_sink = SinkProbe::new();
+        let (new_player, new_session) = probe_player(&new_sink);
+        let new_player_handle = Arc::downgrade(&new_player);
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(engine.on_auth_signal(
+            AuthSignal::Complete {
+                generation,
+                result: Ok(playback_handles(new_player, new_session)),
+            },
+            player_sender,
+        ));
+
+        assert!(
+            old_player_handle.upgrade().is_none(),
+            "the old player is dropped at handover, not merely forgotten"
+        );
+        assert!(
+            !old_sink.is_alive(),
+            "the old player's audio sink dies with it"
+        );
+        let installed = engine
+            .player
+            .as_ref()
+            .expect("the replacement is installed");
+        assert!(
+            new_player_handle
+                .upgrade()
+                .is_some_and(|new| Arc::ptr_eq(installed, &new)),
+            "the installed player is the replacement"
+        );
+        assert_eq!(
+            Arc::strong_count(installed),
+            1,
+            "the engine owns the only reference to the live player"
+        );
+        assert!(engine.state.playing, "the resume intent survived");
+        assert!(new_sink.is_alive());
+    }
+
+    /// The same teardown has to run when the attempt began preserved but the
+    /// resume intent did not survive it: assigning the replacement over a live
+    /// player would silently leave the old one playing and the old session
+    /// unshut.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_completion_without_resume_intent_still_tears_the_old_player_down() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(240_000);
+
+        let old_sink = SinkProbe::new();
+        let (old_player, old_session) = probe_player(&old_sink);
+        let old_player_handle = Arc::downgrade(&old_player);
+        engine.player = Some(old_player);
+        engine.session = Some(old_session.clone());
+        let generation = engine.begin_cached_authentication(true);
+        engine.resume_after_reconnect = false;
+
+        let new_sink = SinkProbe::new();
+        let (new_player, new_session) = probe_player(&new_sink);
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(engine.on_auth_signal(
+            AuthSignal::Complete {
+                generation,
+                result: Ok(playback_handles(new_player, new_session)),
+            },
+            player_sender,
+        ));
+
+        assert!(
+            old_player_handle.upgrade().is_none(),
+            "the old player is dropped rather than assigned over"
+        );
+        assert!(!old_sink.is_alive());
+        assert!(
+            old_session.is_invalid(),
+            "the old session is shut down, not merely dropped: a clone held by \
+             an in-flight browse would otherwise keep it connected"
+        );
+        assert!(!engine.state.playing);
+        assert_eq!(
+            Arc::strong_count(
+                engine
+                    .player
+                    .as_ref()
+                    .expect("the replacement is installed")
+            ),
+            1,
         );
     }
 

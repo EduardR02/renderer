@@ -145,17 +145,29 @@ use tokio::sync::mpsc;
 use crate::resample::Resampler;
 use crate::time_stretch::{AudioPipeline, PipelineConfig};
 
-/// The live rodio sink, registered on first playback so [`set_sink_volume`]
-/// can apply transport volume changes at the output mixer — instantly audible,
-/// including audio already queued in the sink. A weak handle: when the player
-/// drops its sink (stop/shutdown) the entry dies with it.
+/// The audible pipeline: the rodio sink [`set_sink_volume`] applies transport
+/// volume to, the ring a discontinuity clears, and the processing state a
+/// natural boundary flushes through. All three name one [`RodioSink`] and are
+/// claimed together by [`RodioSink::start`] — the moment that sink becomes the
+/// one feeding the device — and released together by its `Drop`.
+///
+/// Ownership has to be that explicit because two sinks exist at once whenever a
+/// player is replaced while another is still playing: a session reconnect that
+/// preserves playback, and a normalisation rebuild, both construct the
+/// replacement before the incumbent is stopped. Claiming at construction would
+/// point every one of these at the silent newcomer, and a newcomer that is then
+/// discarded (a stale rebuild) would leave them dangling at a pipeline nothing
+/// can hear — for the rest of the process. The `Drop` release is therefore
+/// conditional: a sink only ever clears an entry that is still its own.
 static LIVE_SINK: Mutex<Weak<rodio::Sink>> = Mutex::new(Weak::new());
 /// Retained even before the rodio sink is connected, because auth restores the
 /// cached transport volume while the librespot sink is still logically Closed.
 static SINK_VOLUME: AtomicU16 = AtomicU16::new(u16::MAX);
 const LIVE_SINK_POISON_MSG: &str = "live rodio sink registry should not be poisoned";
 static LIVE_RING: Mutex<Weak<SampleRing>> = Mutex::new(Weak::new());
+const LIVE_RING_POISON_MSG: &str = "live sample ring should not be poisoned";
 static LIVE_PROCESSING: Mutex<Weak<Mutex<AudioProcessing>>> = Mutex::new(Weak::new());
+const LIVE_PROCESSING_POISON_MSG: &str = "live audio processing registry should not be poisoned";
 static CUSTOMIZATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CUSTOMIZATION_REVISION: AtomicU64 = AtomicU64::new(0);
 static CUSTOMIZATION: Mutex<Customization> = Mutex::new(Customization {
@@ -236,11 +248,7 @@ fn set_customization(
     drop(customization);
 
     if discontinuous {
-        if let Some(ring) = LIVE_RING
-            .lock()
-            .expect("live sample ring should not be poisoned")
-            .upgrade()
-        {
+        if let Some(ring) = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade() {
             ring.clear();
         }
     }
@@ -259,16 +267,12 @@ pub fn customization_revision() -> u64 {
 pub fn finish_natural_boundary() -> Result<(), String> {
     let Some(processing) = LIVE_PROCESSING
         .lock()
-        .expect("live audio processing registry should not be poisoned")
+        .expect(LIVE_PROCESSING_POISON_MSG)
         .upgrade()
     else {
         return Ok(());
     };
-    let Some(ring) = LIVE_RING
-        .lock()
-        .expect("live sample ring should not be poisoned")
-        .upgrade()
-    else {
+    let Some(ring) = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade() else {
         return Ok(());
     };
 
@@ -700,6 +704,21 @@ fn attach_live_source(sink: &rodio::Sink, ring: &Arc<SampleRing>, rate: rodio::S
     sink.append(LiveSource::new(ring.clone(), rate));
 }
 
+/// Points one live-pipeline entry (see [`LIVE_SINK`]) at this sink's half of it.
+fn claim_live<T>(slot: &Mutex<Weak<T>>, value: &Arc<T>, poison: &str) {
+    *slot.lock().expect(poison) = Arc::downgrade(value);
+}
+
+/// Clears one live-pipeline entry, but only while it still names this sink. A
+/// sink outlived by its replacement must not deregister the pipeline that has
+/// already taken over from it.
+fn release_live<T>(slot: &Mutex<Weak<T>>, value: &Arc<T>, poison: &str) {
+    let mut slot = slot.lock().expect(poison);
+    if slot.ptr_eq(&Arc::downgrade(value)) {
+        *slot = Weak::new();
+    }
+}
+
 struct AudioProcessing {
     resampler: Option<Resampler>,
     pipeline_revision: u64,
@@ -883,9 +902,6 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
     let resampler = Resampler::new(SAMPLE_RATE, output_rate, NUM_CHANNELS as u16);
     let resampling = resampler.is_some();
     let ring = SampleRing::new(write_ahead_samples(output_rate));
-    *LIVE_RING
-        .lock()
-        .expect("live sample ring should not be poisoned") = Arc::downgrade(&ring);
     let processing = Arc::new(Mutex::new(AudioProcessing {
         resampler,
         pipeline_revision: CUSTOMIZATION_REVISION
@@ -893,10 +909,6 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
             .wrapping_sub(1),
         pipeline: None,
     }));
-    *LIVE_PROCESSING
-        .lock()
-        .expect("live audio processing registry should not be poisoned") =
-        Arc::downgrade(&processing);
 
     // The one fact that decides output fidelity, and the one that is otherwise
     // invisible: which rate the device actually opened at, and therefore
@@ -921,8 +933,6 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
     // 512-sample Zero sources and rebuild converters forever while idle. The
     // cpal callback itself remains active because rodio does not expose its
     // stream handle, but an empty mixer has no queue/source work to perform.
-    *LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG) = Weak::new();
-
     RodioSink {
         rodio_sink: None,
         ring,
@@ -934,6 +944,20 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
     }
 }
 
+impl Drop for RodioSink {
+    fn drop(&mut self) {
+        if let Some(sink) = &self.rodio_sink {
+            release_live(&LIVE_SINK, sink, LIVE_SINK_POISON_MSG);
+        }
+        release_live(&LIVE_RING, &self.ring, LIVE_RING_POISON_MSG);
+        release_live(
+            &LIVE_PROCESSING,
+            &self.processing,
+            LIVE_PROCESSING_POISON_MSG,
+        );
+    }
+}
+
 impl Sink for RodioSink {
     fn start(&mut self) -> SinkResult<()> {
         if self.rodio_sink.is_none() {
@@ -941,7 +965,15 @@ impl Sink for RodioSink {
             sink.pause();
             sink.set_volume(volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)));
             attach_live_source(&sink, &self.ring, self.output_rate);
-            *LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG) = Arc::downgrade(&sink);
+            // This sink is about to be the one feeding the device, so the whole
+            // pipeline changes hands here rather than at construction.
+            claim_live(&LIVE_SINK, &sink, LIVE_SINK_POISON_MSG);
+            claim_live(&LIVE_RING, &self.ring, LIVE_RING_POISON_MSG);
+            claim_live(
+                &LIVE_PROCESSING,
+                &self.processing,
+                LIVE_PROCESSING_POISON_MSG,
+            );
             self.rodio_sink = Some(sink);
         }
 
@@ -1482,6 +1514,63 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn live_ring() -> Option<Arc<SampleRing>> {
+        LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade()
+    }
+
+    /// Two sinks exist at once whenever a player is replaced while another is
+    /// still playing (a preserved-playback reconnect, a normalisation rebuild).
+    /// The registry has to follow the audible one through that overlap in both
+    /// orders, and the retiring sink must never take its replacement's entry
+    /// with it: an entry cleared by the wrong sink stays empty for the rest of
+    /// the process, so volume changes, seek discontinuities and the natural
+    /// boundary flush all silently stop reaching the audio that is playing.
+    #[test]
+    fn the_live_pipeline_follows_the_audible_sink_through_a_handover() {
+        let _guard = customization_guard();
+        let old = test_ring();
+        claim_live(&LIVE_RING, &old, LIVE_RING_POISON_MSG);
+
+        // Replacement becomes audible first, incumbent is torn down after.
+        let new = test_ring();
+        claim_live(&LIVE_RING, &new, LIVE_RING_POISON_MSG);
+        release_live(&LIVE_RING, &old, LIVE_RING_POISON_MSG);
+        assert!(
+            live_ring().is_some_and(|ring| Arc::ptr_eq(&ring, &new)),
+            "the retired sink deregistered its replacement"
+        );
+
+        // Incumbent is torn down first, replacement becomes audible after.
+        let newest = test_ring();
+        release_live(&LIVE_RING, &new, LIVE_RING_POISON_MSG);
+        assert!(live_ring().is_none());
+        claim_live(&LIVE_RING, &newest, LIVE_RING_POISON_MSG);
+        assert!(live_ring().is_some_and(|ring| Arc::ptr_eq(&ring, &newest)));
+
+        release_live(&LIVE_RING, &newest, LIVE_RING_POISON_MSG);
+        assert!(live_ring().is_none());
+    }
+
+    /// A player built for a preference change that is superseded before it is
+    /// installed is constructed, never started, and dropped. Because the claim
+    /// happens at `start`, that sink never owned the pipeline, and its drop
+    /// leaves the audible one exactly where it was.
+    #[test]
+    fn a_sink_that_never_became_audible_leaves_the_live_pipeline_alone() {
+        let _guard = customization_guard();
+        let playing = test_ring();
+        claim_live(&LIVE_RING, &playing, LIVE_RING_POISON_MSG);
+
+        let discarded = test_ring();
+        release_live(&LIVE_RING, &discarded, LIVE_RING_POISON_MSG);
+
+        assert!(
+            live_ring().is_some_and(|ring| Arc::ptr_eq(&ring, &playing)),
+            "a discarded replacement must not unregister the playing pipeline"
+        );
+        release_live(&LIVE_RING, &playing, LIVE_RING_POISON_MSG);
+    }
+
     /// The load-bearing bypass gate: at the ordinary transport setting
     /// `RodioSink::write` must hand the converter's own `Vec` straight to the
     /// resampler, and it takes that branch whenever no pipeline was built. So
@@ -1517,9 +1606,7 @@ mod tests {
     fn natural_and_discontinuous_boundaries_have_distinct_queue_semantics() {
         let _guard = customization_guard();
         let ring = test_ring();
-        *LIVE_RING
-            .lock()
-            .expect("live sample ring should not be poisoned") = Arc::downgrade(&ring);
+        *LIVE_RING.lock().expect(LIVE_RING_POISON_MSG) = Arc::downgrade(&ring);
 
         ring.push(packet(1024), Duration::from_millis(50)).unwrap();
         configure_customization_after_natural_boundary(None, 1.0, 0);
@@ -1557,13 +1644,8 @@ mod tests {
             pipeline_revision: CUSTOMIZATION_REVISION.load(Ordering::Acquire),
             pipeline: Some(pipeline),
         }));
-        *LIVE_RING
-            .lock()
-            .expect("live sample ring should not be poisoned") = Arc::downgrade(&ring);
-        *LIVE_PROCESSING
-            .lock()
-            .expect("live audio processing registry should not be poisoned") =
-            Arc::downgrade(&processing);
+        *LIVE_RING.lock().expect(LIVE_RING_POISON_MSG) = Arc::downgrade(&ring);
+        *LIVE_PROCESSING.lock().expect(LIVE_PROCESSING_POISON_MSG) = Arc::downgrade(&processing);
 
         finish_natural_boundary().expect("the output queue has room");
         let expected_total =
