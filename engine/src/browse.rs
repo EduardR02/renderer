@@ -3667,13 +3667,48 @@ fn dedupe_by_id<T>(items: Vec<T>, id: impl Fn(&T) -> &str) -> Vec<T> {
 /// answer is a podcast still yields the best *playable* answer underneath it
 /// instead of nothing. A hit missing an id or a name is skipped for the same
 /// reason: a top result that cannot be opened or named is not a result.
-fn search_top_ref(section: &SearchTopSectionJson) -> Option<renderer_engine::protocol::SearchTopRef> {
+/// How well a candidate's name answers what was typed.
+///
+/// `topResultsV2` is a ranked list, not a chosen answer: nothing in the
+/// response says "this is the top result" — its `featured` sibling is an
+/// editorial playlist, not a pick — and the ranking itself is weighted by
+/// popularity. Searching "taylor" therefore ranks the track "Style" above the
+/// artist Taylor Swift, which is not what someone typing an artist's name is
+/// asking for, while "kygo" ranks the artist first because the name matches
+/// exactly. So the query has to break the tie.
+fn top_match_rank(query: &str, name: &str) -> u8 {
+    let query = query.trim().to_lowercase();
+    let name = name.trim().to_lowercase();
+    if query.is_empty() || name.is_empty() {
+        return 0;
+    }
+    if name == query {
+        return 3;
+    }
+    if name.starts_with(&query) {
+        return 2;
+    }
+    // "rhapsody" should still find "Bohemian Rhapsody"; a bare substring would
+    // also match the middle of a word, which is noise rather than an answer.
+    if name.split_whitespace().any(|word| word.starts_with(&query)) {
+        return 1;
+    }
+    0
+}
+
+/// Picks the top result: best name match wins, and Spotify's own order breaks
+/// ties within a match quality. Their ranking is good, it just answers a
+/// different question than the one the search box asked.
+fn search_top_ref(
+    query: &str,
+    section: &SearchTopSectionJson,
+) -> Option<renderer_engine::protocol::SearchTopRef> {
     use renderer_engine::protocol::SearchTopRef;
     section
         .itemsV2
         .iter()
         .filter_map(|entry| entry.item.as_ref()?.data.as_ref())
-        .find_map(|data| {
+        .filter_map(|data| {
             let (top, id, name) = match data {
                 SearchTopDataJson::Track(hit) => {
                     let reference = track_ref_from_hit(hit);
@@ -3697,8 +3732,14 @@ fn search_top_ref(section: &SearchTopSectionJson) -> Option<renderer_engine::pro
                 }
                 SearchTopDataJson::Unsupported => return None,
             };
-            (!id.is_empty() && !name.is_empty()).then_some(top)
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some((top_match_rank(query, &name), top))
         })
+        .enumerate()
+        .max_by_key(|(index, (rank, _))| (*rank, std::cmp::Reverse(*index)))
+        .map(|(_, (_, top))| top)
 }
 
 fn overview_playlist_ref(item: &SearchPlaylistWrapperJson) -> Option<PlaylistRef> {
@@ -4818,7 +4859,7 @@ pub async fn search_browse(
         let parsed: SearchDesktopResponse = serde_json::from_slice(&payload)
             .map_err(|error| format!("unparseable search response: {error}"))?;
         return Ok(renderer_engine::protocol::SearchBrowse {
-            top: search_top_ref(&parsed.data.searchV2.topResultsV2),
+            top: search_top_ref(query.trim(), &parsed.data.searchV2.topResultsV2),
             tracks: parsed
                 .data
                 .searchV2
@@ -5338,6 +5379,63 @@ mod tests {
         assert!(refs.is_empty());
     }
 
+    /// Spotify ranks `topResultsV2` by popularity, so "taylor" puts the track
+    /// "Style" above the artist Taylor Swift — the whole catalogue outranks the
+    /// person who made it. Someone typing an artist's name is asking for the
+    /// artist, so the name match decides and their order only breaks ties.
+    #[test]
+    fn search_top_result_prefers_what_the_query_actually_names() {
+        let body = r#"{
+            "itemsV2": [
+                {"item": {"__typename": "TrackResponseWrapper", "data": {
+                    "__typename": "Track",
+                    "uri": "spotify:track:1abcdefghijklmnopqrstu",
+                    "name": "Style"
+                }}},
+                {"item": {"__typename": "ArtistResponseWrapper", "data": {
+                    "__typename": "Artist",
+                    "uri": "spotify:artist:2abcdefghijklmnopqrstu",
+                    "profile": {"name": "Taylor Swift"}
+                }}}
+            ]
+        }"#;
+        let section: SearchTopSectionJson = serde_json::from_str(body).unwrap();
+
+        match search_top_ref("taylor", &section).expect("a top result") {
+            renderer_engine::protocol::SearchTopRef::Artist(artist) => {
+                assert_eq!(artist.name, "Taylor Swift");
+            }
+            other => panic!("expected the artist the query names, got {other:?}"),
+        }
+
+        // The same response, asked a different question: now the track is what
+        // was named, and Spotify's own leader is also the right answer.
+        match search_top_ref("style", &section).expect("a top result") {
+            renderer_engine::protocol::SearchTopRef::Track(track) => {
+                assert_eq!(track.name, "Style");
+            }
+            other => panic!("expected the track, got {other:?}"),
+        }
+
+        // Nothing matches the words typed, so their ranking stands unaltered.
+        match search_top_ref("zzzz", &section).expect("a top result") {
+            renderer_engine::protocol::SearchTopRef::Track(track) => {
+                assert_eq!(track.name, "Style");
+            }
+            other => panic!("expected Spotify's own leader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_match_rank_orders_exact_over_prefix_over_word_over_nothing() {
+        assert_eq!(top_match_rank("kygo", "Kygo"), 3);
+        assert_eq!(top_match_rank("taylor", "Taylor Swift"), 2);
+        assert_eq!(top_match_rank("rhapsody", "Bohemian Rhapsody"), 1);
+        assert_eq!(top_match_rank("psod", "Bohemian Rhapsody"), 0);
+        assert_eq!(top_match_rank("", "Kygo"), 0);
+        assert_eq!(top_match_rank("kygo", ""), 0);
+    }
+
     /// The whole point of reading `topResultsV2` rather than "first artist":
     /// a query whose best answer is a playlist must come back as that playlist,
     /// even when the response also carries artists. Verified against a live
@@ -5370,7 +5468,8 @@ mod tests {
             }
         }"#;
         let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        let top = search_top_ref(&parsed.data.searchV2.topResultsV2).expect("a top result");
+        let top = search_top_ref("top 50", &parsed.data.searchV2.topResultsV2)
+            .expect("a top result");
         match top {
             renderer_engine::protocol::SearchTopRef::Playlist(playlist) => {
                 assert_eq!(playlist.name, "Top 50 - Deutschland");
@@ -5398,7 +5497,8 @@ mod tests {
             }
         }"#;
         let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        let top = search_top_ref(&parsed.data.searchV2.topResultsV2).expect("a top result");
+        let top = search_top_ref("real answer", &parsed.data.searchV2.topResultsV2)
+            .expect("a top result");
         match top {
             renderer_engine::protocol::SearchTopRef::Artist(artist) => {
                 assert_eq!(artist.name, "Real Answer");
@@ -5413,7 +5513,7 @@ mod tests {
     fn search_desktop_top_result_absent_is_not_an_error() {
         let parsed: SearchDesktopResponse =
             serde_json::from_str(r#"{"data": {"searchV2": {}}}"#).unwrap();
-        assert!(search_top_ref(&parsed.data.searchV2.topResultsV2).is_none());
+        assert!(search_top_ref("anything", &parsed.data.searchV2.topResultsV2).is_none());
     }
 
     #[test]
@@ -5468,7 +5568,7 @@ mod tests {
         }"#;
         let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
         let converted = renderer_engine::protocol::SearchBrowse {
-            top: search_top_ref(&parsed.data.searchV2.topResultsV2),
+            top: search_top_ref("anything", &parsed.data.searchV2.topResultsV2),
             tracks: parsed
                 .data
                 .searchV2

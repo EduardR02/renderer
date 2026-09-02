@@ -95,6 +95,17 @@
     queueSearch(search.query);
   }
 
+  /**
+   * Clears the field and the results in one gesture, and puts the caret back
+   * so the next query can just be typed — the button is only ever reached
+   * mid-search, and dismissing the keyboard focus there would cost a click.
+   */
+  function clearSearch() {
+    search.query = "";
+    queueSearch("");
+    field?.focus();
+  }
+
   /** Enter skips the remaining debounce without duplicating an in-flight call. */
   function onSubmit(e) {
     e.preventDefault();
@@ -141,5 +152,10 @@
       spellcheck="false"
       onfocus={() => route.name !== "search" && navigate("search")}
     />
+    {#if search.query}
+      <button type="button" class="search-clear" title="Clear search" onclick={clearSearch}>
+        <Icon name="x" size={11} />
+      </button>
+    {/if}
   </form>
 </div>

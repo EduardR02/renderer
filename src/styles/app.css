@@ -877,6 +877,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   text-overflow: ellipsis;
 }
 .searchbox input::placeholder { color: var(--fg-2); }
+/* Sits inside the field's own border, so it must not add height: the box is a
+   fixed 32px and a taller child would push the border out. */
+.search-clear {
+  flex: none; display: grid; place-items: center;
+  width: 20px; height: 20px; margin-right: -2px;
+  border: 0; border-radius: var(--rf); background: none;
+  color: var(--fg-2); cursor: pointer;
+  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+}
+.search-clear:hover { color: var(--fg); background: var(--hover-2); }
 
 /* =====================================================================
    PAGE SCAFFOLD
