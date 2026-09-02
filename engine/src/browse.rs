@@ -1956,7 +1956,14 @@ fn metadata_artist_overview(artist: &Artist) -> ArtistOverview {
         header_image_url: largest_cover_url(
             artist.portraits.iter().chain(artist.portrait_group.iter()),
         ),
-        biography_image_url: largest_cover_url(biography_images),
+        // One picture from this path, deliberately: `portraits` and
+        // `portrait_group` are the SAME photograph at several sizes, not
+        // several photographs, so there is nothing here to page through. The
+        // gallery that has more than one arrives from the overview query and
+        // replaces this in `merge_artist_overview`.
+        biography_image_urls: largest_cover_url(biography_images)
+            .into_iter()
+            .collect(),
         popularity: u32::try_from(artist.popularity)
             .ok()
             .filter(|popularity| *popularity > 0),
@@ -1991,10 +1998,10 @@ fn merge_artist_overview(
                 .header_image_url
                 .clone_from(&supplied.header_image_url);
         }
-        if supplied.biography_image_url.is_some() {
+        if !supplied.biography_image_urls.is_empty() {
             overview
-                .biography_image_url
-                .clone_from(&supplied.biography_image_url);
+                .biography_image_urls
+                .clone_from(&supplied.biography_image_urls);
         }
         overview.followers = supplied.followers;
         overview.monthly_listeners = supplied.monthly_listeners;
@@ -2018,14 +2025,16 @@ fn merge_artist_overview(
         if let Some(header) = visuals.header() {
             overview.header_image_url = Some(header.to_owned());
         }
-        if overview.biography_image_url.is_none() {
-            overview.biography_image_url = visuals.biography().map(str::to_owned);
+        if overview.biography_image_urls.is_empty() {
+            overview
+                .biography_image_urls
+                .extend(visuals.biography().map(str::to_owned));
         }
     }
 
     (overview.biography.is_some()
         || overview.header_image_url.is_some()
-        || overview.biography_image_url.is_some()
+        || !overview.biography_image_urls.is_empty()
         || overview.popularity.is_some()
         || overview.followers.is_some()
         || overview.monthly_listeners.is_some()
@@ -3182,11 +3191,18 @@ struct SearchDesktopData {
 #[derive(Default, Deserialize)]
 #[allow(non_snake_case)] // GraphQL schema field names
 struct SearchV2Json {
-    #[serde(default)]
+    /// The aliases are the PREVIOUS persisted query's names for the same two
+    /// sections, verified against a live response from the fallback hash: the
+    /// payloads underneath are byte-for-byte the shapes these structs already
+    /// parse, only the section keys are pre-V2. Without them a hash rotation
+    /// (the reason the fallback exists at all) silently costs search its whole
+    /// Albums row and its Top Result panel, which is a worse failure than the
+    /// rejected request the fallback was added to survive.
+    #[serde(default, alias = "topResults")]
     topResultsV2: SearchTopSectionJson,
     #[serde(default)]
     tracksV2: SearchTrackSectionJson,
-    #[serde(default)]
+    #[serde(default, alias = "albums")]
     albumsV2: SearchAlbumSectionJson,
     #[serde(default)]
     artists: SearchArtistSectionJson,
@@ -3645,19 +3661,35 @@ fn playlist_ref_from_hit(hit: &SearchPlaylistHitJson) -> PlaylistRef {
             .and_then(|content| parse_count(content.totalCount.as_ref())),
     }
 }
-/// Drops repeats of an id, keeping the first and the service's ordering.
+/// Keeps the entities a card could actually be made of, in the service's own
+/// order: those with both an id and a name, each id only once.
 ///
-/// The per-kind sections can carry one entity twice: a live `OK Computer`
-/// search returns the same album id in two album slots. A grid that draws the
-/// same record twice is wrong on its own terms, and it also throws in the view
-/// — the card grids are keyed by id, and Svelte refuses a duplicate key — so
-/// the whole results page fails to render on nothing worse than a repeated
-/// row. Fixed here, where the id is the identity, rather than per view.
-fn dedupe_by_id<T>(items: Vec<T>, id: impl Fn(&T) -> &str) -> Vec<T> {
+/// Two failures with one cause, and they compound. A hit whose id or name did
+/// not map is not a result — a card's whole job is to be clicked, and there is
+/// nothing to open and nothing to read on it, so it draws as a blank tile with
+/// a placeholder cover. Worse, every unmapped hit in a section carries the
+/// SAME empty id, so deduping folds all of them onto one: a playlists section
+/// whose hits all failed to map arrived as exactly one nameless "?" card
+/// rather than as none, and the row rendered around it. That is the empty
+/// playlist that turned up in search results. `openable_playlist_ref` has
+/// always applied this rule to the artist page's shelves; the search sections
+/// never did.
+///
+/// The dedupe is the older half. The per-kind sections can carry one entity
+/// twice: a live `OK Computer` search returns the same album id in two album
+/// slots. A grid that draws the same record twice is wrong on its own terms,
+/// and it also throws in the view — the card grids are keyed by id, and Svelte
+/// refuses a duplicate key — so the whole results page fails to render on
+/// nothing worse than a repeated row. Both belong here, where the id is the
+/// identity, rather than in each view.
+fn openable_by_id<T>(items: Vec<T>, identity: impl Fn(&T) -> (&str, &str)) -> Vec<T> {
     let mut seen = HashSet::new();
     items
         .into_iter()
-        .filter(|item| seen.insert(id(item).to_owned()))
+        .filter(|item| {
+            let (id, name) = identity(item);
+            !id.is_empty() && !name.is_empty() && seen.insert(id.to_owned())
+        })
         .collect()
 }
 
@@ -3742,7 +3774,15 @@ fn search_top_ref(
         .map(|(_, (_, top))| top)
 }
 
-fn overview_playlist_ref(item: &SearchPlaylistWrapperJson) -> Option<PlaylistRef> {
+/// One playlist wrapper, mapped only if it is a playlist this app can open.
+///
+/// `PlaylistResponseWrapper` is a union: the same slot carries `Playlist`,
+/// `NotFound` for something deleted or unavailable in the region, and kinds
+/// that have been added before and will be again. Only a server-tagged
+/// `Playlist` with an id and a name becomes a card. Shared by the artist
+/// page's playlist shelves and by search results, which is the point — they
+/// were disagreeing about it.
+fn openable_playlist_ref(item: &SearchPlaylistWrapperJson) -> Option<PlaylistRef> {
     let hit = item.data.as_ref()?;
     if hit.typename.as_deref() != Some("Playlist") {
         return None;
@@ -3806,7 +3846,7 @@ fn overview_playlist_refs(section: Option<&ArtistOverviewPlaylistSectionJson>) -
         .and_then(|section| section.items.as_deref())
         .into_iter()
         .flatten()
-        .filter_map(overview_playlist_ref)
+        .filter_map(openable_playlist_ref)
         .filter(|reference| seen.insert(reference.uri.clone()))
         .collect()
 }
@@ -4352,12 +4392,17 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
     let visuals = artist.visuals.as_ref();
     let header_image_url =
         overview_largest_image(visuals.and_then(|visuals| visuals.avatarImage.as_ref()));
-    let biography_image_url = visuals
+    // Every gallery entry, not the first: `visuals.gallery.items` is a list of
+    // distinct editorial photographs (eighteen of them for Taylor Swift), each
+    // carrying its own size ladder. Order is the service's ranking and is
+    // preserved.
+    let biography_image_urls = visuals
         .and_then(|visuals| visuals.gallery.as_ref())
         .and_then(|gallery| gallery.items.as_deref())
         .unwrap_or_default()
         .iter()
-        .find_map(|image| overview_largest_image(Some(image)));
+        .filter_map(|image| overview_largest_image(Some(image)))
+        .collect();
     let biography = profile
         .and_then(|profile| profile.biography.as_ref())
         .and_then(|biography| biography.text.as_deref())
@@ -4451,7 +4496,7 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
         overview: ArtistOverview {
             biography,
             header_image_url,
-            biography_image_url,
+            biography_image_urls,
             popularity: None,
             followers,
             monthly_listeners,
@@ -4868,7 +4913,7 @@ pub async fn search_browse(
                 .iter()
                 .map(|wrapper| track_ref_from_hit(&wrapper.item.data))
                 .collect(),
-            albums: dedupe_by_id(
+            albums: openable_by_id(
                 parsed
                     .data
                     .searchV2
@@ -4877,9 +4922,9 @@ pub async fn search_browse(
                     .iter()
                     .map(|wrapper| album_ref_from_hit(&wrapper.data))
                     .collect(),
-                |album| album.id.as_str(),
+                |album| (album.id.as_str(), album.name.as_str()),
             ),
-            artists: dedupe_by_id(
+            artists: openable_by_id(
                 parsed
                     .data
                     .searchV2
@@ -4888,9 +4933,9 @@ pub async fn search_browse(
                     .iter()
                     .map(|wrapper| artist_ref_from_hit(&wrapper.data))
                     .collect(),
-                |artist| artist.id.as_str(),
+                |artist| (artist.id.as_str(), artist.name.as_str()),
             ),
-            playlists: dedupe_by_id(
+            playlists: openable_by_id(
                 parsed
                     .data
                     .searchV2
@@ -4899,10 +4944,9 @@ pub async fn search_browse(
                     .and_then(|section| section.items.as_deref())
                     .unwrap_or_default()
                     .iter()
-                    .filter_map(|wrapper| wrapper.data.as_ref())
-                    .map(playlist_ref_from_hit)
+                    .filter_map(openable_playlist_ref)
                     .collect(),
-                |playlist| playlist.id.as_str(),
+                |playlist| (playlist.id.as_str(), playlist.name.as_str()),
             ),
         });
     }
@@ -5655,6 +5699,7 @@ mod tests {
                     "playlists": {
                         "items": [
                             {"data": {
+                                "__typename": "Playlist",
                                 "uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
                                 "name": "Public Mix",
                                 "description": "<p>The essential <b>tracks</b>, all in <a href='https://example.invalid'>one playlist</a>.</p>",
@@ -5670,6 +5715,7 @@ mod tests {
                                 "content": {"totalCount": "42"}
                             }},
                             {"data": {
+                                "__typename": "Playlist",
                                 "uri": "spotify:playlist:1abcdefghijklmnopqrstu",
                                 "name": "Owner URI fallback",
                                 "ownerV2": {"data": {"uri": "spotify:user:bob"}}
@@ -5679,18 +5725,7 @@ mod tests {
                 }
             }
         }"#;
-        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-        let playlists: Vec<PlaylistRef> = parsed
-            .data
-            .searchV2
-            .playlists
-            .as_ref()
-            .and_then(|section| section.items.as_deref())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|wrapper| wrapper.data.as_ref())
-            .map(playlist_ref_from_hit)
-            .collect();
+        let playlists = search_playlist_section(body);
 
         assert_eq!(playlists.len(), 2);
         assert_eq!(playlists[0].id, "0123456789ABCDEFGHIJKL");
@@ -5717,8 +5752,18 @@ mod tests {
             r#"{"data":{"searchV2":{"playlists":{"items":null}}}}"#,
             r#"{"data":{"searchV2":{"playlists":{"items":[{"data":null}]}}}}"#,
         ] {
-            let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
-            let playlists: Vec<PlaylistRef> = parsed
+            assert!(
+                search_playlist_section(body).is_empty(),
+                "variant playlist sections must not fail or add blank cards"
+            );
+        }
+    }
+
+    /// The Playlists section exactly as `search_browse` assembles it.
+    fn search_playlist_section(body: &str) -> Vec<PlaylistRef> {
+        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        openable_by_id(
+            parsed
                 .data
                 .searchV2
                 .playlists
@@ -5726,14 +5771,120 @@ mod tests {
                 .and_then(|section| section.items.as_deref())
                 .unwrap_or_default()
                 .iter()
-                .filter_map(|wrapper| wrapper.data.as_ref())
-                .map(playlist_ref_from_hit)
-                .collect();
-            assert!(
-                playlists.is_empty(),
-                "variant playlist sections must not fail or add blank cards"
-            );
-        }
+                .filter_map(openable_playlist_ref)
+                .collect(),
+            |playlist| (playlist.id.as_str(), playlist.name.as_str()),
+        )
+    }
+
+    #[test]
+    fn search_playlists_drop_every_hit_that_could_not_become_a_card() {
+        // The regression. Each of the first three entries fails to map — an
+        // unavailable union member, a Playlist whose uri and name did not come
+        // back, and a kind this app has nowhere to send — and each one used to
+        // map to the SAME empty id. The dedupe then folded all of them onto
+        // ONE survivor, so a section of nothing but junk arrived as a single
+        // nameless card with a placeholder cover, and the Playlists row
+        // rendered around it. That is the "empty playlist with a ? cover".
+        let mixed = r#"{"data":{"searchV2":{"playlists":{"items":[
+            {"data": {"__typename": "NotFound"}},
+            {"data": {"__typename": "Playlist"}},
+            {"data": {"__typename": "PseudoPlaylist",
+                      "uri": "spotify:collection:tracks", "name": "Liked Songs"}},
+            {"data": {"__typename": "Playlist",
+                      "uri": "spotify:playlist:4abcdefghijklmnopqrstu", "name": "A Real Playlist"}},
+            {"data": {"__typename": "Playlist",
+                      "uri": "spotify:playlist:4abcdefghijklmnopqrstu", "name": "A Real Playlist"}}
+        ]}}}}"#;
+        let playlists = search_playlist_section(mixed);
+        assert_eq!(playlists.len(), 1, "one real playlist, listed once");
+        assert_eq!(playlists[0].name, "A Real Playlist");
+
+        // And a section in which NOTHING maps is an EMPTY section, so the view
+        // has no row to draw rather than a row with one blank tile in it.
+        let junk = r#"{"data":{"searchV2":{"playlists":{"items":[
+            {"data": {"__typename": "NotFound"}},
+            {"data": {"__typename": "Playlist"}},
+            {"data": {"__typename": "Playlist", "uri": "spotify:playlist:x"}}
+        ]}}}}"#;
+        assert!(search_playlist_section(junk).is_empty());
+    }
+
+    #[test]
+    fn search_albums_and_artists_drop_hits_with_no_id_or_no_name() {
+        let body = r#"{"data":{"searchV2":{
+            "albumsV2": {"items": [
+                {"data": {"__typename": "Album", "name": "No URI"}},
+                {"data": {"__typename": "Album", "uri": "spotify:album:1abcdefghijklmnopqrstu"}},
+                {"data": {"__typename": "Album",
+                          "uri": "spotify:album:2abcdefghijklmnopqrstu", "name": "Real Record"}}
+            ]},
+            "artists": {"items": [
+                {"data": {"__typename": "Artist", "profile": {"name": "No URI"}}},
+                {"data": {"__typename": "Artist",
+                          "uri": "spotify:artist:3abcdefghijklmnopqrstu",
+                          "profile": {"name": "Real Artist"}}}
+            ]}
+        }}}"#;
+        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        let albums = openable_by_id(
+            parsed
+                .data
+                .searchV2
+                .albumsV2
+                .items
+                .iter()
+                .map(|wrapper| album_ref_from_hit(&wrapper.data))
+                .collect(),
+            |album| (album.id.as_str(), album.name.as_str()),
+        );
+        let artists = openable_by_id(
+            parsed
+                .data
+                .searchV2
+                .artists
+                .items
+                .iter()
+                .map(|wrapper| artist_ref_from_hit(&wrapper.data))
+                .collect(),
+            |artist| (artist.id.as_str(), artist.name.as_str()),
+        );
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].name, "Real Record");
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].name, "Real Artist");
+    }
+
+    #[test]
+    fn search_reads_the_previous_persisted_querys_section_names() {
+        // The fallback hash answers with `albums` and `topResults` where the
+        // current one answers with `albumsV2` and `topResultsV2`; the payloads
+        // underneath are identical. Verified against a live response — without
+        // the aliases a hash rotation silently costs search its Albums row and
+        // its Top Result panel.
+        let body = r#"{"data":{"searchV2":{
+            "albums": {"items": [
+                {"data": {"__typename": "Album",
+                          "uri": "spotify:album:5abcdefghijklmnopqrstu", "name": "Old Shape"}}
+            ]},
+            "topResults": {"itemsV2": [
+                {"item": {"data": {"__typename": "Artist",
+                                   "uri": "spotify:artist:6abcdefghijklmnopqrstu",
+                                   "profile": {"name": "Old Shape Artist"}}}}
+            ]}
+        }}}"#;
+        let parsed: SearchDesktopResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.data.searchV2.albumsV2.items.len(), 1);
+        assert_eq!(
+            album_ref_from_hit(&parsed.data.searchV2.albumsV2.items[0].data).name,
+            "Old Shape"
+        );
+        let top = search_top_ref("old shape artist", &parsed.data.searchV2.topResultsV2)
+            .expect("the pre-V2 top-result section still ranks");
+        assert!(matches!(
+            top,
+            renderer_engine::protocol::SearchTopRef::Artist(_)
+        ));
     }
 
     #[test]
@@ -6289,9 +6440,12 @@ mod tests {
             parsed.overview.header_image_url.as_deref(),
             Some("header-large")
         );
+        // Both gallery entries, each at its own largest source: the About
+        // section pages through them, so dropping everything after the first
+        // would make the rest of an artist's pictures unreachable.
         assert_eq!(
-            parsed.overview.biography_image_url.as_deref(),
-            Some("bio-large")
+            parsed.overview.biography_image_urls,
+            vec!["bio-large".to_owned(), "bio-second".to_owned()]
         );
         assert_eq!(parsed.overview.followers, Some(1200));
         assert_eq!(parsed.overview.monthly_listeners, Some(3400));
@@ -6468,8 +6622,8 @@ mod tests {
             Some(format!("{COVER_BASE}{}", "a2".repeat(20))).as_deref()
         );
         assert_eq!(
-            overview.biography_image_url.as_deref(),
-            Some(format!("{COVER_BASE}{}", "b2".repeat(20))).as_deref()
+            overview.biography_image_urls,
+            vec![format!("{COVER_BASE}{}", "b2".repeat(20))]
         );
         assert!(overview.followers.is_none());
         assert!(overview.popular_releases.is_empty());

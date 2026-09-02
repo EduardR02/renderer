@@ -753,8 +753,21 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .np-empty span { display: block; margin-top: var(--s2); font-size: var(--t-12); }
 /* `position: relative` is the containing block for the topbar's scroll
    sentinel and nothing else — every other absolutely positioned box inside the
-   pane already has a positioned parent of its own. */
-.scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; position: relative; }
+   pane already has a positioned parent of its own.
+
+   `scrollbar-gutter: stable` because the TOPBAR LIVES IN HERE. Every other
+   scroller in the app holds content that can afford to reflow by a scrollbar
+   width; this one holds the search field, and it is sticky, so the moment a
+   page grew past the viewport the 10px scrollbar took its width out of the
+   content box and shifted the field the user was typing into 10px to the
+   left, under their cursor. Typing one character did it, and clicking the
+   clear button did it back. The gutter is reserved at all times instead, so
+   the pane is inset by the same 10px whether or not the page scrolls — which
+   is what the sidebar list and the now-playing rail already do. */
+.scroll {
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; position: relative;
+  scrollbar-gutter: stable;
+}
 
 /* ---------------------------------------------------------------- topbar */
 .topbar {
@@ -859,16 +872,40 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .topbar-play:hover { background: var(--accent-hi); }
 
-/* The field fills its grid track, which is where the sizing now lives. */
+/* The field fills its grid track, which is where the sizing now lives.
+   `--rf`, not `--r2`: it shares this bar with two round history buttons and a
+   round play button, and at 6px it was the one squared-off object among them —
+   a form control dropped into a row of chrome. The ends also give the
+   magnifier and the clear button somewhere to sit that reads as inside the
+   field rather than jammed against a corner, which is why the inline padding
+   is asymmetric: 16px of lead-in for the glyph, 12px of run-out for a control
+   that carries its own 20px hit circle. */
 .searchbox {
   display: flex; align-items: center; gap: var(--s2); min-width: 0;
-  width: 100%; height: 32px; padding: 0 var(--s3);
-  border-radius: var(--r2); background: var(--bg-2);
-  border: 1px solid var(--line); color: var(--fg-2);
-  transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+  width: 100%; height: 32px; padding: 0 var(--s3) 0 var(--s4);
+  border-radius: var(--rf); background: var(--bg-2);
+  border: 1px solid var(--line);
+  /* Owns the magnifier, which inherits it. A glyph carries more ink than text
+     of the same value, so at rest it sits one rung below the placeholder it
+     stands next to and the two read as the same weight. */
+  color: var(--fg-3);
+  transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease),
+              color var(--d1) var(--ease);
 }
 .searchbox:hover:not(:focus-within) { border-color: var(--line-2); }
-.searchbox:focus-within { border-color: var(--foam); background: var(--bg-3); }
+/* Focus used to swap the whole perimeter to undiluted foam, which made a text
+   field the loudest object in the window: 340px of saturated ring around the
+   one control that is already announcing itself with a caret. The state to
+   communicate is "typing lands here", and the app has a quieter vocabulary for
+   it — the surface lifts to the same --bg-3 every other control uses when it is
+   active, the hairline takes foam at hairline strength, and the magnifier
+   comes up a rung with it. Three small agreeing signals instead of one loud
+   one. */
+.searchbox:focus-within {
+  background: var(--bg-3);
+  border-color: color-mix(in srgb, var(--foam) 46%, transparent);
+  color: var(--fg-1);
+}
 .searchbox input {
   flex: 1; min-width: 0; height: 100%; border: 0; background: none;
   outline: none; font-size: var(--t-13); color: var(--fg);
@@ -878,12 +915,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .searchbox input::placeholder { color: var(--fg-2); }
 /* Sits inside the field's own border, so it must not add height: the box is a
-   fixed 32px and a taller child would push the border out. */
+   fixed 32px and a taller child would push the border out. Pulled 4px past the
+   run-out padding so the CIRCLE, not the glyph inside it, is what ends 8px
+   from the pill's edge. */
 .search-clear {
   flex: none; display: grid; place-items: center;
-  width: 20px; height: 20px; margin-right: -2px;
+  width: 20px; height: 20px; margin-right: -4px;
   border: 0; border-radius: var(--rf); background: none;
-  color: var(--fg-2); cursor: pointer;
+  color: var(--fg-3); cursor: pointer;
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .search-clear:hover { color: var(--fg); background: var(--hover-2); }
@@ -1667,6 +1706,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
               background-color var(--d1) var(--ease);
   box-shadow: 0 8px 18px -4px rgba(0, 0, 0, 0.7);
 }
+/* Opacity here is not decoration, it is whether the button exists yet — and
+   `button:disabled { opacity: 0.35 }` at the top of this file is one step MORE
+   specific than a bare `.card-play`, so it was quietly claiming it. Pressing
+   one card's play button sets `busy.id`, which disables EVERY card's play
+   button while the browse is in flight; all of them therefore faded up to 0.35
+   and back, and a whole grid of play buttons flashed on for the length of a
+   transition. Restated at the disabled state's own specificity, and above the
+   reveal rules so a revealed button still reveals. */
+.card-play:disabled { opacity: 0; }
 .card:hover .card-play,
 .card-play:focus-visible,
 .card-open:focus-visible ~ .card-play { opacity: 1; transform: none; }

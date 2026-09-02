@@ -879,9 +879,11 @@ pub struct ArtistOverview {
     /// Largest artist-page avatar supplied by `visuals.avatarImage`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header_image_url: Option<String>,
-    /// First editorial gallery image supplied for the artist biography.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub biography_image_url: Option<String>,
+    /// Every editorial gallery image supplied for the artist biography, in the
+    /// order the service ranks them. An artist can publish more than one — the
+    /// live overview for Taylor Swift carries eighteen — so this is a list
+    /// rather than the first of them.
+    pub biography_image_urls: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub popularity: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

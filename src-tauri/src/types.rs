@@ -642,7 +642,9 @@ impl From<ArtistTopCity> for ArtistTopCityDetail {
 pub struct ArtistOverviewDetail {
     pub biography: Option<String>,
     pub header_image_url: Option<String>,
-    pub biography_image_url: Option<String>,
+    /// Every editorial gallery picture, in the service's own order. The About
+    /// section pages through them.
+    pub biography_image_urls: Vec<String>,
     pub popularity: Option<u32>,
     pub followers: Option<u64>,
     pub monthly_listeners: Option<u64>,
@@ -696,7 +698,7 @@ impl From<ArtistOverview> for ArtistOverviewDetail {
         Self {
             biography: overview.biography,
             header_image_url: overview.header_image_url,
-            biography_image_url: overview.biography_image_url,
+            biography_image_urls: overview.biography_image_urls,
             popularity: overview.popularity,
             followers: overview.followers,
             monthly_listeners: overview.monthly_listeners,
@@ -1206,7 +1208,7 @@ mod tests {
         let overview = ArtistOverview {
             biography: Some("Biography".into()),
             header_image_url: Some("header".into()),
-            biography_image_url: Some("biography-image".into()),
+            biography_image_urls: vec!["biography-image".into(), "biography-image-2".into()],
             popularity: Some(77),
             followers: Some(1_200),
             monthly_listeners: Some(3_400),
@@ -1241,8 +1243,8 @@ mod tests {
         assert_eq!(frontend.biography.as_deref(), Some("Biography"));
         assert_eq!(frontend.header_image_url.as_deref(), Some("header"));
         assert_eq!(
-            frontend.biography_image_url.as_deref(),
-            Some("biography-image")
+            frontend.biography_image_urls,
+            vec!["biography-image".to_owned(), "biography-image-2".to_owned()]
         );
         assert_eq!(frontend.top_cities[0].listeners, Some(900));
         assert_eq!(frontend.popular_releases[0].artist_ids, vec!["artist"]);

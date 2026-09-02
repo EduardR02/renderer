@@ -63,7 +63,25 @@
   const popularity = $derived(
     Number.isFinite(overview?.popularity) && overview.popularity > 0 ? overview.popularity : null,
   );
-  const aboutFigure = $derived(overview?.biography_image_url || overview?.header_image_url || "");
+  /* The About picture is a GALLERY, not a picture. `visuals.gallery.items`
+     carries every editorial photograph the artist has — eighteen of them for
+     Taylor Swift — and this page was drawing item zero with no way to reach
+     the rest. The header avatar stands in for artists whose gallery is empty,
+     and one image is simply a gallery of one: the stepper below the figure
+     appears only when there is somewhere to step to. */
+  const aboutFigures = $derived.by(() => {
+    const gallery = overview?.biography_image_urls ?? [];
+    if (gallery.length) return gallery;
+    return overview?.header_image_url ? [overview.header_image_url] : [];
+  });
+  let figureIndex = $state(0);
+  /* Clamped rather than trusted: the artist can change under a stale index. */
+  const aboutFigure = $derived(aboutFigures[Math.min(figureIndex, aboutFigures.length - 1)] ?? "");
+  function stepFigure(delta) {
+    const n = aboutFigures.length;
+    if (n < 2) return;
+    figureIndex = (Math.min(figureIndex, n - 1) + delta + n) % n;
+  }
   /* The supporting pair. Monthly listeners also lead the header now, and that
      is deliberate rather than an oversight: up there the figure is the first
      thing you read about an artist, down here it is the number the follower
@@ -177,6 +195,8 @@
     playError = "";
     popularExpanded = false;
     songwriterExpanded = false;
+    shelfExpanded = false;
+    figureIndex = 0;
   });
 
   /* An overview may be refreshed independently of the catalogue payload. Do
@@ -231,7 +251,37 @@
     const n = Math.floor((usable + CARD_GAP) / (CARD_MIN + CARD_GAP));
     return Math.max(2, Math.min(7, n));
   });
-  const visibleShelf = $derived(shelf.slice(0, perRow));
+  /**
+   * Popular releases is the one segment that is already complete.
+   *
+   * The overview payload carries all ten ranked releases (Taylor Swift:
+   * `popularReleasesAlbums.items` is ten long), the tab counts them honestly
+   * as ten, and the shelf then drew one row of five and offered "5 more" —
+   * which opened the discography reader, a view that has no Popular grouping
+   * at all, because that ranking exists only in this payload. The five under
+   * the fold were unreachable by any route. So this segment expands in place
+   * instead, exactly as Popular songs above it does; the named catalogue
+   * segments keep the link, because for those there genuinely IS more behind
+   * it and the reader genuinely does have it.
+   */
+  let shelfExpanded = $state(false);
+  const shelfExpandable = $derived(group === "popular");
+  const visibleShelf = $derived(
+    shelf.slice(0, shelfExpandable && shelfExpanded ? shelf.length : perRow),
+  );
+  /**
+   * How many of this segment are not on screen — the number the button says.
+   *
+   * Taken from the SEGMENT's own count, which is the number its tab is already
+   * showing, and not from `shelf.length`. A named segment hydrates one bounded
+   * page at a time, so `shelf.length` is a fact about the last request rather
+   * than about the catalogue: Albums arrived with six loaded against a tab
+   * reading 33, and the link offered "1 more" to a view that then listed all
+   * 33. Reading the tab's own figure is what makes the two agree, and it is
+   * one number in one place instead of two that can drift.
+   */
+  const shelfTotal = $derived(segments.find((segment) => segment.id === group)?.count ?? 0);
+  const shelfRemaining = $derived(Math.max(0, shelfTotal - visibleShelf.length));
   const visibleRelatedArtists = $derived(relatedArtists.slice(0, perRow));
   const appearsOnCount = $derived(counts.appears_on ?? 0);
   const appearsOnReleases = $derived.by(() =>
@@ -396,6 +446,7 @@
      symmetric. */
   let popularSectionEl = $state(null);
   let songwriterSectionEl = $state(null);
+  let dxSectionEl = $state(null);
 
   function toggleExpand(scrollHost, mutate) {
     const sc = scrollHost?.closest(".scroll") ?? null;
@@ -881,7 +932,7 @@
     {/if}
 
     {#if hasReleases}
-      <section class="section dx" aria-labelledby="dx-title">
+      <section class="section dx" aria-labelledby="dx-title" bind:this={dxSectionEl}>
         <div class="section-head">
           <h2 class="section-title" id="dx-title">
             Discography<span class="section-count tnum">{releaseTotal}</span>
@@ -898,7 +949,10 @@
               class:on={group === option.id}
               role="tab"
               aria-selected={group === option.id}
-              onclick={() => (group = option.id)}
+              onclick={() => {
+                group = option.id;
+                shelfExpanded = false;
+              }}
             >
               {option.label}<span class="seg-n tnum">{option.count}</span>
             </button>
@@ -941,11 +995,25 @@
               </div>
             {/each}
           </div>
-          {#if shelf.length > visibleShelf.length}
+          {#if shelfExpandable}
+            {#if shelfRemaining > 0 || shelfExpanded}
+              <!-- Ranked releases are all here already, so this grows the row
+                   rather than leaving the page. Same count, same wording; it
+                   now delivers what it names. -->
+              <button
+                class="shelf-more"
+                aria-expanded={shelfExpanded}
+                onclick={() => toggleExpand(dxSectionEl, () => (shelfExpanded = !shelfExpanded))}
+              >
+                {shelfExpanded ? "Show less" : `${shelfRemaining} more`}
+                <Icon name={shelfExpanded ? "chevron-up" : "chevron-down"} size={12} />
+              </button>
+            {/if}
+          {:else if shelfRemaining > 0}
             <!-- The count is the point: it says how much is behind the link,
                  so "See all" is an informed click rather than a guess. -->
             <button class="shelf-more" onclick={openDiscography}>
-              {shelf.length - visibleShelf.length} more<Icon name="fwd" size={12} />
+              {shelfRemaining} more<Icon name="fwd" size={12} />
             </button>
           {/if}
         {:else}
@@ -1036,8 +1104,23 @@
                  proportions. It was once drawn into the same 148px tile the
                  search results use, then into a fixed portrait box that cropped
                  the sides off a landscape source; it is now simply itself. -->
-            <figure class="about-figure">
+            <figure class="about-figure" class:gallery={aboutFigures.length > 1}>
               <Cover src={aboutFigure} id={artist.id} name={artist.name} natural lg raised />
+              {#if aboutFigures.length > 1}
+                <!-- A caption, not a carousel. No dots for eighteen pictures,
+                     no auto-advance, nothing that moves on its own — two
+                     steppers and the position, set at caption size under the
+                     picture they belong to. -->
+                <figcaption class="figure-nav">
+                  <button class="fig-step" title="Previous picture" aria-label="Previous picture" onclick={() => stepFigure(-1)}>
+                    <Icon name="back" size={12} />
+                  </button>
+                  <span class="fig-n tnum">{Math.min(figureIndex, aboutFigures.length - 1) + 1} / {aboutFigures.length}</span>
+                  <button class="fig-step" title="Next picture" aria-label="Next picture" onclick={() => stepFigure(1)}>
+                    <Icon name="fwd" size={12} />
+                  </button>
+                </figcaption>
+              {/if}
             </figure>
           {/if}
 
@@ -1422,6 +1505,40 @@
      where width/height/aspect are settled. Nothing to override here. */
   .about-figure {
     margin: 0; width: 100%; max-width: 440px; align-self: start; --tile: 300px;
+  }
+  /* A gallery is mounted; a lone photograph is free-standing.
+
+     Natural proportions are exactly right for one editorial photograph and
+     exactly wrong for eighteen of them. Measured in this column, the gallery
+     runs from 279x119 to 279x402, so stepping resized the figure by up to
+     250px: the Next button walked out from under the cursor between clicks,
+     and every section below About moved with it. A picture browser whose
+     browsing shoves the page is not a quiet one.
+
+     So when there is a gallery the picture goes back INTO the app's own tile —
+     one square card, at the shape every other piece of artwork here takes —
+     with the photograph contained whole inside it and the tile's own surface
+     showing as the mat. Nothing is cropped and nothing moves. `.art` already
+     is that tile; these two rules only decline the `natural` overrides, and
+     leave the pending ground alone so a loading picture still has one. */
+  .about-figure.gallery :global(.art.natural) { aspect-ratio: 1; height: auto; }
+  .about-figure.gallery :global(.art.natural:not(.pending)) { background: var(--bg-2); }
+  .about-figure.gallery :global(.art.natural > img) { height: 100%; object-fit: contain; }
+  /* Left-aligned under the picture's edge, at the size the rest of the card's
+     micro-text is set at. It is a caption; it should read as one. */
+  .figure-nav {
+    display: flex; align-items: center; gap: var(--s1);
+    margin-top: var(--s2); color: var(--fg-2);
+  }
+  .fig-step {
+    display: grid; place-items: center; width: 22px; height: 22px;
+    border-radius: var(--rf); color: var(--fg-2);
+    transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+  }
+  .fig-step:hover { color: var(--fg); background: var(--hover-2); }
+  .fig-n {
+    padding: 0 var(--s1);
+    font-family: var(--font-small); font-size: var(--t-11); color: var(--fg-2);
   }
   /* Measure belongs to the prose, not to the block that holds it: the cities
      want the width, a paragraph does not. */

@@ -157,7 +157,7 @@ fixtures.artist = {
   overview: {
     biography: "A fixture artist: enough prose to draw the About card, nothing more.",
     header_image_url: null,
-    biography_image_url: null,
+    biography_image_urls: [],
     popularity: 72,
     followers: 1234567,
     monthly_listeners: 9876543,
