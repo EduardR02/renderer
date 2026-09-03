@@ -1100,7 +1100,7 @@ impl Engine {
             Command::PlayQueueIndex { index } => self.play_queue_index(index),
             Command::Play => self.play(),
             Command::Pause => self.pause(),
-            Command::Next => self.advance(false),
+            Command::Next => self.advance_with_current_skip(false, false, true),
             Command::Previous => self.previous(),
             Command::Seek { position_ms } => self.seek_transport(position_ms),
             Command::SetVolume { percent } => self.set_volume(percent),
@@ -1892,8 +1892,8 @@ impl Engine {
             self.state.duration_ms = self.state.queue[index].duration_ms;
             self.update_transport_position(0);
             self.state.error = None;
-            let start_playing = self.state.playing;
-            self.load_current(start_playing)?;
+            // Symmetric with Next: the press is the request to hear it.
+            self.load_current(true)?;
             Ok(true)
         } else {
             // No earlier track (first track, or already restarting): seek the
@@ -1931,13 +1931,19 @@ impl Engine {
     }
 
     fn advance(&mut self, at_end: bool) -> Result<bool, String> {
-        self.advance_with_current_skip(at_end, false)
+        self.advance_with_current_skip(at_end, false, false)
     }
 
+    /// `resume` is what separates a press of Next from the two advances the
+    /// engine makes on its own. Pressing Next asks to *hear* the next track, so
+    /// it starts a paused queue playing; a natural boundary and an unavailable
+    /// track carry the transport intent across instead, because neither is a
+    /// request to start playback.
     fn advance_with_current_skip(
         &mut self,
         at_end: bool,
         skip_current_for_repeat: bool,
+        resume: bool,
     ) -> Result<bool, String> {
         if at_end {
             // Flush delayed speed/cut output before changing configuration.
@@ -1963,14 +1969,11 @@ impl Engine {
                 self.state.duration_ms = self.state.queue[index].duration_ms;
                 self.update_transport_position(0);
                 self.state.error = None;
-                // A track change carries the transport intent across, exactly
-                // as `previous` does: a paused queue does not start playing
-                // because the user skipped or a track failed, and a playing one
-                // does not fall silent. Loading with a fixed `true` made the
-                // engine call itself paused while librespot played the new
-                // track, leaving the two to be reconciled by whichever event
-                // happened to arrive next.
-                let start_playing = self.state.playing;
+                // Either way the load and `state.playing` agree, which is the
+                // part that matters: loading with a fixed `true` used to leave
+                // the engine calling itself paused while librespot played the
+                // new track, to be reconciled by whichever event arrived next.
+                let start_playing = resume || self.state.playing;
                 if at_end {
                     self.load_current_after_natural_boundary(start_playing)?;
                 } else {
@@ -2499,7 +2502,7 @@ impl Engine {
                 // `skip_current_for_repeat` guard prevents repeat-one from
                 // retrying the same failed loader forever. With no candidate,
                 // the branch below simply leaves this failed row stopped.
-                if let Err(error) = self.advance_with_current_skip(false, true) {
+                if let Err(error) = self.advance_with_current_skip(false, true, false) {
                     self.state.playing = false;
                     self.state.error = Some(error);
                 }
@@ -3935,6 +3938,7 @@ mod tests {
     /// whichever player event happened to arrive next.
     #[tokio::test(flavor = "current_thread")]
     async fn a_track_change_carries_the_transport_intent_across() {
+        // The engine's own advance carries the intent across.
         let (mut paused, _paused_probe) = engine_with_player();
         paused.state = two_track_state();
         paused.state.playing = false;
@@ -3942,7 +3946,21 @@ mod tests {
         assert_eq!(paused.state.current_index, Some(1));
         assert!(
             !paused.state.playing,
-            "skipping ahead in a paused queue must not start playback"
+            "an automatic advance must not start a paused queue playing"
+        );
+
+        // A press of Next is a request to hear the next track, so it resumes.
+        let (mut pressed, _pressed_probe) = engine_with_player();
+        pressed.state = two_track_state();
+        pressed.state.playing = false;
+        assert_eq!(
+            pressed.advance_with_current_skip(false, false, true),
+            Ok(true)
+        );
+        assert_eq!(pressed.state.current_index, Some(1));
+        assert!(
+            pressed.state.playing,
+            "pressing Next on a paused queue must start playing"
         );
 
         let (mut playing, _playing_probe) = engine_with_player();
