@@ -16,6 +16,7 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import Biography from "../components/Biography.svelte";
+  import GalleryLightbox from "../components/GalleryLightbox.svelte";
   import { GROUPS, RELEASE_KEYS } from "../lib/discography.svelte.js";
   import { artistPlaylistCollections, playlistSubtitle } from "../lib/artist.js";
 
@@ -68,19 +69,78 @@
      Taylor Swift — and this page was drawing item zero with no way to reach
      the rest. The header avatar stands in for artists whose gallery is empty,
      and one image is simply a gallery of one: the stepper below the figure
-     appears only when there is somewhere to step to. */
+     appears only when there is somewhere to step to.
+
+     Each entry is `{ url, width, height }`. The avatar is a bare url and is
+     wrapped as an unmeasured entry, which costs it nothing — a gallery of one
+     has no set to be sized against. */
   const aboutFigures = $derived.by(() => {
-    const gallery = overview?.biography_image_urls ?? [];
+    const gallery = overview?.biography_images ?? [];
     if (gallery.length) return gallery;
-    return overview?.header_image_url ? [overview.header_image_url] : [];
+    return overview?.header_image_url ? [{ url: overview.header_image_url }] : [];
   });
   let figureIndex = $state(0);
   /* Clamped rather than trusted: the artist can change under a stale index. */
-  const aboutFigure = $derived(aboutFigures[Math.min(figureIndex, aboutFigures.length - 1)] ?? "");
+  const figurePosition = $derived(Math.min(figureIndex, Math.max(0, aboutFigures.length - 1)));
+  const aboutFigure = $derived(aboutFigures[figurePosition] ?? null);
   function stepFigure(delta) {
     const n = aboutFigures.length;
     if (n < 2) return;
-    figureIndex = (Math.min(figureIndex, n - 1) + delta + n) % n;
+    figureIndex = (figurePosition + delta + n) % n;
+  }
+  /* ------------------------------------------------------- the About frame
+     ONE shape for the whole gallery, decided before a single picture loads.
+
+     The square this replaces was stable and nothing else. It was chosen
+     because stepping at each picture's own proportions resized the figure by
+     up to 250px, so the Next button walked out from under the cursor and every
+     section below About moved with it. But a square buys that stability by
+     discarding the shape of all eighteen photographs, and the shape is most of
+     what an editorial picture is. The dimensions now travel with the urls, so
+     the frame can be derived from the entire set at once — which is exactly as
+     immovable while stepping, and is at least the gallery's own shape.
+
+     MEDIAN rather than mean: one panorama among seventeen portraits must not
+     flatten the frame for the other seventeen, and a median simply does not
+     see it. CLAMPED because a gallery whose median genuinely is 3:1 would
+     still turn this column into a letterbox slot with a page around it.
+     Pictures the service did not measure count as square, so they neither skew
+     the result nor fall out of it. */
+  const FRAME_MIN_ASPECT = 0.75;
+  const FRAME_MAX_ASPECT = 1.6;
+  const frameAspect = $derived.by(() => {
+    if (aboutFigures.length < 2) return 0;
+    const ratios = aboutFigures
+      .map((item) => {
+        const w = Number(item?.width);
+        const h = Number(item?.height);
+        return w > 0 && h > 0 ? w / h : 1;
+      })
+      .sort((a, b) => a - b);
+    const mid = ratios.length >> 1;
+    const median = ratios.length % 2 ? ratios[mid] : (ratios[mid - 1] + ratios[mid]) / 2;
+    return Math.min(FRAME_MAX_ASPECT, Math.max(FRAME_MIN_ASPECT, median));
+  });
+  /* The ceiling is the picture's own width, or 560, whichever is smaller.
+     Blowing a 640px source up to 560 CSS px is already soft on a 1.5x display;
+     past its own width it is a bigger blur and nothing else. The engine says
+     what that width is, so the cap can be honest instead of a guess. */
+  const FIGURE_MAX = 560;
+  const figureMax = $derived.by(() => {
+    const widest = Math.max(0, ...aboutFigures.map((item) => Number(item?.width) || 0));
+    return widest ? Math.min(FIGURE_MAX, widest) : FIGURE_MAX;
+  });
+  /* The frame is deliberately not the whole picture at its own scale, so there
+     has to be somewhere the whole picture IS. */
+  let lightboxOpen = $state(false);
+  let figureButton = $state(null);
+  function closeLightbox() {
+    lightboxOpen = false;
+    /* Back to the control that opened it, and on the frame AFTER the state
+       change: the overlay is still the modal until its own effect runs
+       `close()`, and while it is, every other element in the document is inert
+       and a focus() call on one is simply discarded. */
+    requestAnimationFrame(() => figureButton?.focus());
   }
   /* The supporting pair. Monthly listeners also lead the header now, and that
      is deliberate rather than an oversight: up there the figure is the first
@@ -197,6 +257,7 @@
     songwriterExpanded = false;
     shelfExpanded = false;
     figureIndex = 0;
+    lightboxOpen = false;
   });
 
   /* An overview may be refreshed independently of the catalogue payload. Do
@@ -662,7 +723,7 @@
   }
 </script>
 {#snippet playlistCard(pl)}
-  {@const tone = coverTone(pl.cover_url || pl.cover_urls?.[0] || "", pl.id)}
+  {@const tone = coverTone(pl.cover_url || pl.cover_urls, pl.id)}
   <div class="card" style:--tone-glow={tone.glow}>
     <div class="card-art">
       <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} fill lg />
@@ -700,7 +761,7 @@
   either looking like a mistake.
 -->
 {#snippet pickCard(item)}
-  {@const tone = coverTone(item.cover || item.covers?.[0] || "", item.id)}
+  {@const tone = coverTone(item.cover || item.covers, item.id)}
   <div
     class="pick"
     class:playable={item.kind === "track"}
@@ -1100,12 +1161,26 @@
         <h2 class="about-head" id="about-title">About</h2>
         <div class="about-body" class:no-figure={!aboutFigure} class:wide={aboutWide}>
           {#if aboutFigure}
-            <!-- The official editorial photograph, whole and at its own
-                 proportions. It was once drawn into the same 148px tile the
-                 search results use, then into a fixed portrait box that cropped
-                 the sides off a landscape source; it is now simply itself. -->
-            <figure class="about-figure" class:gallery={aboutFigures.length > 1}>
-              <Cover src={aboutFigure} id={artist.id} name={artist.name} natural lg raised />
+            <!-- The official editorial photograph, whole and never cropped. It
+                 was once drawn into the same 148px tile the search results use,
+                 then into a fixed portrait box that cut the sides off a
+                 landscape source. It is now shown at the gallery's own shape,
+                 and clicking it opens the picture at the size it was made at. -->
+            <figure
+              class="about-figure"
+              class:gallery={aboutFigures.length > 1}
+              style:--figure-max="{figureMax}px"
+              style:--frame-aspect={frameAspect || null}
+            >
+              <button
+                class="figure-open"
+                bind:this={figureButton}
+                title="View at full size"
+                aria-label={`View ${artist.name} at full size`}
+                onclick={() => (lightboxOpen = true)}
+              >
+                <Cover src={aboutFigure.url} id={artist.id} name={artist.name} natural lg raised />
+              </button>
               {#if aboutFigures.length > 1}
                 <!-- A caption, not a carousel. No dots for eighteen pictures,
                      no auto-advance, nothing that moves on its own — two
@@ -1115,7 +1190,7 @@
                   <button class="fig-step" title="Previous picture" aria-label="Previous picture" onclick={() => stepFigure(-1)}>
                     <Icon name="back" size={12} />
                   </button>
-                  <span class="fig-n tnum">{Math.min(figureIndex, aboutFigures.length - 1) + 1} / {aboutFigures.length}</span>
+                  <span class="fig-n tnum">{figurePosition + 1} / {aboutFigures.length}</span>
                   <button class="fig-step" title="Next picture" aria-label="Next picture" onclick={() => stepFigure(1)}>
                     <Icon name="fwd" size={12} />
                   </button>
@@ -1218,6 +1293,21 @@
             </div>
           {/if}
         </div>
+        {#if aboutFigure}
+          <!-- Outside the grid, deliberately: a <dialog> is a grid item like
+               anything else until it is open, and a track that exists only to
+               hold an invisible overlay is a gap in the card. It shares
+               `figureIndex` with the frame, so the overlay and the page are
+               never on different pictures. -->
+          <GalleryLightbox
+            open={lightboxOpen}
+            images={aboutFigures}
+            index={figurePosition}
+            name={artist.name}
+            onStep={stepFigure}
+            onClose={closeLightbox}
+          />
+        {/if}
       </section>
     {/if}
 
@@ -1475,9 +1565,17 @@
      than that when space got tight. Worst of both. A fractional track with a
      floor grows into whatever the card has and never collapses; the ceiling
      lives on the figure so an enormous window does not turn an editorial photo
-     into a poster. */
+     into a poster.
+
+     The fraction itself is larger than it was, and the floor with it. These
+     are editorial photographs, often 1600px at source, and the whole reason
+     they are on the page is to be looked at; a third of the card put them on
+     screen at about 300px, which is a thumbnail with a caption. The copy and
+     the cities lose a little width and lose nothing else — the popularity
+     meter is capped at 340px anyway, and a city row ellipsises its region
+     before anything else gives. */
   .about-body {
-    display: grid; grid-template-columns: minmax(200px, 0.85fr) minmax(0, 1.15fr);
+    display: grid; grid-template-columns: minmax(240px, 1.15fr) minmax(0, 1fr);
     gap: var(--s6) var(--s7); align-items: start;
   }
   .about-side { display: flex; flex-direction: column; gap: var(--s6); min-width: 0; }
@@ -1487,7 +1585,7 @@
      contents` earns its keep: the wrapper stops generating a box and its two
      children place themselves as grid items. */
   .about-body.wide {
-    grid-template-columns: minmax(220px, 1fr) minmax(0, 1fr) minmax(0, 1.2fr);
+    grid-template-columns: minmax(260px, 1.6fr) minmax(0, 0.95fr) minmax(0, 1.1fr);
   }
   .about-body.wide .about-side { display: contents; }
   /* No image, no column. An empty tile beside the copy would be a hole that
@@ -1502,9 +1600,12 @@
      tall hole. Letting the height follow the width means no crop at all and
      no letterbox either — the frame is whatever the image's frame is. */
   /* The shape is the picture's own — see the `natural` mode on Cover, which is
-     where width/height/aspect are settled. Nothing to override here. */
+     where width/height/aspect are settled. The ceiling comes in as
+     `--figure-max`, computed from the gallery's own widest source: past that
+     the picture is only being enlarged, not shown. */
   .about-figure {
-    margin: 0; width: 100%; max-width: 440px; align-self: start; --tile: 300px;
+    margin: 0; width: 100%; max-width: var(--figure-max, 560px);
+    align-self: start; --tile: 300px;
   }
   /* A gallery is mounted; a lone photograph is free-standing.
 
@@ -1515,15 +1616,26 @@
      and every section below About moved with it. A picture browser whose
      browsing shoves the page is not a quiet one.
 
-     So when there is a gallery the picture goes back INTO the app's own tile —
-     one square card, at the shape every other piece of artwork here takes —
-     with the photograph contained whole inside it and the tile's own surface
-     showing as the mat. Nothing is cropped and nothing moves. `.art` already
-     is that tile; these two rules only decline the `natural` overrides, and
-     leave the pending ground alone so a loading picture still has one. */
-  .about-figure.gallery :global(.art.natural) { aspect-ratio: 1; height: auto; }
+     So when there is a gallery the picture is mounted in one frame with the
+     photograph contained whole inside it and the frame's own surface showing
+     as the mat. Nothing is cropped and nothing moves. That frame used to be a
+     square, which was stable because it ignored every picture in the set;
+     `--frame-aspect` is the median of the set's own ratios, which is stable
+     because it is computed from all of them at once and never changes as you
+     step. `.art` already is the tile; these three rules only decline the
+     `natural` overrides, and leave the pending ground alone so a loading
+     picture still has one. */
+  .about-figure.gallery :global(.art.natural) {
+    aspect-ratio: var(--frame-aspect, 1); height: auto;
+  }
   .about-figure.gallery :global(.art.natural:not(.pending)) { background: var(--bg-2); }
   .about-figure.gallery :global(.art.natural > img) { height: 100%; object-fit: contain; }
+  /* The picture is a control, and it says so under the pointer only: a
+     permanent badge on a photograph is chrome laid over the thing you came to
+     look at. */
+  .figure-open { display: block; width: 100%; border-radius: var(--r3); }
+  .figure-open :global(.art) { transition: filter var(--d1) var(--ease); }
+  .figure-open:hover :global(.art) { filter: brightness(1.1); }
   /* Left-aligned under the picture's edge, at the size the rest of the card's
      micro-text is set at. It is a caption; it should read as one. */
   .figure-nav {
@@ -1629,7 +1741,9 @@
     .about-body { grid-template-columns: minmax(0, 1fr); gap: var(--s5); }
     .about-side { display: flex; }
     /* Width only. Forcing a ratio here would put the old portrait box back and
-       reserve space the picture does not occupy. */
-    .about-figure { width: min(260px, 62%); }
+       reserve space the picture does not occupy. It is wider than it was for
+       the same reason the tracks above are: stacked above the copy the picture
+       has the whole card to work with, and 260px of it was timid. */
+    .about-figure { width: min(420px, 80%); }
   }
 </style>

@@ -52,7 +52,7 @@
   style:--tone-glow={tone.glow}
 >
   {#snippet playlistCard(playlist)}
-  {@const tone = coverTone(playlist.cover_url || playlist.cover_urls?.[0] || "", playlist.id)}
+  {@const tone = coverTone(playlist.cover_url || playlist.cover_urls, playlist.id)}
   <div class="card" style:--tone-glow={tone.glow}>
     <div class="card-art">
       <Cover

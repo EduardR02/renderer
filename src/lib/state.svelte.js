@@ -262,6 +262,10 @@ export const playback = $state({
   current_index: -1,
   current_uri: null,
   queue: [],
+  /* Queue indexes in the order automatic playback will actually reach them,
+     current row excluded. Only the engine knows this: it holds the live
+     shuffle bag and the per-playlist exclusions, so index order is a guess. */
+  upcoming: [],
   error: null,
 });
 let playingRequestGeneration = 0;

@@ -283,7 +283,7 @@
   {:else}
     <div class="search-split">
       {#if top}
-        {@const topTone = coverTone(top.cover_url || top.cover_urls?.[0] || "", top.id)}
+        {@const topTone = coverTone(top.cover_url || top.cover_urls, top.id)}
         <div class="split-top">
           <div class="section-head"><h2 class="section-title">Top result</h2></div>
           <!-- The one big coloured object on a results page. Search has no
@@ -345,7 +345,7 @@
         <div class="section-head"><h2 class="section-title">Playlists</h2></div>
         <div class="grid">
           {#each playlists as pl (pl.id)}
-            {@const tone = coverTone(pl.cover_url || pl.cover_urls?.[0] || "", pl.id)}
+            {@const tone = coverTone(pl.cover_url || pl.cover_urls, pl.id)}
             <div class="card" style:--tone-glow={tone.glow}>
               <div class="card-art">
                 <Cover

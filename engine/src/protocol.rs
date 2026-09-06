@@ -866,6 +866,27 @@ pub struct ArtistTopCity {
     pub listeners: Option<u64>,
 }
 
+/// One editorial photograph, carrying the dimensions the service reported for
+/// the source that was chosen.
+///
+/// A URL alone was not enough. The About gallery has to commit to one frame
+/// shape before a single picture has loaded — otherwise stepping through it
+/// resizes the figure and shoves the page — and the only way to compute that
+/// shape up front is to know how big the pictures are. Spotify already says.
+///
+/// Both dimensions stay optional because the persisted GraphQL document is not
+/// ours: a rotation that stops sending `height` must cost the frame its
+/// precision, not its existence.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ArtistImage {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
 /// Optional facts and recommendations that augment the metadata4 artist page.
 ///
 /// This stays a separate object because the pathfinder overview document is a
@@ -882,8 +903,9 @@ pub struct ArtistOverview {
     /// Every editorial gallery image supplied for the artist biography, in the
     /// order the service ranks them. An artist can publish more than one — the
     /// live overview for Taylor Swift carries eighteen — so this is a list
-    /// rather than the first of them.
-    pub biography_image_urls: Vec<String>,
+    /// rather than the first of them. The header avatar above stays a bare URL:
+    /// it is one portrait in a fixed banner, with no gallery to be sized around.
+    pub biography_images: Vec<ArtistImage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub popularity: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1107,6 +1129,12 @@ pub struct StateEvent<'a> {
     pub current_index: Option<usize>,
     pub current_uri: Option<&'a str>,
     pub queue: &'a [TrackRef],
+    /// Queue indexes in the order automatic playback will actually reach them,
+    /// current row excluded: shuffle's live bag when shuffle is on, the
+    /// sequential walk when it is off, exclusions and unavailable rows already
+    /// removed. Derived state, never restored or persisted — the UI would
+    /// otherwise have to guess at a plan only the engine holds.
+    pub upcoming: Vec<usize>,
     pub error: Option<&'a str>,
 }
 
@@ -1337,6 +1365,7 @@ mod tests {
             current_index: Some(0),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
             queue: &queue,
+            upcoming: vec![2, 1],
             error: None,
         })
         .unwrap();
@@ -1348,6 +1377,8 @@ mod tests {
         assert_eq!(state["current_uri"], queue[0].uri);
         assert_eq!(state["queue"][0]["artist_names"], json!(["Artist"]));
         assert_eq!(state["queue"][0]["duration_ms"], 123_456);
+        // The plan is queue indexes in play order, not a second copy of rows.
+        assert_eq!(state["upcoming"], json!([2, 1]));
         assert!(state["error"].is_null());
         // The authorize URL is only present while a login attempt is pending.
         assert!(state["auth_url"].is_null());
@@ -1372,6 +1403,7 @@ mod tests {
             current_index: None,
             current_uri: None,
             queue: &[],
+            upcoming: Vec::new(),
             error: None,
         })
         .unwrap();
@@ -1876,6 +1908,7 @@ mod tests {
             current_index: None,
             current_uri: None,
             queue: &[],
+            upcoming: Vec::new(),
             error: None,
         })
         .unwrap();
@@ -1897,6 +1930,7 @@ mod tests {
             current_index: None,
             current_uri: None,
             queue: &[],
+            upcoming: Vec::new(),
             error: None,
         })
         .unwrap();

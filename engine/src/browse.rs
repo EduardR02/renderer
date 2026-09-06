@@ -64,7 +64,8 @@ use protobuf::{EnumOrUnknown, Message};
 use serde::Deserialize;
 
 use renderer_engine::protocol::{
-    AlbumRef, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity, Canvas,
+    AlbumRef, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity,
+    Canvas,
     CreditArtist, CreditRole, PlaylistRecommendations, PlaylistRef, RadioBrowse,
     SongwriterPlaylist, TrackCredits, TrackRef, sanitize_playlist_description,
 };
@@ -122,16 +123,20 @@ pub fn cover_url(images: &Images) -> Option<String> {
         .map(|hex| format!("{COVER_BASE}{hex}"))
 }
 
-fn largest_cover_url<'a>(
+/// The largest of a metadata4 image set, with its dimensions. Metadata4 states
+/// both axes on every image, so the biography portrait it yields is measured
+/// even when the overview document is unavailable entirely.
+fn largest_cover_image<'a>(
     images: impl IntoIterator<Item = &'a librespot_metadata::image::Image>,
-) -> Option<String> {
-    images
-        .into_iter()
-        .max_by_key(|image| {
-            i64::from(image.width.max(0)).saturating_mul(i64::from(image.height.max(0)))
-        })
-        .and_then(|image| image.id.to_base16().ok())
-        .map(|hex| format!("{COVER_BASE}{hex}"))
+) -> Option<ArtistImage> {
+    let image = images.into_iter().max_by_key(|image| {
+        i64::from(image.width.max(0)).saturating_mul(i64::from(image.height.max(0)))
+    })?;
+    Some(ArtistImage {
+        url: format!("{COVER_BASE}{}", image.id.to_base16().ok()?),
+        width: u32::try_from(image.width).ok().filter(|width| *width > 0),
+        height: u32::try_from(image.height).ok().filter(|height| *height > 0),
+    })
 }
 
 fn id_of(uri: &SpotifyUri) -> String {
@@ -1953,15 +1958,16 @@ fn metadata_artist_overview(artist: &Artist) -> ArtistOverview {
     });
     ArtistOverview {
         biography: biography.map(|biography| biography.text.trim().to_owned()),
-        header_image_url: largest_cover_url(
+        header_image_url: largest_cover_image(
             artist.portraits.iter().chain(artist.portrait_group.iter()),
-        ),
+        )
+        .map(|image| image.url),
         // One picture from this path, deliberately: `portraits` and
         // `portrait_group` are the SAME photograph at several sizes, not
         // several photographs, so there is nothing here to page through. The
         // gallery that has more than one arrives from the overview query and
         // replaces this in `merge_artist_overview`.
-        biography_image_urls: largest_cover_url(biography_images)
+        biography_images: largest_cover_image(biography_images)
             .into_iter()
             .collect(),
         popularity: u32::try_from(artist.popularity)
@@ -1998,10 +2004,10 @@ fn merge_artist_overview(
                 .header_image_url
                 .clone_from(&supplied.header_image_url);
         }
-        if !supplied.biography_image_urls.is_empty() {
+        if !supplied.biography_images.is_empty() {
             overview
-                .biography_image_urls
-                .clone_from(&supplied.biography_image_urls);
+                .biography_images
+                .clone_from(&supplied.biography_images);
         }
         overview.followers = supplied.followers;
         overview.monthly_listeners = supplied.monthly_listeners;
@@ -2025,16 +2031,23 @@ fn merge_artist_overview(
         if let Some(header) = visuals.header() {
             overview.header_image_url = Some(header.to_owned());
         }
-        if overview.biography_image_urls.is_empty() {
+        if overview.biography_images.is_empty() {
+            // The visual-identity trait is a protobuf of URLs and nothing else,
+            // so these arrive unmeasured and the About frame falls back to a
+            // neutral square for them. That is the correct trade: a picture the
+            // page can draw beats a shape the page can compute.
             overview
-                .biography_image_urls
-                .extend(visuals.biography().map(str::to_owned));
+                .biography_images
+                .extend(visuals.biography().map(|url| ArtistImage {
+                    url: url.to_owned(),
+                    ..ArtistImage::default()
+                }));
         }
     }
 
     (overview.biography.is_some()
         || overview.header_image_url.is_some()
-        || !overview.biography_image_urls.is_empty()
+        || !overview.biography_images.is_empty()
         || overview.popularity.is_some()
         || overview.followers.is_some()
         || overview.monthly_listeners.is_some()
@@ -3458,6 +3471,12 @@ struct SearchImageSourceJson {
     url: Option<String>,
     #[serde(default)]
     width: Option<u32>,
+    /// The schema's `ImageSource` carries both axes. Only the gallery reads
+    /// the height — it is what lets the About frame be shaped before the
+    /// pictures load — but it is parsed here because this is the one type
+    /// every image source in this file is deserialized through.
+    #[serde(default)]
+    height: Option<u32>,
 }
 
 #[derive(Default, Deserialize)]
@@ -4314,15 +4333,27 @@ fn overview_image(image: Option<&ArtistOverviewImageJson>) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
-fn overview_largest_image(image: Option<&ArtistOverviewImageJson>) -> Option<String> {
-    image?
+/// The widest source of one editorial image, with whatever dimensions came
+/// with it.
+///
+/// Width and height are carried rather than dropped because the About gallery
+/// sizes one frame from the whole set before anything loads. They are copied
+/// only when the service actually sent a positive number: a zero is not a
+/// measurement, and a gallery item that pretends to be 0-by-0 would poison the
+/// frame's median as thoroughly as a real outlier.
+fn overview_largest_image(image: Option<&ArtistOverviewImageJson>) -> Option<ArtistImage> {
+    let source = image?
         .sources
         .as_deref()
         .unwrap_or_default()
         .iter()
         .filter(|source| source.url.as_deref().is_some_and(|url| !url.is_empty()))
-        .max_by_key(|source| source.width.unwrap_or(0))
-        .and_then(|source| source.url.clone())
+        .max_by_key(|source| source.width.unwrap_or(0))?;
+    Some(ArtistImage {
+        url: source.url.clone()?,
+        width: source.width.filter(|width| *width > 0),
+        height: source.height.filter(|height| *height > 0),
+    })
 }
 
 fn overview_related_artist_ref(artist: &ArtistOverviewRelatedArtistJson) -> ArtistRef {
@@ -4390,13 +4421,13 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
     let stats = artist.stats.as_ref();
     let discography = artist.discography.as_ref();
     let visuals = artist.visuals.as_ref();
-    let header_image_url =
-        overview_largest_image(visuals.and_then(|visuals| visuals.avatarImage.as_ref()));
+    let header_image_url = overview_largest_image(visuals.and_then(|v| v.avatarImage.as_ref()))
+        .map(|image| image.url);
     // Every gallery entry, not the first: `visuals.gallery.items` is a list of
     // distinct editorial photographs (eighteen of them for Taylor Swift), each
     // carrying its own size ladder. Order is the service's ranking and is
     // preserved.
-    let biography_image_urls = visuals
+    let biography_images = visuals
         .and_then(|visuals| visuals.gallery.as_ref())
         .and_then(|gallery| gallery.items.as_deref())
         .unwrap_or_default()
@@ -4496,7 +4527,7 @@ fn parse_artist_overview_payload(payload: &[u8]) -> Result<ArtistOverviewQuery, 
         overview: ArtistOverview {
             biography,
             header_image_url,
-            biography_image_urls,
+            biography_images,
             popularity: None,
             followers,
             monthly_listeners,
@@ -6381,13 +6412,13 @@ mod tests {
                 "profile": {"biography": {"text": "  A real biography.\nSecond paragraph.  "}},
                 "visuals": {
                     "avatarImage": {"sources": [
-                        {"url": "header-small", "width": 320},
-                        {"url": "header-large", "width": 1200}
+                        {"url": "header-small", "width": 320, "height": 320},
+                        {"url": "header-large", "width": 1200, "height": 1200}
                     ]},
                     "gallery": {"items": [
                         {"sources": [
-                            {"url": "bio-small", "width": 400},
-                            {"url": "bio-large", "width": 1600}
+                            {"url": "bio-small", "width": 400, "height": 268},
+                            {"url": "bio-large", "width": 1600, "height": 1072}
                         ]},
                         {"sources": [{"url": "bio-second", "width": 1800}]}
                     ]}
@@ -6442,10 +6473,24 @@ mod tests {
         );
         // Both gallery entries, each at its own largest source: the About
         // section pages through them, so dropping everything after the first
-        // would make the rest of an artist's pictures unreachable.
+        // would make the rest of an artist's pictures unreachable. The second
+        // entry is the degraded case — a source with a width and no height —
+        // and it must survive as a picture with an unknown shape rather than
+        // be dropped or given an invented one.
         assert_eq!(
-            parsed.overview.biography_image_urls,
-            vec!["bio-large".to_owned(), "bio-second".to_owned()]
+            parsed.overview.biography_images,
+            vec![
+                ArtistImage {
+                    url: "bio-large".to_owned(),
+                    width: Some(1600),
+                    height: Some(1072),
+                },
+                ArtistImage {
+                    url: "bio-second".to_owned(),
+                    width: Some(1800),
+                    height: None,
+                },
+            ]
         );
         assert_eq!(parsed.overview.followers, Some(1200));
         assert_eq!(parsed.overview.monthly_listeners, Some(3400));
@@ -6474,6 +6519,44 @@ mod tests {
         );
         assert_eq!(parsed.top_playcounts.get("spotify:track:first"), Some(&99));
         assert!(!parsed.top_playcounts.contains_key("spotify:track:zero"));
+    }
+
+    #[test]
+    fn gallery_images_degrade_to_an_unmeasured_picture_rather_than_a_measured_lie() {
+        // The persisted document is not ours and its `ImageSource` shape can
+        // rotate. When it does, the About frame has to fall back to a neutral
+        // shape — which it can only do if an unmeasured picture is reported as
+        // unmeasured. Zero is the trap: it deserializes happily and would be
+        // read downstream as a real 0-by-0 photograph.
+        let body = br#"{
+            "data": {"artistUnion": {"visuals": {"gallery": {"items": [
+                {"sources": [{"url": "no-dimensions"}]},
+                {"sources": [{"url": "zeroed", "width": 0, "height": 0}]},
+                {"sources": [{"url": "portrait", "width": 640, "height": 960}]}
+            ]}}}}
+        }"#;
+
+        let parsed = parse_artist_overview_payload(body).unwrap();
+        assert_eq!(
+            parsed.overview.biography_images,
+            vec![
+                ArtistImage {
+                    url: "no-dimensions".to_owned(),
+                    width: None,
+                    height: None,
+                },
+                ArtistImage {
+                    url: "zeroed".to_owned(),
+                    width: None,
+                    height: None,
+                },
+                ArtistImage {
+                    url: "portrait".to_owned(),
+                    width: Some(640),
+                    height: Some(960),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -6622,8 +6705,12 @@ mod tests {
             Some(format!("{COVER_BASE}{}", "a2".repeat(20))).as_deref()
         );
         assert_eq!(
-            overview.biography_image_urls,
-            vec![format!("{COVER_BASE}{}", "b2".repeat(20))]
+            overview.biography_images,
+            vec![ArtistImage {
+                url: format!("{COVER_BASE}{}", "b2".repeat(20)),
+                width: Some(300),
+                height: Some(300),
+            }]
         );
         assert!(overview.followers.is_none());
         assert!(overview.popular_releases.is_empty());
@@ -7034,6 +7121,7 @@ mod tests {
                     .map(|width| SearchImageSourceJson {
                         url: Some(format!("https://i.scdn.co/image/w{width}")),
                         width: Some(*width),
+                        height: Some(*width),
                     })
                     .collect(),
             }
@@ -7062,6 +7150,7 @@ mod tests {
             sources: vec![SearchImageSourceJson {
                 url: Some("https://i.scdn.co/image/unsized".to_owned()),
                 width: None,
+                height: None,
             }],
         };
         assert_eq!(

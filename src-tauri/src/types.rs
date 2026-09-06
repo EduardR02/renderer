@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use renderer_engine::protocol::{
     normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
-    ArtistCataloguePage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
+    ArtistCataloguePage, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
     ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist,
     CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage, PlaylistBrowse,
     PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, SearchTopRef,
@@ -626,6 +626,29 @@ pub struct ArtistTopCityDetail {
     pub listeners: Option<u64>,
 }
 
+/// One editorial photograph with the dimensions the service reported for it.
+/// The About gallery needs the shape of every picture before any of them has
+/// loaded, so the size travels with the URL rather than being discovered on
+/// load. Absent dimensions reach the page as null and are read there as a
+/// neutral square.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ArtistImageDetail {
+    pub url: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+impl From<ArtistImage> for ArtistImageDetail {
+    fn from(image: ArtistImage) -> Self {
+        Self {
+            url: image.url,
+            width: image.width,
+            height: image.height,
+        }
+    }
+}
+
 impl From<ArtistTopCity> for ArtistTopCityDetail {
     fn from(city: ArtistTopCity) -> Self {
         Self {
@@ -643,8 +666,8 @@ pub struct ArtistOverviewDetail {
     pub biography: Option<String>,
     pub header_image_url: Option<String>,
     /// Every editorial gallery picture, in the service's own order. The About
-    /// section pages through them.
-    pub biography_image_urls: Vec<String>,
+    /// section pages through them, and sizes its frame from all of them at once.
+    pub biography_images: Vec<ArtistImageDetail>,
     pub popularity: Option<u32>,
     pub followers: Option<u64>,
     pub monthly_listeners: Option<u64>,
@@ -698,7 +721,11 @@ impl From<ArtistOverview> for ArtistOverviewDetail {
         Self {
             biography: overview.biography,
             header_image_url: overview.header_image_url,
-            biography_image_urls: overview.biography_image_urls,
+            biography_images: overview
+                .biography_images
+                .into_iter()
+                .map(ArtistImageDetail::from)
+                .collect(),
             popularity: overview.popularity,
             followers: overview.followers,
             monthly_listeners: overview.monthly_listeners,
@@ -917,6 +944,11 @@ pub struct PlaybackState {
     #[serde(deserialize_with = "string_or_default")]
     pub current_uri: String,
     pub queue: Vec<Track>,
+    /// Queue indexes in the order automatic playback will actually reach them,
+    /// current row excluded. Derived by the engine from shuffle's live bag or
+    /// the sequential walk, with exclusions and unavailable rows removed, so it
+    /// is never restored or persisted — only forwarded.
+    pub upcoming: Vec<usize>,
     #[serde(deserialize_with = "string_or_default")]
     pub error: String,
 }
@@ -941,6 +973,7 @@ impl Default for PlaybackState {
             current_index: None,
             current_uri: String::new(),
             queue: Vec::new(),
+            upcoming: Vec::new(),
             error: String::new(),
         }
     }
@@ -1208,7 +1241,17 @@ mod tests {
         let overview = ArtistOverview {
             biography: Some("Biography".into()),
             header_image_url: Some("header".into()),
-            biography_image_urls: vec!["biography-image".into(), "biography-image-2".into()],
+            biography_images: vec![
+                ArtistImage {
+                    url: "biography-image".into(),
+                    width: Some(1600),
+                    height: Some(1072),
+                },
+                ArtistImage {
+                    url: "biography-image-2".into(),
+                    ..ArtistImage::default()
+                },
+            ],
             popularity: Some(77),
             followers: Some(1_200),
             monthly_listeners: Some(3_400),
@@ -1242,9 +1285,23 @@ mod tests {
         let frontend = ArtistOverviewDetail::from(overview);
         assert_eq!(frontend.biography.as_deref(), Some("Biography"));
         assert_eq!(frontend.header_image_url.as_deref(), Some("header"));
+        // Dimensions cross the boundary with the URL, and a picture the service
+        // did not measure crosses as unmeasured — the page reads that as a
+        // neutral shape rather than as a photograph one pixel square.
         assert_eq!(
-            frontend.biography_image_urls,
-            vec!["biography-image".to_owned(), "biography-image-2".to_owned()]
+            frontend.biography_images,
+            vec![
+                ArtistImageDetail {
+                    url: "biography-image".to_owned(),
+                    width: Some(1600),
+                    height: Some(1072),
+                },
+                ArtistImageDetail {
+                    url: "biography-image-2".to_owned(),
+                    width: None,
+                    height: None,
+                },
+            ]
         );
         assert_eq!(frontend.top_cities[0].listeners, Some(900));
         assert_eq!(frontend.popular_releases[0].artist_ids, vec!["artist"]);

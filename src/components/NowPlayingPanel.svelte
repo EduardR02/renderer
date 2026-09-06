@@ -19,9 +19,7 @@
   const current = $derived(
     playback.current_index >= 0 ? (playback.queue[playback.current_index] ?? null) : null,
   );
-  const next = $derived(
-    playback.current_index >= 0 ? (playback.queue[playback.current_index + 1] ?? null) : null,
-  );
+  const next = $derived(playback.queue[playback.upcoming?.[0]] ?? null);
   const playCountFormatter = new Intl.NumberFormat();
 
   const canvasTrackKey = $derived(current?.id || current?.uri || "");

@@ -344,6 +344,13 @@ async fn run(
                                     )
                                     .map(|()| true);
                                 engine.send_response(&request_id, &result)?;
+                                // An exclusion changes nothing else in the
+                                // state, but it does change the upcoming plan,
+                                // so the queue view only tracks a toggle if a
+                                // fresh state follows the reply.
+                                if result.is_ok() {
+                                    engine.emit_state()?;
+                                }
                             }
                             // Browse and edit commands run their network work
                             // off the loop: the session clone is handed to a

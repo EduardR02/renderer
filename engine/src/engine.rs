@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -337,8 +337,8 @@ impl Engine {
             .set_excluded(playlist_id, track_id, excluded)?;
         // Exclusion changes never stop or reload the current track. They do
         // change every future choice, including a pending shuffle/preload
-        // decision, so rebuild those cheap plans immediately.
-        self.rebuild_shuffle_pool();
+        // decision, so fix up those cheap plans immediately.
+        self.repair_shuffle_pool_for_eligibility();
         self.preload_next();
         Ok(())
     }
@@ -367,6 +367,7 @@ impl Engine {
             current_index: self.state.current_index,
             current_uri,
             queue: &self.state.queue,
+            upcoming: self.upcoming_indices(),
             error: self.state.error.as_deref(),
         })
     }
@@ -1728,7 +1729,11 @@ impl Engine {
         self.state.duration_ms = duration_ms;
         self.update_transport_position(0);
         self.state.error = None;
-        self.rebuild_shuffle_pool();
+        // Clicking a row asks to hear that row, not to be handed a different
+        // random ordering of everything behind it, so the drawn plan survives
+        // minus the row that just became current. The row being left is not put
+        // back: `previous` owns that direction and pushes it there itself.
+        self.repair_shuffle_pool(|pooled| Some(pooled));
         self.last_track_change = Some(Instant::now());
         self.load_current(true)?;
         Ok(true)
@@ -2046,6 +2051,9 @@ impl Engine {
         }
         self.state.shuffle = enabled;
         self.history.clear();
+        // Switching shuffle on is the one place a full draw is the point: there
+        // is no earlier plan to preserve. Switching it off empties the bag by
+        // the same call.
         self.rebuild_shuffle_pool();
         self.preload_next();
         Ok(true)
@@ -2065,7 +2073,7 @@ impl Engine {
         parse_track_uri(&track)?;
         self.state.queue.push(track);
         self.history.clear();
-        self.rebuild_shuffle_pool();
+        self.splice_new_rows_into_shuffle_pool(self.state.queue.len() - 1);
         self.preload_next();
         Ok(true)
     }
@@ -2083,9 +2091,10 @@ impl Engine {
         if tracks.is_empty() {
             return Ok(true);
         }
+        let first_new = self.state.queue.len();
         self.state.queue.extend(tracks);
         self.history.clear();
-        self.rebuild_shuffle_pool();
+        self.splice_new_rows_into_shuffle_pool(first_new);
         self.preload_next();
         Ok(true)
     }
@@ -2138,7 +2147,19 @@ impl Engine {
             Some(current) if index < current => self.state.current_index = Some(current - 1),
             Some(_) => {}
         }
-        self.rebuild_shuffle_pool();
+        // The removed row leaves the bag and everything above it slides down
+        // one. Removing the current row also promotes a replacement that the
+        // bag may already hold; `repair_shuffle_pool` drops whatever is current
+        // by the time it runs, which is why this is called after the match.
+        self.repair_shuffle_pool(|pooled| {
+            if pooled == index {
+                None
+            } else if pooled > index {
+                Some(pooled - 1)
+            } else {
+                Some(pooled)
+            }
+        });
         if reload {
             self.load_current(was_playing)?;
         } else {
@@ -2161,7 +2182,12 @@ impl Engine {
             self.state.current_index = Some(remap_current_index_after_move(current, from, to));
         }
         self.history.clear();
-        self.rebuild_shuffle_pool();
+        // A move is a permutation of the queue, so the bag is remapped through
+        // the very function that just moved `current_index`. Writing the
+        // arithmetic out a second time here would be an opportunity for the two
+        // to disagree, and a bag that disagrees about where the current row
+        // went will happily hand it back as the next track.
+        self.repair_shuffle_pool(|pooled| Some(remap_current_index_after_move(pooled, from, to)));
         self.preload_next();
         Ok(true)
     }
@@ -2300,6 +2326,62 @@ impl Engine {
             &self.track_edits,
         )
     }
+
+    /// The order the queue will actually play from here: shuffle's own plan
+    /// when shuffle is on, the sequential walk when it is off, with exclusions
+    /// and unavailable rows dropped either way. The current row is not part of
+    /// it; the UI puts that at the head itself.
+    ///
+    /// Repeat-one is deliberately ignored. It loops one row for as long as it
+    /// is set, which is a transport detail of the current track rather than a
+    /// different plan for the queue behind it.
+    fn upcoming_indices(&self) -> Vec<usize> {
+        let Some(current) = self.state.current_index else {
+            // Removals can leave a populated queue with no current row. Listing
+            // every eligible row keeps the view honest instead of blank.
+            return (0..self.state.queue.len())
+                .filter(|index| self.automatic_track_eligible(*index))
+                .collect();
+        };
+        if self.state.shuffle {
+            // The pool is popped from the back, so reversed is play order. When
+            // it empties under repeat-context the engine reshuffles into a
+            // brand-new random order (see `take_next_index_with_skip`), which
+            // nothing can know in advance — so the list simply stops there
+            // rather than inventing a continuation.
+            return self
+                .shuffle_pool
+                .iter()
+                .rev()
+                .copied()
+                .filter(|index| self.automatic_track_eligible(*index))
+                .collect();
+        }
+        let mut upcoming: Vec<usize> = (current.saturating_add(1)..self.state.queue.len())
+            .filter(|index| self.automatic_track_eligible(*index))
+            .collect();
+        if self.state.repeat == RepeatMode::Context {
+            // Inclusive of `current`, matching `sequential_automatic_index`'s
+            // wrap exactly: when nothing later is eligible the walk restarts at
+            // zero and may legitimately land back on the row playing now.
+            upcoming.extend(
+                (0..=current.min(self.state.queue.len().saturating_sub(1)))
+                    .filter(|index| self.automatic_track_eligible(*index)),
+            );
+        }
+        upcoming
+    }
+
+    /// Draws a brand-new random play order. This is the right answer only
+    /// where the previous order has genuinely stopped existing: shuffle being
+    /// switched on (there was no plan), a whole different queue being
+    /// installed, and the repeat-context refill that starts a new lap. Every
+    /// other mutation repairs the bag instead — see [`Engine::repair_shuffle_pool`].
+    ///
+    /// The bag it produces defines the four invariants every repair must also
+    /// hold: it never contains `current_index`, never contains an index outside
+    /// `state.queue`, never repeats an index, and is empty whenever shuffle is
+    /// off.
     fn rebuild_shuffle_pool(&mut self) {
         self.shuffle_pool.clear();
         if !self.state.shuffle {
@@ -2325,6 +2407,87 @@ impl Engine {
         for index in (1..self.shuffle_pool.len()).rev() {
             let swap = (self.next_random() as usize) % (index + 1);
             self.shuffle_pool.swap(index, swap);
+        }
+    }
+
+    /// Carries the drawn order across a change in the queue's shape by mapping
+    /// every entry through `remap` and dropping the ones that map to `None`.
+    /// Survivors keep their relative order, which is the whole point: the pool
+    /// is published as "up next", and redrawing it — which is what every queue
+    /// mutation used to do — rescrambles the list the owner is looking at just
+    /// because one unrelated row was added, removed, or dragged.
+    ///
+    /// `remap` must be injective over the bag, since nothing here can tell a
+    /// collision apart from an honest duplicate; the range and current-row
+    /// invariants are enforced below rather than trusted from each caller's
+    /// arithmetic, because a bag entry that no longer indexes the queue is a
+    /// panic waiting in `take_next_index_with_skip`.
+    fn repair_shuffle_pool(&mut self, remap: impl Fn(usize) -> Option<usize>) {
+        if !self.state.shuffle {
+            // `rebuild_shuffle_pool` empties the bag when shuffle goes off, and
+            // a repair must never be the thing that resurrects entries into it.
+            self.shuffle_pool.clear();
+            return;
+        }
+        let length = self.state.queue.len();
+        let current = self.state.current_index;
+        self.shuffle_pool = std::mem::take(&mut self.shuffle_pool)
+            .into_iter()
+            .filter_map(remap)
+            .filter(|index| *index < length && Some(*index) != current)
+            .collect();
+    }
+
+    /// Puts a newly eligible row into the drawn order at a uniformly random
+    /// position, drawn from the same PRNG that shuffled the bag in the first
+    /// place. Pushing it onto one end would be simpler, but the bag is popped
+    /// from the back, so that would make a queued track either always play next
+    /// or always play last — neither of which is what shuffle means.
+    fn splice_into_shuffle_pool(&mut self, index: usize) {
+        let position = (self.next_random() as usize) % (self.shuffle_pool.len() + 1);
+        self.shuffle_pool.insert(position, index);
+    }
+
+    /// Folds rows appended at `first_new` and beyond into the existing drawn
+    /// order. Only the tail of the queue is walked, because that is the only
+    /// part an append can have changed — the indices already in the bag still
+    /// name the same tracks.
+    fn splice_new_rows_into_shuffle_pool(&mut self, first_new: usize) {
+        if !self.state.shuffle {
+            self.shuffle_pool.clear();
+            return;
+        }
+        for index in first_new..self.state.queue.len() {
+            if self.automatic_track_eligible(index) && self.state.current_index != Some(index) {
+                self.splice_into_shuffle_pool(index);
+            }
+        }
+    }
+
+    /// Repairs the bag after a change to what counts as eligible rather than to
+    /// the queue's shape: rows that just became ineligible leave, rows that just
+    /// became eligible are spliced in, and every survivor keeps its drawn
+    /// position. It walks the queue rather than a single index because one
+    /// track id can occupy several queue rows.
+    fn repair_shuffle_pool_for_eligibility(&mut self) {
+        if !self.state.shuffle {
+            self.shuffle_pool.clear();
+            return;
+        }
+        let eligible: Vec<bool> = (0..self.state.queue.len())
+            .map(|index| self.automatic_track_eligible(index))
+            .collect();
+        // Membership is answered from a set built once. Asking the bag itself
+        // with `Vec::contains` per queue row would be quadratic, and a playlist
+        // queue holds thousands of rows for the sake of this one toggle.
+        let pooled: HashSet<usize> = self.shuffle_pool.iter().copied().collect();
+        self.shuffle_pool
+            .retain(|index| eligible.get(*index).copied().unwrap_or(false));
+        let current = self.state.current_index;
+        for index in 0..eligible.len() {
+            if eligible[index] && Some(index) != current && !pooled.contains(&index) {
+                self.splice_into_shuffle_pool(index);
+            }
         }
     }
 
@@ -3638,6 +3801,477 @@ mod tests {
             vec![2],
             "shuffle only contains non-current eligible rows"
         );
+        drop(directory);
+    }
+
+    fn playlist_queue(ids: &[&str]) -> Vec<TrackRef> {
+        ids.iter()
+            .map(|id| contextual_track(id, "playlist:playlist"))
+            .collect()
+    }
+
+    const QUEUE_IDS: [&str; 4] = [
+        "0abcdefghijklmnopqrstu",
+        "1abcdefghijklmnopqrstu",
+        "2abcdefghijklmnopqrstu",
+        "3abcdefghijklmnopqrstu",
+    ];
+
+    #[test]
+    fn upcoming_is_the_shuffle_pool_in_pop_order() {
+        let (directory, store) = store_with_exclusions(&[("playlist", QUEUE_IDS[2])]);
+        let mut engine = engine_with_queue(store, playlist_queue(&QUEUE_IDS), 0);
+        engine.state.shuffle = true;
+        engine.rebuild_shuffle_pool();
+
+        let popped: Vec<usize> = engine.shuffle_pool.iter().rev().copied().collect();
+        assert_eq!(
+            engine.upcoming_indices(),
+            popped,
+            "upcoming is exactly the order the pool will be popped in"
+        );
+
+        // A pool built before an exclusion still carries the row, and the
+        // transport skips it on the way past; upcoming must skip it too.
+        engine.shuffle_pool = vec![3, 2, 1];
+        assert_eq!(engine.upcoming_indices(), vec![1, 3]);
+        drop(directory);
+    }
+
+    #[test]
+    fn upcoming_walks_sequentially_past_an_excluded_row() {
+        let (directory, store) = store_with_exclusions(&[("playlist", QUEUE_IDS[2])]);
+        let engine = engine_with_queue(store, playlist_queue(&QUEUE_IDS), 0);
+
+        assert_eq!(engine.upcoming_indices(), vec![1, 3]);
+        drop(directory);
+    }
+
+    #[test]
+    fn upcoming_wraps_through_the_current_row_under_repeat_context() {
+        let (directory, store) = store_with_exclusions(&[("playlist", QUEUE_IDS[1])]);
+        let mut engine = engine_with_queue(store, playlist_queue(&QUEUE_IDS), 2);
+        engine.state.repeat = RepeatMode::Context;
+
+        assert_eq!(
+            engine.upcoming_indices(),
+            vec![3, 0, 2],
+            "the wrap is inclusive of the current row, like sequential_automatic_index"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn upcoming_ignores_repeat_one() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = engine_with_queue(store, playlist_queue(&QUEUE_IDS), 0);
+        engine.state.repeat = RepeatMode::Track;
+
+        assert_eq!(
+            engine.upcoming_indices(),
+            vec![1, 2, 3],
+            "repeat-one loops the current row, it does not replan the queue"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn upcoming_lists_every_eligible_row_without_a_current() {
+        let (directory, store) = store_with_exclusions(&[("playlist", QUEUE_IDS[1])]);
+        let mut engine = engine_with_queue(store, playlist_queue(&QUEUE_IDS), 0);
+        engine.state.current_index = None;
+
+        assert_eq!(engine.upcoming_indices(), vec![0, 2, 3]);
+        drop(directory);
+    }
+
+    /// A shuffling engine over `QUEUE_IDS` with a hand-written drawn order, so
+    /// a repair's effect on that order is exactly readable. The seed is fixed
+    /// because splices consume the same PRNG the bag was drawn with.
+    fn shuffling_engine(store: TrackEditStore, current: usize, pool: &[usize]) -> Engine {
+        let mut engine = engine_with_queue(store, playlist_queue(&QUEUE_IDS), current);
+        engine.state.shuffle = true;
+        engine.shuffle_pool = pool.to_vec();
+        engine.random_state = 0x2545_f491_4f6c_dd1d;
+        engine
+    }
+
+    /// Every invariant the bag carries, checked as a set rather than one at a
+    /// time, because a repair that breaks one usually breaks another.
+    fn assert_shuffle_pool_invariants(engine: &Engine) {
+        if !engine.state.shuffle {
+            assert!(
+                engine.shuffle_pool.is_empty(),
+                "the bag is empty whenever shuffle is off"
+            );
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for index in &engine.shuffle_pool {
+            assert!(
+                *index < engine.state.queue.len(),
+                "bag entry {index} does not index the queue"
+            );
+            assert!(
+                Some(*index) != engine.state.current_index,
+                "the bag holds the current row {index}"
+            );
+            assert!(seen.insert(*index), "the bag holds {index} twice");
+        }
+    }
+
+    #[test]
+    fn removing_a_row_shifts_the_bag_instead_of_redrawing_it() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 0, &[3, 2, 1]);
+
+        assert_eq!(engine.remove_queue(2), Ok(true));
+        assert_eq!(
+            engine.shuffle_pool,
+            vec![2, 1],
+            "the removed row leaves and the rows above it slide down one"
+        );
+        assert_eq!(engine.upcoming_indices(), vec![1, 2]);
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn removing_the_current_row_drops_its_replacement_from_the_bag() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 1, &[3, 2, 0]);
+
+        assert!(
+            engine.remove_queue(1).is_err(),
+            "the capture engine has no player to reload the replacement on"
+        );
+        assert_eq!(engine.state.current_index, Some(1));
+        assert_eq!(
+            engine.shuffle_pool,
+            vec![2, 0],
+            "the promoted replacement leaves the bag, the rest keep their order"
+        );
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn moving_a_row_remaps_the_bag_the_same_way_as_the_current_row() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 1, &[3, 2, 0]);
+
+        assert_eq!(engine.move_queue(0, 3), Ok(true));
+        assert_eq!(engine.state.current_index, Some(0));
+        assert_eq!(
+            engine.shuffle_pool,
+            vec![
+                remap_current_index_after_move(3, 0, 3),
+                remap_current_index_after_move(2, 0, 3),
+                remap_current_index_after_move(0, 0, 3),
+            ],
+            "one permutation moves the queue, the current row and the bag"
+        );
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn moving_a_row_onto_the_current_row_keeps_it_out_of_the_bag() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 2, &[3, 1, 0]);
+
+        assert_eq!(engine.move_queue(0, 2), Ok(true));
+        assert_eq!(engine.state.current_index, Some(1));
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn adding_a_row_splices_it_without_reordering_the_survivors() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 0, &[]);
+        // Seven survivors, not three: a redraw would have to reproduce one
+        // ordering out of five thousand to sneak past this assertion, which a
+        // four-row queue leaves well within coincidence.
+        for ordinal in 4..8u32 {
+            engine.state.queue.push(contextual_track(
+                &format!("0abcdefghijklmnopqrst{ordinal}"),
+                "playlist:playlist",
+            ));
+        }
+        engine.shuffle_pool = vec![2, 7, 4, 1, 6, 3, 5];
+
+        assert_eq!(
+            engine.add_queue(
+                contextual_track("0abcdefghijklmnopqrst9", "playlist:playlist"),
+                "playlist:playlist".to_owned(),
+            ),
+            Ok(true)
+        );
+        assert!(engine.shuffle_pool.contains(&8));
+        assert_eq!(
+            engine
+                .shuffle_pool
+                .iter()
+                .copied()
+                .filter(|index| *index != 8)
+                .collect::<Vec<usize>>(),
+            vec![2, 7, 4, 1, 6, 3, 5],
+            "queueing a track must not redraw the plan already on screen"
+        );
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn a_batch_add_splices_every_new_row_and_keeps_the_survivors_ordered() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 0, &[3, 2, 1]);
+
+        assert_eq!(
+            engine.add_queue_batch(
+                vec![
+                    contextual_track("4abcdefghijklmnopqrstu", "playlist:playlist"),
+                    contextual_track("5abcdefghijklmnopqrstu", "playlist:playlist"),
+                ],
+                "playlist:playlist".to_owned(),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            engine
+                .shuffle_pool
+                .iter()
+                .copied()
+                .filter(|index| *index < 4)
+                .collect::<Vec<usize>>(),
+            vec![3, 2, 1]
+        );
+        assert!(engine.shuffle_pool.contains(&4) && engine.shuffle_pool.contains(&5));
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn queued_rows_land_somewhere_other_than_one_end_of_the_bag() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 0, &[3, 2, 1]);
+
+        let mut interior = false;
+        for ordinal in 4..24u32 {
+            let id = format!("{ordinal:02}bcdefghijklmnopqrstu");
+            let added = engine.state.queue.len();
+            assert_eq!(
+                engine.add_queue(
+                    contextual_track(&id, "playlist:playlist"),
+                    "playlist:playlist".to_owned(),
+                ),
+                Ok(true)
+            );
+            let at = engine
+                .shuffle_pool
+                .iter()
+                .position(|index| *index == added)
+                .expect("the new row joined the bag");
+            interior |= at > 0 && at + 1 < engine.shuffle_pool.len();
+        }
+        assert!(
+            interior,
+            "appending to an end would make queued tracks always play next or always last"
+        );
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn play_queue_index_drops_only_the_row_it_jumps_to() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 0, &[3, 2, 1]);
+
+        assert!(
+            engine.play_queue_index(2).is_err(),
+            "the capture engine has no player"
+        );
+        assert_eq!(engine.state.current_index, Some(2));
+        assert_eq!(
+            engine.shuffle_pool,
+            vec![3, 1],
+            "the row jumped to leaves; the row left behind is `previous`'s business"
+        );
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn exclusion_toggles_repair_the_bag_in_both_directions() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 0, &[3, 2, 1]);
+
+        assert_eq!(
+            engine.set_playlist_track_excluded("playlist", QUEUE_IDS[2], true),
+            Ok(())
+        );
+        assert_eq!(
+            engine.shuffle_pool,
+            vec![3, 1],
+            "an excluded row leaves without disturbing the others"
+        );
+        assert_shuffle_pool_invariants(&engine);
+
+        assert_eq!(
+            engine.set_playlist_track_excluded("playlist", QUEUE_IDS[2], false),
+            Ok(())
+        );
+        assert!(engine.shuffle_pool.contains(&2));
+        assert_eq!(
+            engine
+                .shuffle_pool
+                .iter()
+                .copied()
+                .filter(|index| *index != 2)
+                .collect::<Vec<usize>>(),
+            vec![3, 1],
+            "a re-included row is spliced in, it does not trigger a redraw"
+        );
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn an_exclusion_toggle_reaches_every_queue_row_holding_that_track() {
+        let repeated = "0abcdefghijklmnopqrstu";
+        let queue = vec![
+            contextual_track("1abcdefghijklmnopqrstu", "playlist:playlist"),
+            contextual_track(repeated, "playlist:playlist"),
+            contextual_track("2abcdefghijklmnopqrstu", "playlist:playlist"),
+            contextual_track(repeated, "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = engine_with_queue(store, queue, 0);
+        engine.state.shuffle = true;
+        engine.shuffle_pool = vec![3, 2, 1];
+        engine.random_state = 0x2545_f491_4f6c_dd1d;
+
+        assert_eq!(
+            engine.set_playlist_track_excluded("playlist", repeated, true),
+            Ok(())
+        );
+        assert_eq!(
+            engine.shuffle_pool,
+            vec![2],
+            "both rows carrying the excluded id leave the bag"
+        );
+
+        assert_eq!(
+            engine.set_playlist_track_excluded("playlist", repeated, false),
+            Ok(())
+        );
+        assert_eq!(engine.shuffle_pool.len(), 3);
+        assert!(engine.shuffle_pool.contains(&1) && engine.shuffle_pool.contains(&3));
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn preview_mode_eligibility_governs_a_repair_like_it_governs_a_redraw() {
+        let excluded_id = QUEUE_IDS[2];
+        let (directory, store) = store_with_exclusions(&[("playlist", excluded_id)]);
+        let mut engine = shuffling_engine(store, 0, &[3, 1]);
+        engine.preview_mode = true;
+
+        // Preview ignores playlist exclusions, so the excluded row is eligible
+        // here and a repair must splice it in rather than leave it out.
+        engine.repair_shuffle_pool_for_eligibility();
+        assert!(engine.shuffle_pool.contains(&2));
+        assert_shuffle_pool_invariants(&engine);
+
+        engine.preview_mode = false;
+        engine.repair_shuffle_pool_for_eligibility();
+        assert_eq!(
+            engine.shuffle_pool,
+            vec![3, 1],
+            "leaving preview puts the exclusion back in force"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn a_mutation_leaves_the_drawn_order_of_untouched_rows_alone() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = engine_with_queue(store, playlist_queue(&QUEUE_IDS), 0);
+        engine.state.shuffle = true;
+        engine.random_state = 0x9e37_79b9_7f4a_7c15;
+        engine.rebuild_shuffle_pool();
+        let drawn = engine.shuffle_pool.clone();
+
+        assert_eq!(
+            engine.add_queue(
+                contextual_track("4abcdefghijklmnopqrstu", "playlist:playlist"),
+                "playlist:playlist".to_owned(),
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            engine
+                .shuffle_pool
+                .iter()
+                .copied()
+                .filter(|index| *index != 4)
+                .collect::<Vec<usize>>(),
+            drawn,
+            "this is the regression: a queue mutation used to redraw the whole plan"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn repairs_never_resurrect_the_bag_while_shuffle_is_off() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = engine_with_queue(store, playlist_queue(&QUEUE_IDS), 0);
+
+        for seed in 0..3 {
+            engine.shuffle_pool = vec![3, 2, 1];
+            match seed {
+                0 => assert_eq!(engine.move_queue(1, 2), Ok(true)),
+                1 => assert_eq!(engine.remove_queue(3), Ok(true)),
+                _ => assert_eq!(
+                    engine.add_queue(
+                        contextual_track("4abcdefghijklmnopqrstu", "playlist:playlist"),
+                        "playlist:playlist".to_owned(),
+                    ),
+                    Ok(true)
+                ),
+            }
+            assert!(
+                engine.shuffle_pool.is_empty(),
+                "an ordered queue has no shuffle plan to repair"
+            );
+        }
+        engine.shuffle_pool = vec![3, 2, 1];
+        assert_eq!(
+            engine.set_playlist_track_excluded("playlist", QUEUE_IDS[1], true),
+            Ok(())
+        );
+        assert!(engine.shuffle_pool.is_empty());
+        drop(directory);
+    }
+
+    #[test]
+    fn the_repeat_context_refill_still_draws_a_fresh_lap() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 0, &[]);
+        engine.state.repeat = RepeatMode::Context;
+
+        let next = engine
+            .take_next_index_with_skip(false, false)
+            .expect("an emptied bag refills under repeat-context");
+        assert_ne!(next, 0, "the refill never offers the current row");
+        assert_eq!(
+            engine.shuffle_pool.len(),
+            2,
+            "a new lap is a new draw of every other eligible row"
+        );
+        assert_shuffle_pool_invariants(&engine);
         drop(directory);
     }
 

@@ -9,7 +9,7 @@
   const tone = $derived.by(() => {
     const playlist = playlists[0];
     return coverTone(
-      playlist?.cover_url || playlist?.cover_urls?.[0] || "",
+      playlist?.cover_url || playlist?.cover_urls,
       playlist?.id || "made-for-you",
     );
   });
@@ -24,7 +24,7 @@
 </script>
 
 {#snippet playlistCard(pl)}
-  {@const cardTone = coverTone(pl.cover_url || pl.cover_urls?.[0] || "", pl.id)}
+  {@const cardTone = coverTone(pl.cover_url || pl.cover_urls, pl.id)}
   <div class="card" style:--tone-glow={cardTone.glow}>
     <div class="card-art">
       <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} fill lg />

@@ -157,7 +157,11 @@ fixtures.artist = {
   overview: {
     biography: "A fixture artist: enough prose to draw the About card, nothing more.",
     header_image_url: null,
-    biography_image_urls: [],
+    biography_images: [
+      { url: "/dev/gallery-landscape.svg", width: 640, height: 429 },
+      { url: "/dev/gallery-portrait.svg", width: 800, height: 1000 },
+      { url: "/dev/gallery-panorama.svg", width: 1200, height: 500 },
+    ],
     popularity: 72,
     followers: 1234567,
     monthly_listeners: 9876543,
@@ -491,8 +495,88 @@ const playback = {
   error: "",
 };
 
+/**
+ * The queue's real play order, mirroring `Engine::upcoming_indices`.
+ *
+ * The engine publishes this because index order is a guess: only it holds the
+ * shuffle bag and the per-playlist skips. A harness that shipped the state
+ * event without it would render a Queue view permanently showing one row, so
+ * the surface under test would not be the surface.
+ *
+ * The bag is modelled the same way too — drawn once, popped as tracks play,
+ * repaired rather than redrawn — because a harness that reshuffled on every
+ * mutation would hide exactly the defect the engine's repair exists to fix.
+ * The draw is seeded and deterministic so a harness run is reproducible.
+ */
+let shuffleBag = [];
+let bagSeed = 0x9e3779b9;
+
+function bagRandom() {
+  bagSeed ^= bagSeed << 13;
+  bagSeed ^= bagSeed >>> 7;
+  bagSeed ^= bagSeed << 17;
+  return bagSeed >>> 0;
+}
+
+function queueRowEligible(index) {
+  const track = playback.queue[index];
+  if (!track || track.unavailable) return false;
+  const context = String(track.context ?? "");
+  if (!context.startsWith("playlist:")) return true;
+  const excluded = exclusionsFor(context.slice("playlist:".length)) ?? [];
+  return !excluded.some((value) => String(value) === String(track.id));
+}
+
+function redrawShuffleBag() {
+  shuffleBag = [];
+  if (!playback.shuffle) return;
+  for (let index = 0; index < playback.queue.length; index++) {
+    if (index !== playback.current_index && queueRowEligible(index)) shuffleBag.push(index);
+  }
+  for (let i = shuffleBag.length - 1; i > 0; i--) {
+    const j = bagRandom() % (i + 1);
+    [shuffleBag[i], shuffleBag[j]] = [shuffleBag[j], shuffleBag[i]];
+  }
+}
+
+/** A new row joins the bag at a random slot, never at either end: the bag
+    pops from the back, so an append would pin it to "always next" or
+    "always last". Mirrors `Engine::splice_into_shuffle_pool`. */
+function spliceIntoShuffleBag(index) {
+  if (!playback.shuffle || index === playback.current_index) return;
+  if (!queueRowEligible(index) || shuffleBag.includes(index)) return;
+  shuffleBag.splice(bagRandom() % (shuffleBag.length + 1), 0, index);
+}
+
+/** Drops a removed row and shifts the rows above it down, keeping the drawn
+    order of every survivor. Mirrors `Engine::repair_shuffle_pool`. */
+function repairShuffleBagAfterRemoval(index) {
+  shuffleBag = shuffleBag
+    .filter((pooled) => pooled !== index)
+    .map((pooled) => (pooled > index ? pooled - 1 : pooled))
+    .filter((pooled) => pooled !== playback.current_index && pooled < playback.queue.length);
+}
+
+function upcomingIndices() {
+  const current = playback.current_index;
+  if (!(current >= 0)) {
+    return playback.queue.map((_, i) => i).filter(queueRowEligible);
+  }
+  if (playback.shuffle) {
+    return shuffleBag.filter(queueRowEligible).reverse();
+  }
+  const out = [];
+  for (let i = current + 1; i < playback.queue.length; i++) {
+    if (queueRowEligible(i)) out.push(i);
+  }
+  if (playback.repeat === "context") {
+    for (let i = 0; i <= current; i++) if (queueRowEligible(i)) out.push(i);
+  }
+  return out;
+}
+
 function emitState() {
-  emit("state", clone(playback));
+  emit("state", { ...clone(playback), upcoming: upcomingIndices() });
 }
 
 function playlistIdFrom(args) {
@@ -703,6 +787,7 @@ window.__TAURI_INTERNALS__ = {
         applyTrackExclusion(id, args.trackId ?? args.track_id, Boolean(args.excluded));
         // Refresh the open detail so row marks and the header note agree.
         emit("playlist", clone(detailFor(id)));
+        emitState();
         return null;
       }
       case "touch_playlist_activity":
@@ -754,6 +839,7 @@ window.__TAURI_INTERNALS__ = {
         return null;
       case "set_shuffle":
         playback.shuffle = Boolean(args.enabled ?? args.shuffle);
+        redrawShuffleBag();
         emitState();
         return null;
       case "set_repeat":
@@ -774,6 +860,9 @@ window.__TAURI_INTERNALS__ = {
           : requestedIndex;
         playQueueLog.push({ automaticStart, requestedIndex, startedIndex });
         setCurrent(startedIndex);
+        // A different queue has no plan worth keeping, which is the one case
+        // where the engine redraws the bag rather than repairing it.
+        redrawShuffleBag();
         playback.playing = true;
         playback.preview = false;
         emitState();
@@ -789,6 +878,7 @@ window.__TAURI_INTERNALS__ = {
       case "add_queue_item": {
         const item = args.uri ?? args.trackUri ?? args.track_uri ?? args.track;
         playback.queue.push(...queueWithEdits([trackFromQueueItem(item)]));
+        spliceIntoShuffleBag(playback.queue.length - 1);
         emitState();
         return null;
       }
@@ -800,6 +890,7 @@ window.__TAURI_INTERNALS__ = {
           playback.queue.splice(at, 1);
           if (at < playback.current_index) playback.current_index -= 1;
           if (at === playback.current_index) setCurrent(Math.min(at, playback.queue.length - 1), false);
+          repairShuffleBagAfterRemoval(at);
         }
         emitState();
         return null;
@@ -840,6 +931,21 @@ window.__TAURI_INTERNALS__ = {
         return clone(trackCreditsPayload(args.id ?? args.trackId ?? "t0"));
       case "get_cache_stats":
         return { entries: 0, bytes: 0 };
+      // Artwork the browser can already fetch for itself. The real command
+      // downloads a remote cover and hands back a local path; a fixture that
+      // ships its own picture inline has nothing to download, and returning
+      // null for it would draw the "lost artwork" tile over every fixture
+      // image instead of the image.
+      // Artwork the browser can fetch for itself. The real command downloads a
+      // remote cover and returns a local path for the asset protocol; fixture
+      // artwork is already served by the dev server, so it only needs to come
+      // back absolute — a root-relative path would be handed to convertFileSrc
+      // and rewritten into an asset URL that resolves to nothing.
+      case "get_cover": {
+        const url = String(args.url ?? "");
+        if (!url) return null;
+        return /^https?:/.test(url) ? url : new URL(url, location.origin).href;
+      }
       default:
         return null;
     }

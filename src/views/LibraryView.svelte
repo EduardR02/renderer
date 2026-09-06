@@ -108,7 +108,7 @@
   );
   const tone = $derived(
     coverTone(
-      tonePlaylist?.cover_url || tonePlaylist?.cover_urls?.[0] || "",
+      tonePlaylist?.cover_url || tonePlaylist?.cover_urls,
       tonePlaylist?.id ?? "home",
     ),
   );
@@ -154,7 +154,7 @@
 {/snippet}
 
 {#snippet playlistCard(pl)}
-  {@const cardTone = coverTone(pl.cover_url || pl.cover_urls?.[0] || "", pl.id)}
+  {@const cardTone = coverTone(pl.cover_url || pl.cover_urls, pl.id)}
   <div class="card" style:--tone-glow={cardTone.glow}>
     <div class="card-art">
       <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} fill lg />

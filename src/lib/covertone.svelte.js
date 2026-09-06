@@ -11,6 +11,9 @@
         here, at fixed targets, so a white sleeve cannot produce a white header
         and a neon one cannot produce a neon header. The app stays as dark as
         it was designed to be, and every page is a different colour anyway.
+        The hue is not quite untouched either: `warpHue` folds one arc of the
+        wheel away, the arc that has no dark form at all. That is the only
+        place a sleeve is overruled, and it is 118° out of 360.
 
      2. Nothing here is allowed to fail loudly. A cross-origin refusal, a
         decode error, a cover that never arrives — each one falls through to a
@@ -64,6 +67,59 @@ function hex(L, C, hueDeg) {
   return `#${((1 << 24) | (r << 16) | (g << 8) | bl).toString(16).slice(1)}`;
 }
 
+/* --- The fold -------------------------------------------------------- */
+
+/**
+ * The arc with no dark form, and the two edges where colour comes back.
+ *
+ * Every other hue at L 0.35 is a recognisable dark version of itself: 200° is
+ * teal, 300° is aubergine, 14° is oxblood. This arc is the exception, and not
+ * because of a bad choice of lightness — "amber" IS a light yellow, so there
+ * is no dark amber, there is only brown. The failure runs the whole way from
+ * burnt orange through olive; at the identity chroma, 68° is #5a2e00, 118° is
+ * #374000 and 130° is still #294400. Warm survives up to about 38 and green
+ * comes back at about 138, and between those two numbers there is nothing
+ * worth showing.
+ */
+const ARC_LO = 38;
+const ARC_HI = 156;
+const WARM_TIP = 54;
+const GREEN_TOE = 138;
+/** Pure yellow, and the middle of the arc: the one hue with no flank to prefer. */
+const FOLD = (ARC_LO + ARC_HI) / 2;
+
+/**
+ * Vacate the arc by FOLDING it onto its own two edges.
+ *
+ * The thing to understand first is that no continuous monotonic remap can do
+ * this. Push, squeeze, ease it however you like — if the map is continuous and
+ * increasing, some input still lands in the middle, because that is what
+ * continuity means. The narrow lightness bump this replaces did not even try:
+ * it lifted a 64°-wide band around 68° and left the olive above it and the
+ * burnt orange below it exactly as they were.
+ *
+ * So the map folds. Below 97° hues run down the warm flank towards burnt
+ * sienna; above it they run up the green flank towards pine. It is continuous
+ * at 38 and at 156, which is the part that matters, because those are the
+ * seams with the untouched rest of the wheel and a jump there would be visible
+ * as two neighbouring records looking unrelated. The one discontinuity sits at
+ * the fold itself, on pure yellow, where a cover at 96 opens burnt orange and
+ * one at 98 opens forest green. Nobody can tell: extraction is deterministic
+ * per image, so no single record ever changes colour, and there is no second
+ * rendering of the same cover to compare against.
+ *
+ * The cost is real and it is spread: 118° of input arrive on 34° of output, so
+ * two gold sleeves that differ slightly now open the same page. That is the
+ * trade being made on purpose — the arc had no variation worth keeping, only
+ * different browns.
+ */
+function warpHue(hue) {
+  const h = ((hue % 360) + 360) % 360;
+  if (h < ARC_LO || h > ARC_HI) return h;
+  if (h < FOLD) return ARC_LO + ((h - ARC_LO) / (FOLD - ARC_LO)) * (WARM_TIP - ARC_LO);
+  return GREEN_TOE + ((h - FOLD) / (ARC_HI - FOLD)) * (ARC_HI - GREEN_TOE);
+}
+
 /* --- The clamp ------------------------------------------------------- */
 
 /**
@@ -73,32 +129,41 @@ function hex(L, C, hueDeg) {
  */
 function palette(hue, chroma) {
   const c = Math.min(0.115, Math.max(0, chroma));
+  const h = warpHue(hue);
   /**
-   * The one hue-dependent correction, and it is the brown fix.
+   * How far up the warm flank we landed, 0 at 38° and 1 at 54°.
    *
-   * Every other hue at L 0.35 is a recognisable dark version of itself: 200°
-   * is teal, 300° is aubergine, 14° is oxblood. Amber is the exception —
-   * there is no dark amber, there is only brown, because "amber" IS a light
-   * yellow. A gold sleeve rendered at the same lightness as everything else
-   * comes out #5e2b00, which is the exact colour this design has been told
-   * twice to stay away from. Lifting the band around 68° by five points of
-   * lightness buys back enough to read as tobacco rather than as mud, and
-   * white type still clears 5:1 against it.
+   * This can be read off the OUTPUT hue, which is the whole reason the fold is
+   * worth having: the warp guarantees nothing exists between 54 and 138, so a
+   * correction keyed on the output cannot accidentally catch a hue it was not
+   * meant for, and it needs no second copy of the arc's arithmetic to know
+   * where it is.
+   *
+   * The green flank asks for nothing — 138° at L 0.35 is #1a4603, which is
+   * already a pine and not an olive. The warm flank still does, because it
+   * ends on a hue that reads as brown until it is both lighter and less
+   * saturated: at the tip, six points of lightness and a fifth off the chroma
+   * turn #622600 into #6c3d1a, mud into burnt sienna. Both corrections ramp
+   * from zero at 38 so the seam with the untouched wheel stays seamless, and
+   * both apply only to the wash pair — at L 0.6 the same hue is a caramel and
+   * wants no help at all.
    */
-  const amber = Math.max(0, 1 - Math.abs(hue - 68) / 32);
-  const lift = 0.055 * amber;
+  const clay = h > WARM_TIP ? 0 : Math.max(0, (h - ARC_LO) / (WARM_TIP - ARC_LO));
+  const lift = 0.06 * clay;
+  const cw = c * (1 - 0.22 * clay);
   return {
-    hue,
+    hue: h,
     chroma: c,
     /** Header wash, top stop. Dark enough for 56px white type over it. */
-    wash: hex(0.35 + lift, c, hue),
-    /** Deeper stop, so the fade has a shape instead of a straight ramp. */
-    washDeep: hex(0.26 + lift * 0.7, c * 0.82, hue),
+    wash: hex(0.35 + lift, cw, h),
+    /** Deeper stop, so the fade has a shape instead of a straight ramp. Both
+        stops take the same lift, which is what keeps the fade's 0.09 span. */
+    washDeep: hex(0.26 + lift, cw * 0.82, h),
     /** Coloured light: card hover shadows, artwork glow, panel tint. */
-    glow: hex(0.6, Math.min(0.14, c * 1.25), hue),
+    glow: hex(0.6, Math.min(0.14, c * 1.25), h),
     /** Generated identity tile, light corner → dark corner. */
-    tileA: hex(0.68, Math.min(0.14, c * 1.3), hue),
-    tileB: hex(0.32, Math.min(0.1, c * 0.9), hue),
+    tileA: hex(0.68, Math.min(0.14, c * 1.3), h),
+    tileB: hex(0.32, Math.min(0.1, c * 0.9), h),
   };
 }
 
@@ -110,15 +175,20 @@ function palette(hue, chroma) {
  * same pale warm and — once that same pick drove the header wash — half of all
  * playlists opened brown.
  *
- * These eight are spread around the wheel and skip 45°–135° entirely, because
- * every one of them has to survive being rendered at L 0.35 for the header
- * wash and that whole arc turns to mud down there. 70° gives #533400, which is
- * brown; 118° gives #374000, which is army olive; 130° is still #294400. Green
- * only becomes green again at about 140 (#1b4610), and warm only stays a
- * colour below about 40 (#632316, a burnt red). Those are the two edges, and
- * the ring lives outside them.
+ * Avoiding the mud arc is no longer this list's job — `warpHue` folds any hue
+ * out of it, so a careless entry would come out fine. What the list is for is
+ * that a coverless playlist should get a colour someone CHOSE, spread far
+ * enough from the other seven that two unrelated records never look like the
+ * same record.
+ *
+ * Which is exactly why every entry has to be a FIXED POINT of the warp: a
+ * number here that the fold would move is a number that no longer says what
+ * colour you get. Only hues below 38 and above 156 qualify, plus those two
+ * exactly. The green slot used to be 142 and the fold moved it to 152, so it
+ * is 158 now — still a forest green, `#004926` at the wash, and the only
+ * clearing left between the arc's top edge and the sea green at 172.
  */
-const IDENTITY_HUES = [14, 38, 142, 172, 198, 228, 268, 316];
+const IDENTITY_HUES = [14, 38, 158, 172, 198, 228, 268, 316];
 
 /** FNV-1a, unchanged from the one the artwork tiles have always used. */
 function fnv(seed) {
@@ -272,22 +342,63 @@ const tones = $state({});
 const inflight = new Set();
 
 /**
+ * What is actually on screen, which is what the page is allowed to take its
+ * colour from. `Cover.svelte` builds the same list — distinct, non-empty,
+ * capped at four — and then only draws all four when it has all four; with one
+ * to three it falls back to a single tile of the first. Reading a cover the
+ * viewer cannot see would be a colour with no visible source, so the tiers
+ * match here too.
+ */
+function coverPool(covers) {
+  const list = Array.isArray(covers) ? covers : [covers];
+  const pool = [...new Set(list.filter(Boolean))].slice(0, 4);
+  return pool.length >= 4 ? pool : pool.slice(0, 1);
+}
+
+/**
  * The tone for a piece of content, available synchronously.
  *
  * Returns the identity fallback immediately and upgrades to the extracted
  * colour when it lands, which means a page never waits on a canvas read to
  * paint and never flashes a neutral header first.
+ *
+ * `covers` is a url or a list of them, because a playlist without artwork of
+ * its own is drawn as a mosaic of four records and there is no reason the page
+ * should take its colour from whichever of the four happens to be first. That
+ * was a real bug and it is what the fold above was wrongly blamed for: the
+ * playlist "headphone demo" measures 37.8°/C 0.051 on cell one — a taupe that
+ * lands a fifth of a degree under `ARC_LO`, where the fold cannot reach it —
+ * while cell two measures 234.2°/C 0.084. The page opened brown standing next
+ * to three tiles that were not.
+ *
+ * So read every cell and PICK the strongest, never average. `readHue` derives
+ * chroma monotonically from how much of an image agreed on one hue, so the
+ * highest chroma IS the cell that most clearly has a colour. Averaging would
+ * repeat the mistake `MIN_C` is there to prevent, one level up: four unrelated
+ * records are four unrelated hues, and their mean is mud — which is the
+ * complaint we would be answering with a different spelling of itself.
  */
-export function coverTone(coverUrl, seed = "") {
-  const key = coverUrl || `seed:${seed}`;
+export function coverTone(covers, seed = "") {
+  const pool = coverPool(covers);
+  const key = pool.join("|") || `seed:${seed}`;
   const hit = tones[key];
   if (hit) return hit;
 
-  if (coverUrl && !inflight.has(key)) {
+  if (pool.length && !inflight.has(key)) {
     inflight.add(key);
-    resolveCoverUrl(coverUrl)
-      .then((local) => (local ? readHue(local) : null))
+    Promise.all(
+      pool.map((url) =>
+        resolveCoverUrl(url)
+          .then((local) => (local ? readHue(local) : null))
+          .catch(() => null),
+      ),
+    )
       .then((found) => {
+        /* `null` never got looked at, `"mono"` was looked at and had no colour
+           in it; neither can win a contest scored on chroma, so both drop out
+           here and the vote is between the cells that actually measured. */
+        let best = null;
+        for (const f of found) if (f && f !== "mono" && (!best || f.chroma > best.chroma)) best = f;
         /* Cache the miss as well, as the fallback: one failed read per cover.
            A cover that HAS no colour — a black-and-white sleeve, a black
            square — gets the identity hue at a chroma so low it is effectively
@@ -295,7 +406,7 @@ export function coverTone(coverUrl, seed = "") {
            monochrome record should not open a blue page. It also keeps the
            scale continuous, because a nearly-monochrome sleeve lands on almost
            exactly the same tone through the measured path. */
-        tones[key] = found ? palette(found.hue, found.chroma) : identityTone(seed || key, 0.022);
+        tones[key] = best ? palette(best.hue, best.chroma) : identityTone(seed || key, 0.022);
       })
       .catch(() => {
         tones[key] = identityTone(seed || key);

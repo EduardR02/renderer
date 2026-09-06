@@ -238,14 +238,17 @@
   /**
    * The page's colour, read out of the artwork.
    *
-   * A playlist's own cover if it has one; otherwise the first track's, because
-   * Spotify's rootlist ships no playlist covers at all and a mosaic of four
-   * sleeves has no single colour anyway — the first one is at least a real
-   * colour from the record you are about to hear. With neither, `coverTone`
-   * falls back to the same id-hashed identity hue the generated tile uses, so
-   * the header and the tile still agree.
+   * A playlist's own cover if it has one; otherwise the whole mosaic, the same
+   * list and in the same order the header's `<Cover>` is about to draw from.
+   * It used to be `artPool[0]`, one arbitrary cell of four, which is how this
+   * page opened brown beside three tiles that were not — `coverTone` now reads
+   * every cell and keeps the one that most strongly has a colour. With
+   * neither, it falls back to the same id-hashed identity hue the generated
+   * tile uses, so the header and the tile still agree.
    */
-  const tone = $derived(coverTone(pl?.cover_url || artPool[0] || "", pl?.id ?? ""));
+  const tone = $derived(
+    coverTone(pl?.cover_url || (pl?.cover_urls?.length ? pl.cover_urls : artPool), pl?.id ?? ""),
+  );
 
   let renaming = $state(false);
   let nameDraft = $state("");
