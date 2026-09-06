@@ -121,6 +121,18 @@
     const median = ratios.length % 2 ? ratios[mid] : (ratios[mid - 1] + ratios[mid]) / 2;
     return Math.min(FRAME_MAX_ASPECT, Math.max(FRAME_MIN_ASPECT, median));
   });
+  /* The mat under the picture takes the PICTURE's colour, not the page's.
+     Everywhere else on this page `--tone-*` is the artist's, which is right
+     because the artist is what the page is about; inside this frame the
+     subject changes under you every time you step, and a mat that stayed the
+     header's colour would be the one surface disagreeing with the thing
+     standing on it. `coverTone` is the same measurement the header wash is
+     built from — hue from the image, lightness and chroma imposed in
+     covertone.svelte.js — so a pale photograph cannot lift the mat and a neon
+     one cannot make it glow. The artist id seeds the fallback, so a picture
+     that never resolves lands on the colour the artist's own generated tile
+     would have used. */
+  const figureTone = $derived(coverTone(aboutFigure?.url ?? "", artist?.id ?? ""));
   /* The ceiling is the picture's own width, or 560, whichever is smaller.
      Blowing a 640px source up to 560 CSS px is already soft on a 1.5x display;
      past its own width it is a bigger blur and nothing else. The engine says
@@ -837,9 +849,18 @@
         />
       {:else}
         <!-- Something has to be behind the banner's darkening gradient while
-             the portrait is on its way, or 260px of the page is pure black and
-             reads as a rendering failure rather than as a wait. -->
-        <span class="banner-sk"></span>
+             the portrait is on its way, or the top of the page is pure black
+             and reads as a rendering failure rather than as a wait. It used to
+             be a flat `--bg-2` slab, which is a grey answer to a question the
+             app can already answer in colour: the identity tile is a hash of
+             the artist id, so the route alone is enough to know what colour
+             this artist is before a single byte of the payload has landed.
+             Which also means the wait is the artist's OWN colour and not a
+             stand-in — an artist with no portrait keeps exactly this ground
+             when the payload arrives, because that is the same tile. The
+             banner suppresses the monogram, so what shows is the colour and
+             nothing else, and the name is left to the skeleton below. -->
+        <Cover id={route.id} name={artistNameHint(route.id)} fill />
       {/if}
     </div>
     <span class="tag">Artist</span>
@@ -1171,6 +1192,8 @@
               class:gallery={aboutFigures.length > 1}
               style:--figure-max="{figureMax}px"
               style:--frame-aspect={frameAspect || null}
+              style:--tone-wash={figureTone.wash}
+              style:--tone-glow={figureTone.glow}
             >
               <button
                 class="figure-open"
@@ -1419,8 +1442,6 @@
 </section>
 
 <style>
-  .banner-sk { position: absolute; inset: 0; background: var(--bg-2); }
-
   .dx { margin-top: var(--s8); }
   .dx .seg { margin-bottom: var(--s5); }
   .appears { margin-top: var(--s9); }
@@ -1622,14 +1643,47 @@
      square, which was stable because it ignored every picture in the set;
      `--frame-aspect` is the median of the set's own ratios, which is stable
      because it is computed from all of them at once and never changes as you
-     step. `.art` already is the tile; these three rules only decline the
-     `natural` overrides, and leave the pending ground alone so a loading
-     picture still has one. */
+     step. `.art` already is the tile; these rules only decline the `natural`
+     overrides and paint the mat. */
+  /* The frame is GEOMETRY, not decoration, and that distinction is the whole
+     of this block. Something has to reserve the tallest shape in the set or
+     the page shoves on every step; nothing has to draw it. Painting it — as
+     `--bg-2`, and later as a tinted mat of the picture's own light — put a
+     rectangle on screen whose edges belong to the median of thirteen
+     photographs rather than to the one you are looking at, so it read as a
+     box the picture had failed to fill. So the box keeps its size and gives
+     up its surface: no ground, no ring, no radius, and `overflow: visible`
+     so the light below is not clipped back to those same edges.
+
+     Centring is done by the BOX rather than by `object-fit`, which is what
+     lets everything else here be honest. Contained inside a fixed element,
+     an <img>'s border box is still the whole frame and only its painted
+     pixels are inset — so a radius rounded the frame's corners and a shadow
+     traced the frame's edges, and the picture got neither. Sized to fit and
+     centred by flex, the element IS the photograph: the radius rounds the
+     print, and a plain `box-shadow` follows it exactly, with none of the
+     raster cost a `drop-shadow` filter would have charged for the same
+     outline. */
   .about-figure.gallery :global(.art.natural) {
     aspect-ratio: var(--frame-aspect, 1); height: auto;
+    display: flex; align-items: center; justify-content: center;
+    background: none; box-shadow: none; overflow: visible;
   }
-  .about-figure.gallery :global(.art.natural:not(.pending)) { background: var(--bg-2); }
-  .about-figure.gallery :global(.art.natural > img) { height: 100%; object-fit: contain; }
+  /* The print lies on the page and lights it. Two shadows, one job each: a
+     tight dark one for the millimetre of depth that says the photograph is
+     on top of the page rather than punched into it, and a wide soft one in
+     the picture's own hue — `coverTone` has already measured this url for
+     the lightbox, same key, same cache — so the light around a print comes
+     from the print. It is the gesture the sleeve already makes in the
+     now-playing rail, at a fraction of the strength, because this one has to
+     survive being looked at for as long as you read the biography. */
+  .about-figure.gallery :global(.art.natural > img) {
+    width: auto; height: auto; max-width: 100%; max-height: 100%;
+    border-radius: var(--r3);
+    box-shadow:
+      0 16px 36px -14px rgba(0, 0, 0, 0.78),
+      0 0 72px -10px color-mix(in srgb, var(--tone-glow) 46%, transparent);
+  }
   /* The picture is a control, and it says so under the pointer only: a
      permanent badge on a photograph is chrome laid over the thing you came to
      look at. */

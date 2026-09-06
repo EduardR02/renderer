@@ -1,5 +1,6 @@
 <script>
   import { resolveCoverUrl } from "../lib/state.svelte.js";
+  import { coverTone } from "../lib/covertone.svelte.js";
   import Icon from "./Icon.svelte";
 
   /**
@@ -39,6 +40,11 @@
      known. A gallery with no measurements gets a square, which is the same
      neutral the inline frame falls back to. */
   const pendingAspect = $derived(width && height ? width / height : 1);
+  /* The one light in the room is the picture's own. `coverTone` has already
+     measured this url for the mat behind the inline frame — same key, same
+     cache — so the overlay costs nothing to light and cannot disagree with the
+     frame it was opened from. */
+  const tone = $derived(coverTone(source, name));
 
   $effect(() => {
     if (!open || !total) return;
@@ -99,6 +105,7 @@
   oncancel={onNativeCancel}
   onclick={onBackdropClick}
   onkeydown={onKeydown}
+  style:--tone-glow={tone.glow}
 >
   <figure class="shot">
     {#if src}
@@ -169,7 +176,16 @@
        anyway. */
     max-width: min(1600px, 84vw); max-height: 82vh;
     border-radius: var(--r3);
-    box-shadow: 0 32px 80px rgba(0, 0, 0, 0.8);
+    /* A black shadow in a black room does nothing, which is what the single
+       rgba() here amounted to: 80px of blur nobody could see. The picture is
+       the only light source in this room, so it throws its OWN colour under
+       itself — the same gesture the sleeve makes in the inspector, the credits
+       sheet and the Top Result panel, and the same measurement the mat in the
+       inline frame is painted with. The black shadow stays underneath it to
+       keep an edge on a pale photograph. */
+    box-shadow:
+      0 32px 80px rgba(0, 0, 0, 0.8),
+      0 30px 96px -26px color-mix(in srgb, var(--tone-glow) 62%, transparent);
   }
   .shot-pending {
     display: block; width: min(560px, 70vw); max-height: 82vh;
