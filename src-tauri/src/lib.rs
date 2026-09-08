@@ -109,6 +109,7 @@ pub fn run() {
             commands::browse_liked_songs,
             commands::browse_track_credits,
             commands::browse_canvas,
+            commands::browse_followed_artists,
             commands::create_playlist,
             commands::rename_playlist,
             commands::delete_playlist,

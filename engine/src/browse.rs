@@ -555,7 +555,7 @@ pub fn album_ref(album: &Album) -> AlbumRef {
 /// `METADATA_RETRY_ATTEMPTS` retries after the first attempt, backing off
 /// from `base_ms`, doubling, and capping at `max_ms`. Pure so the schedule is
 /// unit-testable.
-fn backoff_sequence(attempts: usize, base_ms: u64, max_ms: u64) -> Vec<u64> {
+pub(crate) fn backoff_sequence(attempts: usize, base_ms: u64, max_ms: u64) -> Vec<u64> {
     (0..attempts)
         .map(|attempt| (base_ms << attempt).min(max_ms))
         .collect()
@@ -564,7 +564,7 @@ fn backoff_sequence(attempts: usize, base_ms: u64, max_ms: u64) -> Vec<u64> {
 /// Extracts the HTTP status code when a librespot error wraps an
 /// `HttpClientError::StatusCode` — the shape unmapped server statuses such
 /// as 502 Bad Gateway take (reported under [`ErrorKind::Unknown`]).
-fn http_status_of(error: &librespot_core::Error) -> Option<u16> {
+pub(crate) fn http_status_of(error: &librespot_core::Error) -> Option<u16> {
     use librespot_core::http_client::HttpClientError;
     match error.error.downcast_ref::<HttpClientError>() {
         Some(HttpClientError::StatusCode(code)) => Some(code.as_u16()),
@@ -578,7 +578,7 @@ fn http_status_of(error: &librespot_core::Error) -> Option<u16> {
 /// mapping leaves as `Unknown` wrapping the status). Client errors (4xx)
 /// and other kinds are permanent and fail fast. `status` is the HTTP status
 /// when the error wraps one. Pure so the retry decision is unit-testable.
-fn browse_error_is_transient(kind: ErrorKind, status: Option<u16>) -> bool {
+pub(crate) fn browse_error_is_transient(kind: ErrorKind, status: Option<u16>) -> bool {
     match kind {
         ErrorKind::Unavailable | ErrorKind::DeadlineExceeded => true,
         ErrorKind::Unknown => status.is_some_and(|code| (500..=599).contains(&code)),

@@ -399,6 +399,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   padding: var(--s5) var(--s3); color: var(--fg-2); text-align: center;
   font-family: var(--font-small); font-size: var(--t-11);
 }
+/* A failed collection gets its retry on its own line, at the size of the
+   sentence above it: `.link-more` is set for pane copy, which is a step
+   larger than anything in the rail. */
+.lib-filter-empty .link-more {
+  display: block; margin: var(--s2) auto 0; font-size: var(--t-11);
+}
 .lib-list {
   flex: 1; min-height: 0; overflow-y: auto; padding-right: var(--s1);
   scrollbar-gutter: stable;
@@ -449,11 +455,43 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      and this one row's bar is warm because its wash is. */
   box-shadow: inset 2px 0 var(--rose-ink);
 }
-.liked-row { margin-bottom: var(--s2); }
-.liked-row + .lib-row { position: relative; }
-.liked-row + .lib-row::before {
-  content: ""; position: absolute; left: var(--s2); right: var(--s2); top: calc(var(--s1) * -1);
-  height: 1px; background: var(--line);
+/* The library's two collections, as the section label rather than as anything
+   new in the column. Following used to be a pinned row here and that cost a
+   playlist row for ever; a switch in the head costs nothing at rest and the
+   list below never moves.
+
+   The selected one is simply the label the rail always had, at full strength.
+   The other is the same type dimmed — no pill, no underline, no segmented
+   track: two words at 11px are already a small enough object that a container
+   around them would be the loudest thing in the rail. */
+.lib-modes { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+/* Sentence case, not the tracked caps every other section label wears, and
+   that is a measurement rather than a preference: two tracked caps words plus
+   the head's two buttons overrun a 212px rail by fourteen pixels. The slot is
+   already sentence case half the time anyway — opening the filter replaces
+   this label with a "Filter library" placeholder at the same weight — so the
+   head keeps one voice either way. */
+.lib-mode {
+  font-family: var(--font-small);
+  font-size: var(--t-11); font-weight: var(--w-semi);
+  color: var(--fg-3); white-space: nowrap;
+  transition: color var(--d1) var(--ease);
+}
+.lib-mode:hover { color: var(--label); }
+/* Two clear steps of the same type rather than a highlight: the selected word
+   is the heading, so it takes the emphasised label token, and the other sits a
+   step below the ordinary one. Not foam — the rail spends foam on the row you
+   have OPENED, and a foam heading here would compete with the selection it is
+   sitting above. */
+.lib-mode.on { color: var(--label-hi); }
+/* One dot between them, so the pair reads as one control rather than as a
+   heading with a stray word after it. Drawn on the separator itself, which
+   costs no element: `gap` already spaces the words. */
+.lib-mode + .lib-mode { position: relative; padding-left: calc(var(--s2) + 2px); }
+.lib-mode + .lib-mode::before {
+  content: ""; position: absolute; left: 0; top: 50%;
+  width: 2px; height: 2px; margin-top: -1px; border-radius: var(--rf);
+  background: var(--fg-3);
 }
 /* The 32px tile that used to live here — a flat pale rose square with a dark
    heart punched out of it — was a SECOND drawing of the Liked Songs mark, and

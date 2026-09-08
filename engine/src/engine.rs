@@ -19,8 +19,9 @@ use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
 use crate::io::ProtocolWriter;
 use renderer_engine::protocol::{
-    AuthState, BrowseResponse, Command, HistoryItem, LoopRange, PositionEvent, RepeatMode,
-    Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus, TrackRef,
+    AuthState, BrowseResponse, Command, HistoryPage, HistoryQuery, LoopRange, PositionEvent,
+    RepeatMode, Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
+    TrackRef,
 };
 use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
@@ -285,8 +286,8 @@ impl Engine {
         }
     }
 
-    pub fn history(&self) -> Result<Vec<HistoryItem>, String> {
-        self.listening_history.snapshot()
+    pub fn history(&self, request: &HistoryQuery) -> Result<HistoryPage, String> {
+        self.listening_history.page(request)
     }
 
     pub fn clear_history(&mut self) -> Result<bool, String> {
@@ -979,7 +980,7 @@ impl Engine {
             }
             return Ok(true);
         }
-        if matches!(&command, Command::GetHistory) {
+        if matches!(&command, Command::GetHistory { .. }) {
             return Ok(true);
         }
         if matches!(&command, Command::ClearHistory) {
@@ -1029,7 +1030,7 @@ impl Engine {
         }
         match command {
             Command::Status
-            | Command::GetHistory
+            | Command::GetHistory { .. }
             | Command::ClearHistory
             | Command::Shutdown
             | Command::Login
@@ -1048,6 +1049,7 @@ impl Engine {
             | Command::BrowseSearch { .. }
             | Command::BrowseTrackCredits { .. }
             | Command::BrowseCanvas { .. }
+            | Command::BrowseFollowedArtists
             | Command::GetTrackWaveform { .. }
             | Command::CancelTrackWaveform { .. }
             | Command::GetTrackEdit { .. }
@@ -3133,6 +3135,22 @@ mod tests {
         (engine, root)
     }
 
+    /// The archive keeps plays that were listened to, so a test that wants a
+    /// real row has to supply real listening rather than a touch.
+    fn listened(engine: &mut Engine) {
+        engine.listening_history.pretend_listened();
+    }
+
+    fn history_rows(engine: &Engine) -> Vec<renderer_engine::protocol::HistoryItem> {
+        engine
+            .history(&renderer_engine::protocol::HistoryQuery {
+                limit: usize::MAX,
+                ..renderer_engine::protocol::HistoryQuery::default()
+            })
+            .unwrap()
+            .items
+    }
+
     fn unavailable_track(id: &str) -> TrackRef {
         TrackRef {
             id: id.to_owned(),
@@ -3461,7 +3479,8 @@ mod tests {
             track_id: uri.clone(),
             position_ms: 5_000,
         }));
-        assert_eq!(engine.history().unwrap().len(), 1);
+        listened(&mut engine);
+        assert_eq!(history_rows(&engine).len(), 1);
 
         let track = engine.state.queue[0].clone();
         assert!(
@@ -3471,7 +3490,7 @@ mod tests {
             "the capture engine has no player"
         );
         assert!(engine.preview_mode);
-        let rows = engine.history().unwrap();
+        let rows = history_rows(&engine);
         assert_eq!(rows.len(), 1, "the real row is finalized, not discarded");
         assert_eq!(rows[0].row.track_id, "0123456789ABCDEFGHIJKL");
         assert!(!rows[0].row.completed);
@@ -3483,7 +3502,7 @@ mod tests {
             position_ms: 5_000,
         }));
         assert_eq!(
-            engine.history().unwrap().len(),
+            history_rows(&engine).len(),
             1,
             "a preview Playing event cannot append a draft row"
         );
@@ -3535,9 +3554,9 @@ mod tests {
             play_request_id: 9,
             track_id: track_uri(),
         }));
-        assert!(engine.history().unwrap().is_empty());
+        assert!(history_rows(&engine).is_empty());
         engine.shutdown();
-        assert!(engine.history().unwrap().is_empty());
+        assert!(history_rows(&engine).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3571,7 +3590,8 @@ mod tests {
             track_id: track_uri(),
             position_ms: 0,
         }));
-        let rows = engine.history().unwrap();
+        listened(&mut engine);
+        let rows = history_rows(&engine);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].row.track_id, "0123456789ABCDEFGHIJKL");
         assert_eq!(rows[0].row.context, "library");
@@ -3587,15 +3607,16 @@ mod tests {
             track_id: uri.clone(),
             position_ms: 5_000,
         }));
+        listened(&mut engine);
         assert!(engine.on_player_event(PlayerEvent::Paused {
             play_request_id: 7,
             track_id: uri,
             position_ms: 5_000,
         }));
-        let paused_ms = engine.history().unwrap()[0].row.ms_played;
+        let paused_ms = history_rows(&engine)[0].row.ms_played;
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(
-            engine.history().unwrap()[0].row.ms_played,
+            history_rows(&engine)[0].row.ms_played,
             paused_ms,
             "audio-device or player pauses must not accrue silent wall time"
         );
@@ -3610,13 +3631,13 @@ mod tests {
             track_id: track_uri(),
             position_ms: 5_000,
         }));
+        listened(&mut engine);
         assert!(engine.on_player_signal(PlayerSignal::Closed { generation: 0 }));
 
-        let stored: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("listening_history.json")).unwrap())
-                .unwrap();
-        assert!(stored["active"].is_null());
-        assert_eq!(stored["finalized"].as_array().unwrap().len(), 1);
+        // The play is in the journal and the in-progress sidecar is gone.
+        let journal = std::fs::read_to_string(root.join("listening_history.jsonl")).unwrap();
+        assert_eq!(journal.lines().filter(|line| !line.is_empty()).count(), 1);
+        assert!(!root.join("listening_history_active.json").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

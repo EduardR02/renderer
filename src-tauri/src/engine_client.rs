@@ -968,8 +968,17 @@ impl EngineClient {
 
     pub async fn get_history(
         &self,
-    ) -> Result<Vec<renderer_engine::protocol::HistoryItem>, String> {
-        let reply = self.request("get_history", Value::Null).await?;
+        offset: usize,
+        limit: usize,
+        query: &str,
+        sort: &str,
+    ) -> Result<renderer_engine::protocol::HistoryPage, String> {
+        let reply = self
+            .request(
+                "get_history",
+                json!({"offset": offset, "limit": limit, "query": query, "sort": sort}),
+            )
+            .await?;
         parse_data(reply, "get_history")
     }
 
@@ -1251,6 +1260,13 @@ impl EngineClient {
             .request("browse_search", json!({"query": query, "limit": limit}))
             .await?;
         parse_data(reply, "browse_search")
+    }
+
+    pub async fn browse_followed_artists(
+        &self,
+    ) -> Result<Vec<renderer_engine::protocol::ArtistRef>, String> {
+        let reply = self.request("browse_followed_artists", json!({})).await?;
+        parse_data(reply, "browse_followed_artists")
     }
 
     pub async fn create_playlist(

@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use renderer_engine::protocol::{
     normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
     ArtistCataloguePage, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
-    ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist,
-    CreditRole, HistoryItem as EngineHistoryItem, LikedSongsPage, PlaylistBrowse,
-    PlaylistRecommendations, PlaylistRef, RadioBrowse, SearchBrowse, SearchTopRef,
-    SongwriterPlaylist as EngineSongwriterPlaylist, TrackCredits, TrackEdit, TrackRef,
-    TrackWaveform as EngineTrackWaveform,
+    ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist, CreditRole,
+    HistoryItem as EngineHistoryItem, HistoryPage as EngineHistoryPage,
+    LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse,
+    SearchBrowse, SearchTopRef, SongwriterPlaylist as EngineSongwriterPlaylist, TrackCredits,
+    TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform,
 };
 
 /// The verified songwriter playlist returned by the artist's separate
@@ -205,6 +205,28 @@ impl From<EngineHistoryItem> for HistoryEntry {
             completed: entry.row.completed,
             context: entry.row.context,
             track: Track::from(entry.track),
+        }
+    }
+}
+
+/// One window of the listening archive, as the view consumes it.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct HistoryPageDetail {
+    pub entries: Vec<HistoryEntry>,
+    pub total: usize,
+    pub recorded: usize,
+    pub offset: usize,
+    pub next_offset: Option<usize>,
+}
+
+impl From<EngineHistoryPage> for HistoryPageDetail {
+    fn from(page: EngineHistoryPage) -> Self {
+        Self {
+            entries: page.items.into_iter().map(HistoryEntry::from).collect(),
+            total: page.total,
+            recorded: page.recorded,
+            offset: page.offset,
+            next_offset: page.next_offset,
         }
     }
 }
@@ -1061,6 +1083,40 @@ mod tests {
         assert_eq!(entry.track.name, "Song");
     }
 
+    /// The page's counts are what the view sizes its scrollbar and its
+    /// "showing N of M" line from, so they have to survive the crossing
+    /// distinct from each other and from the number of rows carried.
+    #[test]
+    fn history_page_conversion_keeps_the_window_and_both_counts() {
+        let item = |id: &str| EngineHistoryItem {
+            row: renderer_engine::protocol::HistoryRow {
+                track_id: id.to_owned(),
+                started_at: 1_725_000_000_000,
+                ms_played: 91_000,
+                completed: true,
+                context: String::new(),
+            },
+            track: TrackRef {
+                id: id.to_owned(),
+                name: format!("Song {id}"),
+                ..TrackRef::default()
+            },
+        };
+        let detail = HistoryPageDetail::from(EngineHistoryPage {
+            items: vec![item("a"), item("b")],
+            total: 340,
+            recorded: 1_204,
+            offset: 200,
+            next_offset: Some(202),
+        });
+        assert_eq!(detail.entries.len(), 2);
+        assert_eq!(detail.entries[1].track.name, "Song b");
+        assert_eq!(detail.total, 340, "the filtered list being paged");
+        assert_eq!(detail.recorded, 1_204, "the archive behind it");
+        assert_eq!(detail.offset, 200);
+        assert_eq!(detail.next_offset, Some(202));
+    }
+
     #[test]
     fn cover_candidates_take_the_first_four_distinct_covers() {
         let covers = ["a", "a", "b", "c", "b", "d", "e"];
@@ -1234,6 +1290,31 @@ mod tests {
             Playlist::from(&reference).description,
             "Songs under < 3 min > classics"
         );
+    }
+
+    #[test]
+    fn followed_artists_carry_their_portraits_to_the_frontend() {
+        let artists: Vec<Artist> = vec![
+            ArtistRef {
+                id: "ar1".into(),
+                uri: "spotify:artist:ar1".into(),
+                name: "Artist One".into(),
+                portrait_url: Some("portrait".into()),
+            },
+            ArtistRef {
+                id: "ar2".into(),
+                uri: "spotify:artist:ar2".into(),
+                name: "Artist Two".into(),
+                portrait_url: None,
+            },
+        ]
+        .into_iter()
+        .map(Artist::from)
+        .collect();
+        assert_eq!(artists[0].cover_url, "portrait");
+        // The frontend `Artist` has no optional cover; a missing portrait is
+        // the empty string the identity tile already stands in for.
+        assert_eq!(artists[1].cover_url, "");
     }
 
     #[test]

@@ -9,6 +9,7 @@
     ui,
     retryDetail,
     loadCataloguePage,
+    resolveCoverUrl,
   } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
@@ -88,6 +89,25 @@
     if (n < 2) return;
     figureIndex = (figurePosition + delta + n) % n;
   }
+  /* Both neighbours, warmed as soon as you land on a picture. The frame no
+     longer breaks while a photograph is on its way — it holds the outgoing one
+     until the incoming has decoded, see Cover — but held is still waited, and
+     a step should not be a wait at all. One picture ahead in each direction is
+     the same bet the lightbox already makes, and `resolveCoverUrl` is cached,
+     so stepping back over ground you have covered costs nothing. The <img> is
+     what puts the bytes in the browser's own cache; the command only says
+     where the file landed on disk. */
+  $effect(() => {
+    const n = aboutFigures.length;
+    if (n < 2) return;
+    for (const offset of [1, -1]) {
+      const url = aboutFigures[(figurePosition + offset + n) % n]?.url;
+      if (!url) continue;
+      resolveCoverUrl(url).then((local) => {
+        if (local) new Image().src = local;
+      });
+    }
+  });
   /* ------------------------------------------------------- the About frame
      ONE shape for the whole gallery, decided before a single picture loads.
 
@@ -941,6 +961,11 @@
       <button class="btn-ghost" onclick={openArtistRadio} disabled={!artist?.id}>
         Artist Radio
       </button>
+      <!-- No Follow button. Spotify's artist follow is a protobuf collection
+           write against an internal service librespot ships no schema for, so
+           this app can read who you follow and cannot change it; the engine's
+           `follow` module records what a write would take. A control that
+           cannot act is worse than no control. -->
     </div>
 
     {#if top.length}

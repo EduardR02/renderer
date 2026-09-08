@@ -179,6 +179,45 @@ fixtures.artist = {
 };
 fixtures.songwriterPlaylist = clone(songwriterPlaylist);
 
+/**
+ * Who the fixture account follows.
+ *
+ * Read-only, like the real thing: this app cannot follow or unfollow anybody
+ * (see the engine's `follow` module), so there is no mutation for the harness
+ * to fake. What it does reproduce is the shape the rail has to survive — a
+ * mix of artists with portraits and without, and names long enough to reach
+ * the ellipsis in a 212px rail.
+ *
+ * Nine entries, which is what the owner's real account carries: enough to
+ * fill the rail's visible run without paging, which the real read does not do
+ * either.
+ */
+let followedArtists = [
+  { id: "ar1", uri: "spotify:artist:ar1", name: "Artist 1", cover_url: "/dev/gallery-portrait.svg" },
+  { id: "ar2", uri: "spotify:artist:ar2", name: "Artist 2", cover_url: "" },
+  { id: "fa1", uri: "spotify:artist:fa1", name: "Conrad.", cover_url: "/dev/gallery-landscape.svg" },
+  { id: "fa2", uri: "spotify:artist:fa2", name: "The Sundown Committee", cover_url: "" },
+  { id: "fa3", uri: "spotify:artist:fa3", name: "Marguerite Fontaine-Delacroix", cover_url: "/dev/gallery-panorama.svg" },
+  { id: "fa4", uri: "spotify:artist:fa4", name: "Halogen", cover_url: "" },
+  { id: "fa5", uri: "spotify:artist:fa5", name: "Nightjar", cover_url: "" },
+  { id: "fa6", uri: "spotify:artist:fa6", name: "Beacon & Ash", cover_url: "" },
+  { id: "fa7", uri: "spotify:artist:fa7", name: "Yuki Watanabe Ensemble", cover_url: "" },
+];
+let followedFailure = null;
+/** How long the read pretends the network takes; see `setFollowedDelay`,
+    which is what makes the rail's loading frame observable at all. */
+let followedDelayMs = 0;
+
+async function followedRoundTrip() {
+  if (followedDelayMs > 0) await new Promise((done) => setTimeout(done, followedDelayMs));
+  if (followedFailure) {
+    // Rejected with the bare string, the way a Tauri command's
+    // `Result<_, String>` reaches the frontend — an Error here would put an
+    // "Error:" prefix on screen that production never shows.
+    return Promise.reject(followedFailure);
+  }
+}
+
 /** Track ids for catalogue releases start past every library fixture. */
 let catalogueTrackOffset = 200;
 
@@ -259,14 +298,57 @@ const ARTIST_ROUTE_NAMES = [
 
 const now = Date.now();
 const H = 3600_000;
-fixtures.history = makeTracks(14).map((track, i) => ({
-  track_id: track.id,
-  started_at: now - i * (37 * 60_000) - H / 3,
-  ms_played: i % 5 === 0 ? Math.floor(track.duration_ms * 0.4) : track.duration_ms,
-  completed: i % 5 !== 0,
-  context: ["playlist:p1", "album:al1", "search", "liked", "radio:r1"][i % 5],
-  track,
-}));
+
+/**
+ * An archive the size of the real one, because the history view's problems are
+ * only visible at scale: fourteen rows page in one request and group into one
+ * day, so a fourteen-row fixture proves nothing about either. This builds ~1200
+ * plays across three weeks with days of wildly different length — including two
+ * silent days, which is the case that a naive day-grouping gets wrong.
+ *
+ * Deterministic: a small LCG rather than Math.random, so a screenshot taken now
+ * and one taken after a change differ only where the code differs.
+ */
+const HISTORY_DAYS = 21;
+const DAY = 86_400_000;
+function historyArchive() {
+  const catalogue = makeTracks(60);
+  const contexts = ["playlist:p1", "album:al1", "search", "liked", "radio:r1", "playlist:p2", ""];
+  const rows = [];
+  let seed = 20_260_908;
+  const rand = () => ((seed = (seed * 1_103_515_245 + 12_345) & 0x7fffffff) / 0x7fffffff);
+  const midnight = new Date();
+  midnight.setHours(0, 0, 0, 0);
+  for (let day = 0; day < HISTORY_DAYS; day += 1) {
+    // Two deliberately silent days, so the grouping has gaps to survive.
+    if (day === 4 || day === 11) continue;
+    const plays = day === 0 ? 9 : 20 + Math.floor(rand() * 70);
+    // Listening starts somewhere in the morning and runs forward from there.
+    let at = midnight.getTime() - day * DAY + (8 + rand() * 3) * H;
+    for (let play = 0; play < plays && at < now; play += 1) {
+      const track = catalogue[Math.floor(rand() * catalogue.length)];
+      const completed = rand() > 0.28;
+      rows.push({
+        track_id: track.id,
+        started_at: Math.round(at),
+        ms_played: completed
+          ? track.duration_ms
+          : Math.floor(track.duration_ms * (0.12 + rand() * 0.6)),
+        completed,
+        context: contexts[Math.floor(rand() * contexts.length)],
+        track,
+      });
+      at += track.duration_ms + rand() * 4 * 60_000;
+    }
+  }
+  rows.sort((a, b) => b.started_at - a.started_at);
+  return rows;
+}
+fixtures.history = historyArchive();
+
+/** Every history page this harness has served, so paging can be measured. */
+const historyPages = [];
+window.__historyPages = historyPages;
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -654,6 +736,8 @@ function trackCreditsPayload(id) {
 
 
 window.__fixtures = fixtures;
+/** How long `get_cover` pretends the network takes. See the command below. */
+let coverDelayMs = 0;
 window.__TAURI_INTERNALS__ = {
   callbacks,
   transformCallback,
@@ -727,8 +811,34 @@ window.__TAURI_INTERNALS__ = {
         settings.animated_canvas = Boolean(args.enabled ?? args.value);
         emit("settings", clone(settings));
         return null;
-      case "get_history":
-        return clone(fixtures.history);
+      /* Pages exactly as the engine does — filter and sort here, return a
+         window plus the two counts — so the view is exercised against the
+         real contract instead of a fixture that hands it everything. Every
+         page served is recorded, which is how the paging can be measured. */
+      case "get_history": {
+        const needle = String(args.query ?? "").trim().toLowerCase();
+        const sort = String(args.sort ?? "recent");
+        const artistsOf = (row) => (row.track.artist_names ?? []).join(", ");
+        let rows = needle
+          ? fixtures.history.filter((row) =>
+              row.track.name.toLowerCase().includes(needle) ||
+              artistsOf(row).toLowerCase().includes(needle))
+          : fixtures.history.slice();
+        if (sort === "oldest") rows.reverse();
+        else if (sort === "title") rows.sort((a, b) => a.track.name.localeCompare(b.track.name) || b.started_at - a.started_at);
+        else if (sort === "artist") rows.sort((a, b) => artistsOf(a).localeCompare(artistsOf(b)) || a.track.name.localeCompare(b.track.name) || b.started_at - a.started_at);
+        const offset = Math.max(0, Number(args.offset ?? 0));
+        const limit = Math.max(1, Number(args.limit ?? 100));
+        const entries = rows.slice(offset, offset + limit);
+        historyPages.push({ offset, limit, query: needle, sort, served: entries.length });
+        return {
+          entries: clone(entries),
+          total: rows.length,
+          recorded: fixtures.history.length,
+          offset,
+          next_offset: offset + entries.length < rows.length ? offset + entries.length : null,
+        };
+      }
       case "get_track_waveform":
         return waveformFor(args.trackId ?? args.track_id, args.durationMs ?? args.duration_ms);
       case "get_track_edit": {
@@ -927,6 +1037,11 @@ window.__TAURI_INTERNALS__ = {
         emit("session", { auth_state: "logged_out", username: "", error: "" });
         emitState();
         return null;
+      case "browse_followed_artists":
+        // The whole collection in one answer, no cursor — the real endpoint
+        // returns no cursor field of any kind, so neither does this.
+        await followedRoundTrip();
+        return clone(followedArtists);
       case "browse_track_credits":
         return clone(trackCreditsPayload(args.id ?? args.trackId ?? "t0"));
       case "get_cache_stats":
@@ -944,6 +1059,11 @@ window.__TAURI_INTERNALS__ = {
       case "get_cover": {
         const url = String(args.url ?? "");
         if (!url) return null;
+        // The real command is a network download; here it is a same-origin
+        // path that resolves within a frame, which hides every defect that
+        // lives in the window between "a url is wanted" and "its pixels
+        // exist". `setCoverDelay` reopens that window on demand.
+        if (coverDelayMs > 0) await new Promise((done) => setTimeout(done, coverDelayMs));
         return /^https?:/.test(url) ? url : new URL(url, location.origin).href;
       }
       default:
@@ -984,6 +1104,10 @@ window.__harness = {
     return [...(exclusionsFor(playlistId) ?? [])];
   },
   getExcluded: (playlistId = "p1") => [...(exclusionsFor(playlistId) ?? [])],
+  /** Make artwork resolution take as long as a real one does. Anything that
+      only misbehaves while a cover is on its way — a picture that has been
+      asked for and does not exist yet — is invisible without this. */
+  setCoverDelay: (ms = 0) => (coverDelayMs = Math.max(0, Number(ms) || 0)),
 };
 
 await import("../src/styles/app.css");
@@ -1036,7 +1160,56 @@ Object.assign(window.__harness, {
     state.navigate("artist", fixtures.artist.id);
     return clone(fixtures.songwriterPlaylist);
   },
-  selectHistory: () => state.navigate("history"),
+  selectHistory: () => {
+    historyPages.length = 0;
+    return state.navigate("history");
+  },
+  /** What the view actually asked for, versus what the archive holds. */
+  historyPages: () => ({
+    requests: historyPages.length,
+    rowsServed: historyPages.reduce((sum, page) => sum + page.served, 0),
+    archive: fixtures.history.length,
+    pages: clone(historyPages),
+  }),
+  /** Shrink or regrow the archive to exercise the empty and one-day cases. */
+  setHistorySize: (count) => {
+    fixtures.history = historyArchive().slice(0, Math.max(0, count));
+    return fixtures.history.length;
+  },
+  /**
+   * Replace the followed collection, then make the rail forget it has asked —
+   * the read happens once per session, so swapping the fixture alone would
+   * leave the rail showing the list it already has.
+   */
+  setFollowedArtists: (artists = []) => {
+    followedArtists = artists.map((artist, index) => ({
+      id: artist.id ?? `fa${index}`,
+      uri: artist.uri ?? `spotify:artist:${artist.id ?? `fa${index}`}`,
+      name: artist.name ?? `Artist ${index}`,
+      cover_url: artist.cover_url ?? "",
+    }));
+    state.followed.loaded = false;
+    state.followed.error = "";
+    state.followed.artists = [];
+    return followedArtists.length;
+  },
+  /**
+   * Make the followed-artists read answer the way a refused round trip does.
+   * Pass null to allow it again. The rail must show the refusal and offer the
+   * retry rather than reading as an account that follows nobody.
+   */
+  setFollowedFailure: (message = "followed-artists request failed: 503 Service Unavailable") => {
+    followedFailure = message || null;
+    /* A recorded failure is what stops the rail asking again, so clearing it
+       here is what lets the next switch actually re-request. */
+    state.followed.loaded = false;
+    state.followed.error = "";
+    return followedFailure;
+  },
+  /** Make the read take as long as a real one, so the rail's loading frame is
+      observable at all; the same reason `setCoverDelay` exists. */
+  setFollowedDelay: (ms = 0) => (followedDelayMs = Math.max(0, Number(ms) || 0)),
+  followedArtists: () => followedArtists.map((artist) => artist.id),
   bootCachedLibrary: () => {
     // Stage 1 of the cached-then-fresh boot: hydrate from a cached get_state
     // snapshot — including one row the fresh rootlist will drop — without

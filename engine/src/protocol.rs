@@ -275,9 +275,25 @@ pub enum Command {
         track_id: String,
         enabled: bool,
     },
-    /// One newest-first, bounded snapshot of local listening history. This is
-    /// deliberately available before Spotify authentication is ready.
-    GetHistory,
+    /// One page of local listening history, filtered and ordered by the
+    /// engine. This is deliberately available before Spotify authentication
+    /// is ready.
+    ///
+    /// Filtering and ordering belong here rather than in the view because the
+    /// view only ever holds a window: a client-side filter would have to pull
+    /// the whole archive back to answer, which is the thing paging exists to
+    /// avoid.
+    GetHistory {
+        #[serde(default)]
+        offset: usize,
+        #[serde(default = "default_history_page_size")]
+        limit: usize,
+        /// Case-insensitive substring over title and credited artists.
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        sort: HistorySort,
+    },
     /// Removes all finalized and in-progress local listening history rows.
     ClearHistory,
     Shutdown,
@@ -360,6 +376,11 @@ pub enum Command {
     BrowseCanvas {
         id: String,
     },
+    /// Every artist this account follows, in one answer. Responded to with a
+    /// `browse_followed_artists` message carrying an array of [`ArtistRef`].
+    /// There is no cursor: the engine's `follow` module records why this read
+    /// does not page.
+    BrowseFollowedArtists,
     /// Creates a playlist via the spclient playlist4 create endpoint and adds
     /// it to the user's rootlist. Responded to with an `edit_create_playlist`
     /// message carrying the new playlist's [`PlaylistRef`].
@@ -436,8 +457,64 @@ pub struct HistoryItem {
     pub track: TrackRef,
 }
 
+/// The orders the history view offers. Chronological order is free — it is the
+/// order the archive is stored in — so only the two name orders cost a sort.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySort {
+    #[default]
+    Recent,
+    Oldest,
+    Title,
+    Artist,
+}
+
+/// One request for a window of the local listening archive.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HistoryQuery {
+    pub offset: usize,
+    pub limit: usize,
+    pub query: String,
+    pub sort: HistorySort,
+}
+
+impl Default for HistoryQuery {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: default_history_page_size(),
+            query: String::new(),
+            sort: HistorySort::default(),
+        }
+    }
+}
+
+/// One page of the archive, plus the two counts the view needs to size a
+/// scrollbar and to notice that the archive moved underneath it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HistoryPage {
+    pub items: Vec<HistoryItem>,
+    /// Rows matching the filter: the length of the list being paged.
+    pub total: usize,
+    /// Rows in the whole archive, filter ignored. A change here is how the
+    /// view learns that a play qualified while it was scrolling, without
+    /// polling for one.
+    pub recorded: usize,
+    pub offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
 fn default_catalogue_release_page_size() -> usize {
     4
+}
+
+/// Sized so one page comfortably outruns a fast scroll on a tall window
+/// (a 56px row, so ~14 rows per 800px) without ever approaching the archive.
+pub fn default_history_page_size() -> usize {
+    100
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1164,6 +1241,16 @@ mod tests {
     };
 
     #[test]
+    fn the_followed_artists_command_carries_nothing_but_its_name() {
+        let request: Request = serde_json::from_value(json!({
+            "request_id": "request-40",
+            "type": "browse_followed_artists",
+        }))
+        .unwrap();
+        assert!(matches!(request.command, Command::BrowseFollowedArtists));
+    }
+
+    #[test]
     fn edit_commands_deserialize_from_the_line_protocol() {
         let create: Request = serde_json::from_value(json!({
             "request_id": "request-16",
@@ -1434,13 +1521,40 @@ mod tests {
     }
 
     #[test]
-    fn get_history_is_a_zero_argument_command() {
-        let request: Request = serde_json::from_value(json!({
+    fn get_history_pages_and_defaults_to_the_newest_first_page() {
+        let bare: Request = serde_json::from_value(json!({
             "request_id": "request-history",
             "type": "get_history",
         }))
         .unwrap();
-        assert!(matches!(request.command, Command::GetHistory));
+        assert!(matches!(
+            bare.command,
+            Command::GetHistory {
+                offset: 0,
+                limit,
+                ref query,
+                sort: super::HistorySort::Recent,
+            } if limit == super::default_history_page_size() && query.is_empty()
+        ));
+
+        let paged: Request = serde_json::from_value(json!({
+            "request_id": "request-history",
+            "type": "get_history",
+            "offset": 300,
+            "limit": 50,
+            "query": "rick",
+            "sort": "artist",
+        }))
+        .unwrap();
+        assert!(matches!(
+            paged.command,
+            Command::GetHistory {
+                offset: 300,
+                limit: 50,
+                ref query,
+                sort: super::HistorySort::Artist,
+            } if query == "rick"
+        ));
     }
 
     #[test]

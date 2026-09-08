@@ -20,8 +20,8 @@ use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, Sta
 use crate::log;
 use crate::media_keys;
 use crate::types::{
-    AlbumDetail, AppState as AppStateSnapshot, ArtistCataloguePageDetail, ArtistDetail,
-    CacheStats, HistoryEntry, LikedSongsDetail, Playlist, PlaylistDetail,
+    AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail,
+    CacheStats, HistoryPageDetail, LikedSongsDetail, Playlist, PlaylistDetail,
     PlaylistRecommendationsDetail, RadioDetail, SearchResult, SongwriterPlaylist, Track,
     TrackCreditsDetail, TrackPlaylistRef, TrackWaveform,
 };
@@ -168,16 +168,26 @@ pub async fn move_queue(
     client.move_queue(from, to).await
 }
 
+/// One page of the listening archive. The filter and the order are the
+/// engine's to apply: it holds the archive, and the view holds a window.
 #[tauri::command]
 pub async fn get_history(
     client: State<'_, Arc<EngineClient>>,
-) -> Result<Vec<HistoryEntry>, String> {
-    Ok(client
-        .get_history()
-        .await?
-        .into_iter()
-        .map(HistoryEntry::from)
-        .collect())
+    offset: Option<usize>,
+    limit: Option<usize>,
+    query: Option<String>,
+    sort: Option<String>,
+) -> Result<HistoryPageDetail, String> {
+    Ok(HistoryPageDetail::from(
+        client
+            .get_history(
+                offset.unwrap_or(0),
+                limit.unwrap_or_else(renderer_engine::protocol::default_history_page_size),
+                query.as_deref().unwrap_or_default(),
+                sort.as_deref().unwrap_or("recent"),
+            )
+            .await?,
+    ))
 }
 
 #[tauri::command]
@@ -456,6 +466,30 @@ pub async fn browse_canvas(
     id: String,
 ) -> Result<Option<renderer_engine::protocol::Canvas>, String> {
     client.browse_canvas(&id).await
+}
+
+// ---------------------------------------------------------------------------
+// Follow commands
+// ---------------------------------------------------------------------------
+
+/// Every artist the signed-in account follows. Read-only: this app has no way
+/// to change who you follow — the engine's `follow` module records why — so
+/// the rail shows the collection and the official client edits it.
+///
+/// Deliberately uncached. The rail asks for it the first time the library
+/// switches to artists, and following is mutable from every other Spotify
+/// client, so a stale list held on disk would be a worse answer than a round
+/// trip nobody pays for unless they look.
+#[tauri::command]
+pub async fn browse_followed_artists(
+    client: State<'_, Arc<EngineClient>>,
+) -> Result<Vec<Artist>, String> {
+    Ok(client
+        .browse_followed_artists()
+        .await?
+        .into_iter()
+        .map(Artist::from)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

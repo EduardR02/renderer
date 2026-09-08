@@ -71,6 +71,26 @@
       fetchable; until its pixels exist the tile holds the neutral
       `.art.pending` ground rather than anything resembling content. */
   let shown = $state({});
+  /**
+   * The url the single tier's <img> is holding, which only ever moves FORWARD.
+   *
+   * Taking a src away does not blank an <img>, it BREAKS it: the browser drops
+   * the picture and draws its own glyph, 16px of it, in the middle of whatever
+   * box the element has. That is the "no image" mark that flashed in the
+   * artist gallery — one element, reused across the set, and every step handed
+   * it `resolved[nextUrl]` while that was still undefined.
+   *
+   * Handing it the outgoing url instead costs nothing and closes the window
+   * completely, because holding one picture until the next can replace it is
+   * the platform's own behaviour: an <img> whose src changes keeps presenting
+   * the image it already has until the new one has decoded, then swaps in a
+   * single frame. Which is also the nicest thing a stepper could do.
+   */
+  let painted = $state("");
+  $effect(() => {
+    const local = resolved[primary];
+    if (local) painted = local;
+  });
 
   $effect(() => {
     const wanted = tier === "mosaic" ? pool : primary ? [primary] : [];
@@ -98,6 +118,13 @@
    * Reveal an <img> once its pixels exist. A cache hit can finish decoding
    * before an onload handler could ever be bound, so completeness is
    * checked here, synchronously, where the listener cannot lose that race.
+   *
+   * On an UPDATE that check answers for the picture the element is still
+   * holding rather than for the one just asked for, and that is deliberate:
+   * `shown` gates the reveal fade, and a tile that already has pixels on
+   * screen must not fade them out and back in because the entity behind them
+   * changed. The swap itself is atomic (see `painted`), so there is no moment
+   * to cover.
    */
   function bindArt(node, url) {
     let gate = null;
@@ -142,8 +169,12 @@
           <img use:bindArt={url} class:fresh={!shown[url]} src={resolved[url]} alt="" width={Math.round(size / 2)} height={Math.round(size / 2)} draggable="false" loading="lazy" decoding="async" />
         {/if}
       {/each}
-    {:else}
-      <img use:bindArt={primary} class:fresh={!shown[primary]} src={resolved[primary]} alt={name} width={size} height={size} draggable="false" loading="lazy" decoding="async" />
+    {:else if painted}
+      <!-- No picture, no picture element, the same rule the mosaic keeps above.
+           A srcless <img> is not an empty box either: it lays out the 16px
+           broken-image placeholder, which the reveal fade happened to hide at
+           opacity 0 — and `prefers-reduced-motion` turns that fade off. -->
+      <img use:bindArt={primary} class:fresh={!shown[primary]} src={painted} alt={name} width={size} height={size} draggable="false" loading="lazy" decoding="async" />
     {/if}
   </span>
 {:else}

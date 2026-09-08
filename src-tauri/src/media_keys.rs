@@ -297,9 +297,22 @@ fn disable_unsupported_seek_buttons(hwnd: usize) -> windows::core::Result<()> {
 
 #[cfg(windows)]
 fn clear_windows_metadata(hwnd: usize) -> windows::core::Result<()> {
+    use windows::Media::MediaPlaybackType;
+
     let updater = windows_controls(hwnd)?.DisplayUpdater()?;
     updater.ClearAll()?;
     updater.Update()?;
+    // `ClearAll` also resets the playback type to `Unknown`, and an untyped
+    // updater refuses to hand out `MusicProperties` at all — every later track
+    // would fail to publish with ERROR_NOT_SUPPORTED, which is exactly what
+    // happened: the first engine state arrives before authentication finishes,
+    // carries no track, and poisoned the updater for the rest of the session.
+    // Souvlaki types the updater once when it attaches, so restoring the type
+    // it chose is what puts the updater back where the rest of this file
+    // assumes it is. Retyping after `Update` rather than before it keeps the
+    // published card empty; setting the type first would push a blank music
+    // item to Windows on the way past.
+    updater.SetType(MediaPlaybackType::Music)?;
     Ok(())
 }
 

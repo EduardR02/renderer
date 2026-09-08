@@ -605,6 +605,72 @@ export function loadDetail(name = route.name, id = route.id) {
 export function retryDetail() {
   loadDetail(route.name, route.id);
 }
+
+/* ---------------- Followed artists ---------------- */
+
+/**
+ * The artists this account follows, as the library rail's other list.
+ *
+ * Read-only, and that is a property of Spotify rather than a shortcut: an
+ * artist follow is a protobuf collection write against an internal service
+ * librespot carries no schema for (the engine's `follow` module records what
+ * it would take). So this app shows the collection and the official client is
+ * where it changes.
+ *
+ * Nothing is fetched until the rail is actually switched to artists. That is
+ * the whole point of the rail's design — Following costs nothing at rest —
+ * and it costs nothing here either. `loaded` rather than `artists.length` is
+ * the "has this been asked" flag, because an account following nobody is a
+ * real answer and must not re-request on every switch.
+ */
+export const followed = $state({ artists: [], loaded: false, loading: false, error: "" });
+
+let followedGeneration = 0;
+
+/**
+ * Loads the followed artists, once per session unless forced.
+ *
+ * Not cached to disk anywhere: following is mutable from every other Spotify
+ * client, so a list restored from last week is a list of people you may no
+ * longer follow, and the round trip is one request nobody pays for unless
+ * they open the switch.
+ */
+export function loadFollowedArtists({ force = false } = {}) {
+  if (followed.loading) return;
+  /* A failure is an answer too, and it stops the asking. The rail calls this
+     from an effect that watches these very flags, so without the `error` term
+     a refused read would set `error`, wake the effect, and be asked again
+     immediately — a request loop against a service that had just said no.
+     Only Try again, or a new account, asks a second time. */
+  if (!force && (followed.loaded || followed.error)) return;
+  const generation = ++followedGeneration;
+  followed.loading = true;
+  followed.error = "";
+  api
+    .browseFollowedArtists()
+    .then((artists) => {
+      if (generation !== followedGeneration) return;
+      followed.artists = Array.isArray(artists) ? artists.filter((entry) => entry?.id) : [];
+      followed.loaded = true;
+    })
+    .catch((reason) => {
+      if (generation !== followedGeneration) return;
+      followed.error = String(reason || "Could not load your followed artists.");
+    })
+    .finally(() => {
+      if (generation === followedGeneration) followed.loading = false;
+    });
+}
+
+/** Who you follow is an account fact, so it cannot outlive the account. */
+function resetFollowsForSession() {
+  followedGeneration += 1;
+  followed.artists = [];
+  followed.loaded = false;
+  followed.loading = false;
+  followed.error = "";
+}
+
 export const search = $state({ query: "", results: null, submitted: false, busy: false, error: null });
 
 /**
@@ -755,6 +821,7 @@ function observeSearchSession(payload) {
       searchSessionEpoch += 1;
       resetSearchForSession();
       resetPersonalizedDiscoveryForSession();
+      resetFollowsForSession();
       clearPlaylistRecommendationsCache();
       // The previous account's recency must not leak into the next session's
       // Home: shelves stay hidden until the new account's own `library` event.
@@ -1667,7 +1734,14 @@ export const api = {
     clearLazyQueue();
     return invoke("move_queue", { from, to });
   },
-  getHistory: () => invoke("get_history"),
+  /**
+   * One window of the listening archive. The filter and the order travel with
+   * the request because the engine holds the archive and the view holds only
+   * the rows it is showing — answering either here would mean pulling the
+   * whole thing back, which is what the paging exists to stop.
+   */
+  getHistory: (offset = 0, limit = 100, query = "", sort = "recent") =>
+    invoke("get_history", { offset, limit, query, sort }),
   clearHistory: () => invoke("clear_history"),
   getTrackEdit: (trackId, playlistId = null) =>
     invoke("get_track_edit", { trackId, playlistId }),
@@ -1736,6 +1810,7 @@ export const api = {
   browseArtist: (id) => invoke("browse_artist", { id }),
   browseArtistSongwriter: (id, name) =>
     invoke("browse_artist_songwriter", { id, name }),
+  browseFollowedArtists: () => invoke("browse_followed_artists"),
   createPlaylist: (name) => invoke("create_playlist", { name }),
   renamePlaylist: (id, name) => invoke("rename_playlist", { id, name }),
   deletePlaylist: (id) => invoke("delete_playlist", { id }),

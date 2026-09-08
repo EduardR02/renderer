@@ -4,6 +4,7 @@ mod browse;
 mod customization;
 mod edits;
 mod engine;
+mod follow;
 mod history;
 mod io;
 mod resample;
@@ -20,9 +21,9 @@ use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use renderer_engine::protocol::{
-    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, Canvas, Command, LikedSongsPage, LikedUrisPage,
-    PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse, Response, SearchBrowse,
-    SongwriterPlaylist, TrackCredits, TrackWaveform,
+    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistRef, Canvas, Command, HistoryQuery,
+    LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
+    RadioBrowse, Response, SearchBrowse, SongwriterPlaylist, TrackCredits, TrackWaveform,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -86,6 +87,10 @@ enum BrowseOutcome {
     Search {
         request_id: String,
         result: Result<SearchBrowse, String>,
+    },
+    FollowedArtists {
+        request_id: String,
+        result: Result<Vec<ArtistRef>, String>,
     },
     CreatePlaylist {
         request_id: String,
@@ -260,8 +265,18 @@ async fn run(
                                 engine.shutdown();
                                 break;
                             }
-                            Command::GetHistory => {
-                                let result = engine.history();
+                            Command::GetHistory {
+                                offset,
+                                limit,
+                                query,
+                                sort,
+                            } => {
+                                let result = engine.history(&HistoryQuery {
+                                    offset,
+                                    limit,
+                                    query,
+                                    sort,
+                                });
                                 engine.send_browse_response(&request_id, "history", &result)?;
                             }
                             Command::ClearHistory => {
@@ -584,6 +599,20 @@ async fn run(
                                     }
                                 }
                             }
+                            Command::BrowseFollowedArtists => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = follow::followed_artists(&session).await;
+                                            let _ = sender.send(BrowseOutcome::FollowedArtists { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::FollowedArtists { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
                             Command::EditCreatePlaylist { name } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -770,6 +799,9 @@ async fn run(
                         }
                         BrowseOutcome::Search { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_search", &result)?;
+                        }
+                        BrowseOutcome::FollowedArtists { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_followed_artists", &result)?;
                         }
                         BrowseOutcome::CreatePlaylist { request_id, result } => {
                             engine.send_browse_response(&request_id, "edit_create_playlist", &result)?;
