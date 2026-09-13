@@ -402,7 +402,9 @@ export function maybeBackfillLazyQueue() {
   return backfillLazyQueue(false);
 }
 
-export const session = $state({ username: null, error: null });
+/** `authPending` covers the invoke that binds the OAuth callback port; the
+    Log in buttons disable on it so one click cannot become two flows. */
+export const session = $state({ username: null, error: null, authPending: false });
 
 /* ---------------- Playhead projection ---------------- */
 /* The Rust side emits a full `state` only when something other than the
@@ -1942,8 +1944,43 @@ export function togglePlay() {
   requestPlaying(!playback.playing).catch(() => {});
 }
 
-export function openAuthUrl() {
-  if (playback.auth_url) openUrl(playback.auth_url);
+/**
+ * Start a Spotify sign-in: arm the engine first, open the browser second.
+ *
+ * The order is the whole point. `login` is what binds the loopback listener on
+ * 127.0.0.1:5588 that Spotify's redirect comes back to, and until this
+ * function existed in this shape nothing ever invoked it — the button opened
+ * the authorize URL and nothing else, so the callback arrived at a port no
+ * process held and the sign-in died there. The engine binds synchronously
+ * before it answers, so awaiting the invoke is proof the port is held; opening
+ * the browser first, or without awaiting, would put the race back.
+ *
+ * A failure here means the flow cannot start at all (the port is taken by
+ * something else), so the browser must not be opened: the user is left on the
+ * login surface with the reason, and the engine is still in `needs_login` with
+ * its prepared URL intact, so clicking again is a clean retry.
+ */
+export async function openAuthUrl() {
+  // The engine no-ops a second concurrent flow, but the UI must not rely on
+  // that to know its own state: two clicks would otherwise open two tabs.
+  if (session.authPending) return;
+  const url = playback.auth_url;
+  if (!url) return;
+  session.authPending = true;
+  session.error = null;
+  try {
+    await api.login();
+  } catch (error) {
+    session.error = String(error?.message ?? error);
+    return;
+  } finally {
+    session.authPending = false;
+  }
+  // The listener is up and will wait; a browser that refuses to open is the
+  // one remaining way for the user to be left with nothing on screen.
+  openUrl(url).catch((error) => {
+    session.error = `Could not open your browser: ${String(error?.message ?? error)}`;
+  });
 }
 
 /* ---------------- Event wiring ---------------- */

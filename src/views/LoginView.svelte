@@ -33,8 +33,14 @@
 
   <div class="empty">
     <div class="actions">
-      <button class="btn-accent" disabled={!playback.auth_url} onclick={openAuthUrl}>
-        <Icon name="login" size={15} />Log in with Spotify
+      <button
+        class="btn-accent"
+        disabled={!playback.auth_url || session.authPending}
+        onclick={openAuthUrl}
+      >
+        <Icon name="login" size={15} />{session.authPending
+          ? "Opening Spotify…"
+          : "Log in with Spotify"}
       </button>
       <button class="link-more" onclick={() => navigate("settings")}>Settings</button>
     </div>

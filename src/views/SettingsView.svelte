@@ -187,10 +187,15 @@
                 ? "Opens Spotify in your browser to authorise this device."
                 : "Waiting for Spotify sign-in to be ready…"}
             </div>
+            {#if session.error}<div class="inline-error" role="alert">{session.error}</div>{/if}
           </div>
           <div class="set-ctl">
-            <button class="btn-accent" disabled={!playback.auth_url} onclick={openAuthUrl}>
-              <Icon name="login" size={15} />Log in
+            <button
+              class="btn-accent"
+              disabled={!playback.auth_url || session.authPending}
+              onclick={openAuthUrl}
+            >
+              <Icon name="login" size={15} />{session.authPending ? "Opening…" : "Log in"}
             </button>
           </div>
         </div>

@@ -218,6 +218,10 @@ async function followedRoundTrip() {
   }
 }
 
+/** How the fake engine answers `login`: null accepts, a string refuses with
+    that message. See `setLoginFailure`. */
+let loginFailure = null;
+
 /** Track ids for catalogue releases start past every library fixture. */
 let catalogueTrackOffset = 200;
 
@@ -1024,6 +1028,11 @@ window.__TAURI_INTERNALS__ = {
         return null;
       case "login":
       case "start_auth":
+        // The real command binds the OAuth callback port before it answers,
+        // so its rejection is the one thing standing between the user and a
+        // browser tab that could never come back. Rejected with the bare
+        // string, the way a Tauri `Result<_, String>` reaches the frontend.
+        if (loginFailure) return Promise.reject(loginFailure);
         playback.auth_state = "ready";
         playback.username = "eduard";
         emit("session", { auth_state: "ready", username: "eduard", error: "" });
@@ -1210,6 +1219,37 @@ Object.assign(window.__harness, {
       observable at all; the same reason `setCoverDelay` exists. */
   setFollowedDelay: (ms = 0) => (followedDelayMs = Math.max(0, Number(ms) || 0)),
   followedArtists: () => followedArtists.map((artist) => artist.id),
+  /**
+   * Put the app on the sign-in screen, which is otherwise unreachable here:
+   * the harness boots an authenticated fixture, so LoginView — the first
+   * surface a new machine ever shows — was never rendered in a browser check.
+   */
+  setLoggedOut: (authUrl = "https://accounts.spotify.com/authorize?fixture") => {
+    playback.auth_state = "needs_login";
+    playback.auth_url = authUrl;
+    playback.username = "";
+    playback.ready = false;
+    playback.playing = false;
+    state.session.username = null;
+    state.session.error = null;
+    state.session.authPending = false;
+    emit("session", { auth_state: "needs_login", username: "", error: "" });
+    emitState();
+    return playback.auth_url;
+  },
+  /**
+   * Make `login` refuse, the way the engine does when another process already
+   * holds the fixed callback port. Pass null to allow it again. The browser
+   * must NOT be opened in that case, and the reason has to land on screen.
+   */
+  setLoginFailure: (
+    message = "another program is already using port 5588 on this machine, and Spotify can " +
+      "only send the sign-in back to that exact port. Close whatever is holding it (or restart " +
+      "the computer) and try again.",
+  ) => {
+    loginFailure = message || null;
+    return loginFailure;
+  },
   bootCachedLibrary: () => {
     // Stage 1 of the cached-then-fresh boot: hydrate from a cached get_state
     // snapshot — including one row the fresh rootlist will drop — without

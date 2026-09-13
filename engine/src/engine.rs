@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 
 use crate::audio::AudioSignal;
 use crate::auth::{
-    AuthFailure, PendingAuth, PlaybackHandles, complete_oauth, connect_cached, create_playback,
-    percent_to_volume, prepare_oauth,
+    AuthFailure, OauthListener, PendingAuth, PlaybackHandles, bind_oauth_listener, complete_oauth,
+    connect_cached, create_playback, percent_to_volume, prepare_oauth,
 };
 use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
@@ -54,6 +54,20 @@ const TRACK_CHANGE_BURST_MINIMUM: usize = 2;
 /// classified each failure as isolated, and evicted the cache for every track
 /// it touched. The window has to outlast the failure, not the gesture.
 const UNAVAILABLE_BURST_WINDOW: Duration = Duration::from_secs(30);
+/// How many current-track load failures inside [`UNAVAILABLE_BURST_WINDOW`]
+/// stop playback outright instead of skipping onward.
+///
+/// One failure is a track: skip it, which is what the engine has always done
+/// and what a genuinely dead row still deserves. A run of them is not a queue
+/// full of dead rows, it is the service refusing to serve this client at all —
+/// Spotify's key service answers `error audio key 0 2`, librespot warns that it
+/// is "continuing without decryption", and the decoder times out on the
+/// resulting garbage about three seconds later. Skipping through that empties
+/// the whole queue in silence at a key request per track, feeding the very
+/// throttle that caused it, and it outlives the process because the throttle
+/// is server-side. Three is the smallest limit that still lets two genuinely
+/// dead rows sit next to each other in an otherwise working queue.
+const UNAVAILABLE_STOP_LIMIT: usize = 3;
 
 /// How long to wait before the first automatic reconnect after the session
 /// dies, and the ceiling the wait doubles up to while reconnects keep failing.
@@ -118,7 +132,9 @@ pub struct Engine {
     recent_track_changes: VecDeque<Instant>,
     /// Current-track load failures seen recently. A later failure in the same
     /// window is considered transient even when the user did not change
-    /// tracks between the failures.
+    /// tracks between the failures. Its length is also the circuit breaker's
+    /// count (see [`UNAVAILABLE_STOP_LIMIT`]) and, while it is non-empty, the
+    /// reason next-track preloading is held back.
     recent_unavailable: VecDeque<Instant>,
     /// Earliest time an automatic reconnect may be attempted, and how long to
     /// wait after the next failure. `None` means "no reconnect is pending":
@@ -195,6 +211,20 @@ struct PlaybackState {
 enum PositionSpace {
     Source,
     Transport,
+}
+
+/// What one current-track load failure says about the run it belongs to. The
+/// two answers are kept apart because they protect different things and
+/// disagree on purpose: the second failure in a burst already suppresses cache
+/// eviction, long before enough of them have piled up to stop playback.
+struct UnavailableBurst {
+    /// Whether cached audio for the failed track must be preserved: a
+    /// clustered failure is evidence about the service, not about the file.
+    clustered: bool,
+    /// Failures in the current run, this one included. Reset by the first
+    /// load that succeeds (see [`Engine::clear_unavailable_burst`]) and by the
+    /// burst window expiring.
+    consecutive: usize,
 }
 
 pub enum AuthSignal {
@@ -665,6 +695,11 @@ impl Engine {
     /// Starts the OAuth flow on demand, consuming the prepared attempt so the
     /// flow listens for exactly the authorize URL the UI opened. No-op while a
     /// session is live (`Ready`) or a flow is already running.
+    ///
+    /// Returning `Ok` is a promise the caller relies on: the loopback callback
+    /// port is bound by the time this returns, so the UI may open the browser
+    /// the moment the command answers. Nothing about that ordering is left to
+    /// the spawned task — it is handed a listener that is already listening.
     pub fn login(
         &mut self,
         auth_sender: &mpsc::UnboundedSender<AuthSignal>,
@@ -675,14 +710,15 @@ impl Engine {
         if self.auth_running {
             return Ok(true);
         }
-        let pending = self.begin_login_flow()?;
+        let (pending, listener) = self.begin_login_flow()?;
         let generation = self.generation;
         let auth_sender = auth_sender.clone();
         let cache = self.cache.clone();
         let temporary_directory = self.temporary_directory.clone();
         let normalisation = Arc::clone(&self.normalisation);
         tokio::spawn(async move {
-            let result = complete_oauth(cache, temporary_directory, pending, normalisation).await;
+            let result =
+                complete_oauth(cache, temporary_directory, pending, listener, normalisation).await;
             let _ = auth_sender.send(AuthSignal::Complete {
                 generation,
                 result: result.map_err(AuthFailure::Rejected),
@@ -691,10 +727,19 @@ impl Engine {
         Ok(true)
     }
 
-    /// State half of [`Engine::login`]: consumes (or prepares) the OAuth
-    /// attempt and marks the engine `Authenticating`. Split out so the
-    /// transition is unit-testable without spawning a live flow.
-    fn begin_login_flow(&mut self) -> Result<PendingAuth, String> {
+    /// Synchronous half of [`Engine::login`]: binds the callback port, then
+    /// consumes (or prepares) the OAuth attempt and marks the engine
+    /// `Authenticating`. Split out so the transition is unit-testable without
+    /// spawning a live flow.
+    ///
+    /// The bind comes first and its failure returns before anything is
+    /// mutated. A port this application cannot have means the attempt is
+    /// impossible, and the user must be told while still looking at the Log in
+    /// button — not left in `Authenticating` waiting on a callback that has
+    /// nowhere to land. Failing here also preserves the prepared attempt and
+    /// the published authorize URL, so the next click is a clean retry.
+    fn begin_login_flow(&mut self) -> Result<(PendingAuth, OauthListener), String> {
+        let listener = bind_oauth_listener()?;
         let pending = match self.pending_auth.take() {
             Some(pending) => pending,
             None => prepare_oauth()?,
@@ -707,7 +752,7 @@ impl Engine {
         self.state.playing = false;
         self.state.error = None;
         self.state.auth_url = Some(pending.auth_url.clone());
-        Ok(pending)
+        Ok((pending, listener))
     }
 
     /// Clears the cached credentials and tears the session down; the state
@@ -929,11 +974,12 @@ impl Engine {
         self.recent_track_changes.push_back(now);
     }
 
-    /// Returns whether this failure belongs to a transient burst. A second
-    /// failure within the failure window is clustered even when the same
-    /// track was retried; two or more recent load starts also protect the
-    /// first failure observed after rapid clicks.
-    fn unavailable_is_clustered(&mut self, now: Instant) -> bool {
+    /// Records a current-track load failure and reports the two independent
+    /// things the engine decides with. A second failure within the failure
+    /// window is clustered even when the same track was retried; two or more
+    /// recent load starts also protect the first failure observed after rapid
+    /// clicks.
+    fn record_unavailable(&mut self, now: Instant) -> UnavailableBurst {
         Self::prune_recent_times(
             &mut self.recent_track_changes,
             now,
@@ -943,11 +989,15 @@ impl Engine {
         let clustered = self.recent_unavailable.len() >= 1
             || self.recent_track_changes.len() >= TRACK_CHANGE_BURST_MINIMUM;
         self.recent_unavailable.push_back(now);
-        clustered
+        UnavailableBurst {
+            clustered,
+            consecutive: self.recent_unavailable.len(),
+        }
     }
 
-    /// Successful playback ends the current failure burst. A later isolated
-    /// failure should again be eligible for corrupt-cache cleanup.
+    /// A load that succeeded ends the current failure burst: a later isolated
+    /// failure is again eligible for corrupt-cache cleanup, the
+    /// [`UNAVAILABLE_STOP_LIMIT`] count starts over, and preloading resumes.
     fn clear_unavailable_burst(&mut self) {
         self.recent_unavailable.clear();
     }
@@ -2229,9 +2279,7 @@ impl Engine {
         } else {
             self.configure_current_audio_at_loop_pass(position_ms, self.loop_pass);
         }
-        let next_uri = self
-            .peek_next_index()
-            .and_then(|next| playable_track_uri(&self.state.queue[next]).ok());
+        let next_uri = self.gapless_preload_target();
         self.play_request_id = None;
         self.seek_in_flight = false;
         self.loop_decoder_eof = false;
@@ -2251,6 +2299,24 @@ impl Engine {
             player.preload(uri);
         }
         Ok(())
+    }
+
+    /// The track handed to librespot for gapless preloading alongside a load,
+    /// if one should be.
+    ///
+    /// Preloading doubles the audio-key requests a load makes, which is
+    /// precisely the wrong thing to do while the key service is what is
+    /// failing: the incident log shows two tracks loading per failed skip,
+    /// each asking for a key the service is already refusing. Holding the
+    /// second request back costs a gap between tracks that are not playing
+    /// anyway. The burst is cleared by the first load that succeeds, so
+    /// ordinary preloading returns the moment playback is healthy again.
+    fn gapless_preload_target(&self) -> Option<SpotifyUri> {
+        if !self.recent_unavailable.is_empty() {
+            return None;
+        }
+        self.peek_next_index()
+            .and_then(|next| playable_track_uri(&self.state.queue[next]).ok())
     }
 
     fn preload_next(&self) {
@@ -2635,7 +2701,7 @@ impl Engine {
                 play_request_id,
                 track_id,
             } if self.is_current_event(play_request_id, &track_id) => {
-                let clustered = self.unavailable_is_clustered(Instant::now());
+                let burst = self.record_unavailable(Instant::now());
                 self.seek_in_flight = false;
                 self.loading_failed = true;
                 self.finalize_listening(false);
@@ -2659,9 +2725,44 @@ impl Engine {
                 // this removes every format before the next user retry. Once
                 // failures cluster, preserve all cache files: key-service or
                 // network failures are not evidence of corruption.
-                if !clustered {
-                    self.evict_track_audio_cache(track_id);
+                if !burst.clustered {
+                    self.evict_track_audio_cache(track_id.clone());
                 }
+
+                // Pause has to win here, and it used to lose. librespot runs a
+                // load to completion whether or not it was told to start
+                // playing, so the failure of a paused load arrived exactly like
+                // the failure of a playing one and skipped onward all the same:
+                // the queue walked itself silently, track after track, with the
+                // pause button visibly doing nothing. A paused engine has no
+                // continuity to protect, so hold the failed row and let the
+                // owner choose — Play retries it, Next moves past it.
+                if !self.state.playing {
+                    eprintln!(
+                        "transport: load failed for {track_id} while paused; holding this row"
+                    );
+                    return true;
+                }
+
+                // A run of failures is the service refusing this client, not a
+                // run of bad rows, so stop and say so rather than spending the
+                // rest of the queue finding that out one track at a time.
+                if burst.consecutive >= UNAVAILABLE_STOP_LIMIT {
+                    self.state.playing = false;
+                    // The banner in App.svelte ellipsises a long error, so the
+                    // part that says what happened comes first.
+                    self.state.error = Some(format!(
+                        "Spotify refused audio for {} tracks in a row; playback stopped",
+                        burst.consecutive
+                    ));
+                    eprintln!(
+                        "transport: {} load failures within {} s; stopping instead of skipping past {track_id}",
+                        burst.consecutive,
+                        UNAVAILABLE_BURST_WINDOW.as_secs(),
+                    );
+                    return true;
+                }
+
                 // A runtime failure is an automatic progression opportunity:
                 // continue with the next eligible row when one exists. The
                 // `skip_current_for_repeat` guard prevents repeat-one from
@@ -2912,7 +3013,8 @@ mod tests {
     use super::{
         AudioSignal, AuthFailure, AuthSignal, Engine, PlaybackHandles, PlaybackState, PlayerSignal,
         RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW,
-        TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW, automatic_track_eligible,
+        TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW, UNAVAILABLE_STOP_LIMIT,
+        automatic_track_eligible,
         first_automatic_from, first_automatic_wrapping, first_available_from,
         first_available_wrapping, remap_current_index_after_move, sequential_automatic_index,
         sequential_available_index, sequential_next_index, track_change_wait, with_preview_edit,
@@ -3070,6 +3172,22 @@ mod tests {
             duration_ms: 180_000,
             ..TrackRef::default()
         });
+        state
+    }
+
+    /// Long enough that a run of failures has somewhere to march to, which is
+    /// what the circuit-breaker tests have to be able to observe it not doing.
+    fn five_track_state() -> PlaybackState {
+        let mut state = playback_state(240_000);
+        for suffix in ['M', 'N', 'P', 'Q'] {
+            let id = format!("0123456789ABCDEFGHIJK{suffix}");
+            state.queue.push(TrackRef {
+                uri: format!("spotify:track:{id}"),
+                id,
+                duration_ms: 180_000,
+                ..TrackRef::default()
+            });
+        }
         state
     }
 
@@ -4626,10 +4744,10 @@ mod tests {
         assert!(playing.state.playing);
     }
 
-    /// The same rule under a runtime failure: skipping past an unavailable
-    /// track resumes a queue that was playing and leaves a paused one paused.
+    /// A runtime failure only advances a queue that is actually playing: the
+    /// skip exists to keep audio flowing, and a paused queue has no flow.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_failed_track_hands_its_transport_intent_to_the_replacement() {
+    async fn a_failed_track_advances_only_while_playing() {
         let (mut playing, _playing_probe) = engine_with_player();
         playing.state = two_track_state();
         playing.state.playing = true;
@@ -4643,6 +4761,9 @@ mod tests {
             "a failure mid-playback continues with the next track"
         );
 
+        // The bug the owner hit: librespot finishes a paused load and fails it
+        // just the same, and the engine used to skip on that failure, so pause
+        // could not stop the queue from walking itself.
         let (mut paused, _paused_probe) = engine_with_player();
         paused.state = two_track_state();
         paused.state.playing = false;
@@ -4650,10 +4771,123 @@ mod tests {
             play_request_id: 7,
             track_id: track_uri(),
         }));
-        assert_eq!(paused.state.current_index, Some(1));
+        assert_eq!(
+            paused.state.current_index,
+            Some(0),
+            "a failure while paused holds the row instead of advancing"
+        );
+        assert!(!paused.state.playing);
+        assert!(paused.loading_failed, "Play must re-arm a fresh loader");
+    }
+
+    /// A run of failures is the key service refusing this client. Stopping is
+    /// the only answer that does not empty the queue in silence and does not
+    /// keep asking the throttle for more keys.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consecutive_failures_stop_playback_with_an_error() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = true;
+
+        for expected_next in 1..UNAVAILABLE_STOP_LIMIT {
+            let failed = engine.state.queue[engine.state.current_index.expect("a current row")]
+                .uri
+                .clone();
+            assert!(engine.on_player_event(PlayerEvent::Unavailable {
+                play_request_id: engine.play_request_id.expect("a live play request"),
+                track_id: SpotifyUri::from_uri(&failed).expect("queue uris are valid"),
+            }));
+            assert_eq!(engine.state.current_index, Some(expected_next));
+            assert!(
+                engine.state.playing,
+                "the queue keeps flowing below the limit"
+            );
+            // Each skip issues a fresh load, so the next failure needs the id
+            // that load will report.
+            engine.play_request_id = Some(100 + expected_next as u64);
+        }
+
+        let failed = engine.state.queue[engine.state.current_index.expect("a current row")]
+            .uri
+            .clone();
+        assert!(engine.on_player_event(PlayerEvent::Unavailable {
+            play_request_id: engine.play_request_id.expect("a live play request"),
+            track_id: SpotifyUri::from_uri(&failed).expect("queue uris are valid"),
+        }));
+        assert!(!engine.state.playing, "the run trips the breaker");
+        assert_eq!(
+            engine.state.current_index,
+            Some(UNAVAILABLE_STOP_LIMIT - 1),
+            "the breaker stops on the failed row rather than spending another"
+        );
+        let error = engine.state.error.expect("the breaker explains itself");
         assert!(
-            !paused.state.playing,
-            "a load that failed while paused must not start the replacement"
+            error.contains("tracks in a row"),
+            "the UI needs a reason, got {error:?}"
+        );
+    }
+
+    /// The breaker must not turn one dead row into a stop. A success between
+    /// failures resets the run, which is what tells "this track is gone" apart
+    /// from "the service is gone".
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_isolated_failure_still_skips_and_a_success_resets_the_run() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = five_track_state();
+        engine.state.playing = true;
+
+        for round in 0..UNAVAILABLE_STOP_LIMIT + 1 {
+            let index = engine.state.current_index.expect("a current row");
+            let failed = engine.state.queue[index].uri.clone();
+            let play_request_id = engine.play_request_id.expect("a live play request");
+            assert!(engine.on_player_event(PlayerEvent::Unavailable {
+                play_request_id,
+                track_id: SpotifyUri::from_uri(&failed).expect("queue uris are valid"),
+            }));
+            assert!(
+                engine.state.playing,
+                "round {round}: an isolated failure skips, it does not stop"
+            );
+            let landed = engine.state.current_index.expect("a replacement row");
+            assert_eq!(landed, (index + 1) % engine.state.queue.len());
+
+            // The replacement plays, which is what a lone bad row looks like.
+            engine.play_request_id = Some(200 + round as u64);
+            let uri =
+                SpotifyUri::from_uri(&engine.state.queue[landed].uri).expect("queue uris are valid");
+            assert!(engine.on_player_event(PlayerEvent::Playing {
+                play_request_id: engine.play_request_id.expect("a live play request"),
+                track_id: uri,
+                position_ms: 0,
+            }));
+            assert!(
+                engine.recent_unavailable.is_empty(),
+                "round {round}: a successful load ends the run"
+            );
+        }
+    }
+
+    /// Preloading asks for a second audio key per load. While the key service
+    /// is the thing failing, that is the request that must not be made.
+    #[test]
+    fn a_failure_burst_holds_back_the_next_track_preload() {
+        let mut engine = playing_engine();
+        engine.state = two_track_state();
+        engine.state.playing = true;
+
+        assert!(
+            engine.gapless_preload_target().is_some(),
+            "a healthy engine preloads the next track"
+        );
+        engine.record_unavailable(Instant::now());
+        assert!(
+            engine.gapless_preload_target().is_none(),
+            "a failing engine must not ask for a second audio key per load"
+        );
+        engine.clear_unavailable_burst();
+        assert!(
+            engine.gapless_preload_target().is_some(),
+            "a successful load restores gapless preloading"
         );
     }
 
@@ -5177,16 +5411,18 @@ mod tests {
         let start = Instant::now();
 
         assert!(
-            !engine.unavailable_is_clustered(start),
+            !engine.record_unavailable(start).clustered,
             "the first failure in a quiet period stays eligible for cleanup"
         );
         let second = start + Duration::from_millis(8_900);
         assert!(
-            engine.unavailable_is_clustered(second),
+            engine.record_unavailable(second).clustered,
             "a failure 8.9 s later is the same outage, not a corrupt cache file"
         );
         assert!(
-            engine.unavailable_is_clustered(second + Duration::from_millis(6_500)),
+            engine
+                .record_unavailable(second + Duration::from_millis(6_500))
+                .clustered,
             "and so is the one after that"
         );
     }
@@ -5198,23 +5434,35 @@ mod tests {
 
         // One quiet load failure is eligible for the corrupt-cache cleanup.
         engine.note_track_change(start);
-        assert!(!engine.unavailable_is_clustered(start + Duration::from_millis(10)));
+        assert!(
+            !engine
+                .record_unavailable(start + Duration::from_millis(10))
+                .clustered
+        );
 
         // A second failure shortly afterward is clustered, so valid cache
         // files are preserved while the key/network burst settles.
-        assert!(engine.unavailable_is_clustered(start + Duration::from_millis(20)));
+        assert!(
+            engine
+                .record_unavailable(start + Duration::from_millis(20))
+                .clustered
+        );
 
         // After both windows expire, cleanup is eligible again.
         let quiet = start
             + TRACK_CHANGE_BURST_WINDOW.max(UNAVAILABLE_BURST_WINDOW)
             + Duration::from_millis(25);
-        assert!(!engine.unavailable_is_clustered(quiet));
+        assert!(!engine.record_unavailable(quiet).clustered);
 
         // Two paced load starts protect even the first failure observed after
         // a rapid-click burst.
         engine.note_track_change(quiet);
         engine.note_track_change(quiet + Duration::from_millis(100));
-        assert!(engine.unavailable_is_clustered(quiet + Duration::from_millis(200)));
+        assert!(
+            engine
+                .record_unavailable(quiet + Duration::from_millis(200))
+                .clustered
+        );
     }
 
     #[test]
@@ -5885,6 +6133,7 @@ mod tests {
 
     #[test]
     fn begin_login_flow_consumes_the_published_attempt_and_marks_authenticating() {
+        let _serialized = crate::auth::lock_oauth_port();
         let mut engine = test_engine().0;
         engine.enter_needs_login();
         let published = engine
@@ -5892,7 +6141,7 @@ mod tests {
             .auth_url
             .clone()
             .expect("needs_login publishes a url");
-        let pending = engine.begin_login_flow().expect("flow begins");
+        let (pending, _listener) = engine.begin_login_flow().expect("flow begins");
         assert_eq!(
             pending.auth_url, published,
             "the flow must use the published URL"
@@ -5905,9 +6154,10 @@ mod tests {
 
     #[test]
     fn begin_login_flow_prepares_a_fresh_attempt_when_none_is_pending() {
+        let _serialized = crate::auth::lock_oauth_port();
         let mut engine = test_engine().0;
         engine.state.auth_state = renderer_engine::protocol::AuthState::NeedsLogin;
-        let pending = engine.begin_login_flow().expect("flow begins");
+        let (pending, _listener) = engine.begin_login_flow().expect("flow begins");
         assert!(
             pending
                 .auth_url
@@ -5918,6 +6168,60 @@ mod tests {
             engine.state.auth_url.as_deref(),
             Some(pending.auth_url.as_str())
         );
+    }
+
+    /// The bug this whole path exists to prevent: the browser used to be
+    /// opened without the command ever running, so Spotify redirected to a
+    /// port nothing held. The fix is an ordering promise — by the time the
+    /// command path returns, the callback socket is already accepting — and
+    /// this is that promise measured from outside the engine.
+    #[test]
+    fn the_command_path_holds_the_callback_port_before_it_returns() {
+        let _serialized = crate::auth::lock_oauth_port();
+        let mut engine = test_engine().0;
+        engine.enter_needs_login();
+
+        let (_pending, listener) = engine.begin_login_flow().expect("flow begins");
+
+        assert_eq!(listener.address().to_string(), "127.0.0.1:5588");
+        assert!(
+            std::net::TcpListener::bind("127.0.0.1:5588").is_err(),
+            "the engine must already hold the port when it answers"
+        );
+        std::net::TcpStream::connect("127.0.0.1:5588")
+            .expect("a redirect arriving now would be accepted, not refused");
+    }
+
+    /// A port this application cannot have is a dead end, because the redirect
+    /// URI is registered against librespot's client id and cannot be moved.
+    /// The click must fail with that news and leave the engine exactly where
+    /// it was, ready for a clean retry — not stranded in `Authenticating`
+    /// waiting for a callback that can never arrive.
+    #[test]
+    fn a_taken_callback_port_refuses_the_login_without_disturbing_the_state() {
+        let _serialized = crate::auth::lock_oauth_port();
+        let squatter =
+            std::net::TcpListener::bind("127.0.0.1:5588").expect("the test takes the port first");
+        let mut engine = test_engine().0;
+        engine.enter_needs_login();
+        let published = engine.state.auth_url.clone().expect("a url is published");
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = engine.login(&sender).expect_err("the port is unavailable");
+        assert!(error.contains("5588"), "the port must be named: {error}");
+        assert_eq!(
+            engine.state.auth_state,
+            renderer_engine::protocol::AuthState::NeedsLogin,
+            "a login that cannot start must not claim to be authenticating"
+        );
+        assert!(!engine.auth_running);
+        assert_eq!(
+            engine.state.auth_url.as_deref(),
+            Some(published.as_str()),
+            "the prepared attempt survives for the retry"
+        );
+        assert!(engine.pending_auth.is_some());
+        drop(squatter);
     }
 
     #[test]
