@@ -154,11 +154,6 @@
       spellcheck="false"
       onfocus={() => route.name !== "search" && navigate("search")}
     />
-    {#if search.link?.kind}
-      <button type="submit" class="search-clear" title="Open Spotify link" aria-label="Open Spotify link">
-        <Icon name="forward" size={12} />
-      </button>
-    {/if}
     {#if search.query}
       <button type="button" class="search-clear" title="Clear search" onclick={clearSearch}>
         <Icon name="x" size={11} />

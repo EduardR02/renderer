@@ -120,7 +120,16 @@
 //!   the stall as a normal sink error after [`WRITE_DRAIN_TIMEOUT`];
 //!   librespot's `handle_packet` error path pauses the player (never exits),
 //!   so a dead output device degrades to pause-and-retry instead of a hang
-//!   or death.
+//!   or death. The sink also reports that stall as
+//!   [`AudioSignal::OutputStalled`], because the pause is all librespot says
+//!   about it and the engine has to know the device is what stopped.
+//! - the device is opened by [`SinkOpener`] rather than from a librespot sink
+//!   builder, which cannot report a failure at all: a machine with no output
+//!   device — a fresh boot whose dongle the driver has not recognised yet —
+//!   used to panic on the player thread from inside that builder, and the
+//!   engine answered by shutting the session down. [`open`] returns the typed
+//!   [`RodioError`] instead, and `auth::create_playback` turns it into a state
+//!   the engine recovers from without losing the session.
 //! The only remaining librespot `exit(1)` sites are state-machine asserts
 //! (`is_playing`, `playing_to_*`, `handle_player_stop`, `start_playback`
 //! transition checks) that are unreachable from the engine's serialized
@@ -129,6 +138,7 @@
 //! between `mem::replace(self, Invalid)` and the reassignment.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -192,11 +202,37 @@ pub enum AudioSignal {
     /// to load key, continuing without decryption") — announces itself exactly
     /// like a track that works. Everything downstream of that announcement,
     /// the playhead included, is then a fiction until the decoder chokes on
-    /// the ciphertext seconds later. Only the sink knows the difference, so
+    /// ciphertext seconds later. Only the sink knows the difference, so
     /// the sink is what says so.
     Output {
         revision: u64,
     },
+    /// The output stopped draining: a packet waited out the whole
+    /// [`WRITE_DRAIN_TIMEOUT`] without the device consuming the ring, which
+    /// on a machine whose dongle was just unplugged is the only evidence the
+    /// playback side ever gets. librespot turns the write error that follows
+    /// into a pause and never mentions the device, so the engine has to hear
+    /// it from here.
+    ///
+    /// Revision-gated like [`AudioSignal::Output`], and for the same reason:
+    /// this arrives on the player thread, two seconds after the write began,
+    /// and a player the engine has already replaced must not act on its
+    /// replacement.
+    OutputStalled {
+        revision: u64,
+    },
+}
+
+/// Hands one signal to the engine. Called from the player thread and from the
+/// audio callback, both of which own no engine state: the lock is only ever
+/// held for the send itself, and a signal nobody is listening for is dropped.
+fn signal(signal: AudioSignal) {
+    let sender = AUDIO_SIGNAL_SENDER
+        .lock()
+        .expect("audio signal sender should not be poisoned");
+    if let Some(sender) = sender.as_ref() {
+        let _ = sender.send(signal);
+    }
 }
 
 struct Customization {
@@ -333,16 +369,38 @@ impl From<RodioError> for SinkError {
     fn from(error: RodioError) -> SinkError {
         use RodioError::*;
         match error {
-            StreamError(_) | PlayError(_) | Samples(_) => SinkError::OnWrite(error_string(error)),
+            StreamError(_) | PlayError(_) | Samples(_) => SinkError::OnWrite(error_string(&error)),
             NoDeviceAvailable | DeviceNotAvailable(_) => {
-                SinkError::ConnectionRefused(error_string(error))
+                SinkError::ConnectionRefused(error_string(&error))
             }
-            DevicesError(_) => SinkError::InvalidParams(error_string(error)),
+            DevicesError(_) => SinkError::InvalidParams(error_string(&error)),
         }
     }
 }
 
-fn error_string(error: RodioError) -> String {
+impl fmt::Display for RodioError {
+    /// What went wrong, for a reader who is not a librespot maintainer: this
+    /// string ends up in the engine's state event, which is the only thing the
+    /// owner sees when the machine has no output device. The library-style
+    /// rendering in [`error_string`] stays where librespot's own error type
+    /// carries it, but it leads with the sink's name and says "Not Available",
+    /// which is not a sentence to hand a user.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use RodioError::*;
+        match self {
+            NoDeviceAvailable => formatter.write_str("no output device is present"),
+            DeviceNotAvailable(name) => {
+                write!(formatter, "output device \"{name}\" is not available")
+            }
+            PlayError(error) => write!(formatter, "output device playback failed: {error}"),
+            StreamError(error) => write!(formatter, "output device could not be opened: {error}"),
+            DevicesError(error) => write!(formatter, "audio devices could not be listed: {error}"),
+            Samples(text) => formatter.write_str(text),
+        }
+    }
+}
+
+fn error_string(error: &RodioError) -> String {
     use RodioError::*;
     match error {
         NoDeviceAvailable => "<RodioSink> No Device Available".to_owned(),
@@ -653,16 +711,10 @@ impl Iterator for LiveSource {
         while self.pos == self.packet.samples.len() {
             if let Some(position_ms) = self.packet.loop_to_ms.take() {
                 let revision = self.packet.loop_revision;
-                if let Some(sender) = AUDIO_SIGNAL_SENDER
-                    .lock()
-                    .expect("audio signal sender should not be poisoned")
-                    .as_ref()
-                {
-                    let _ = sender.send(AudioSignal::LoopBoundary {
-                        position_ms,
-                        revision,
-                    });
-                }
+                signal(AudioSignal::LoopBoundary {
+                    position_ms,
+                    revision,
+                });
                 let boundary_id = std::mem::take(&mut self.packet.boundary_id);
                 self.ring.acknowledge_boundary(boundary_id);
             }
@@ -914,14 +966,47 @@ fn create_stream(
     Ok(stream)
 }
 
-/// Opens the default output device through rodio with an immediate-stop sink.
-/// Mirrors librespot's `mk_rodio(None, format)`.
-pub fn open_default_sink(format: AudioFormat) -> Box<dyn Sink> {
-    Box::new(open(cpal::default_host(), format))
+/// Opens the output device for one player: a sink, or the typed reason there
+/// is none.
+///
+/// The engine holds one of these instead of calling [`open`] directly, for two
+/// reasons that are the same reason seen from both ends. librespot's sink
+/// builder cannot report a failure — it runs on the player thread and must
+/// return a `Sink`, so the only way it can say "no device" is by killing that
+/// thread — so the device step has to happen where its answer can travel
+/// somewhere, and a machine with no output device is a state the engine has to
+/// reach on demand, which real hardware cannot be asked to arrange.
+pub type SinkOpener = Arc<dyn Fn(AudioFormat) -> Result<Box<dyn Sink>, RodioError> + Send + Sync>;
+
+/// The opener the engine uses in production: whatever output device Windows
+/// currently calls the default, in the format the player feeds.
+pub fn default_sink_opener() -> SinkOpener {
+    Arc::new(|format| Ok(Box::new(open(cpal::default_host(), format)?)))
 }
 
-pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
-    let stream = create_stream(&host, format).expect("rodio stream could not open");
+/// The sink librespot is handed when the device step has already failed.
+///
+/// It exists because the failure cannot travel back through the builder: the
+/// player thread calls it and needs a `Sink` to store. Nothing is ever played
+/// into it — `auth::create_playback` drops the player the moment it reads the
+/// device error beside it — so every packet is discarded.
+pub struct SilentSink;
+
+impl Sink for SilentSink {
+    fn write(&mut self, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
+        Ok(())
+    }
+}
+
+/// Opens the default host's output device with an immediate-stop sink.
+///
+/// Infallible in the sense that it never panics, which it used to: a machine
+/// whose dongle the driver has not recognised yet has no default output
+/// device, and that was an `expect` on librespot's player thread. It is an
+/// ordinary [`RodioError`] now, and the caller decides what to do about a
+/// machine that cannot currently play anything.
+pub fn open(host: cpal::Host, format: AudioFormat) -> Result<RodioSink, RodioError> {
+    let stream = create_stream(&host, format)?;
     let output_rate = stream.config().sample_rate();
     let resampler = Resampler::new(SAMPLE_RATE, output_rate, NUM_CHANNELS as u16);
     let resampling = resampler.is_some();
@@ -957,7 +1042,7 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
     // 512-sample Zero sources and rebuild converters forever while idle. The
     // cpal callback itself remains active because rodio does not expose its
     // stream handle, but an empty mixer has no queue/source work to perform.
-    RodioSink {
+    Ok(RodioSink {
         rodio_sink: None,
         ring,
         output_rate,
@@ -966,7 +1051,7 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
         resampler_scratch: Vec::new(),
         signalled_revision: None,
         _stream: stream,
-    }
+    })
 }
 
 impl Drop for RodioSink {
@@ -1056,13 +1141,7 @@ impl Sink for RodioSink {
         // a packet the cuts remove entirely still proves the track decodes.
         if self.signalled_revision != Some(revision) {
             self.signalled_revision = Some(revision);
-            if let Some(sender) = AUDIO_SIGNAL_SENDER
-                .lock()
-                .expect("audio signal sender should not be poisoned")
-                .as_ref()
-            {
-                let _ = sender.send(AudioSignal::Output { revision });
-            }
+            signal(AudioSignal::Output { revision });
         }
 
         let processing = Arc::clone(&self.processing);
@@ -1133,17 +1212,25 @@ impl RodioSink {
         samples: Vec<f32>,
         loop_to_ms: Option<u32>,
     ) -> SinkResult<()> {
-        self.ring
-            .push_marked_at_generation(
-                ring_generation,
-                samples,
-                loop_to_ms,
-                loop_to_ms.map_or(0, |_| revision),
-                WRITE_DRAIN_TIMEOUT,
-            )
-            .map_err(|()| {
-                SinkError::OnWrite("rodio sink stalled: audio output is not draining".to_owned())
-            })
+        let queued = self.ring.push_marked_at_generation(
+            ring_generation,
+            samples,
+            loop_to_ms,
+            loop_to_ms.map_or(0, |_| revision),
+            WRITE_DRAIN_TIMEOUT,
+        );
+        if queued.is_err() {
+            // The only way this wait expires is that nothing consumed the ring
+            // for the whole timeout — `stop()` clears it, which returns `Ok` —
+            // so the device that was taking audio is not taking it any more.
+            // The decode side cannot act on that on its own, and librespot only
+            // ever reports the resulting write error as a pause.
+            signal(AudioSignal::OutputStalled { revision });
+            return Err(SinkError::OnWrite(
+                "rodio sink stalled: audio output is not draining".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 

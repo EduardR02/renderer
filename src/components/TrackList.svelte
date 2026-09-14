@@ -16,6 +16,7 @@
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
   import { formatTime } from "../lib/time.js";
+  import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
   import { pressTrack, justDragged, registerReorderZone, trackDrag } from "../lib/dnd.svelte.js";
@@ -593,52 +594,20 @@
   }
 
   /* ---------------- Copy link ----------------
-     The public URL for a track is `open.spotify.com/track/<id>`, and the id is
-     the one already on the row — derived from `id`, or from the trailing
-     segment of `spotify:track:<id>` when only the URI is present. Never
-     assembled from anything else: a guessed URL that resolves to the wrong page
-     is worse than no menu item.
-
-     `navigator.clipboard` is available because WebView2 serves the app from a
-     localhost origin, which is a secure context. No clipboard PLUGIN is
-     installed and this deliberately does not add one. The execCommand path is
-     the fallback for the case where the async API is refused (it can reject on
-     a document that is not focused), and it is the only thing left that works
-     there. */
-  function trackLink(track) {
-    const id = track?.id || String(track?.uri ?? "").split(":").pop();
-    return id ? `https://open.spotify.com/track/${id}` : "";
-  }
-
-  async function writeClipboard(text) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      try {
-        const field = document.createElement("textarea");
-        field.value = text;
-        field.setAttribute("readonly", "");
-        field.style.cssText = "position:fixed;top:-1000px;opacity:0";
-        document.body.appendChild(field);
-        field.select();
-        const ok = document.execCommand("copy");
-        field.remove();
-        return ok;
-      } catch {
-        return false;
-      }
-    }
-  }
+     The URL is built from the id already on the row — `id`, or the trailing
+     segment of `spotify:track:<id>` when only the URI is present — and never
+     from anything else, so a row with neither draws no item. Both the string
+     and the clipboard write are the shared ones every share surface uses; see
+     lib/spotify-link.js. */
+  const menuLink = $derived(spotifyLink("track", menu.track?.id || menu.track?.uri));
 
   let copyResetTimer = 0;
   /* The menu STAYS OPEN on copy, because the confirmation is on the item
      itself and dismissing it would take the only feedback with it. It closes
      shortly after, which is also what reverts the label. */
   async function copyTrackLink() {
-    const link = trackLink(menu.track);
-    if (!link) return;
-    menu.copied = await writeClipboard(link);
+    if (!menuLink) return;
+    menu.copied = await writeClipboard(menuLink);
     if (!menu.copied) return;
     clearTimeout(copyResetTimer);
     copyResetTimer = setTimeout(() => {
@@ -1093,7 +1062,7 @@
     {#if allowAddToPlaylist}
       <button class="menu-item" onclick={openPicker}>Add to playlist…</button>
     {/if}
-    {#if trackLink(menu.track)}
+    {#if menuLink}
       <!-- The confirmation lives on the item, which is why the menu does not
            close on click: a copy with no feedback is indistinguishable from a
            dead control, and a toast system for one line of text is not worth

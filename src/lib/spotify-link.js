@@ -1,5 +1,8 @@
+/* The kinds this app can name. One list, read from both directions: `RESOURCE`
+   is what search accepts, and `spotifyLink` builds only these. */
+const KINDS = ["track", "album", "artist", "playlist"];
 const SPOTIFY_ID = "[A-Za-z0-9]{22}";
-const RESOURCE = "(track|album|artist|playlist)";
+const RESOURCE = `(${KINDS.join("|")})`;
 const URI_PATTERN = new RegExp(`^spotify:${RESOURCE}:(${SPOTIFY_ID})$`);
 const PATH_PATTERN = new RegExp(`^/(?:intl-[a-z]{2}(?:-[a-z]{2})?/)?${RESOURCE}/(${SPOTIFY_ID})/?$`, "i");
 const INVALID_LINK = "Use a Spotify song, album, artist or playlist link with a valid Spotify ID.";
@@ -33,4 +36,52 @@ export function parseSpotifyLink(value) {
   }
   const match = PATH_PATTERN.exec(url.pathname);
   return match ? { kind: match[1].toLowerCase(), id: match[2] } : { error: INVALID_LINK };
+}
+
+/**
+ * The public page for one Spotify resource — the inverse of the parser above,
+ * and the reason a link copied out of this app pastes back into its own search
+ * and opens here.
+ *
+ * `id` is the id already on the payload. A `spotify:<kind>:<id>` URI is taken
+ * too, because a row that carries only the URI still has an id and it is the
+ * trailing segment. Nothing is assembled from anything else: a guessed URL that
+ * resolves to the wrong page is worse than the menu item the empty string
+ * removes.
+ */
+export function spotifyLink(kind, id) {
+  if (!KINDS.includes(kind)) return "";
+  const value = String(id ?? "").split(":").pop().trim();
+  return value ? `https://open.spotify.com/${kind}/${value}` : "";
+}
+
+/**
+ * Put text on the system clipboard; true when it landed, which is what the
+ * menus turn into "Link copied".
+ *
+ * `navigator.clipboard` is available because WebView2 serves the app from a
+ * localhost origin, which is a secure context. No clipboard PLUGIN is installed
+ * and this deliberately does not add one. The execCommand path is the fallback
+ * for the case where the async API is refused (it can reject on a document that
+ * is not focused), and it is the only thing left that works there.
+ */
+export async function writeClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const field = document.createElement("textarea");
+      field.value = text;
+      field.setAttribute("readonly", "");
+      field.style.cssText = "position:fixed;top:-1000px;opacity:0";
+      document.body.appendChild(field);
+      field.select();
+      const ok = document.execCommand("copy");
+      field.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
 }

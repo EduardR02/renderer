@@ -240,6 +240,7 @@ async fn run(
         credentials_file,
         state_directory,
         normalisation,
+        audio::default_sink_opener(),
     );
     engine.start_authentication(auth_sender.clone());
     engine.emit_state()?;
@@ -850,6 +851,12 @@ async fn run(
                 // Catches a session librespot invalidated on its own, which is
                 // otherwise invisible until a track refuses to load.
                 if engine.tick_session_health(&auth_sender) {
+                    engine.emit_state()?;
+                }
+                // Opens an output device for a machine that did not have one —
+                // a dongle Windows recognised late, or one plugged back in —
+                // and puts the player back together around it.
+                if engine.tick_audio_device(&auth_sender) {
                     engine.emit_state()?;
                 }
                 // Arms the next-track preload once the current track nears its

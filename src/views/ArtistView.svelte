@@ -12,6 +12,7 @@
     resolveCoverUrl,
   } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById } from "../lib/play.js";
+  import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
@@ -264,6 +265,11 @@
   let artistGeneration = 0;
   let busy = $state("");
   let playError = $state("");
+  let menuOpen = $state(false);
+  let menuButton = $state(null);
+  let menu = $state(null);
+  let copied = $state(false);
+  let copyTimer = 0;
 
   /* The artist changed under us — a link from a track row, say. Start the new
      artist on its ranked releases when the overview provides them, otherwise
@@ -290,6 +296,8 @@
     shelfExpanded = false;
     figureIndex = 0;
     lightboxOpen = false;
+    menuOpen = false;
+    copied = false;
   });
 
   /* An overview may be refreshed independently of the catalogue payload. Do
@@ -565,6 +573,83 @@
 
   function openArtistRadio() {
     if (artist?.id) navigate("radio", `artist:${artist.id}`);
+  }
+
+  /* The header's share menu. It hangs off its button the way the playlist
+     header's does: focus the first item on open, close on Escape/Tab or a
+     pointerdown outside it, and give the button its focus back when it
+     closes. */
+  $effect(() => {
+    if (!menuOpen) return;
+    queueMicrotask(() => menu?.querySelector('[role="menuitem"]')?.focus());
+
+    function onPointerDown(event) {
+      if (!menu?.contains(event.target) && !menuButton?.contains(event.target)) menuOpen = false;
+    }
+
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  });
+
+  function closeMenu(returnFocus = false) {
+    menuOpen = false;
+    if (returnFocus) queueMicrotask(() => menuButton?.focus());
+  }
+
+  function toggleMenu() {
+    if (menuOpen) {
+      closeMenu(true);
+      return;
+    }
+    /* A copy still counting down must not close the menu that replaces it. */
+    clearTimeout(copyTimer);
+    copied = false;
+    menuOpen = true;
+  }
+
+  function onMenuKeyDown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeMenu(true);
+      return;
+    }
+    if (event.key === "Tab") {
+      closeMenu();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const items = [...menu.querySelectorAll('[role="menuitem"]:not(:disabled)')];
+    const current = items.indexOf(document.activeElement);
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? items.length - 1
+          : event.key === "ArrowDown"
+            ? (current + 1) % items.length
+            : (current - 1 + items.length) % items.length;
+    items[next]?.focus();
+  }
+
+  /**
+   * The link is the artist's own id — the page this one is drawn from — so a
+   * paste into our search lands back here.
+   *
+   * The menu STAYS OPEN on copy, because the confirmation is on the item
+   * itself and dismissing it would take the only feedback with it. It closes
+   * shortly after, which is also what reverts the label.
+   */
+  async function copyLink() {
+    const link = spotifyLink("artist", artist?.id);
+    if (!link) return;
+    copied = await writeClipboard(link);
+    if (!copied) return;
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => {
+      menuOpen = false;
+      copied = false;
+    }, 900);
   }
 
   /* ------------------------------------------------------- written by
@@ -961,6 +1046,37 @@
       <button class="btn-ghost" onclick={openArtistRadio} disabled={!artist?.id}>
         Artist Radio
       </button>
+      <div class="head-menu-wrap">
+        <button
+          class="btn-icon"
+          bind:this={menuButton}
+          aria-label="Artist actions"
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          aria-controls="artist-actions-menu"
+          title="Artist actions"
+          onclick={toggleMenu}
+        >
+          <Icon name="more" size={18} />
+        </button>
+        {#if menuOpen}
+          <div
+            id="artist-actions-menu"
+            class="menu head-menu"
+            role="menu"
+            tabindex="-1"
+            bind:this={menu}
+            onkeydown={onMenuKeyDown}
+          >
+            <!-- The confirmation lives on the item, which is why the menu does
+                 not close on click: a copy with no feedback is
+                 indistinguishable from a dead control. -->
+            <button class="menu-item" role="menuitem" class:done={copied} onclick={copyLink}>
+              {copied ? "Link copied" : "Copy link"}
+            </button>
+          </div>
+        {/if}
+      </div>
       <!-- No Follow button. Spotify's artist follow is a protobuf collection
            write against an internal service librespot ships no schema for, so
            this app can read who you follow and cannot change it; the engine's
@@ -1470,6 +1586,13 @@
   .dx { margin-top: var(--s8); }
   .dx .seg { margin-bottom: var(--s5); }
   .appears { margin-top: var(--s9); }
+
+  .head-menu-wrap { position: relative; }
+  /* Right-aligned because this button ends the row, and a 216px menu opening
+     to the right of it would leave the pane. */
+  .head-menu { position: absolute; z-index: 1; top: calc(100% + var(--s1)); right: 0; }
+  /* A copy that landed: the same label-and-colour pairing the row menu uses. */
+  .menu-item.done { color: var(--accent); }
 
   /* One row, always. `repeat(auto-fill, …)` was not an option: it decides how
      many cards fit and then wraps the rest, and a shelf that wraps is a grid.

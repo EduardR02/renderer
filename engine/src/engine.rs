@@ -10,10 +10,11 @@ use librespot_playback::mixer::{Mixer, softmixer::SoftMixer};
 use librespot_playback::player::{Player, PlayerEvent};
 use tokio::sync::mpsc;
 
-use crate::audio::AudioSignal;
+use crate::audio::{self, AudioSignal};
 use crate::auth::{
-    AuthFailure, OauthListener, PendingAuth, PlaybackHandles, bind_oauth_listener, complete_oauth,
-    connect_cached, create_playback, percent_to_volume, prepare_oauth,
+    AUDIO_START_TIMEOUT, AuthFailure, ConnectedSession, OauthListener, PendingAuth, PlaybackError,
+    PlaybackHandles, bind_oauth_listener, complete_oauth, connect_cached, create_playback,
+    percent_to_volume, prepare_oauth, stored_volume_percent,
 };
 use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
@@ -149,6 +150,19 @@ const PRELOAD_WATERMARK_MS: u32 = 30_000;
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// How long the heartbeat waits before trying the output device again after a
+/// failed open, and the ceiling that wait doubles up to.
+///
+/// These are short because this wait is the delay between the owner plugging
+/// the dongle back in and hearing music, and a probe costs one device
+/// enumeration when nothing has changed — no network, no audio key, no track
+/// load. The first retry is a heartbeat or two after the device would have
+/// landed; the ceiling keeps a machine that has been without audio since boot
+/// from enumerating WASAPI every tick, and is low enough that a dongle Windows
+/// recognises late still plays without anyone pressing anything.
+const AUDIO_PROBE_BACKOFF_MIN: Duration = Duration::from_secs(2);
+const AUDIO_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
 pub struct Engine {
     writer: ProtocolWriter,
     cache: Cache,
@@ -264,6 +278,35 @@ pub struct Engine {
     /// `needs_login` state; `login` consumes it so the UI opens exactly the
     /// URL the flow listens for. Regenerated per attempt.
     pending_auth: Option<PendingAuth>,
+    /// The output device every player this engine builds opens. Held rather
+    /// than reached for, so a machine with no output device is a state a test
+    /// can put the engine in (see [`audio::SinkOpener`]) — real hardware
+    /// cannot be asked to boot without one.
+    audio_device: audio::SinkOpener,
+    /// Set while the machine has no output device to open. See
+    /// [`AudioUnavailable`].
+    audio_unavailable: Option<AudioUnavailable>,
+    /// How long the heartbeat waits before probing for an output device
+    /// again, doubling per failed probe up to [`AUDIO_PROBE_BACKOFF_MAX`].
+    audio_probe_backoff: Duration,
+}
+
+/// The machine has no output device the engine can open.
+///
+/// This is deliberately not an error *state*: `state.ready` stays true, the
+/// session stays connected, and the only thing missing is the player. The
+/// device is a property of the machine that the user changes without telling
+/// the engine, so the engine asks again on its heartbeat until one answers.
+struct AudioUnavailable {
+    /// What the user is shown: the cause and the way out.
+    message: String,
+    /// The next moment the heartbeat may open a device. A probe already running
+    /// holds this at the instant its own open must have finished by
+    /// ([`AUDIO_START_TIMEOUT`]), so one runs at a time — and a probe whose
+    /// answer is dropped, because the session was replaced while it ran, is
+    /// still replaced by another instead of leaving the device untried for
+    /// good.
+    retry_at: Instant,
 }
 
 struct PlaybackState {
@@ -308,12 +351,12 @@ struct UnavailableBurst {
 pub enum AuthSignal {
     Complete {
         generation: u64,
-        result: Result<PlaybackHandles, AuthFailure>,
+        result: Result<ConnectedSession, AuthFailure>,
     },
     PlayerRebuilt {
         generation: u64,
         normalisation: bool,
-        result: Result<PlaybackHandles, String>,
+        result: Result<PlaybackHandles, PlaybackError>,
     },
 }
 
@@ -330,6 +373,7 @@ impl Engine {
         credentials_file: std::path::PathBuf,
         state_directory: std::path::PathBuf,
         normalisation: bool,
+        audio_device: audio::SinkOpener,
     ) -> Self {
         let history_root = state_directory.clone();
         let track_edits = TrackEditStore::load_or_empty(&state_directory);
@@ -338,6 +382,7 @@ impl Engine {
             .map(|duration| duration.as_nanos() as u64)
             .unwrap_or(0x9e37_79b9_7f4a_7c15)
             ^ u64::from(std::process::id());
+        let volume = stored_volume_percent(&cache);
         Self {
             writer,
             cache,
@@ -351,7 +396,7 @@ impl Engine {
                 playing: false,
                 position_ms: 0,
                 duration_ms: 0,
-                volume: 50,
+                volume,
                 shuffle: false,
                 repeat: RepeatMode::Off,
                 playback_speed: 1.0,
@@ -395,6 +440,9 @@ impl Engine {
             auth_running: false,
             normalisation: Arc::new(AtomicBool::new(normalisation)),
             pending_auth: None,
+            audio_device,
+            audio_unavailable: None,
+            audio_probe_backoff: AUDIO_PROBE_BACKOFF_MIN,
         }
     }
 
@@ -689,6 +737,120 @@ impl Engine {
         true
     }
 
+    /// Probes for an output device while the machine has none, on the same
+    /// heartbeat that advances the playhead.
+    ///
+    /// Returns whether the engine's state changed and should be emitted.
+    ///
+    /// A probe is one device enumeration, and the rebuild it eventually starts
+    /// is the same one a normalisation change performs; the only unusual thing
+    /// about it is that it runs while a session is already up. Its own answer
+    /// re-arms the clock — success clears the state, failure reschedules with
+    /// the next backoff — so nothing here needs a timer of its own.
+    pub fn tick_audio_device(&mut self, sender: &mpsc::UnboundedSender<AuthSignal>) -> bool {
+        let Some(unavailable) = self.audio_unavailable.as_ref() else {
+            return false;
+        };
+        if Instant::now() < unavailable.retry_at {
+            return false;
+        }
+        let Some(session) = self.session.clone() else {
+            // Nothing to build a player against; the session's own retry
+            // decides when that changes.
+            return false;
+        };
+        // The probe now owns the clock for as long as its open may take, which
+        // is what keeps a second one from starting beside it.
+        if let Some(unavailable) = self.audio_unavailable.as_mut() {
+            unavailable.retry_at = Instant::now() + AUDIO_START_TIMEOUT;
+        }
+        let generation = self.generation;
+        let cache = self.cache.clone();
+        let normalisation = Arc::clone(&self.normalisation);
+        let audio = Arc::clone(&self.audio_device);
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            let enabled = normalisation.load(Ordering::Acquire);
+            let result = create_playback(session, cache, enabled, audio).await;
+            let _ = sender.send(AuthSignal::PlayerRebuilt {
+                generation,
+                normalisation: enabled,
+                result,
+            });
+        });
+        false
+    }
+
+    /// Enters the recoverable no-output-device state: no player, the session
+    /// untouched, and the queue and playhead exactly as they were.
+    ///
+    /// Playback intent survives — `state.playing` is deliberately not touched —
+    /// so a track that was playing when the device went away plays again when
+    /// one comes back, which is the whole point of not treating this as a
+    /// failure of the session.
+    fn enter_audio_unavailable(&mut self, message: String) {
+        self.detach_player();
+        // Events still in flight from the detached player — the pause its own
+        // stalled write caused, and the close that follows the player thread's
+        // end — are about a player this engine has already let go. Without
+        // this, the close would be read as the player dying and would take the
+        // session down, which is the very thing this state exists to undo.
+        self.generation = self.generation.wrapping_add(1);
+        self.pause_listening();
+        eprintln!("audio: {message}");
+        self.state.error = Some(message.clone());
+        self.audio_unavailable = Some(AudioUnavailable {
+            message,
+            retry_at: Instant::now() + self.audio_probe_backoff,
+        });
+        self.audio_probe_backoff = (self.audio_probe_backoff * 2).min(AUDIO_PROBE_BACKOFF_MAX);
+    }
+
+    /// A player exists, so whatever was wrong with the output device is over:
+    /// drop the message and start the next outage at the short backoff.
+    fn clear_audio_unavailable(&mut self) {
+        self.audio_unavailable = None;
+        self.audio_probe_backoff = AUDIO_PROBE_BACKOFF_MIN;
+    }
+
+    /// Whether `command` can be applied while the machine has no output device.
+    ///
+    /// The queue, the volume, the shuffle mode and the play/pause intent are
+    /// engine state that a player is built *from*; everything else needs a
+    /// player to act on and is answered with the device's own message instead.
+    /// Refusing these too would leave a machine that booted without audio with
+    /// a player bar that cannot be filled and a startup restore the shell
+    /// reports as failed — for a device that may appear a second later.
+    ///
+    /// `state.ready` is part of the question rather than an oversight: the
+    /// exemption is from the *device* check, not from the session's. An engine
+    /// without a session has nothing to fill in and answers with the reason it
+    /// has no session.
+    fn runs_without_output_device(&self, command: &Command) -> bool {
+        self.state.ready
+            && self.audio_unavailable.is_some()
+            && matches!(
+                command,
+                Command::Play
+                    | Command::Pause
+                    | Command::SetVolume { .. }
+                    | Command::SetShuffle { .. }
+                    | Command::SetRepeat { .. }
+                    | Command::RestoreQueue { .. }
+            )
+    }
+
+    /// Clears the last error, unless the machine has no output device: nothing
+    /// a command does brings the audio back, so a command that succeeds while
+    /// it is in force has not made the silence go away. The message is released
+    /// where the condition is — by the probe that opens a device, in
+    /// [`Engine::clear_audio_unavailable`].
+    fn clear_error(&mut self) {
+        if self.audio_unavailable.is_none() {
+            self.state.error = None;
+        }
+    }
+
     /// Enables or disables track-gain volume normalisation.
     ///
     /// A live change constructs only a new player against the existing
@@ -711,8 +873,9 @@ impl Engine {
         let cache = self.cache.clone();
         let sender = sender.clone();
         let generation = self.generation;
+        let audio = Arc::clone(&self.audio_device);
         tokio::spawn(async move {
-            let result = create_playback(session, cache, enabled).await;
+            let result = create_playback(session, cache, enabled, audio).await;
             let _ = sender.send(AuthSignal::PlayerRebuilt {
                 generation,
                 normalisation: enabled,
@@ -746,8 +909,9 @@ impl Engine {
         let cache = self.cache.clone();
         let temporary_directory = self.temporary_directory.clone();
         let normalisation = Arc::clone(&self.normalisation);
+        let audio = Arc::clone(&self.audio_device);
         tokio::spawn(async move {
-            let result = connect_cached(cache, temporary_directory, normalisation).await;
+            let result = connect_cached(cache, temporary_directory, normalisation, audio).await;
             let _ = sender.send(AuthSignal::Complete { generation, result });
         });
     }
@@ -790,6 +954,10 @@ impl Engine {
         self.resume_after_reconnect = false;
         self.next_reconnect = None;
         self.awaiting_transport_retry = false;
+        // The device state belongs to a live session: a machine that is being
+        // asked to log in again is not also missing its output device as far as
+        // the user or the next connection is concerned.
+        self.clear_audio_unavailable();
         self.shuffle_pool.clear();
         self.history.clear();
         self.state.error = None;
@@ -829,9 +997,17 @@ impl Engine {
         let cache = self.cache.clone();
         let temporary_directory = self.temporary_directory.clone();
         let normalisation = Arc::clone(&self.normalisation);
+        let audio = Arc::clone(&self.audio_device);
         tokio::spawn(async move {
-            let result =
-                complete_oauth(cache, temporary_directory, pending, listener, normalisation).await;
+            let result = complete_oauth(
+                cache,
+                temporary_directory,
+                pending,
+                listener,
+                normalisation,
+                audio,
+            )
+            .await;
             let _ = auth_sender.send(AuthSignal::Complete {
                 generation,
                 result: result.map_err(AuthFailure::Rejected),
@@ -913,7 +1089,7 @@ impl Engine {
                 }
                 self.auth_running = false;
                 match result {
-                    Ok(handles) => {
+                    Ok(connected) => {
                         let had_queue = self.state.current_index.is_some();
                         let restored_volume = self.state.volume;
                         let resume = had_queue && self.resume_after_reconnect;
@@ -931,36 +1107,56 @@ impl Engine {
                         self.resume_after_reconnect = false;
                         self.state.ready = true;
                         self.state.auth_state = AuthState::Ready;
-                        self.state.volume = if had_queue {
-                            restored_volume
-                        } else {
-                            handles.volume_percent
-                        };
-                        self.state.error = None;
                         self.state.auth_url = None;
                         self.pending_auth = None;
-                        self.player = Some(handles.player);
-                        self.mixer = Some(handles.mixer);
-                        self.session = Some(handles.session);
-                        if had_queue {
-                            let volume = percent_to_volume(restored_volume);
-                            if let Some(mixer) = &self.mixer {
-                                mixer.set_volume(volume);
-                            }
-                            crate::audio::set_sink_volume(volume);
-                            self.current_needs_load = true;
-                            self.state.playing = resume;
-                            if resume {
-                                if let Err(error) = self.load_current(true) {
-                                    self.state.playing = false;
-                                    self.state.error = Some(error);
-                                }
-                            }
-                        }
+                        // The session is live in both arms below, and stays
+                        // live: a machine with no output device can browse,
+                        // search and edit playlists, and the player is the only
+                        // thing it cannot have yet.
+                        self.session = Some(connected.session);
                         self.next_reconnect = None;
                         self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
                         self.awaiting_transport_retry = false;
-                        Self::forward_player_events(handles.events, generation, player_sender);
+                        match connected.playback {
+                            Ok(handles) => {
+                                self.clear_audio_unavailable();
+                                self.state.volume = if had_queue {
+                                    restored_volume
+                                } else {
+                                    handles.volume_percent
+                                };
+                                self.state.error = None;
+                                self.player = Some(handles.player);
+                                self.mixer = Some(handles.mixer);
+                                if had_queue {
+                                    let volume = percent_to_volume(restored_volume);
+                                    if let Some(mixer) = &self.mixer {
+                                        mixer.set_volume(volume);
+                                    }
+                                    crate::audio::set_sink_volume(volume);
+                                    self.current_needs_load = true;
+                                    self.state.playing = resume;
+                                    if resume {
+                                        if let Err(error) = self.load_current(true) {
+                                            self.state.playing = false;
+                                            self.state.error = Some(error);
+                                        }
+                                    }
+                                }
+                                Self::forward_player_events(
+                                    handles.events,
+                                    generation,
+                                    player_sender,
+                                );
+                            }
+                            Err(message) => {
+                                // No output device. Everything a session is
+                                // for still happened — the queue, the volume,
+                                // the auth state — and the player arrives from
+                                // the heartbeat once the machine has one.
+                                self.enter_audio_unavailable(message);
+                            }
+                        }
                         true
                     }
                     Err(failure) => {
@@ -1000,12 +1196,23 @@ impl Engine {
                 }
                 let handles = match result {
                     Ok(handles) => handles,
+                    // This is the device probe's answer, or a normalisation
+                    // rebuild that ran into the same machine: either way the
+                    // session is fine and only the device is missing, so the
+                    // engine stays exactly where it was and asks again later.
+                    Err(PlaybackError::NoOutputDevice(message)) => {
+                        self.enter_audio_unavailable(message);
+                        return true;
+                    }
                     Err(error) => {
-                        self.state.error =
-                            Some(format!("could not rebuild the audio player: {error}"));
+                        self.state.error = Some(format!(
+                            "could not rebuild the audio player: {}",
+                            error.message()
+                        ));
                         return true;
                     }
                 };
+                self.clear_audio_unavailable();
 
                 let was_playing = self.state.playing;
                 if let Some(player) = self.player.take() {
@@ -1210,7 +1417,13 @@ impl Engine {
                 return Ok(false);
             }
         }
-        self.ensure_ready()?;
+        // A machine with no output device can still be *told* what to do: see
+        // [`Engine::runs_without_output_device`]. Everything else needs a
+        // player to act on — and gets the device's own message, not a generic
+        // "player unavailable", when there is none.
+        if !self.runs_without_output_device(&command) {
+            self.ensure_ready()?;
+        }
         // Pace command-driven track changes so rapid next/prev spam cannot
         // burst audio-key requests (each load of an uncached track fetches
         // its decryption key; the key service rate-limits bursts and
@@ -1516,6 +1729,35 @@ impl Engine {
                 }
                 true
             }
+            // The output stopped draining mid-write: nothing has consumed the
+            // ring for the whole write-drain timeout, which is what an
+            // unplugged device looks like from inside the player thread.
+            // librespot turns the resulting write error into a pause and says
+            // nothing about the device, so this is the engine's only chance to
+            // put the transport somewhere it can recover from.
+            AudioSignal::OutputStalled { revision } => {
+                if revision != self.audio_revision {
+                    // A player this engine has already let go, reporting two
+                    // seconds after the fact. Acting on it would tear down the
+                    // player that replaced it.
+                    return false;
+                }
+                if self.audio_unavailable.is_some() {
+                    return false;
+                }
+                // A stalled write means librespot had audio in flight when the
+                // device stopped taking it, so this track was playing. Read
+                // that intent now rather than later: the pause librespot emits
+                // for the same failure travels a different channel, the two can
+                // be handled in either order, and a pause that got here first
+                // would otherwise have cleared the very thing playback has to
+                // resume from.
+                let was_playing = self.state.current_index.is_some()
+                    && (self.state.playing || self.current_load_produced_audio);
+                self.state.playing = was_playing;
+                self.enter_audio_unavailable(audio_stalled_message());
+                true
+            }
         }
     }
     pub fn shutdown(&mut self) {
@@ -1618,10 +1860,8 @@ impl Engine {
     }
 
     fn ensure_ready(&self) -> Result<(), String> {
-        if self.state.ready && self.player.is_some() {
-            Ok(())
-        } else {
-            Err(match self.state.auth_state {
+        if !self.state.ready {
+            return Err(match self.state.auth_state {
                 AuthState::Authenticating => {
                     "Spotify authentication is still in progress".to_owned()
                 }
@@ -1634,14 +1874,26 @@ impl Engine {
                     .clone()
                     .unwrap_or_else(|| "Spotify authentication failed".to_owned()),
                 AuthState::Ready => "the local audio player is unavailable".to_owned(),
-            })
+            });
         }
+        if self.player.is_some() {
+            return Ok(());
+        }
+        // Ready with no player has exactly one cause now, and the user has to
+        // act on it: say what it is and what fixes it.
+        Err(self.audio_unavailable.as_ref().map_or_else(
+            || "the local audio player is unavailable".to_owned(),
+            |unavailable| unavailable.message.clone(),
+        ))
     }
 
     fn player(&self) -> Result<&Arc<Player>, String> {
-        self.player
-            .as_ref()
-            .ok_or_else(|| "the local audio player is unavailable".to_owned())
+        self.player.as_ref().ok_or_else(|| {
+            self.audio_unavailable.as_ref().map_or_else(
+                || "the local audio player is unavailable".to_owned(),
+                |unavailable| unavailable.message.clone(),
+            )
+        })
     }
 
     fn finalize_listening(&mut self, completed: bool) {
@@ -1895,7 +2147,10 @@ impl Engine {
             self.update_transport_position(0);
         }
         self.state.playing = false;
-        self.state.error = None;
+        // Not `state.error = None` directly: a startup restore on a machine
+        // with no output device installs the queue perfectly well, and must not
+        // take the message that says why there is no sound with it.
+        self.clear_error();
         self.history.clear();
         self.rebuild_shuffle_pool();
         self.play_request_id = None;
@@ -1969,6 +2224,20 @@ impl Engine {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
+        if self.audio_unavailable.is_some() {
+            // There is no player to send this to, but the request itself is
+            // worth keeping: `state.playing` is what the device probe starts
+            // from when it finds one, so pressing play into a mute machine is
+            // answered by music as soon as the machine can make any. The row is
+            // marked as not loaded for the same reason a teardown marks it.
+            self.state.playing = true;
+            self.current_needs_load = true;
+            eprintln!(
+                "transport: play at {} ms with no output device; it starts when one appears",
+                self.state.position_ms,
+            );
+            return Ok(true);
+        }
         let was_playing = self.state.playing;
         // There is no live load to resume when one is pending, has failed, or
         // has run off the end of the track, so those all start a fresh one.
@@ -2004,6 +2273,21 @@ impl Engine {
     fn pause(&mut self) -> Result<bool, String> {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
+        }
+        if self.audio_unavailable.is_some() {
+            // Nothing is audible, so there is nothing to stop — but the intent
+            // still has to be cleared here, or the device probe would start
+            // playing something the user asked to stop.
+            let was_playing = self.state.playing;
+            self.state.playing = false;
+            self.pause_listening();
+            self.update_position(self.state.position_ms);
+            eprintln!(
+                "transport: pause at {} ms with no output device (engine was {})",
+                self.state.position_ms,
+                if was_playing { "playing" } else { "paused" },
+            );
+            return Ok(true);
         }
         let was_playing = self.state.playing;
         // The engine may not call itself paused before librespot has been told
@@ -2258,16 +2542,19 @@ impl Engine {
             return Ok(false);
         }
         let volume = percent_to_volume(percent);
-        self.mixer
-            .as_ref()
-            .ok_or_else(|| "the software mixer is unavailable".to_owned())?
-            .set_volume(volume);
+        // A machine with no output device has no mixer and no sink to apply
+        // this to, but the volume is still a real setting: it is persisted
+        // here, reported in the state the UI reads, and applied by the player
+        // the device probe builds.
+        if let Some(mixer) = &self.mixer {
+            mixer.set_volume(volume);
+        }
         self.cache.save_volume(volume);
         // The audible volume lives on the rodio sink (per-packet attenuation
         // is disabled); apply it there so the change is heard immediately.
         crate::audio::set_sink_volume(volume);
         self.state.volume = percent;
-        self.state.error = None;
+        self.clear_error();
         Ok(true)
     }
 
@@ -3171,6 +3458,21 @@ impl Engine {
     }
 
     fn stop_playback_handles(&mut self) {
+        self.detach_player();
+        self.recent_unavailable.clear();
+        if let Some(session) = self.session.take() {
+            session.shutdown();
+        }
+    }
+
+    /// Drops the installed player and everything that only made sense with it,
+    /// keeping the session: the queue, the playhead and browsing do not depend
+    /// on the audio device, and a player attached to a stream that can never
+    /// drain again would do nothing for a transport command but lie about it.
+    ///
+    /// The caller owns the generation bump that discards events still in
+    /// flight from this player — see [`Engine::enter_audio_unavailable`].
+    fn detach_player(&mut self) {
         if let Some(player) = self.player.take() {
             player.stop();
         }
@@ -3183,15 +3485,11 @@ impl Engine {
         self.loop_pass = 1;
         self.seek_in_flight = false;
         self.recent_track_changes.clear();
-        self.recent_unavailable.clear();
         self.current_load_produced_audio = false;
         self.retry_current_at = None;
         self.current_load_is_retry = false;
         self.preload_armed = false;
         self.mixer = None;
-        if let Some(session) = self.session.take() {
-            session.shutdown();
-        }
     }
 }
 
@@ -3296,6 +3594,20 @@ fn first_available_wrapping(queue: &[TrackRef], start: usize) -> Option<usize> {
         .or_else(|| (0..start.min(queue.len())).find(|index| !queue[*index].unavailable))
 }
 
+/// What the user is told when the output stopped draining mid-track.
+///
+/// Deliberately not the "no output device" wording yet: all the engine knows at
+/// this point is that nothing has consumed the audio ring for a couple of
+/// seconds, and the device may still be there — a driver restart, a USB
+/// re-enumeration, a display that went to sleep. The probe that follows asks
+/// the device itself, and its answer replaces this one within seconds when
+/// there really is none.
+fn audio_stalled_message() -> String {
+    "the audio output stopped responding; playback resumes by itself when an output device is \
+     available"
+        .to_owned()
+}
+
 #[cfg(test)]
 fn sequential_available_index(
     queue: &[TrackRef],
@@ -3351,19 +3663,22 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     };
     use std::time::{Duration, Instant};
 
     use super::{
-        AudioSignal, AuthFailure, AuthSignal, Engine, LOAD_RETRY_BACKOFF, PRELOAD_WATERMARK_MS,
-        PlaybackHandles, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
+        AUDIO_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MIN, AudioSignal, AuthFailure, AuthSignal,
+        ConnectedSession, Engine, LOAD_RETRY_BACKOFF, PRELOAD_WATERMARK_MS, PlaybackHandles,
+        PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
         TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW,
         UNAVAILABLE_STOP_LIMIT, automatic_track_eligible, first_automatic_from,
         first_automatic_wrapping, first_available_from, first_available_wrapping,
         remap_current_index_after_move, sequential_automatic_index, sequential_available_index,
         sequential_next_index, track_change_wait, with_preview_edit,
     };
+    use crate::audio::{self, RodioError};
+    use crate::auth::{PlaybackError, create_playback};
     use crate::customization::TrackEditStore;
     use crate::io::ProtocolWriter;
     use librespot_core::SpotifyUri;
@@ -3373,13 +3688,28 @@ mod tests {
     use librespot_playback::decoder::AudioPacket;
     use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume, softmixer::SoftMixer};
     use librespot_playback::player::{Player, PlayerEvent};
-    use renderer_engine::protocol::{LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
+    use renderer_engine::protocol::{Command, LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
 
     fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
         test_engine_in(PathBuf::new())
     }
 
     fn test_engine_in(state_directory: PathBuf) -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
+        test_engine_with_audio(state_directory, device_present())
+    }
+
+    /// A machine that always has an output device, behind a sink that accepts
+    /// everything: librespot needs a `Sink` and nothing in these tests listens
+    /// to what it is handed. Tests that are *about* the device replace this
+    /// with one they can take away (see [`TestAudioDevice`]).
+    fn device_present() -> audio::SinkOpener {
+        Arc::new(|_| Ok(Box::new(TestSink)))
+    }
+
+    fn test_engine_with_audio(
+        state_directory: PathBuf,
+        audio_device: audio::SinkOpener,
+    ) -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
         let (writer, buffer) = ProtocolWriter::capture();
         let cache = librespot_core::cache::Cache::new(
             None::<PathBuf>,
@@ -3396,9 +3726,67 @@ mod tests {
                 PathBuf::new(),
                 state_directory,
                 false,
+                audio_device,
             ),
             buffer,
         )
+    }
+
+    /// Stands in for a machine's audio output: librespot needs a sink and
+    /// nothing here listens to what it is handed.
+    struct TestSink;
+
+    impl Sink for TestSink {
+        fn write(&mut self, _packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A machine whose output device can be unplugged and plugged back in, and
+    /// which counts the sinks the engine opened on it. Both directions of the
+    /// device bug turn on exactly these two facts, and neither is something
+    /// real hardware can be asked to provide on cue.
+    #[derive(Default)]
+    struct TestAudioDevice {
+        present: AtomicBool,
+        opened: AtomicUsize,
+    }
+
+    impl TestAudioDevice {
+        /// A machine whose output device is not there.
+        fn absent() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        /// A machine with a working output device.
+        fn present() -> Arc<Self> {
+            let device = Arc::new(Self::default());
+            device.plug_in();
+            device
+        }
+
+        fn plug_in(&self) {
+            self.present.store(true, Ordering::Release);
+        }
+
+        fn unplug(&self) {
+            self.present.store(false, Ordering::Release);
+        }
+
+        fn opened(&self) -> usize {
+            self.opened.load(Ordering::Acquire)
+        }
+
+        fn opener(self: &Arc<Self>) -> audio::SinkOpener {
+            let device = Arc::clone(self);
+            Arc::new(move |_| {
+                if !device.present.load(Ordering::Acquire) {
+                    return Err(RodioError::NoDeviceAvailable);
+                }
+                device.opened.fetch_add(1, Ordering::AcqRel);
+                Ok(Box::new(TestSink))
+            })
+        }
     }
 
     /// Watches one librespot player from the outside. The sink is destroyed
@@ -3465,14 +3853,25 @@ mod tests {
         (player, session)
     }
 
-    fn playback_handles(player: Arc<Player>, session: librespot_core::Session) -> PlaybackHandles {
+    fn playback_handles(player: Arc<Player>) -> PlaybackHandles {
         let events = player.get_player_event_channel();
         PlaybackHandles {
             player,
             events,
             mixer: Arc::new(SoftMixer::open(MixerConfig::default()).expect("software mixer")),
-            session,
             volume_percent: 50,
+        }
+    }
+
+    /// The signal a successful cached connection produces: a live session with
+    /// a player built against it.
+    fn connected_handles(
+        player: Arc<Player>,
+        session: librespot_core::Session,
+    ) -> ConnectedSession {
+        ConnectedSession {
+            session,
+            playback: Ok(playback_handles(player)),
         }
     }
 
@@ -6058,7 +6457,7 @@ mod tests {
         assert!(engine.on_auth_signal(
             AuthSignal::Complete {
                 generation,
-                result: Ok(playback_handles(new_player, new_session)),
+                result: Ok(connected_handles(new_player, new_session)),
             },
             player_sender,
         ));
@@ -6113,7 +6512,7 @@ mod tests {
         assert!(engine.on_auth_signal(
             AuthSignal::Complete {
                 generation,
-                result: Ok(playback_handles(new_player, new_session)),
+                result: Ok(connected_handles(new_player, new_session)),
             },
             player_sender,
         ));
@@ -6765,6 +7164,7 @@ mod tests {
                     fixture.credentials_file(),
                     fixture.directory.clone(),
                     false,
+                    device_present(),
                 ),
                 buffer,
             )
@@ -6815,6 +7215,7 @@ mod tests {
             fixture.credentials_file(),
             fixture.directory.clone(),
             false,
+            device_present(),
         );
         assert!(engine.logout().expect("first logout"));
         assert!(!fixture.credentials_exist());
@@ -7135,5 +7536,392 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&line).expect("state json");
         assert!(value.get("auth_url").is_none(), "auth_url must be omitted");
         assert_eq!(value["auth_state"], "ready");
+    }
+
+    /// Awaits one signal from the engine, so a task that never answers fails
+    /// the test instead of hanging it.
+    async fn receive_auth_signal(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<AuthSignal>,
+    ) -> AuthSignal {
+        tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("the engine answers within the timeout")
+            .expect("the engine holds the sender")
+    }
+
+    /// Waits for the load the engine issued to reach librespot. librespot
+    /// announces every load with `PlayRequestIdChanged` before it fetches
+    /// anything, so this is the only evidence of a real load that exists
+    /// outside the engine — and it is what "the row is playing again" has to
+    /// mean when the load itself cannot succeed without Spotify.
+    async fn receive_load(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<PlayerSignal>) {
+        let loaded = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(signal) = receiver.recv().await {
+                if matches!(
+                    signal,
+                    PlayerSignal::Event {
+                        event: PlayerEvent::PlayRequestIdChanged { .. },
+                        ..
+                    }
+                ) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(
+            matches!(loaded, Ok(true)),
+            "the engine's load must reach librespot"
+        );
+    }
+
+    /// Puts the engine in the state a machine with no output device boots into,
+    /// through the real player-construction path: the device step fails, the
+    /// session survives it, and the engine is left holding a message instead of
+    /// a player.
+    async fn engine_without_output_device(
+        engine: &mut Engine,
+        device: &Arc<TestAudioDevice>,
+    ) -> librespot_core::Session {
+        let session = librespot_core::Session::new(librespot_core::SessionConfig::default(), None);
+        let cache = librespot_core::cache::Cache::new(
+            None::<PathBuf>,
+            None::<PathBuf>,
+            None::<PathBuf>,
+            None,
+        )
+        .expect("cache");
+        let message = match create_playback(session.clone(), cache, false, device.opener()).await {
+            Err(PlaybackError::NoOutputDevice(message)) => message,
+            Err(error) => panic!("a missing device must be a device failure, got {error}"),
+            Ok(_) => panic!("a machine with no output device must not produce a player"),
+        };
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(engine.on_auth_signal(
+            AuthSignal::Complete {
+                generation: engine.generation,
+                result: Ok(ConnectedSession {
+                    session: session.clone(),
+                    playback: Err(message),
+                }),
+            },
+            player_sender,
+        ));
+        session
+    }
+
+    /// Booting with no output device must not cost the session, the browsing or
+    /// the engine itself. Before this, the device step panicked on librespot's
+    /// player thread, playback construction failed, the session was shut down
+    /// with it, and the engine answered every browse command with a login
+    /// prompt — for a machine whose only problem was that its dongle had not
+    /// been recognised yet.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_output_device_leaves_a_live_session_browsing_and_says_why() {
+        let device = TestAudioDevice::absent();
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        let session = engine_without_output_device(&mut engine, &device).await;
+
+        assert_eq!(device.opened(), 0, "nothing was opened on a machine with no device");
+        assert!(
+            !session.is_invalid(),
+            "the output device is not the session's business"
+        );
+        assert!(engine.state.ready, "the engine is up");
+        assert_eq!(
+            engine.state.auth_state,
+            renderer_engine::protocol::AuthState::Ready,
+            "a missing device is not an authentication failure"
+        );
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("no audio output device")),
+            "the user is told the cause, not a WASAPI stack trace: {:?}",
+            engine.state.error
+        );
+        assert!(engine.player.is_none(), "no player is installed without a device");
+        assert!(engine.session.is_some(), "the session is installed");
+        assert!(
+            engine.browse_session_clone().is_ok(),
+            "browse commands have their session"
+        );
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            matches!(
+                engine.process_command(Command::Status, &auth_sender).await,
+                Ok(true)
+            ),
+            "status still answers"
+        );
+        let refused = engine
+            .player()
+            .err()
+            .expect("there is no player to reach");
+        assert!(
+            refused.contains("no audio output device"),
+            "a command that needs a player names the device: {refused}"
+        );
+    }
+
+    /// The other direction, and the owner's expectation: the device appears, so
+    /// the engine builds the player it could not build before, forgets the
+    /// message, and plays what was asked for — from where the sound stopped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_device_that_appears_rebuilds_the_player_and_resumes_the_queue() {
+        let device = TestAudioDevice::absent();
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.update_position(42_000);
+        let session = engine_without_output_device(&mut engine, &device).await;
+        assert!(engine.player.is_none());
+
+        device.plug_in();
+        let (auth_sender, mut auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (player_sender, mut player_receiver) = tokio::sync::mpsc::unbounded_channel();
+        // The probe waits its backoff before it runs; bring the due time
+        // forward the way the heartbeat would.
+        engine
+            .audio_unavailable
+            .as_mut()
+            .expect("no device")
+            .retry_at = Instant::now() - Duration::from_millis(1);
+        assert!(
+            !engine.tick_audio_device(&auth_sender),
+            "starting a probe is not itself a state change"
+        );
+        let signal = receive_auth_signal(&mut auth_receiver).await;
+        assert!(engine.on_auth_signal(signal, player_sender));
+
+        assert_eq!(device.opened(), 1, "the probe opened the device");
+        assert!(engine.player.is_some(), "the player is back");
+        assert!(engine.audio_unavailable.is_none());
+        assert!(
+            engine.state.error.is_none(),
+            "the message goes with the condition that produced it"
+        );
+        assert!(engine.state.playing, "the requested playback is resumed");
+        assert!(
+            !engine.current_needs_load,
+            "the row is loaded again, not merely marked as needing it"
+        );
+        assert_eq!(
+            engine.state.position_ms, 42_000,
+            "it resumes where the sound stopped"
+        );
+        assert!(!session.is_invalid(), "on the session that never went away");
+        receive_load(&mut player_receiver).await;
+    }
+
+    /// A device that disappears mid-track lands in the same recoverable state,
+    /// and does not take the session, the queue or the intent to resume with
+    /// it. The sink's report of the stall is the only evidence there is:
+    /// librespot turns the write error into a pause and never mentions the
+    /// device, and the pause arrives on another channel, in either order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_device_lost_mid_playback_returns_to_the_recoverable_state() {
+        let device = TestAudioDevice::present();
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        let probe = SinkProbe::new();
+        let (player, session) = probe_player(&probe);
+        let player_handle = Arc::downgrade(&player);
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.player = Some(player);
+        engine.session = Some(session.clone());
+        engine.play_request_id = Some(7);
+        engine.update_position(42_000);
+        note_audio(&mut engine);
+        let generation = engine.generation;
+
+        assert!(engine.on_audio_signal(AudioSignal::OutputStalled {
+            revision: engine.audio_revision,
+        }));
+
+        assert!(engine.player.is_none(), "the dead player is not left installed");
+        assert!(
+            player_handle.upgrade().is_none() && !probe.is_alive(),
+            "and it is really gone, sink and all"
+        );
+        assert!(engine.session.is_some(), "the session is not the device's");
+        assert!(engine.state.ready);
+        assert_eq!(
+            engine.state.auth_state,
+            renderer_engine::protocol::AuthState::Ready
+        );
+        assert!(
+            engine.state.playing,
+            "the user asked for this track and has not asked to stop it"
+        );
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("stopped responding")),
+            "the stall is reported as what it is: {:?}",
+            engine.state.error
+        );
+        assert!(engine.audio_unavailable.is_some(), "the probe is armed");
+        assert!(engine.current_needs_load, "the row will have to be loaded again");
+        assert_eq!(engine.state.position_ms, 42_000);
+        assert!(
+            !engine.tick_position(),
+            "nothing is audible, so the playhead does not move"
+        );
+
+        // librespot's own reaction to the same failure, and the player thread
+        // ending behind it, both belong to the player that was just let go.
+        assert!(!engine.on_player_signal(PlayerSignal::Event {
+            generation,
+            event: PlayerEvent::Paused {
+                play_request_id: 7,
+                track_id: track_uri(),
+                position_ms: 42_000,
+            },
+        }));
+        assert!(!engine.on_player_signal(PlayerSignal::Closed { generation }));
+        assert!(
+            engine.session.is_some(),
+            "a dead player thread must not take the session with it"
+        );
+        assert!(
+            engine.state.playing,
+            "and must not erase the intent to resume"
+        );
+
+        // Still no device: the probe answers with the real cause, which
+        // replaces the stall's wording, and schedules the next attempt.
+        device.unplug();
+        let (auth_sender, mut auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (player_sender, mut player_receiver) = tokio::sync::mpsc::unbounded_channel();
+        engine
+            .audio_unavailable
+            .as_mut()
+            .expect("no device")
+            .retry_at = Instant::now() - Duration::from_millis(1);
+        assert!(!engine.tick_audio_device(&auth_sender));
+        let signal = receive_auth_signal(&mut auth_receiver).await;
+        assert!(engine.on_auth_signal(signal, player_sender.clone()));
+        let message = engine.state.error.clone().expect("still no sound");
+        assert!(message.contains("no audio output device"), "{message}");
+        assert_eq!(device.opened(), 0);
+
+        // The dongle is plugged back in.
+        device.plug_in();
+        engine
+            .audio_unavailable
+            .as_mut()
+            .expect("no device")
+            .retry_at = Instant::now() - Duration::from_millis(1);
+        assert!(!engine.tick_audio_device(&auth_sender));
+        let signal = receive_auth_signal(&mut auth_receiver).await;
+        assert!(engine.on_auth_signal(signal, player_sender));
+
+        assert!(engine.player.is_some(), "the player comes back");
+        assert!(engine.state.error.is_none(), "and the message does not");
+        assert!(engine.state.playing, "the track plays again");
+        assert_eq!(engine.state.position_ms, 42_000);
+        receive_load(&mut player_receiver).await;
+    }
+
+    /// The device exemption is from the device check, not from the session's:
+    /// an engine that has just logged out must not accept a volume change
+    /// because the machine also happens to have no output device. The device
+    /// state is forgotten with the session, so the reason it gives is the real
+    /// one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_device_failure_never_stands_in_for_a_missing_session() {
+        let device = TestAudioDevice::absent();
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        let session = engine_without_output_device(&mut engine, &device).await;
+        assert!(engine.audio_unavailable.is_some());
+
+        assert!(engine.logout().expect("logout succeeds"));
+        assert_eq!(
+            engine.state.auth_state,
+            renderer_engine::protocol::AuthState::NeedsLogin
+        );
+        assert!(
+            engine.audio_unavailable.is_none(),
+            "the device's failure does not outlive the session it was noticed on"
+        );
+        assert!(session.is_invalid(), "and the session really ends");
+
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let refused = engine
+            .process_command(Command::SetVolume { percent: 30 }, &auth_sender)
+            .await
+            .expect_err("a volume change is not what a signed-out engine needs");
+        assert!(refused.contains("login"), "{refused}");
+        assert_eq!(engine.state.volume, 50, "and the volume did not move");
+    }
+
+    /// The retry clock: one probe at a time, each failure waiting longer than
+    /// the last, and a ceiling — a machine that has been without audio since
+    /// boot must not enumerate devices on every heartbeat for the rest of the
+    /// day, and a device that lands must still be picked up in seconds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn device_probes_back_off_to_a_ceiling_one_at_a_time() {
+        let device = TestAudioDevice::absent();
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        engine_without_output_device(&mut engine, &device).await;
+        let (auth_sender, mut auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(!engine.tick_audio_device(&auth_sender));
+        assert!(
+            auth_receiver.try_recv().is_err(),
+            "the first probe waits its backoff rather than firing immediately"
+        );
+        let mut waits = Vec::new();
+        for _ in 0..5 {
+            let retry_at = engine.audio_unavailable.as_ref().expect("no device").retry_at;
+            waits.push(retry_at.saturating_duration_since(Instant::now()));
+            // Bring the due time forward, the way a heartbeat would.
+            engine
+                .audio_unavailable
+                .as_mut()
+                .expect("no device")
+                .retry_at = Instant::now() - Duration::from_millis(1);
+            assert!(!engine.tick_audio_device(&auth_sender));
+            // The probe holds the clock while it runs, so a tick arriving
+            // during it cannot start a second one against the same device.
+            let held = engine.audio_unavailable.as_ref().expect("no device").retry_at;
+            assert!(held > Instant::now(), "the probe holds the clock");
+            assert!(!engine.tick_audio_device(&auth_sender));
+            assert_eq!(
+                engine.audio_unavailable.as_ref().expect("no device").retry_at,
+                held,
+                "and a second tick leaves it exactly where the probe put it"
+            );
+            let signal = receive_auth_signal(&mut auth_receiver).await;
+            assert!(engine.on_auth_signal(signal, player_sender.clone()));
+            assert_eq!(device.opened(), 0, "there is still nothing to open");
+        }
+
+        assert!(
+            waits
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1] + Duration::from_millis(1)),
+            "each failure waits at least as long as the last: {waits:?}"
+        );
+        assert!(
+            waits.iter().all(|wait| *wait <= AUDIO_PROBE_BACKOFF_MAX),
+            "no wait may outlast the ceiling: {waits:?}"
+        );
+        assert_eq!(
+            engine.audio_probe_backoff, AUDIO_PROBE_BACKOFF_MAX,
+            "and the backoff stops growing there"
+        );
+        assert!(
+            AUDIO_PROBE_BACKOFF_MIN >= Duration::from_secs(1)
+                && AUDIO_PROBE_BACKOFF_MAX <= Duration::from_secs(30),
+            "the ceiling is what bounds how long a plugged-in device stays silent"
+        );
     }
 }

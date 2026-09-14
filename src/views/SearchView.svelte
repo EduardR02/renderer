@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, submitSearch, retrySearch, playback } from "../lib/state.svelte.js";
+  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch, playback } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById, cardPlay } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -163,17 +163,7 @@
     </p>
   </div>
 
-  {#if search.link && !search.submitted}
-    <div class="empty" role="status">
-      <p class="h">Spotify {search.link.kind === "track" ? "song" : search.link.kind} link</p>
-      <p class="sub">Open it here in the app. Nothing plays until you choose Play.</p>
-      <div class="actions">
-        <button class="btn-ghost" onclick={() => submitSearch(search.query)}>
-          Open {search.link.kind === "track" ? "song" : search.link.kind}
-        </button>
-      </div>
-    </div>
-  {:else if !search.submitted}
+  {#if !search.submitted}
     {#if recents.length}
       <div class="section" style="margin-top:0">
         <div class="section-head">

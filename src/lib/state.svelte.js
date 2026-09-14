@@ -780,6 +780,15 @@ function searchRequestKey(epoch, seq) {
   return `${epoch}:${seq}`;
 }
 
+/**
+ * A link's identity, independent of how its text is spelled: Spotify's own
+ * share text carries a `?si=` tail, and typing or pasting that tail re-parses
+ * to the same target. Null for anything that is not an openable link.
+ */
+function linkKey(link) {
+  return link?.kind ? `${link.kind}:${link.id}` : null;
+}
+
 function resetSearchForSession() {
   clearTimeout(searchTimer);
   searchTimer = null;
@@ -959,7 +968,8 @@ function maybeStartDeferredSearch() {
 
 function enqueueSearch(query, force = false) {
   const q = String(query ?? "").trim();
-  search.link = parseSpotifyLink(q);
+  const link = parseSpotifyLink(q);
+  search.link = link;
   const current = currentSearch;
 
   // Input events may call this for the same value more than once. A retry for
@@ -1002,7 +1012,7 @@ function enqueueSearch(query, force = false) {
 
   const seq = ++searchSeq;
   const epoch = searchSessionEpoch;
-  currentSearch = { q, seq, epoch };
+  currentSearch = { q, seq, epoch, linkKey: linkKey(link) };
   deferredSearch = null;
   search.submitted = true;
   search.busy = true;
@@ -1016,14 +1026,95 @@ function enqueueSearch(query, force = false) {
   }, SEARCH_DEBOUNCE_MS);
 }
 
+/**
+ * Starts `q` now instead of waiting out the debounce. Enter and a pasted link
+ * are decisions, not keystrokes: both can arrive while the timer is still
+ * counting, and neither may duplicate the call that timer was about to make.
+ */
+function runSearchNow(query) {
+  const q = String(query ?? "").trim();
+  if (
+    !currentSearch ||
+    currentSearch.q !== q ||
+    currentSearch.epoch !== searchSessionEpoch
+  ) {
+    enqueueSearch(q);
+  }
+  clearTimeout(searchTimer);
+  searchTimer = null;
+  const current = currentSearch;
+  if (!current) return;
+  const key = searchRequestKey(current.epoch, current.seq);
+  if (searchRequests.has(key)) {
+    // A readiness event or an explicit submit can arrive more than once. Keep
+    // the one request and leave any deferred token intact until it settles.
+    search.busy = true;
+    search.error = null;
+    return;
+  }
+  runSearch(current.q, current.seq, current.epoch);
+}
+
+/**
+ * Whether `key` is already this surface's answer: its request is in flight,
+ * waiting for Spotify to connect, or settled on screen. A failed attempt is
+ * deliberately not an answer, so Try again and a fresh paste run it once more.
+ */
+function linkAlreadyResolving(key) {
+  const current = currentSearch;
+  if (!current || current.linkKey !== key || current.epoch !== searchSessionEpoch) return false;
+  if (searchRequests.has(searchRequestKey(current.epoch, current.seq))) return true;
+  if (deferredSearch?.q === current.q && deferredSearch.seq === current.seq) return true;
+  return !search.error;
+}
+
+/**
+ * Opens a Spotify link, from a paste (`queueSearch`) or Enter (`submitSearch`).
+ * A song resolves through `browse_track` and its one result replaces the page;
+ * an album, artist or playlist link leaves the search surface for its own
+ * route. Neither opens a stream: a link names a page, and the Play there is
+ * still the only thing that starts playback.
+ *
+ * Idempotent by target, because an input event is not a user decision: the same
+ * link re-detected — extended with a share tail, or echoed by a second input
+ * event — must not resolve twice or push its route twice.
+ */
+function openLink(link, text) {
+  if (link.error) {
+    enqueueSearch("");
+    search.link = link;
+    search.error = link.error;
+    search.submitted = true;
+    return;
+  }
+
+  if (link.kind !== "track") {
+    /* A route is its own record of being open: re-pasting the album that is
+       already on screen has nothing left to do, while the same link pasted
+       after visiting anywhere else still goes where it points. */
+    if (route.name === link.kind && route.id === link.id) return;
+    /* The surface is emptied rather than left holding the link: the route owns
+       what that link shows now, and a heading still claiming a link is open
+       above a page that has searched nothing is a worse record than none. */
+    enqueueSearch("");
+    navigate(link.kind, link.id);
+    return;
+  }
+
+  if (linkAlreadyResolving(linkKey(link))) return;
+  /* The previous query's results answer a different question; the view shows
+     its loading frame until `browse_track` lands. */
+  search.results = null;
+  runSearchNow(text);
+}
+
 export function queueSearch(query) {
   const link = parseSpotifyLink(query);
   if (link) {
-    // A paste cancels older text requests but never navigates or starts playback.
-    enqueueSearch("");
-    search.link = link;
-    search.error = link.error ?? null;
-    search.submitted = !!link.error;
+    /* A paste opens the link itself — the same thing Enter does — because the
+       state in between ("here is a link, open it?") asked the user to confirm
+       an action they had already taken. */
+    openLink(link, query);
     return;
   }
   if (search.link) search.results = null;
@@ -1036,37 +1127,15 @@ export function submitSearch(query) {
   search.query = raw;
   const q = raw.trim();
   const link = parseSpotifyLink(q);
-  if (link?.error || (link && link.kind !== "track")) {
-    enqueueSearch("");
-    search.link = link;
-    search.error = link.error ?? null;
-    search.submitted = !!link.error;
-    if (!link.error) navigate(link.kind, link.id);
+  if (link) {
+    openLink(link, q);
     return;
   }
   if (!q) {
     enqueueSearch("");
     return;
   }
-  if (
-    !currentSearch ||
-    currentSearch.q !== q ||
-    currentSearch.epoch !== searchSessionEpoch
-  ) {
-    if (link) search.results = null;
-    enqueueSearch(q);
-  }
-  clearTimeout(searchTimer);
-  searchTimer = null;
-  const current = currentSearch;
-  if (!current) return;
-  const key = searchRequestKey(current.epoch, current.seq);
-  if (searchRequests.has(key)) {
-    search.busy = true;
-    search.error = null;
-    return;
-  }
-  runSearch(current.q, current.seq, current.epoch);
+  runSearchNow(q);
 }
 
 export function retrySearch() {

@@ -19,6 +19,7 @@
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import PlaylistCleanup from "../components/PlaylistCleanup.svelte";
   import { coverTone } from "../lib/covertone.svelte.js";
+  import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { formatTotal } from "../lib/time.js";
   import { detailArtSize } from "../lib/layout.js";
 
@@ -259,6 +260,8 @@
   let menuOpen = $state(false);
   let menuButton = $state(null);
   let menu = $state(null);
+  let copied = $state(false);
+  let copyTimer = 0;
   let deleteOpen = $state(false);
   let deleting = $state(false);
   let deleteError = $state("");
@@ -288,8 +291,10 @@
     });
   });
 
+  /* The menu belongs to the page, not to an owner: every playlist has one.
+     Only the items inside it are gated by `editable`. */
   $effect(() => {
-    if (!menuOpen || !editable) return;
+    if (!menuOpen) return;
     queueMicrotask(() => menu?.querySelector('[role="menuitem"]')?.focus());
 
     function onPointerDown(event) {
@@ -519,9 +524,36 @@
   }
 
   function toggleMenu() {
-    if (!editable) return;
-    if (menuOpen) closeMenu(true);
-    else menuOpen = true;
+    if (menuOpen) {
+      closeMenu(true);
+      return;
+    }
+    /* A copy still counting down must not close the menu that replaces it. */
+    clearTimeout(copyTimer);
+    copied = false;
+    menuOpen = true;
+  }
+
+  /**
+   * Sharing is not editing, so this is the one item every playlist gets,
+   * ours and everybody else's alike — and the reason a playlist the user does
+   * not own has an actions button at all. The link is the page's own id, which
+   * is also the thing our search resolves back to here.
+   *
+   * The menu STAYS OPEN on copy, because the confirmation is on the item
+   * itself and dismissing it would take the only feedback with it. It closes
+   * shortly after, which is also what reverts the label.
+   */
+  async function copyLink() {
+    const link = spotifyLink("playlist", pl?.id);
+    if (!link) return;
+    copied = await writeClipboard(link);
+    if (!copied) return;
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => {
+      menuOpen = false;
+      copied = false;
+    }, 900);
   }
 
   function onMenuKeyDown(event) {
@@ -735,7 +767,6 @@
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
             <Icon name="shuffle" size={14} />Shuffle
           </button>
-          {#if editable}
           <div class="playlist-menu-wrap">
             <button
               class="btn-icon"
@@ -758,14 +789,25 @@
                 bind:this={menu}
                 onkeydown={onMenuKeyDown}
               >
-                <button class="menu-item" role="menuitem" onclick={startRename}>Rename playlist</button>
-                <button class="menu-item" role="menuitem" disabled={!tracks.length} onclick={() => { closeMenu(); cleanupId = pl.id; }}>Remove songs by rules…</button>
-                <div class="menu-sep" role="separator"></div>
-                <button class="menu-item danger" role="menuitem" onclick={requestDelete}>Delete playlist…</button>
+                {#if editable}
+                  <button class="menu-item" role="menuitem" onclick={startRename}>Rename playlist</button>
+                  <button class="menu-item" role="menuitem" disabled={!tracks.length} onclick={() => { closeMenu(); cleanupId = pl.id; }}>Remove songs by rules…</button>
+                {/if}
+                <!-- The confirmation lives on the item, which is why the menu
+                     does not close on click: a copy with no feedback is
+                     indistinguishable from a dead control. Sharing is not
+                     editing, so this item is the whole menu for a playlist
+                     that is not ours. -->
+                <button class="menu-item" role="menuitem" class:done={copied} onclick={copyLink}>
+                  {copied ? "Link copied" : "Copy link"}
+                </button>
+                {#if editable}
+                  <div class="menu-sep" role="separator"></div>
+                  <button class="menu-item danger" role="menuitem" onclick={requestDelete}>Delete playlist…</button>
+                {/if}
               </div>
             {/if}
           </div>
-          {/if}
         </div>
         {#if automaticStartBlocked}
           <!-- Calm by design: grey type under the controls, not a red banner.
@@ -870,3 +912,9 @@
     <PlaylistCleanup playlist={pl} onClose={() => { cleanupId = null; queueMicrotask(() => menuButton?.focus()); }} />
   {/key}
 {/if}
+
+<style>
+  /* A copy that landed: the same label-and-colour pairing the row menu uses,
+     and the one colour this app has for a thing you just did. */
+  .menu-item.done { color: var(--accent); }
+</style>

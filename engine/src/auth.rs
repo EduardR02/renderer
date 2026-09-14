@@ -23,6 +23,8 @@ use oauth2::{
 };
 use url::Url;
 
+use crate::audio::{RodioError, SinkOpener, SilentSink};
+
 const OAUTH_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const OAUTH_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:5588/login";
@@ -85,14 +87,87 @@ const OAUTH_LISTENER_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// the URL and opens the socket to use it. Ten seconds is far past that and
 /// far short of a wait anyone notices.
 const OAUTH_CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a device open may take before the engine treats it as a machine
+/// with no usable output device. The engine's probe clock is held for the same
+/// span, so one open runs at a time; see `engine::AudioUnavailable::retry_at`.
+pub const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct PlaybackHandles {
     pub player: Arc<Player>,
     pub events: PlayerEventChannel,
     pub mixer: Arc<SoftMixer>,
-    pub session: Session,
     pub volume_percent: u8,
+}
+
+/// A live Spotify session, and whether it has a player.
+///
+/// The two answers are separate because they fail separately. A machine with
+/// no output device has a session that browses, searches and edits playlists
+/// exactly as well as one with a device; the player is all that is missing, and
+/// nothing about the account or the network is in question.
+pub struct ConnectedSession {
+    pub session: Session,
+    /// `Ok` is a player. `Err` is a machine with no output device to open —
+    /// the string names that and what to do about it, and the engine keeps the
+    /// session, reports the message, and retries the device on its heartbeat.
+    /// Every other playback failure arrives as an [`AuthFailure`] instead,
+    /// with the session shut down.
+    pub playback: Result<PlaybackHandles, String>,
+}
+
+/// Why player construction did not produce a player.
+///
+/// The distinction decides what happens to the session, and that is the whole
+/// of it. A missing output device is a fact about the machine that the user can
+/// change while the engine runs: the session stays up, browsing keeps working,
+/// and the output device is retried until it appears. Everything else is a
+/// construction failure that a retry would reproduce, and the session goes with
+/// it — which is what a refused login gets too.
+#[derive(Debug)]
+pub enum PlaybackError {
+    /// The output device could not be opened. The string is what the user is
+    /// shown, and it names the cause and the way out.
+    NoOutputDevice(String),
+    /// Anything else: the software mixer, the player thread, or librespot
+    /// itself failing before the device was ever reached.
+    Fatal(String),
+}
+
+impl PlaybackError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NoOutputDevice(message) | Self::Fatal(message) => message,
+        }
+    }
+}
+
+impl fmt::Display for PlaybackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// The way out, appended to every message about a missing output device: the
+/// engine retries the device by itself, so the user's only part is to give the
+/// machine something to play to.
+const NO_OUTPUT_DEVICE_REMEDY: &str = "Plug in or enable headphones, speakers, or a display's \
+                                       audio output and playback resumes by itself";
+
+/// What the user is told when there is no output device to open.
+///
+/// This message is the whole diagnosis they get, so it leads with the cause and
+/// ends with the way out. The detail is appended only when it adds something:
+/// "no output device is present" says no more than the sentence that already
+/// named it, while a device that exists and will not open is worth the exact
+/// reason. What this replaced was a panic on librespot's player thread and,
+/// where that was caught, a WASAPI stack trace — neither of which says that
+/// plugging the headphones back in is the fix.
+fn no_output_device_message(error: &RodioError) -> String {
+    let detail = match error {
+        RodioError::NoDeviceAvailable => String::new(),
+        error => format!(" ({error})"),
+    };
+    format!("no audio output device{detail}. {NO_OUTPUT_DEVICE_REMEDY}")
 }
 
 /// A prepared OAuth authorization-code + PKCE attempt. The authorize URL is
@@ -179,11 +254,16 @@ fn classify_connect_error(error: &librespot_core::Error) -> AuthFailure {
 /// when no credentials are cached, they are rejected, or Spotify cannot be
 /// reached; the caller decides which of those means `NeedsLogin` (the flow is
 /// never started implicitly).
+///
+/// A machine with no output device is not one of those failures. It comes back
+/// as a [`ConnectedSession`] whose playback is missing and whose session is
+/// live, because the audio device is not what browsing uses.
 pub async fn connect_cached(
     cache: Cache,
     temporary_directory: PathBuf,
     normalisation: Arc<AtomicBool>,
-) -> Result<PlaybackHandles, AuthFailure> {
+    audio: SinkOpener,
+) -> Result<ConnectedSession, AuthFailure> {
     let credentials = cache.credentials().ok_or_else(|| {
         AuthFailure::Rejected("no cached Spotify credentials".to_owned())
     })?;
@@ -191,9 +271,25 @@ pub async fn connect_cached(
     session_config.tmp_dir = temporary_directory;
     let session = Session::new(session_config, Some(cache.clone()));
     match session.connect(credentials, false).await {
-        Ok(()) => create_playback_latest(session, cache, normalisation)
-            .await
-            .map_err(AuthFailure::Rejected),
+        Ok(()) => match create_playback_latest(session.clone(), cache, normalisation, audio).await {
+            Ok(playback) => Ok(ConnectedSession {
+                session,
+                playback: Ok(playback),
+            }),
+            // The device is the machine's problem, not the account's: the
+            // session is left running and the engine retries the device.
+            Err(PlaybackError::NoOutputDevice(message)) => Ok(ConnectedSession {
+                session,
+                playback: Err(message),
+            }),
+            // Unchanged from when playback construction was one string: a
+            // player that cannot be built at all is reported as a login
+            // problem, session torn down, exactly as a refusal is.
+            Err(PlaybackError::Fatal(message)) => {
+                session.shutdown();
+                Err(AuthFailure::Rejected(message))
+            }
+        },
         Err(error) => {
             let failure = classify_connect_error(&error);
             eprintln!("{failure}");
@@ -262,7 +358,8 @@ pub async fn complete_oauth(
     pending: PendingAuth,
     listener: OauthListener,
     normalisation: Arc<AtomicBool>,
-) -> Result<PlaybackHandles, String> {
+    audio: SinkOpener,
+) -> Result<ConnectedSession, String> {
     eprintln!("Browse to: {}", pending.auth_url);
     let access_token = tokio::task::spawn_blocking(move || run_oauth_flow(pending, listener))
         .await
@@ -278,7 +375,23 @@ pub async fn complete_oauth(
         session.shutdown();
         return Err(format!("Spotify authentication failed: {error}"));
     }
-    create_playback_latest(session, cache, normalisation).await
+    match create_playback_latest(session.clone(), cache, normalisation, audio).await {
+        Ok(playback) => Ok(ConnectedSession {
+            session,
+            playback: Ok(playback),
+        }),
+        // Signing in on a machine with no output device used to fail the whole
+        // flow, which is a strange thing to tell someone whose password was
+        // accepted: the session is live, and the device is retried.
+        Err(PlaybackError::NoOutputDevice(message)) => Ok(ConnectedSession {
+            session,
+            playback: Err(message),
+        }),
+        Err(PlaybackError::Fatal(message)) => {
+            session.shutdown();
+            Err(message)
+        }
+    }
 }
 
 /// Blocking OAuth half of [`complete_oauth`]: loopback listener + token
@@ -581,16 +694,17 @@ async fn create_playback_latest(
     session: Session,
     cache: Cache,
     normalisation: Arc<AtomicBool>,
-) -> Result<PlaybackHandles, String> {
+    audio: SinkOpener,
+) -> Result<PlaybackHandles, PlaybackError> {
     loop {
         let enabled = normalisation.load(Ordering::Acquire);
-        let handles = match create_playback(session.clone(), cache.clone(), enabled).await {
-            Ok(handles) => handles,
-            Err(error) => {
-                session.shutdown();
-                return Err(error);
-            }
-        };
+        // The session is deliberately not shut down on a failure here. Whether
+        // a failure ends the session is the caller's decision, and the one
+        // failure this actually happens with — a machine with no output device
+        // — is not about the session at all. Shutting it down here is what once
+        // took browsing out together with the audio device.
+        let handles =
+            create_playback(session.clone(), cache.clone(), enabled, audio.clone()).await?;
         if normalisation.load(Ordering::Acquire) == enabled {
             return Ok(handles);
         }
@@ -604,15 +718,22 @@ pub async fn create_playback(
     session: Session,
     cache: Cache,
     normalisation: bool,
-) -> Result<PlaybackHandles, String> {
-    let mixer = Arc::new(
-        SoftMixer::open(mixer_config())
-            .map_err(|error| format!("could not initialize software volume: {error}"))?,
-    );
-    let cached_volume = cache.volume().unwrap_or(u16::MAX / 2);
+    audio: SinkOpener,
+) -> Result<PlaybackHandles, PlaybackError> {
+    let mixer = Arc::new(SoftMixer::open(mixer_config()).map_err(|error| {
+        PlaybackError::Fatal(format!("could not initialize software volume: {error}"))
+    })?);
+    let cached_volume = stored_volume(&cache);
     mixer.set_volume(cached_volume);
 
-    let (audio_ready_tx, audio_ready_rx) = std_mpsc::sync_channel(1);
+    // The device step runs inside the sink builder, on librespot's player
+    // thread, because that is where a cpal stream has always been opened — and
+    // because the builder has no way to report failure: it must hand back a
+    // `Sink`, so a device error raised in there can only kill the thread. The
+    // answer therefore travels back beside the builder, over this channel, and
+    // the builder hands back a sink that discards everything for the moment
+    // between opening and the caller reading the error off the other end.
+    let (device_tx, device_rx) = std_mpsc::sync_channel(1);
     let config = player_config(normalisation);
     // Volume is applied by the rodio sink (see audio::set_sink_volume), not
     // per decoded packet, so a transport volume change is audible on the
@@ -626,24 +747,52 @@ pub async fn create_playback(
         // the sink's own path is float end to end, so asking cpal for 16-bit
         // would insert an undithered quantisation that nothing downstream
         // wants. The device's mix format is what actually gets opened.
-        let sink = crate::audio::open_default_sink(AudioFormat::F32);
-        crate::audio::set_sink_volume(cached_volume);
-        let _ = audio_ready_tx.send(());
-        sink
+        match audio(AudioFormat::F32) {
+            Ok(sink) => {
+                crate::audio::set_sink_volume(cached_volume);
+                let _ = device_tx.send(None);
+                sink
+            }
+            Err(error) => {
+                let _ = device_tx.send(Some(error));
+                Box::new(SilentSink)
+            }
+        }
     });
 
-    let audio_result = tokio::task::spawn_blocking(move || {
-        audio_ready_rx
-            .recv_timeout(AUDIO_START_TIMEOUT)
-            .map_err(|error| format!("WASAPI/rodio output did not initialize: {error}"))
-    })
-    .await
-    .map_err(|error| format!("audio initialization worker failed: {error}"))?;
-    if let Err(error) = audio_result {
-        return Err(error);
+    let device = tokio::task::spawn_blocking(move || device_rx.recv_timeout(AUDIO_START_TIMEOUT))
+        .await
+        .map_err(|error| {
+            PlaybackError::Fatal(format!("audio initialization worker failed: {error}"))
+        })?;
+    match device {
+        Ok(None) => {}
+        Ok(Some(error)) => {
+            return Err(PlaybackError::NoOutputDevice(no_output_device_message(&error)))
+        }
+        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+            // A driver that blocks inside the open for ten seconds is a device
+            // the user can wait out or unplug, not a broken engine, so it is
+            // retried like the rest.
+            return Err(PlaybackError::NoOutputDevice(format!(
+                "no audio output device: opening one did not finish within {} s. \
+                 {NO_OUTPUT_DEVICE_REMEDY}",
+                AUDIO_START_TIMEOUT.as_secs()
+            )));
+        }
+        // The builder was never reached, which means the player thread ended
+        // before it could ask for a device: a librespot or runtime failure, and
+        // a retry would meet the same one.
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(PlaybackError::Fatal(
+                "the audio player terminated before it opened an output device".to_owned(),
+            ))
+        }
     }
     if player.is_invalid() {
-        return Err("WASAPI/rodio player terminated during initialization".to_owned());
+        return Err(PlaybackError::Fatal(
+            "the audio player terminated during initialization".to_owned(),
+        ));
     }
 
     let events = player.get_player_event_channel();
@@ -652,7 +801,6 @@ pub async fn create_playback(
         player,
         events,
         mixer,
-        session,
         volume_percent: volume_to_percent(cached_volume),
     })
 }
@@ -663,6 +811,22 @@ pub fn percent_to_volume(percent: u8) -> u16 {
 
 fn volume_to_percent(volume: u16) -> u8 {
     ((u32::from(volume) * 100 + u32::from(u16::MAX) / 2) / u32::from(u16::MAX)) as u8
+}
+
+/// The transport volume stored in the cache, in librespot's u16 scale: what the
+/// mixer, the sink and the reported state all start from. Half of full scale
+/// until something has been stored, which is where a fresh install starts.
+fn stored_volume(cache: &Cache) -> u16 {
+    cache.volume().unwrap_or(u16::MAX / 2)
+}
+
+/// [`stored_volume`] as the percentage the engine's state and the UI both
+/// speak. The engine reports this from the moment it starts, so a machine that
+/// could not open an output device at startup still shows the volume its
+/// recovered playback will use — otherwise the first state event would claim
+/// half volume and the rebuilt player would be set to it.
+pub fn stored_volume_percent(cache: &Cache) -> u8 {
+    volume_to_percent(stored_volume(cache))
 }
 
 #[cfg(test)]
