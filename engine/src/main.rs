@@ -505,7 +505,7 @@ async fn run(
                                     }
                                 }
                             }
-                            Command::BrowseArtistCatalogue { id, release_types, offset, limit } => {
+                            Command::BrowseArtistCatalogue { id, release_types, offset, limit, refs_only } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
                                         let sender = browse_sender.clone();
@@ -516,6 +516,7 @@ async fn run(
                                                 &release_types,
                                                 offset,
                                                 limit,
+                                                refs_only,
                                             )
                                             .await;
                                             let _ = sender.send(BrowseOutcome::ArtistCatalogue { request_id, result });

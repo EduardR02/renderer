@@ -1,0 +1,94 @@
+import { expect, test } from "bun:test";
+
+/* The hub is a runes module. Outside Svelte `$state` is just the value it is
+   handed, and what these tests are about is which array objects the store
+   keeps — identity, not reactivity — so the stub has to exist before the
+   module is evaluated. */
+globalThis.$state = (value) => value;
+
+const { applyPlayback, detail, playback } = await import("./state.svelte.js");
+
+function track(id, cached = false) {
+  return { id, uri: `spotify:track:${id}`, name: `Track ${id}`, duration_ms: 180_000, cached };
+}
+
+test("rows whose generation did not move keep their identity", () => {
+  const rows = [track("a"), track("b")];
+  applyPlayback({ queue: rows, queue_revision: 5, current_index: 0 });
+  const held = playback.queue;
+  expect(held[0]).toBe(rows[0]);
+
+  // The same generation again: a payload carrying an equal array must not
+  // replace the rows every consumer of the queue is keyed on.
+  applyPlayback({ queue: [track("a"), track("b")], queue_revision: 5, position_ms: 1_000 });
+  expect(playback.queue).toBe(held);
+  expect(playback.queue[0]).toBe(held[0]);
+});
+
+test("a new generation adopts the rows it names, an empty one included", () => {
+  applyPlayback({ queue: [track("a")], queue_revision: 6, current_index: 0 });
+  expect(playback.queue.map((row) => row.id)).toEqual(["a"]);
+
+  applyPlayback({ queue: [track("a"), track("b")], queue_revision: 7, current_index: 0 });
+  expect(playback.queue.map((row) => row.id)).toEqual(["a", "b"]);
+
+  // A queue that became empty is a new generation with no rows: it has to
+  // clear the store rather than be read as "unchanged".
+  applyPlayback({ queue: [], queue_revision: 8 });
+  expect(playback.queue).toEqual([]);
+});
+
+test("a payload with no revision at all is adopted as it arrives", () => {
+  const rows = [track("c")];
+  applyPlayback({ queue: rows, current_index: 0 });
+  expect(playback.queue[0]).toBe(rows[0]);
+});
+
+test("a payload that keeps the queue still updates everything else", () => {
+  applyPlayback({ queue: [track("a")], queue_revision: 11, current_index: 0, duration_ms: 1_000 });
+  const held = playback.queue;
+  applyPlayback({ queue_revision: 11, current_index: 0, position_ms: 4_000, duration_ms: 2_000 });
+  expect(playback.position_ms).toBe(4_000);
+  expect(playback.duration_ms).toBe(2_000);
+  expect(playback.queue).toBe(held);
+});
+
+test("a download mark that moved reaches the list on screen", () => {
+  applyPlayback({ queue: [track("a"), track("b")], queue_revision: 20, current_index: 0 });
+  detail.playlist = { tracks: [track("a"), track("b")] };
+  applyPlayback({ queue: [track("a", true), track("b")], queue_revision: 21, current_index: 0 });
+  expect(detail.playlist.tracks[0].cached).toBe(true);
+  expect(detail.playlist.tracks[1].cached).toBe(false);
+});
+
+test("rows that shifted under a mark are never misread", () => {
+  /* Same length, different rows: an index-wise comparison would hand the flag
+     at index 0 to whatever now sits there, so the identity check has to reject
+     the alignment and mark only rows the payload really calls cached. */
+  applyPlayback({ queue: [track("a"), track("b", true)], queue_revision: 30, current_index: 0 });
+  detail.playlist = { tracks: [track("a"), track("b"), track("x")] };
+  applyPlayback({ queue: [track("x", true), track("a")], queue_revision: 31, current_index: 0 });
+  const rows = detail.playlist.tracks;
+  expect(rows.find((row) => row.id === "x").cached).toBe(true);
+  expect(rows.find((row) => row.id === "a").cached).toBe(false);
+});
+
+test("a row replaced in place still carries its mark to the list", () => {
+  /* Same length and both rows already marked, so nothing about the flags
+     differs — only the row does. An index whose row is not the row retained is
+     an insertion or a removal that shifted the rest, never an alignment, so the
+     payload's own rows have to be read rather than skipped. */
+  applyPlayback({ queue: [track("a", true)], queue_revision: 40, current_index: 0 });
+  detail.playlist = { tracks: [track("x")] };
+  applyPlayback({ queue: [track("x", true)], queue_revision: 41, current_index: 0 });
+  expect(detail.playlist.tracks[0].cached).toBe(true);
+});
+
+test("revision 0 names no generation, so it is never matched", () => {
+  /* What a pre-revision engine sends, and what the shell's own default leaves
+     behind. Two payloads that both say 0 describe unrelated queues, so the
+     second one's rows are adopted instead of being read as "unchanged". */
+  applyPlayback({ queue: [track("a")], queue_revision: 0, current_index: 0 });
+  applyPlayback({ queue: [track("b")], queue_revision: 0, current_index: 0 });
+  expect(playback.queue.map((row) => row.id)).toEqual(["b"]);
+});

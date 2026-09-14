@@ -1,3 +1,71 @@
+<script module>
+  import { boundedMisses } from "../lib/cover-work.js";
+
+  /**
+   * Urls the engine has answered with nothing, so the round trip is paid once
+   * instead of once per tile.
+   *
+   * An empty answer is not a property of one tile: every tile that shows a url
+   * shares it — the same record on a card and in a playlist's mosaic, the same
+   * playlist in the rail and on its page — and resolving is an IPC round trip
+   * per url per tile. Without this, a cover that cannot be fetched at all (a
+   * delisted record, an engine that is not logged in) is asked for again by
+   * every new tile that scrolls past. Bounded, because a session sees
+   * thousands of urls and the memory must not grow with them — and a url is
+   * only given up on once the empty answer has repeated recently (see
+   * [`boundedMisses`]), because one empty answer can be the network, and two
+   * of them a little later can be an outage.
+   */
+  const coverMisses = boundedMisses(512);
+
+  /**
+   * The top-layer pseudo-classes this engine understands, or `""`.
+   *
+   * A modal `<dialog>` and an open popover are laid out in the browser's top
+   * layer, whose containing block is the viewport: the `.scroll` the sheet is
+   * written inside stops being a containing block for anything in it, so an
+   * observer rooted there measures a rectangle the tile is not laid out in and
+   * reports `isIntersecting: false` for a tile that is plainly on screen. That
+   * is the playlist cleanup sheet's preview rows: visible, with artwork, never
+   * resolved.
+   *
+   * These selectors are how the top layer is asked about. An engine that does
+   * not know one of them THROWS on the query rather than answering false,
+   * which would take the whole resolve path down with it, so the ones it can
+   * answer are found once, here. An empty answer leaves the scroller in
+   * charge, exactly as before this existed.
+   */
+  const TOP_LAYER = [":modal", ":popover-open"]
+    .filter((selector) => {
+      try {
+        document.documentElement.matches(selector);
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .join(", ");
+
+  /**
+   * The element a tile's intersection is measured in: the scroller it is
+   * actually in, or `null` for the viewport.
+   *
+   * The rail and the main pane scroll independently, so the nearest `.scroll`
+   * is the right root for an ordinary list, and a header or hero tile — with
+   * no `.scroll` above it — wants the viewport anyway. A sheet in the top
+   * layer is the other way round: the scroller it is written inside does not
+   * clip it at all (see [`TOP_LAYER`]), so the viewport is the only honest
+   * root there. A scroller inside the same top layer still counts: it clips
+   * its own contents normally.
+   */
+  function observerRoot(node) {
+    const scroller = node.closest(".scroll");
+    if (!scroller || !TOP_LAYER) return scroller;
+    const lifted = node.closest(TOP_LAYER);
+    return lifted && !lifted.contains(scroller) ? null : scroller;
+  }
+</script>
+
 <script>
   import { resolveCoverUrl } from "../lib/state.svelte.js";
   import { identityTone } from "../lib/covertone.svelte.js";
@@ -92,14 +160,85 @@
     if (local) painted = local;
   });
 
+  /**
+   * The tile's own box: what the viewport question is asked about, and the
+   * element that gets the <img>.
+   */
+  let art = $state(null);
+  /**
+   * Whether the tile has ever been on screen. One-way on purpose: a tile that
+   * has been seen must not lose its cover when it scrolls back out of view.
+   */
+  let seen = $state(false);
+
+  /**
+   * Resolving is an IPC round trip per url — up to four for a mosaic — and it
+   * happens at MOUNT, not at paint: `loading="lazy"` defers the browser's own
+   * fetch for a row below the fold, but it has never deferred this. A rail of
+   * 48 playlists measured 132 resolutions for the twelve rows on screen.
+   *
+   * So the tile's own container is what gets observed: a list resolves the
+   * rows the viewer can see and pays for the rest as they arrive, while a
+   * header or hero tile is on screen the moment it mounts and pays nothing
+   * extra — one frame's wait, the same frame the observer's first callback is
+   * delivered in.
+   */
   $effect(() => {
+    if (seen) return;
+    const node = art;
+    if (!node) return;
+    /* No IntersectionObserver to ask: resolve at once, which is exactly what
+       every tile did before this gate existed. */
+    if (typeof IntersectionObserver !== "function") {
+      seen = true;
+      return;
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry.isIntersecting) return;
+        seen = true;
+        observer.disconnect();
+      },
+      /* The scroller this tile is really in, or the viewport — including for a
+         sheet in the top layer, where the scroller it is written inside clips
+         nothing at all. See [`observerRoot`]. */
+      { root: observerRoot(node) },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  });
+
+  $effect(() => {
+    if (!seen) return;
     const wanted = tier === "mosaic" ? pool : primary ? [primary] : [];
     for (const url of wanted) {
       if (url in resolved || url in failed) continue;
-      resolveCoverUrl(url).then((local) => {
-        if (local) resolved[url] = local;
-        else failed[url] = true;
-      });
+      /* A url the engine has already answered with nothing twice is left alone
+         here too, and without a round trip: the tile takes the generated
+         ground it would have taken had the answer come back empty again. */
+      if (coverMisses.dead(url)) {
+        failed[url] = true;
+        continue;
+      }
+      resolveCoverUrl(url).then(
+        (local) => {
+          if (local) {
+            resolved[url] = local;
+            coverMisses.resolved(url);
+          } else {
+            failed[url] = true;
+            coverMisses.miss(url);
+          }
+        },
+        /* The resolve itself failed — the bridge was not there, the call never
+           reached the engine — and that says nothing about the url: this tile
+           falls back now and the next mount asks again. Remembering it here is
+           what turned one flicker of the network into a cover that never came
+           back. */
+        () => {
+          failed[url] = true;
+        },
+      );
     }
   });
 
@@ -146,6 +285,7 @@
 
 {#if tier !== "gen" && !lost}
   <span
+    bind:this={art}
     class="art {cls}"
     class:lg
     class:circle

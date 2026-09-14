@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -108,6 +108,142 @@ impl JobBook {
     }
 }
 
+/// What the artifact a response was built from looked like.
+///
+/// A cached response carries the payload a `.wfm` file held, which is only an
+/// answer while that file is still the file it was read from: an artifact
+/// rewritten or corrupted after the entry was built would otherwise be served
+/// from memory with its size check, its checksum and its bin walk all skipped.
+/// Size and mtime are enough to notice a replacement, and cost one
+/// `metadata()` call where finding out by re-reading costs ~840 KB.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ArtifactIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl ArtifactIdentity {
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = fs::metadata(path).ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    /// `false` for a file that changed, and for one that is gone: only the
+    /// artifact this identity was taken from can vouch for the payload.
+    fn matches(&self, path: &Path) -> bool {
+        Self::of(path).is_some_and(|current| current == *self)
+    }
+}
+
+/// A finished response and the artifact it was read from.
+struct CachedResponse {
+    identity: ArtifactIdentity,
+    response: TrackWaveform,
+}
+
+/// Finished responses for the audio files most recently asked for.
+///
+/// A warm request re-read the whole artifact off disk, checksummed it,
+/// validated every bin, and base64-encoded ~840 KB — 7-9 ms for a
+/// three-and-a-half-minute track, and the encode copies the payload again on
+/// top of the read. None of that depends on *which* track id asked: the key is
+/// the audio file and its duration, so an entry here is the answer to the
+/// artifact's own content, and the disk artifact stays the source of truth —
+/// every entry records the identity of the file it was read from and a hit
+/// that no longer matches it is a miss, so a replaced artifact is decoded
+/// again instead of answered from here. An eviction or a restart behaves
+/// exactly as today — one cold read later — and the artifact is still what a
+/// decode is validated against and written to.
+#[derive(Default)]
+struct ResponseCache {
+    /// Insertion order, oldest first. A hit deliberately does not re-insert:
+    /// the answer did not change, and refreshing the order would only churn
+    /// which entries survive.
+    order: VecDeque<(FileId, u32)>,
+    responses: HashMap<(FileId, u32), CachedResponse>,
+}
+
+/// Small on purpose. This makes revisiting a handful of tracks cheap — the
+/// waveform panel, a queue stepped back and forth — rather than mirroring the
+/// disk cache, which is bounded separately and has a much larger budget.
+const RESPONSE_CACHE_CAPACITY: usize = 8;
+
+impl ResponseCache {
+    fn get(&self, file_id: FileId, duration_ms: u32) -> Option<&CachedResponse> {
+        self.responses.get(&(file_id, duration_ms))
+    }
+
+    fn insert(
+        &mut self,
+        file_id: FileId,
+        duration_ms: u32,
+        identity: ArtifactIdentity,
+        response: TrackWaveform,
+    ) {
+        let key = (file_id, duration_ms);
+        if self
+            .responses
+            .insert(key, CachedResponse { identity, response })
+            .is_none()
+        {
+            self.order.push_back(key);
+        }
+        if self.order.len() > RESPONSE_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.responses.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// The finished response for this artifact, as long as the artifact is still
+/// the one it was built from.
+///
+/// A hit skips the artifact read, the checksum, the bin walk and the encode, so
+/// it has to answer for the file that is on disk *now* rather than the one that
+/// was there when it was filed. A mismatch — a rewritten or corrupted `.wfm`,
+/// or a file that is gone — is a miss, and the caller's read below decides what
+/// the file actually holds, including invalidating one that no longer parses.
+fn cached_response(
+    responses: &Mutex<ResponseCache>,
+    path: &Path,
+    file_id: FileId,
+    duration_ms: u32,
+) -> Option<TrackWaveform> {
+    let cache = responses.lock().ok()?;
+    let entry = cache.get(file_id, duration_ms)?;
+    entry.identity.matches(path).then(|| entry.response.clone())
+}
+
+/// Hands the response back and keeps a copy for the next request for the same
+/// audio file. The file id is the identity here, not the requested track id: a
+/// region-replaced track plays from a substitute recording, so both ids
+/// resolve to the same audio and are answered from one entry. The copy carries
+/// whoever asked first, which is why the hit path rewrites the id it returns.
+///
+/// The copy is filed with the identity of the artifact it came from, so a
+/// later hit can tell whether that artifact is still the one on disk. A
+/// response whose artifact cannot be inspected is handed back but not kept:
+/// nothing could validate it against the file later.
+fn remember_response(
+    responses: &Mutex<ResponseCache>,
+    path: &Path,
+    file_id: FileId,
+    duration_ms: u32,
+    response: TrackWaveform,
+) -> TrackWaveform {
+    let Some(identity) = ArtifactIdentity::of(path) else {
+        return response;
+    };
+    if let Ok(mut cache) = responses.lock() {
+        cache.insert(file_id, duration_ms, identity, response.clone());
+    }
+    response
+}
+
 /// Owns all waveform jobs for the engine process. Unique tracks share one
 /// process-wide permit; requests for the same track share one generation and
 /// fan its eventual result out to every waiter.
@@ -116,6 +252,7 @@ pub struct WaveformService {
     cache_directory: PathBuf,
     worker: Arc<Semaphore>,
     outcomes: mpsc::UnboundedSender<WorkerOutcome>,
+    responses: Arc<Mutex<ResponseCache>>,
     jobs: JobBook,
 }
 
@@ -136,6 +273,7 @@ impl WaveformService {
                 cache_directory,
                 worker: Arc::new(Semaphore::new(1)),
                 outcomes,
+                responses: Arc::new(Mutex::new(ResponseCache::default())),
                 jobs: JobBook::default(),
             },
             receiver,
@@ -151,6 +289,7 @@ impl WaveformService {
         let cache_directory = self.cache_directory.clone();
         let worker = self.worker.clone();
         let outcomes = self.outcomes.clone();
+        let responses = self.responses.clone();
         tokio::spawn(drive_job(
             outcomes,
             track_id.clone(),
@@ -162,6 +301,7 @@ impl WaveformService {
                 track_id,
                 cancellation,
                 worker,
+                responses,
             ),
         ));
     }
@@ -214,6 +354,7 @@ async fn run_job(
     requested_track_id: String,
     cancellation: Arc<AtomicBool>,
     worker: Arc<Semaphore>,
+    responses: Arc<Mutex<ResponseCache>>,
 ) -> Result<TrackWaveform, String> {
     check_cancelled(&cancellation)?;
     let _permit = worker
@@ -232,7 +373,19 @@ async fn run_job(
     let (format, file_id, bytes_per_second) = select_file(&item.files, &cache)?;
     let duration_ms = item.duration_ms;
 
+    // The audio file is the identity of the payload, so a finished response for
+    // it is the whole answer — and the one path that skips everything below:
+    // the artifact read, the checksum, the bin walk and the ~840 KB encode. It
+    // answers only while the artifact is still the one it was read from, which
+    // the path lets it check without reading the file.
     let path = cache_path(&cache_directory, file_id)?;
+    if let Some(response) = cached_response(&responses, &path, file_id, duration_ms) {
+        return Ok(TrackWaveform {
+            track_id: requested_track_id,
+            ..response
+        });
+    }
+
     let cached_path = path.clone();
     let cached =
         tokio::task::spawn_blocking(move || read_or_invalidate_artifact(&cached_path, duration_ms))
@@ -240,7 +393,13 @@ async fn run_job(
             .map_err(|error| format!("waveform cache reader failed: {error}"))??;
     check_cancelled(&cancellation)?;
     if let Some(payload) = cached {
-        return waveform_response(requested_track_id, duration_ms, payload);
+        return Ok(remember_response(
+            &responses,
+            &path,
+            file_id,
+            duration_ms,
+            waveform_response(requested_track_id, duration_ms, payload)?,
+        ));
     }
 
     check_cancelled(&cancellation)?;
@@ -285,7 +444,13 @@ async fn run_job(
     .await
     .map_err(|error| format!("waveform cache writer failed: {error}"))??;
     check_cancelled(&cancellation)?;
-    waveform_response(requested_track_id, duration_ms, decoded)
+    Ok(remember_response(
+        &responses,
+        &path,
+        file_id,
+        duration_ms,
+        waveform_response(requested_track_id, duration_ms, decoded)?,
+    ))
 }
 
 async fn resolve_audio_item(
@@ -501,12 +666,17 @@ fn bin_for_frame(frame: u64) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// The wire shape for a payload that has already been validated: every caller
+/// gets its bytes from [`read_artifact`] or [`write_artifact_atomic`], which
+/// reject a wrong length or an inverted peak before returning or storing them.
+/// Validating again here walked every bin a second time — a whole-payload scan
+/// on the path whose entire job is to hand back bytes that are already known
+/// good.
 fn waveform_response(
     track_id: String,
     duration_ms: u32,
     payload: Vec<u8>,
 ) -> Result<TrackWaveform, String> {
-    validate_payload(duration_ms, &payload)?;
     Ok(TrackWaveform {
         track_id,
         duration_ms,
@@ -729,13 +899,37 @@ fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+/// CRC-32 (reflected, polynomial `0xedb88320`), table-driven.
+///
+/// This runs over the whole payload on every artifact read and every write —
+/// 840 KB for a three-and-a-half-minute track, up to 16 MiB at the artifact
+/// limit — and the bit-at-a-time loop it replaces burnt a serial dependency
+/// chain of eight shifts per byte. The table is that same polynomial evaluated
+/// for all 256 byte values, so every payload still checksums to the same u32:
+/// artifacts already on disk stay valid and a corrupted one fails exactly as
+/// before.
+const CRC32_TABLE: [u32; 256] = crc32_table();
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = (value >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(value & 1));
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+}
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
-        }
+        crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ u32::from(*byte)) & 0xff) as usize];
     }
     !crc
 }
@@ -1005,5 +1199,133 @@ mod tests {
         assert_eq!(contents, (10u8..90).collect::<Vec<_>>());
         assert_eq!(subfile.seek(SeekFrom::End(50)).unwrap(), 80);
         assert_eq!(subfile.seek(SeekFrom::Current(-200)).unwrap(), 0);
+    }
+
+    /// The table must answer exactly what the bit-at-a-time loop answered:
+    /// every artifact already on disk carries a checksum it computed, so a
+    /// difference here would both invalidate the whole cache and let a
+    /// corrupted payload pass.
+    #[test]
+    fn the_checksum_agrees_with_the_bit_at_a_time_reference() {
+        let reference = |bytes: &[u8]| -> u32 {
+            let mut crc = !0u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            !crc
+        };
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926, "the standard check value");
+        for length in [0usize, 1, 27, 28, 255, 256, 4096, 840 * 1024] {
+            let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            assert_eq!(crc32(&bytes), reference(&bytes), "at length {length}");
+        }
+    }
+
+    /// The finished-response cache is bounded, drops the entry that was
+    /// inserted first, and keys on the audio file *and* its duration — a
+    /// different duration is a different payload and must not answer.
+    #[test]
+    fn finished_responses_are_bounded_and_evicted_in_insertion_order() {
+        let mut cache = ResponseCache::default();
+        let response = |id: &str| TrackWaveform {
+            track_id: id.to_owned(),
+            duration_ms: 1000,
+            interval_ms: INTERVAL_MS,
+            bin_count: 1,
+            peaks_base64: "AAAAAA==".to_owned(),
+        };
+        // Nothing here is looked up against a file, so this is the shape of an
+        // identity rather than one taken from an artifact.
+        let identity = ArtifactIdentity {
+            len: 1,
+            modified: None,
+        };
+        for index in 0..RESPONSE_CACHE_CAPACITY {
+            let file_id = FileId::from_raw(&[index as u8; 20]);
+            cache.insert(file_id, 1000, identity, response(&format!("track-{index}")));
+        }
+        let oldest = FileId::from_raw(&[0u8; 20]);
+        let newest = FileId::from_raw(&[RESPONSE_CACHE_CAPACITY as u8 - 1; 20]);
+        assert_eq!(cache.responses.len(), RESPONSE_CACHE_CAPACITY);
+        // A hit does not refresh the order: the next fresh file still takes the
+        // entry that arrived first.
+        assert!(cache.get(oldest, 1000).is_some());
+        assert!(cache.get(oldest, 1000).is_some());
+
+        let newcomer = FileId::from_raw(&[0xff; 20]);
+        cache.insert(newcomer, 1000, identity, response("newcomer"));
+        assert_eq!(cache.responses.len(), RESPONSE_CACHE_CAPACITY);
+        assert!(
+            cache.get(oldest, 1000).is_none(),
+            "the first insertion made room"
+        );
+        assert!(cache.get(newest, 1000).is_some());
+        assert!(cache.get(newcomer, 1000).is_some());
+        assert!(
+            cache.get(newcomer, 1001).is_none(),
+            "the duration is part of the identity"
+        );
+    }
+
+    /// A hit skips the artifact read, the checksum, the bin walk and the
+    /// encode, so it may only answer for the artifact it was built from: a
+    /// `.wfm` replaced or corrupted after the entry was filed has to be a miss,
+    /// or the panel renders a file that is no longer on disk until the entry
+    /// happens to be evicted.
+    #[test]
+    fn a_response_is_not_served_once_its_artifact_changes_on_disk() {
+        let scratch = ScratchDir::new();
+        let file_id = FileId::from_raw(&[0x91; 20]);
+        let path = cache_path(&scratch.0, file_id).unwrap();
+        let mut envelope = Envelope::new(20).unwrap();
+        envelope.push_interleaved_stereo(&[-1.0, 1.0]).unwrap();
+        let payload = envelope.finish();
+        write_artifact_atomic(&path, 20, &payload).unwrap();
+
+        let responses = Mutex::new(ResponseCache::default());
+        remember_response(
+            &responses,
+            &path,
+            file_id,
+            20,
+            waveform_response("track-a".to_owned(), 20, payload.clone()).unwrap(),
+        );
+        assert!(
+            cached_response(&responses, &path, file_id, 20).is_some(),
+            "a warm entry answers while its artifact is untouched"
+        );
+
+        // Replaced by something of another size. The read path would reject
+        // this too; the point is that the cache never gets to answer before it.
+        fs::write(&path, b"WFM1").unwrap();
+        assert!(
+            cached_response(&responses, &path, file_id, 20).is_none(),
+            "a replaced artifact is not the artifact the response was read from"
+        );
+        assert!(read_or_invalidate_artifact(&path, 20).unwrap().is_none());
+
+        // The timestamp half of the identity on its own, asserted against a
+        // synthetic stamp so this does not rest on filesystem resolution.
+        write_artifact_atomic(&path, 20, &payload).unwrap();
+        let identity = ArtifactIdentity::of(&path).unwrap();
+        assert!(identity.matches(&path), "the artifact as it stands matches");
+        if let Some(modified) = identity.modified {
+            let shifted = ArtifactIdentity {
+                modified: Some(modified + Duration::from_secs(60)),
+                ..identity
+            };
+            assert!(
+                !shifted.matches(&path),
+                "the artifact's timestamp is part of its identity"
+            );
+        }
+
+        // And an artifact that is gone: the entry outlives the file only if
+        // nothing looks.
+        fs::remove_file(&path).unwrap();
+        assert!(cached_response(&responses, &path, file_id, 20).is_none());
     }
 }

@@ -488,7 +488,18 @@ function emitPlaylistSummary(id) {
   if (summary) emit("playlist_summary", clone(summary));
 }
 
+/* The queue's revision, mirroring the engine's. Rows and the plan are published
+   when it moves and omitted when the receiver already holds that generation, so
+   a harness that shipped them on every event would never exercise the identity
+   path the real protocol depends on — the surface under test would not be the
+   surface. Every helper that can change a row, the current index, the order or
+   the plan bumps it. */
+let queueRevision = 1;
+let emittedQueueRevision = 0;
+function touchQueue() { queueRevision += 1; }
+
 function refreshQueueEdits() {
+  touchQueue();
   playback.queue = playback.queue.map((entry) => {
     const track = findTrack(entry.uri);
     const edit = track && effectiveEdit(track);
@@ -553,6 +564,7 @@ function trackFromQueueItem(item) {
 }
 
 function setCurrent(index, resetPosition = true) {
+  touchQueue();
   if (!playback.queue.length) {
     playback.current_index = 0;
     playback.current_uri = null;
@@ -621,6 +633,7 @@ function queueRowEligible(index) {
 }
 
 function redrawShuffleBag() {
+  touchQueue();
   shuffleBag = [];
   if (!playback.shuffle) return;
   for (let index = 0; index < playback.queue.length; index++) {
@@ -636,6 +649,7 @@ function redrawShuffleBag() {
     pops from the back, so an append would pin it to "always next" or
     "always last". Mirrors `Engine::splice_into_shuffle_pool`. */
 function spliceIntoShuffleBag(index) {
+  touchQueue();
   if (!playback.shuffle || index === playback.current_index) return;
   if (!queueRowEligible(index) || shuffleBag.includes(index)) return;
   shuffleBag.splice(bagRandom() % (shuffleBag.length + 1), 0, index);
@@ -644,6 +658,7 @@ function spliceIntoShuffleBag(index) {
 /** Drops a removed row and shifts the rows above it down, keeping the drawn
     order of every survivor. Mirrors `Engine::repair_shuffle_pool`. */
 function repairShuffleBagAfterRemoval(index) {
+  touchQueue();
   shuffleBag = shuffleBag
     .filter((pooled) => pooled !== index)
     .map((pooled) => (pooled > index ? pooled - 1 : pooled))
@@ -669,7 +684,18 @@ function upcomingIndices() {
 }
 
 function emitState() {
-  emit("state", { ...clone(playback), upcoming: upcomingIndices() });
+  /* Rows and the plan ride out only when the revision moved; every scalar rides
+     every event. This is the engine's contract (`queue_revision`), and the
+     frontend's identity rule is written against it. */
+  const rows = queueRevision !== emittedQueueRevision;
+  emittedQueueRevision = queueRevision;
+  const state = { ...clone(playback), queue_revision: queueRevision };
+  if (rows) state.upcoming = upcomingIndices();
+  else {
+    delete state.queue;
+    delete state.upcoming;
+  }
+  emit("state", state);
 }
 
 function playlistIdFrom(args) {
@@ -1115,7 +1141,7 @@ window.__harness = {
   unlisten: unregisterListener,
   emit,
   invoke: (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args),
-  getState: () => clone(playback),
+  getState: () => ({ ...clone(playback), queue_revision: queueRevision, upcoming: upcomingIndices() }),
   /** Deterministic skip controls for browser checks: patch the store,
       refresh the open detail, and report the resulting ids. No timers. */
   setExcluded: (trackIds, excluded = true, playlistId = "p1") => {

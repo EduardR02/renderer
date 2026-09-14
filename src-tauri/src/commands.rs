@@ -10,10 +10,10 @@ use crate::app::{
     is_followed_playlist, load_app_settings, load_playlist_list, now_secs, order_by_last_activity,
     playlist_detail_from_cache, playlist_qualifies, remove_membership, save_app_settings,
     save_membership, save_playlist_list, save_tracks_cache,
-    touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, upsert_membership,
-    upsert_playlist, upsert_tracks_cache, AppSettings, AppState, MembershipEntry,
-    PlaylistListCache, PlaylistTracksEntry, CACHE_STATS_TTL_SECS, LIBRARY_LENGTH,
-    LIKED_MEMBERSHIP_ID,
+    touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, tracks_cache_bytes,
+    upsert_membership, upsert_playlist, upsert_tracks_cache, write_tracks_cache_bytes, AppSettings,
+    AppState, MembershipEntry, PlaylistListCache, PlaylistTracksEntry, RefreshCause,
+    CACHE_STATS_TTL_SECS, LIBRARY_LENGTH, LIKED_MEMBERSHIP_ID,
 };
 use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
@@ -342,7 +342,7 @@ pub async fn browse_playlist(
                 "playlist not found".to_owned()
             });
         }
-        spawn_refresh_playlist(app, id);
+        spawn_refresh_playlist(app, id, RefreshCause::Reopen);
         return Ok(detail);
     }
     let result = fetch_playlist(&app, &state, &client, &id).await?;
@@ -581,7 +581,7 @@ pub async fn add_playlist_tracks(
     uris: Vec<String>,
 ) -> Result<(), String> {
     client.add_playlist_tracks(&id, &uris).await?;
-    spawn_refresh_playlist(app, id);
+    spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
 
@@ -594,7 +594,7 @@ pub async fn remove_playlist_tracks(
     expected_snapshot_id: Option<String>,
 ) -> Result<(), String> {
     client.remove_playlist_tracks(&id, &uris, expected_snapshot_id.as_deref()).await?;
-    spawn_refresh_playlist(app, id);
+    spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
 
@@ -607,7 +607,7 @@ pub async fn reorder_playlist_tracks(
     to: usize,
 ) -> Result<(), String> {
     client.reorder_playlist_tracks(&id, from, to).await?;
-    spawn_refresh_playlist(app, id);
+    spawn_refresh_playlist(app, id, RefreshCause::Edit);
     Ok(())
 }
 
@@ -1438,14 +1438,19 @@ async fn browse_all_liked_uris(client: &EngineClient) -> Result<HashSet<String>,
     }
 }
 
-fn spawn_refresh_playlist(app: AppHandle, id: String) {
+/// Refreshes one playlist in the background, repeating once when an edit
+/// landed behind the fetch that just finished. `cause` describes why the
+/// caller is asking; a re-open that meets a fetch already out is dropped by
+/// [`AppState::start_playlist_refresh`] rather than queued, because that fetch
+/// is about to emit exactly the payload a second pass would fetch.
+fn spawn_refresh_playlist(app: AppHandle, id: String, cause: RefreshCause) {
     tauri::async_runtime::spawn(async move {
         let client = app.state::<Arc<EngineClient>>();
         let state = app.state::<Mutex<AppState>>();
         loop {
             {
                 let mut guard = state.lock();
-                if !guard.start_playlist_refresh(&id) {
+                if !guard.start_playlist_refresh(&id, cause) {
                     return;
                 }
             }
@@ -1567,7 +1572,7 @@ async fn fetch_playlist(
     let fetched_at = now_secs();
     let persistence = state.lock().playlist_persistence.clone();
     let _serialize = persistence.lock();
-    let (dir, list_cache, tracks_cache, membership) = {
+    let (dir, list_cache, tracks_bytes, membership) = {
         let mut guard = state.lock();
         if !library_generation_is_current(&guard, generation) {
             return Ok(PlaylistFetchResult {
@@ -1576,7 +1581,7 @@ async fn fetch_playlist(
                 applied: false,
             });
         }
-        upsert_tracks_cache(
+        let tracks_changed = upsert_tracks_cache(
             &mut guard.tracks_cache,
             PlaylistTracksEntry {
                 id: detail.playlist.id.clone(),
@@ -1611,6 +1616,14 @@ async fn fetch_playlist(
         } else {
             None
         };
+        // A browse that only confirmed what the cache already held owes the
+        // disk nothing: this file is 1.5 MB of rows, and re-serializing it
+        // under the lock for an unchanged entry is pure churn. The bytes are
+        // built here because they borrow the rows — a clone to serialize them
+        // elsewhere would cost more than the serialization.
+        let tracks_bytes = tracks_changed
+            .then(|| tracks_cache_bytes(&guard.tracks_cache))
+            .flatten();
         (
             guard.data_dir.clone(),
             should_persist_library.then(|| PlaylistListCache {
@@ -1619,11 +1632,18 @@ async fn fetch_playlist(
                 me_id: guard.me_id.clone(),
                 playlists: guard.playlists.clone(),
             }),
-            guard.tracks_cache.clone(),
+            tracks_bytes,
             membership,
         )
     };
-    save_tracks_cache(&dir, &tracks_cache);
+    if let Some(bytes) = tracks_bytes {
+        // 1.5 MB of fsync does not belong on an async worker. `block_in_place`
+        // rather than `spawn_blocking` because the persistence guard above has
+        // to stay held until the bytes land: the unfollow path serializes its
+        // own removal under the same guard, and a refresh that captured the
+        // removed row before it must not overtake it on disk.
+        tokio::task::block_in_place(|| write_tracks_cache_bytes(&dir, &bytes));
+    }
     if let Some(list_cache) = list_cache {
         save_playlist_list(&dir, &list_cache);
     }

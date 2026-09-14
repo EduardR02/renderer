@@ -14,6 +14,7 @@
   const overview = $derived(artist?.overview ?? null);
   const collections = $derived(artistPlaylistCollections(overview));
   const discovered = $derived(route.name === "discovered-on");
+  const playlists = $derived(discovered ? collections.discovered : collections.artist);
   const title = $derived(discovered ? "Discovered on" : "Artist playlists");
   /* The artist's own tone, soft: these collection pages are rooms off the
      artist's page, and they share its colour the way the playlist and album
@@ -21,6 +22,8 @@
   const tone = $derived(coverTone(artist?.cover_url || "", artist?.id || ""));
 
   let loadedRoute = "";
+  let busy = $state({ id: "" });
+  let error = $state("");
 
   $effect(() => {
     const key = `${route.name}:${route.id ?? ""}`;

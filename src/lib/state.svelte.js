@@ -294,16 +294,35 @@ function clearLazyQueue() {
   lazyBackfillPromise = null;
 }
 
+/**
+ * Labels a row with the context it is about to play in.
+ *
+ * The engine adds this label to every row that arrives without one: `play_queue`,
+ * `add_queue`, `add_queue_batch` and `restore_queue` all fill an empty context
+ * from the command's own `context` argument (`fill_queue_context` in the
+ * engine), so a row the caller never labelled does not need a copy carrying the
+ * label. Building those copies was the whole cost of a click on a long list —
+ * one fresh object per row, and with them a fresh Svelte proxy per row for
+ * every consumer of the queue. Only a row that already claims a different
+ * context is rewritten here, because that is the one thing the engine will not
+ * decide for it.
+ */
 function contextTrack(track, context) {
   const source = String(context ?? "").trim();
   if (!source || !track) return track;
-  return track.context === source ? track : { ...track, context: source };
+  if (!track.context || track.context === source) return track;
+  return { ...track, context: source };
 }
 
+/** The same rule as [`contextTrack`], for a list: an unlabelled list is handed
+    over as it stands, and only a list holding a row that claims another
+    context is rewritten row by row. */
 function contextTracks(tracks, context) {
   const source = String(context ?? "").trim();
   if (!source) return tracks;
-  return (tracks ?? []).map((track) => contextTrack(track, source));
+  const rows = tracks ?? [];
+  if (!rows.some((track) => track?.context && track.context !== source)) return rows;
+  return rows.map((track) => contextTrack(track, source));
 }
 
 function contextForQueueSource(source) {
@@ -466,6 +485,33 @@ export function positionMs() {
     : projected;
 }
 
+/**
+ * The queue generation `playback.queue` holds, or null while it holds rows
+ * whose generation nothing has named. The engine sends the rows with the
+ * revision that identifies them and omits both when the revision has not
+ * moved, which is how a state event can be read as "these rows did not
+ * change" instead of "the queue is empty".
+ */
+let queueRevision = null;
+
+/**
+ * The generation a payload names, or null when it names none.
+ *
+ * A payload that leaves `queue_revision` out parses as `NaN` here, and the
+ * field's own default is `0` — the value a pre-revision engine and every
+ * snapshot written before this field existed carry (see
+ * `PlaybackState::queue_revision` in the shell, where `0` means "assume
+ * changed"). Neither can be a generation to compare against: two payloads that
+ * both arrive that way describe unrelated queues, so both read as "nothing
+ * named" and the rows the payload carries are adopted instead of being merged
+ * against the rows already held under a number that names no rows in
+ * particular.
+ */
+function namedQueueRevision(value) {
+  const revision = Number(value);
+  return Number.isFinite(revision) && revision !== 0 ? revision : null;
+}
+
 export function applyPlayback(payload) {
   if (!payload) return;
   if ("playing" in payload) playingAuthorityGeneration += 1;
@@ -474,7 +520,18 @@ export function applyPlayback(payload) {
     confirmedVolume = payload.volume;
   }
   const loggedOut = observeSearchSession(payload);
+  /* The queue is adopted below rather than copied with the scalars: rows that
+     the revision says have not moved must keep their identity, because every
+     consumer of a queue row — the player bar's container lookup, the plan
+     derived from it, the queue view's rows — is keyed on the row object, and a
+     fresh array of equal rows is a fresh set of objects to all of them. */
+  const incomingQueue = "queue" in payload ? payload.queue : null;
+  const incomingRevision = namedQueueRevision(payload.queue_revision);
+  const queueHeld =
+    incomingQueue === null ||
+    (queueRevision !== null && incomingRevision === queueRevision);
   for (const key of Object.keys(playback)) {
+    if (key === "queue") continue;
     // A full state for an older drag position must not undo the live intent.
     if (key === "volume" && volumePendingGeneration !== null) continue;
     if (key in payload) playback[key] = payload[key];
@@ -488,7 +545,16 @@ export function applyPlayback(payload) {
      reports no change then repairs any ticker that drifted, at the price of a
      null check, and no caller has to remember the `buffering` term. */
   syncPlayheadTicker();
-  if ("queue" in payload) propagateCachedMarks(payload.queue);
+  if (!queueHeld) {
+    propagateCachedMarks(playback.queue, incomingQueue);
+    playback.queue = incomingQueue;
+    /* Only a generation the payload actually named is remembered. One that
+       named none is a payload from before this contract (or from a harness):
+       its rows are adopted as they arrive, and the next payload that does name
+       a generation starts the comparison afresh rather than matching against a
+       number that stands for nothing. */
+    queueRevision = incomingRevision;
+  }
   maybeStartDeferredSearch();
 }
 
@@ -501,16 +567,44 @@ export function applyPlayback(payload) {
  * for the same songs, so without this the mark would appear in the queue and
  * nowhere the reader is looking.
  *
+ * The rows a payload carries are the authority on their own marks, so the diff
+ * below only ever skips a row it can show is the row the previous payload held
+ * at that index: the same id, with a mark that did not move. An index holding a
+ * different row is an insertion or a removal that shifted everything after it,
+ * and then no index-wise reading is trustworthy — the pass reads the whole
+ * incoming queue instead. That fallback is what covers the case the optimised
+ * walk would otherwise miss: a replacement of the same length whose rows are
+ * both marked, where the flags on their own say "nothing moved".
+ *
  * One-way and set-only: a track that has become cached stays marked for as long
  * as the list is open. Un-marking would mean re-deriving the whole list from a
  * payload that only speaks about two tracks, and inferring "not cached" from
  * "not mentioned" is exactly the wrong reading.
  */
-function propagateCachedMarks(queue) {
-  const cachedIds = new Set(
-    (queue ?? []).filter((track) => track?.cached && track.id).map((track) => track.id),
-  );
-  if (!cachedIds.size) return;
+function propagateCachedMarks(previous, incoming) {
+  const rows = incoming ?? [];
+  let marked = [];
+  let aligned = Array.isArray(previous) && previous.length === rows.length;
+  if (aligned) {
+    for (let index = 0; index < rows.length; index += 1) {
+      const from = previous[index];
+      const into = rows[index];
+      if (from?.id !== into?.id) {
+        aligned = false;
+        break;
+      }
+      if (from?.cached || !into?.cached) continue;
+      marked.push(into.id);
+    }
+  }
+  if (!aligned) {
+    marked = [];
+    for (const row of rows) {
+      if (row?.cached && row.id) marked.push(row.id);
+    }
+  }
+  if (!marked.length) return;
+  const cachedIds = new Set(marked);
   for (const view of [detail.playlist, detail.album, detail.artist, detail.radio]) {
     for (const track of view?.tracks ?? []) {
       if (!track.cached && cachedIds.has(track.id)) track.cached = true;
@@ -850,6 +944,7 @@ function observeSearchSession(payload) {
       resetPersonalizedDiscoveryForSession();
       resetFollowsForSession();
       clearPlaylistRecommendationsCache();
+      invalidateLikedFirstPage();
       // The previous account's recency must not leak into the next session's
       // Home: shelves stay hidden until the new account's own `library` event.
       libraryState.fresh = false;
@@ -1600,6 +1695,90 @@ export function applyPlaylistSummary(summary) {
 }
 
 /* ---------------- Spotify saved tracks ---------------- */
+
+/**
+ * How long the first page of Saved Tracks is worth keeping.
+ *
+ * Short because nothing here can subscribe to the collection: the shell's
+ * membership index is refreshed on its own schedule, so a like added from
+ * another client is only visible to us when `memberships_changed` arrives. A
+ * bound of half a minute keeps the cache from outliving that by much while
+ * still covering the burst it exists for — opening the page and pressing Play
+ * on the Library card, both of which used to walk the same first page over the
+ * network every single time.
+ */
+const LIKED_FIRST_PAGE_TTL_MS = 30_000;
+
+/** The cached first page, the moment it was answered, and the session it
+    belongs to. */
+let likedFirstPage = null;
+/** The walk in flight, so two callers share one pass over the network. */
+let likedFirstPagePending = null;
+
+/**
+ * One page of Saved Tracks, deduplicated and reused for [`LIKED_FIRST_PAGE_TTL_MS`].
+ *
+ * Only the first page is cached: the collection is walked by cursor, and the
+ * pages behind the first are read once while scrolling, by a view that owns the
+ * cursor. The first page is the one every entry point asks for.
+ *
+ * Both the page kept here and the walk in flight belong to one account, and the
+ * account is [`searchSessionEpoch`] — the counter `observeSearchSession` moves
+ * whenever the identity of the session changes. Neither can be checked against
+ * the account once it is in the air: a walk shared across a transition hands
+ * the new account the previous one's saved tracks, and the page it answers with
+ * would then be cached as if it were the new account's. Keying on the epoch is
+ * what makes a stale page unreachable for another account even mid-flight, and
+ * it holds for a transition that never reached `invalidateLikedFirstPage`.
+ */
+function browseLikedFirstPage() {
+  const epoch = searchSessionEpoch;
+  if (
+    likedFirstPage &&
+    likedFirstPage.epoch === epoch &&
+    performance.now() - likedFirstPage.answeredAt < LIKED_FIRST_PAGE_TTL_MS
+  ) {
+    return Promise.resolve(likedFirstPage.page);
+  }
+  if (likedFirstPagePending && likedFirstPagePending.epoch === epoch) {
+    return likedFirstPagePending.promise;
+  }
+  const pending = invoke("browse_liked_songs", { cursor: null })
+    .then((page) => {
+      /* Only the walk the hub is still tracking may cache its answer. An
+         invalidation — a change of account, or news about what is saved — and a
+         newer walk both take the slot, so a page that predates either cannot
+         land on top of a fresher one, and a page walked for another account is
+         not this one's to keep. */
+      if (epoch === searchSessionEpoch && likedFirstPagePending?.promise === pending) {
+        likedFirstPage = { page, answeredAt: performance.now(), epoch };
+      }
+      return page;
+    })
+    .finally(() => {
+      // Only this walk clears the slot it took; a walk started after a
+      // transition owns it now.
+      if (likedFirstPagePending?.promise === pending) likedFirstPagePending = null;
+    });
+  likedFirstPagePending = { promise: pending, epoch };
+  return pending;
+}
+
+/**
+ * Drops the cached page and the walk in flight, so the next reader pays for a
+ * fresh one from the account that is current now.
+ *
+ * Called for the two things that can move the collection under us: the shell
+ * reporting that its membership index changed (a like added or removed, here or
+ * in another client), and a change of account, where the previous account's
+ * saved tracks are not this one's. A stale page would draw and play the wrong
+ * list.
+ */
+function invalidateLikedFirstPage() {
+  likedFirstPage = null;
+  likedFirstPagePending = null;
+}
+
 /* ---------------- Cover resolution ---------------- */
 
 const coverCache = new Map(); // remote url -> cover:// url
@@ -1925,7 +2104,14 @@ export const api = {
   setAnimatedCanvas: (enabled) =>
     mutateAppSettings("set_animated_canvas", { enabled: !!enabled }),
   browsePlaylists: () => invoke("browse_playlists"),
-  browseLikedSongs: (cursor = null) => invoke("browse_liked_songs", { cursor }),
+  /**
+   * The collection is walked by cursor; only the first page is deduplicated and
+   * kept for a moment (see [`browseLikedFirstPage`]). Later pages belong to the
+   * view that is scrolling, which holds the cursor and the rows it has already
+   * merged.
+   */
+  browseLikedSongs: (cursor = null) =>
+    cursor == null ? browseLikedFirstPage() : invoke("browse_liked_songs", { cursor }),
   browsePlaylist: (id) => invoke("browse_playlist", { id }),
   browseRadio: (id) => invoke("browse_radio", { id }),
   browsePlaylistRecommendations: (id) => invoke("browse_playlist_recommendations", { id }),
@@ -2194,6 +2380,10 @@ export async function initEvents() {
     ],
     ["playlist", handlePlaylistRefresh],
     ["session", (e) => applySession(e.payload)],
+    // The shell's index of what is saved changed — a like or an unlike, here or
+    // in another client. The first page of Saved Tracks is the one piece of
+    // that collection this hub keeps, and it must not outlive the news.
+    ["memberships_changed", () => invalidateLikedFirstPage()],
     // The one authoritative rootlist answer; the only writer that promotes
     // `libraryState.fresh` (a completed play may also, via promotePlaylist).
     ["library", (e) => setLibrary(e.payload, { fresh: true })],

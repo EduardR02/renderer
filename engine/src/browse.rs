@@ -195,7 +195,15 @@ fn log_available_formats_once(track: &Track) {
     });
 }
 
-#[derive(Clone, Debug)]
+/// The session state availability verdicts are decided from.
+///
+/// Every field is mutable underneath the engine: librespot updates `country`
+/// and the user's `catalogue` attribute on a reconnect, and the explicit
+/// filter is an account setting. That is why this is part of
+/// [`PlaylistTracksKey`] and not read once and trusted — the same username can
+/// answer differently for the same track without the playlist's revision
+/// moving.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AvailabilityPolicy {
     country: String,
     catalogue: String,
@@ -215,6 +223,11 @@ impl AvailabilityPolicy {
     }
 }
 
+/// The one unavailability verdict that time alone overturns. A list holding a
+/// row that is not out yet has to be resolved again rather than memoized, so
+/// the verdict and that check share this constant instead of a literal.
+const RELEASE_EMBARGO_REASON: &str = "not available until its release date";
+
 /// Computes only stable metadata/account restrictions. Loader, key, format,
 /// and network errors deliberately do not enter this path.
 fn permanent_unavailability(track: &Track, policy: &AvailabilityPolicy) -> Option<String> {
@@ -232,7 +245,7 @@ fn permanent_unavailability(track: &Track, policy: &AvailabilityPolicy) -> Optio
                 .iter()
                 .all(|availability| now < availability.start))
     {
-        return Some("not available until its release date".to_owned());
+        return Some(RELEASE_EMBARGO_REASON.to_owned());
     }
     for restriction in track.restrictions.iter().filter(|restriction| {
         restriction
@@ -396,7 +409,7 @@ fn remember_canvas(uri: &str, value: Option<Canvas>) {
         return;
     };
     let key_is_absent = !cache.contains_key(uri);
-    evict_oldest_for_fresh_key(&mut cache, CANVAS_CACHE_MAX, key_is_absent, |entry| {
+    evict_oldest_for_fresh_key(&mut cache, CANVAS_CACHE_MAX, 1, key_is_absent, |entry| {
         entry.fetched_at
     });
     cache.insert(
@@ -415,13 +428,33 @@ pub fn clear_canvas_cache() {
     }
 }
 
+/// How many entries [`FILE_IDS`] gives up when it is full.
+///
+/// That index is filled once per parsed track, and finding the stalest entries
+/// means walking all of them, so making room one entry at a time would pay a
+/// ten-thousand-entry walk — under the write lock — for every row of a large
+/// playlist. An eighth of the capacity at a time carries the same
+/// stalest-first choice further per scan, which spreads that walk over the
+/// inserts that follow.
+///
+/// The request-scoped caches deliberately do not do this: they are filled once
+/// per request rather than once per row, so a walk per eviction costs nothing
+/// and the tighter occupancy is worth keeping.
+const FILE_IDS_EVICTION_BATCH: usize = FILE_IDS_CAPACITY / 8;
+
 /// The one bounded-growth rule every browse cache shares: when a fresh key
-/// joins a map already at capacity, the stalest resident makes room. Only a
+/// joins a map already at capacity, the stalest residents make room. Only a
 /// genuinely new key can evict — refreshing an existing entry never touches
 /// anyone else — so the caller reports whether the key was absent.
+///
+/// `batch` is how many entries one scan may remove, and callers that fill
+/// their cache from a per-row loop ask for more than one (see
+/// [`FILE_IDS_EVICTION_BATCH`]); everyone else passes `1` and keeps the
+/// tightest occupancy. Either way what leaves is chosen from the stale end.
 fn evict_oldest_for_fresh_key<K, V>(
     entries: &mut HashMap<K, V>,
     capacity: usize,
+    batch: usize,
     key_is_absent: bool,
     fetched_at_of: impl Fn(&V) -> Instant,
 ) where
@@ -430,12 +463,18 @@ fn evict_oldest_for_fresh_key<K, V>(
     if !key_is_absent || entries.len() < capacity {
         return;
     }
-    let oldest = entries
+    let batch = batch.max(1).min(entries.len());
+    let mut stalest: Vec<(Instant, &K)> = entries
         .iter()
-        .min_by_key(|(_, entry)| fetched_at_of(entry))
-        .map(|(key, _)| key.clone());
-    if let Some(oldest) = oldest {
-        entries.remove(&oldest);
+        .map(|(key, entry)| (fetched_at_of(entry), key))
+        .collect();
+    // Linear partition rather than a sort: nothing here reads the order within
+    // the batch, only which entries are in it.
+    stalest.select_nth_unstable_by_key(batch - 1, |(stamp, _)| *stamp);
+    stalest.truncate(batch);
+    let doomed: Vec<K> = stalest.into_iter().map(|(_, key)| key.clone()).collect();
+    for key in doomed {
+        entries.remove(&key);
     }
 }
 
@@ -461,9 +500,13 @@ fn remember_track_files(id: &str, track: &Track) {
     };
     if let Ok(mut index) = FILE_IDS.write() {
         let key_is_absent = !index.contains_key(id);
-        evict_oldest_for_fresh_key(&mut index, FILE_IDS_CAPACITY, key_is_absent, |entry| {
-            entry.fetched_at
-        });
+        evict_oldest_for_fresh_key(
+            &mut index,
+            FILE_IDS_CAPACITY,
+            FILE_IDS_EVICTION_BATCH,
+            key_is_absent,
+            |entry| entry.fetched_at,
+        );
         index.insert(id.to_owned(), entry);
     }
 }
@@ -510,6 +553,206 @@ pub fn cached_track_ids(ids: &[String], cache: Option<&Cache>) -> Vec<String> {
         .filter(|id| resolve_cached(id, &index, cache, true) == Some(true))
         .cloned()
         .collect()
+}
+
+/// Resolved playlist track lists, keyed by the playlist's revision.
+///
+/// Opening a playlist re-resolved every row. The header fetch is unavoidable
+/// — it is what carries the revision — but the header's contents are bare URIs,
+/// so the tracks behind them came from extended-metadata batches: for a
+/// thousand-track playlist, 25 POSTs, a thousand payload parses and a thousand
+/// file probes, and then the revision was read out one line later and dropped.
+/// The revision is the playlist's own version stamp (the shell keeps it as
+/// `snapshot_id` and invalidates its own cache on it), so a list resolved for
+/// it is still current: same items, same order, same added timestamps.
+///
+/// Keyed by revision rather than by time: a TTL would decide an unchanged
+/// playlist had expired and re-fetch it, while a revision that has moved is
+/// itself the invalidation, immediately. Nothing here is served as-is except
+/// the list — the download marks are re-derived on every hit, because they are
+/// the one field that changes while the playlist does not.
+///
+/// The session is the other half of the key, because what is stored is not
+/// only the playlist: its availability verdicts are decided by a policy the
+/// session can change underneath the engine — a logout hands it a different
+/// account, and a reconnect can move the country or the user's catalogue
+/// attribute under the same one. A revision says nothing about any of that.
+/// Time is deliberately *not* in the key; the one verdict time alone overturns
+/// keeps its list out of the memo entirely, see [`remember_playlist_tracks`].
+static PLAYLIST_TRACKS_CACHE: LazyLock<Mutex<HashMap<PlaylistTracksKey, PlaylistTracksEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Four playlists is what flipping between a few of them needs. This is a
+/// shortcut across a network round trip, not an archive of the library, and a
+/// large playlist's resolved list is a real amount of memory to hold.
+const PLAYLIST_TRACKS_CACHE_CAPACITY: usize = 4;
+
+/// What a memoized list is an answer for: one playlist's revision, resolved
+/// for one session.
+///
+/// The revision covers membership and order. The policy underneath it covers
+/// the availability verdicts the list carries, because those follow the
+/// session rather than the playlist and the revision cannot see a change to
+/// them.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PlaylistTracksKey {
+    user: String,
+    playlist_id: String,
+    revision: String,
+    policy: AvailabilityPolicy,
+}
+
+/// Builds the key for a lookup or a store. The caller must pass the policy it
+/// resolved with, or the entry it just wrote is not the one it reads back.
+fn playlist_tracks_key(
+    policy: &AvailabilityPolicy,
+    user: &str,
+    id: &str,
+    revision: &str,
+) -> PlaylistTracksKey {
+    PlaylistTracksKey {
+        user: user.to_owned(),
+        playlist_id: id.to_owned(),
+        revision: revision.to_owned(),
+        policy: policy.clone(),
+    }
+}
+
+struct PlaylistTracksEntry {
+    /// When these tracks were resolved. The stamp the shared eviction rule
+    /// ages entries by, not a freshness signal — the revision is the freshness
+    /// signal, and it is in the key.
+    fetched_at: Instant,
+    tracks: Vec<TrackRef>,
+}
+
+fn memo_playlist_tracks(
+    policy: &AvailabilityPolicy,
+    user: &str,
+    id: &str,
+    revision: &str,
+) -> Option<Vec<TrackRef>> {
+    // An empty revision is not a version, so it can never key a hit: serving a
+    // list nothing has vouched for is worse than resolving it again.
+    if revision.is_empty() {
+        return None;
+    }
+    let cache = PLAYLIST_TRACKS_CACHE.lock().ok()?;
+    cache
+        .get(&playlist_tracks_key(policy, user, id, revision))
+        .map(|entry| entry.tracks.clone())
+}
+
+/// Whether a resolve may stand in for every later open of its revision.
+///
+/// A revision proves which items the playlist holds. It does not prove that
+/// this resolve saw all of them, and it says nothing about time:
+///
+/// - A resolve that dropped a source item — a metadata batch that exhausted
+///   its retries, an id the endpoint never answered for — is a *partial* list.
+///   Storing it would hide the missing rows for as long as the revision stands,
+///   because the hit path can only re-check the rows it has.
+/// - A row that is not out yet carries [`RELEASE_EMBARGO_REASON`], the one
+///   verdict that flips with nothing but the clock. Every other verdict is a
+///   property of the metadata and the policy, and the policy is in the key, so
+///   a list without an embargoed row can be kept.
+fn playlist_resolve_is_memoizable(
+    items: &[(SpotifyUri, Option<i64>)],
+    tracks: &[TrackRef],
+) -> bool {
+    // [`playlist_tracks_from_resolved`] restores exactly one row per source
+    // item it could place, so a short list is a resolve that lost rows.
+    tracks.len() == items.len()
+        && !tracks
+            .iter()
+            .any(|track| track.unavailable_reason.as_deref() == Some(RELEASE_EMBARGO_REASON))
+}
+
+/// Stores a resolved list for the revision it was resolved against, when that
+/// list can stand in for every later open of it ([`playlist_resolve_is_memoizable`]).
+///
+/// A partial resolve is served to the caller that made it — that is what a
+/// resolve returning what it could place has always done — it is simply never
+/// remembered as the revision's list.
+fn remember_playlist_tracks(
+    policy: &AvailabilityPolicy,
+    user: &str,
+    id: &str,
+    revision: &str,
+    items: &[(SpotifyUri, Option<i64>)],
+    tracks: &[TrackRef],
+) {
+    if revision.is_empty() || !playlist_resolve_is_memoizable(items, tracks) {
+        return;
+    }
+    let Ok(mut cache) = PLAYLIST_TRACKS_CACHE.lock() else {
+        return;
+    };
+    let key = playlist_tracks_key(policy, user, id, revision);
+    let key_is_absent = !cache.contains_key(&key);
+    evict_oldest_for_fresh_key(
+        &mut cache,
+        PLAYLIST_TRACKS_CACHE_CAPACITY,
+        1,
+        key_is_absent,
+        |entry| entry.fetched_at,
+    );
+    cache.insert(
+        key,
+        PlaylistTracksEntry {
+            fetched_at: Instant::now(),
+            tracks: tracks.to_vec(),
+        },
+    );
+}
+
+/// A memoized list for this revision, this session's policy, with its download
+/// marks re-derived; or `None` when nothing is memoized for it — or the session
+/// index can no longer answer for one of its rows, since an id the engine has
+/// never parsed has no answer here and only a real resolve can supply one.
+fn fresh_playlist_tracks(
+    policy: &AvailabilityPolicy,
+    user: &str,
+    id: &str,
+    revision: &str,
+    cache: Option<&Cache>,
+) -> Option<Vec<TrackRef>> {
+    let mut tracks = memo_playlist_tracks(policy, user, id, revision)?;
+    recompute_cached_marks(&mut tracks, cache).then_some(tracks)
+}
+
+/// Re-derives a memoized list's download marks, in place, the way a fresh
+/// parse derives them: a track is cached when one of *its own* files is on
+/// disk, with no alternative consulted. That is the question [`track_is_cached`]
+/// answers for a row in a list, and not the one [`cached_track_ids`] answers
+/// for a row about to play, which follows the substitute recording a
+/// region-locked track actually plays from.
+///
+/// `false` when the index has aged out one of these rows, so the caller falls
+/// back to a full resolve rather than reporting a mark it cannot support.
+fn recompute_cached_marks(tracks: &mut [TrackRef], cache: Option<&Cache>) -> bool {
+    let Some(cache) = cache else {
+        // Without a cache directory nothing can be on disk, which is what a
+        // fresh parse concludes too.
+        for track in tracks.iter_mut() {
+            track.cached = false;
+        }
+        return true;
+    };
+    let Ok(index) = FILE_IDS.read() else {
+        return false;
+    };
+    let marks: Option<Vec<bool>> = tracks
+        .iter()
+        .map(|track| resolve_cached(&track.id, &index, cache, false))
+        .collect();
+    let Some(marks) = marks else {
+        return false;
+    };
+    for (track, cached) in tracks.iter_mut().zip(marks) {
+        track.cached = cached;
+    }
+    true
 }
 
 /// Release year of an album, or `None` when the metadata carries no date.
@@ -814,12 +1057,23 @@ pub async fn fetch_tracks<'a>(
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
 ) -> Result<Vec<TrackRef>, String> {
     let policy = AvailabilityPolicy::for_session(session);
+    fetch_tracks_with_policy(session, uris, &policy).await
+}
+
+/// [`fetch_tracks`] for a caller that keys what it stores by the policy it
+/// resolved with: the verdicts and the key then come from one read of the
+/// session, rather than two that could disagree if the policy moved in between.
+async fn fetch_tracks_with_policy<'a>(
+    session: &Session,
+    uris: impl IntoIterator<Item = &'a SpotifyUri>,
+    policy: &AvailabilityPolicy,
+) -> Result<Vec<TrackRef>, String> {
     let cache = session.cache().cloned();
     fetch_extended(
         session,
         uris,
         ExtensionKind::TRACK_V4,
-        |entity_uri, payload| parse_track_payload(entity_uri, payload, &policy, cache.as_deref()),
+        |entity_uri, payload| parse_track_payload(entity_uri, payload, policy, cache.as_deref()),
     )
     .await
 }
@@ -880,8 +1134,10 @@ fn limited_playlist_items(
 async fn fetch_playlist_tracks(
     session: &Session,
     items: &[(SpotifyUri, Option<i64>)],
+    policy: &AvailabilityPolicy,
 ) -> Result<Vec<TrackRef>, String> {
-    let resolved = fetch_tracks(session, items.iter().map(|(uri, _)| uri)).await?;
+    let resolved =
+        fetch_tracks_with_policy(session, items.iter().map(|(uri, _)| uri), policy).await?;
     Ok(playlist_tracks_from_resolved(items, resolved))
 }
 
@@ -1418,7 +1674,31 @@ async fn metadata_get<T: Metadata>(
     }
 }
 
+/// A playlist's items in source order, each with the only trustworthy "added"
+/// timestamp it carries. This is what a resolve is made from, so a memo hit
+/// never builds it.
+fn playlist_items(playlist: &Playlist) -> Vec<(SpotifyUri, Option<i64>)> {
+    playlist
+        .contents
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                playlist_added_at(item.attributes.timestamp.as_timestamp_ms()),
+            )
+        })
+        .collect()
+}
+
 /// Playlist header and tracks via the spclient playlist4 endpoint.
+///
+/// The header is fetched every time — it is where the revision comes from —
+/// but the track list behind it is served from [`PLAYLIST_TRACKS_CACHE`] when
+/// that revision has already been resolved for the session's current policy.
+/// A resolve that could not place every item is returned but never remembered,
+/// so the next open tries for the rows it is missing instead of inheriting
+/// them from here.
 pub async fn playlist_browse(
     session: &Session,
     id: &str,
@@ -1432,23 +1712,26 @@ pub async fn playlist_browse(
         ),
         _ => (String::new(), String::new()),
     };
-    let items: Vec<(SpotifyUri, Option<i64>)> = playlist
-        .contents
-        .items
-        .iter()
-        .map(|item| {
-            (
-                item.id.clone(),
-                playlist_added_at(item.attributes.timestamp.as_timestamp_ms()),
-            )
-        })
-        .collect();
-    let tracks = fetch_playlist_tracks(session, &items).await?;
+    let user = session.username();
+    let revision = hex(&playlist.revision);
+    let cache = session.cache().cloned();
+    // Read once: the verdicts in the resolved list and the key it is stored
+    // under must come from the same policy.
+    let policy = AvailabilityPolicy::for_session(session);
+    let tracks = match fresh_playlist_tracks(&policy, &user, id, &revision, cache.as_deref()) {
+        Some(tracks) => tracks,
+        None => {
+            let items = playlist_items(&playlist);
+            let tracks = fetch_playlist_tracks(session, &items, &policy).await?;
+            remember_playlist_tracks(&policy, &user, id, &revision, &items, &tracks);
+            tracks
+        }
+    };
     Ok(renderer_engine::protocol::PlaylistBrowse {
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
         name: playlist.name().to_owned(),
-        revision: Some(hex(&playlist.revision)),
+        revision: Some(revision),
         owner_id,
         description: playlist_description(&playlist.attributes.description),
         owner_name,
@@ -2195,17 +2478,7 @@ async fn discover_songwriter_playlist(
     if normalize_playlist_title(&reference.name) != normalize_playlist_title(&query) {
         return Ok(None);
     }
-    let items: Vec<(SpotifyUri, Option<i64>)> = playlist
-        .contents
-        .items
-        .iter()
-        .map(|item| {
-            (
-                item.id.clone(),
-                playlist_added_at(item.attributes.timestamp.as_timestamp_ms()),
-            )
-        })
-        .collect();
+    let items = playlist_items(&playlist);
     let mut tracks = fetch_playlist_tracks_limited(session, &items, SONGWRITER_TRACK_LIMIT).await?;
     tracks.truncate(SONGWRITER_TRACK_LIMIT);
     if tracks.is_empty() {
@@ -2390,6 +2663,7 @@ impl CatalogueManifestCache {
         evict_oldest_for_fresh_key(
             &mut self.entries,
             CATALOGUE_MANIFEST_CACHE_CAPACITY,
+            1,
             key_is_absent,
             |entry| entry.fetched_at,
         );
@@ -2767,12 +3041,27 @@ async fn catalogue_manifest(
     Ok(releases)
 }
 
+/// One page of an artist's releases, resolved from the catalogue manifest.
+///
+/// `refs_only` asks for the page the shelf hydrator needs: the same `AlbumRef`
+/// list, with no track resolution and no play-count request behind it. It is
+/// the artist page's discography row, which fetches whole pages of releases
+/// only to draw six cover tiles and reads none of the tracks — every page paid
+/// a batched metadata resolve for every track of every release plus one
+/// Pathfinder POST per release, all of it discarded on arrival.
+///
+/// A refs-only page is a picture of a release, not a page the reader can use:
+/// its releases carry no tracks, so a caller that wants rows to play, queue,
+/// cache-mark or page through must ask for a normal page. The two paths share
+/// the manifest, the page window and the header mapping, so the only thing
+/// that differs is what is fetched behind them.
 pub async fn artist_catalogue_browse(
     session: &Session,
     id: &str,
     release_types: &[String],
     offset: usize,
     limit: usize,
+    refs_only: bool,
 ) -> Result<renderer_engine::protocol::ArtistCataloguePage, String> {
     let selected = if release_types.is_empty() {
         vec![0, 1, 2]
@@ -2800,6 +3089,13 @@ pub async fn artist_catalogue_browse(
         parse_catalogue_release_payload,
     )
     .await?;
+    if refs_only {
+        return Ok(renderer_engine::protocol::ArtistCataloguePage {
+            releases: seeds.into_iter().map(|release| release.header).collect(),
+            total,
+            next_offset: (end < total).then_some(end),
+        });
+    }
     let wanted_tracks: Vec<SpotifyUri> = seeds
         .iter()
         .flat_map(|release| release.track_uris.iter().cloned())
@@ -3949,6 +4245,7 @@ impl SongwriterPlaylistCache {
         evict_oldest_for_fresh_key(
             &mut self.entries,
             SONGWRITER_PLAYLIST_CACHE_CAPACITY,
+            1,
             key_is_absent,
             |entry| entry.fetched_at,
         );
@@ -4064,6 +4361,7 @@ impl ArtistOverviewCache {
         evict_oldest_for_fresh_key(
             &mut self.entries,
             ARTIST_OVERVIEW_CACHE_CAPACITY,
+            1,
             key_is_absent,
             |entry| entry.fetched_at,
         );
@@ -6166,17 +6464,48 @@ mod tests {
             entries.insert(index.to_string(), now + Duration::from_secs(index as u64));
         }
 
-        evict_oldest_for_fresh_key(&mut entries, 3, false, |stamp| *stamp);
+        evict_oldest_for_fresh_key(&mut entries, 3, 1, false, |stamp| *stamp);
         assert_eq!(
             entries.len(),
             3,
             "refreshing an existing key evicts nothing"
         );
 
-        evict_oldest_for_fresh_key(&mut entries, 3, true, |stamp| *stamp);
+        evict_oldest_for_fresh_key(&mut entries, 3, 1, true, |stamp| *stamp);
         assert_eq!(entries.len(), 2);
         assert!(!entries.contains_key("0"), "the stalest resident made room");
         assert!(entries.contains_key("2"), "the freshest resident survived");
+    }
+
+    /// A batch is still the same stalest-first rule, taken for more than one
+    /// entry: it makes room for exactly as many as it was asked for, and the
+    /// survivors are the freshest ones. A batch larger than the map is clamped
+    /// rather than overshooting.
+    #[test]
+    fn a_batched_eviction_makes_room_from_the_stale_end() {
+        let now = Instant::now();
+        let capacity = 64;
+        let batch = 8;
+        let mut entries: HashMap<String, Instant> = HashMap::new();
+        for index in 0..capacity {
+            entries.insert(index.to_string(), now + Duration::from_secs(index as u64));
+        }
+
+        evict_oldest_for_fresh_key(&mut entries, capacity, batch, true, |stamp| *stamp);
+
+        assert_eq!(entries.len(), capacity - batch);
+        for index in 0..capacity {
+            assert_eq!(
+                entries.contains_key(&index.to_string()),
+                index >= batch,
+                "entry {index} survived the wrong side of the batch"
+            );
+        }
+
+        let mut small: HashMap<String, Instant> = HashMap::new();
+        small.insert("only".to_owned(), now);
+        evict_oldest_for_fresh_key(&mut small, 1, FILE_IDS_EVICTION_BATCH, true, |stamp| *stamp);
+        assert!(small.is_empty());
     }
 
     #[test]
@@ -7592,6 +7921,7 @@ mod tests {
 mod file_index_tests {
     use super::*;
     use librespot_metadata::track::Tracks;
+    use std::path::{Path, PathBuf};
 
     /// The index is a process-wide map, so every test in here uses ids of its
     /// own rather than sharing fixtures.
@@ -7638,5 +7968,388 @@ mod file_index_tests {
     fn without_a_cache_nothing_is_reported_as_cached() {
         let ids = vec!["1indexDDDDDDDDDDDDDDDD".to_owned()];
         assert!(cached_track_ids(&ids, None).is_empty());
+    }
+
+    /// A scratch `audio` directory for the one test that needs files on disk.
+    fn scratch() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "renderer-playlist-memo-test-{}-{ordinal}",
+            std::process::id()
+        ))
+    }
+
+    /// The memo is process-wide and holds four entries, so tests that write to
+    /// it take turns: a test that inserts while another is between its insert
+    /// and its lookup could evict the entry the other is about to read.
+    fn memo_guard() -> std::sync::MutexGuard<'static, ()> {
+        static PLAYLIST_MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        PLAYLIST_MEMO_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The source items a resolve was handed. The guard asks how many items a
+    /// resolve was given, not which, so these are source slots.
+    fn playlist_items(count: usize) -> Vec<(SpotifyUri, Option<i64>)> {
+        let item = || {
+            (
+                SpotifyUri::from_uri("spotify:track:0123456789ABCDEFGHIJKL").unwrap(),
+                None,
+            )
+        };
+        std::iter::repeat_with(item).take(count).collect()
+    }
+
+    /// The memo answers for one revision of one playlist in one session, and
+    /// what it answers with is only the list: the download marks are the one
+    /// field that moves while the playlist does not, so a hit has to re-derive
+    /// them from the filesystem instead of serving what was stored.
+    #[test]
+    fn a_memoized_revision_returns_the_same_tracks_with_re_derived_marks() {
+        let _guard = memo_guard();
+        let root = scratch();
+        let audio = root.join("audio");
+        std::fs::create_dir_all(&audio).unwrap();
+        let cache = Cache::new(None::<&Path>, None::<&Path>, Some(audio.as_path()), None).unwrap();
+
+        // An id no other test uses: FILE_IDS and the memo are process-wide.
+        let track_id = "1memoAAAAAAAAAAAAAAAAA";
+        let file = FileId::from_raw(&[0x5a; 20]);
+        let mut metadata = tests::test_track(
+            track_id,
+            "Memoized",
+            1000,
+            tests::test_album(
+                "1memoBBBBBBBBBBBBBBBBB",
+                "Album",
+                Vec::new(),
+                Default::default(),
+            ),
+            Vec::new(),
+        );
+        metadata
+            .files
+            .insert(librespot_metadata::audio::AudioFileFormat::OGG_VORBIS_96, file);
+        remember_track_files(track_id, &metadata);
+
+        let policy = AvailabilityPolicy {
+            country: "US".to_owned(),
+            catalogue: "premium".to_owned(),
+            filter_explicit: false,
+        };
+        let stored = TrackRef {
+            id: track_id.to_owned(),
+            uri: format!("spotify:track:{track_id}"),
+            name: "Memoized".to_owned(),
+            added_at: Some(1_700_000_000_000),
+            ..TrackRef::default()
+        };
+        let items = playlist_items(1);
+        remember_playlist_tracks(
+            &policy,
+            "memo-user",
+            "1memoPlaylist",
+            "rev-a",
+            &items,
+            &[stored.clone()],
+        );
+
+        let path = cache.file_path(file).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+
+        let hit = fresh_playlist_tracks(
+            &policy,
+            "memo-user",
+            "1memoPlaylist",
+            "rev-a",
+            Some(&cache),
+        )
+        .expect("the revision was memoized");
+        assert_eq!(hit.len(), 1, "a hit answers with the memoized list");
+        assert_eq!(hit[0].id, track_id);
+        assert_eq!(hit[0].name, "Memoized");
+        assert_eq!(hit[0].added_at, Some(1_700_000_000_000));
+        assert!(
+            hit[0].cached,
+            "the mark comes from the file on disk, not from the memo"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let hit = fresh_playlist_tracks(
+            &policy,
+            "memo-user",
+            "1memoPlaylist",
+            "rev-a",
+            Some(&cache),
+        )
+        .expect("the revision is still memoized");
+        assert!(
+            !hit[0].cached,
+            "a memo hit must re-derive the mark, never serve the stored one"
+        );
+
+        // Everything a hit must refuse: another revision, another session
+        // user, an empty revision that no one has vouched for, and a row the
+        // session index cannot answer for.
+        let other_revision = fresh_playlist_tracks(
+            &policy,
+            "memo-user",
+            "1memoPlaylist",
+            "rev-b",
+            Some(&cache),
+        );
+        assert!(other_revision.is_none(), "a moved revision is not a hit");
+        assert!(
+            fresh_playlist_tracks(
+                &policy,
+                "other-user",
+                "1memoPlaylist",
+                "rev-a",
+                Some(&cache)
+            )
+            .is_none(),
+            "availability verdicts are the session's, so the user keys the entry"
+        );
+        remember_playlist_tracks(
+            &policy,
+            "memo-user",
+            "1memoEmptyRevision",
+            "",
+            &items,
+            &[stored],
+        );
+        assert!(
+            fresh_playlist_tracks(
+                &policy,
+                "memo-user",
+                "1memoEmptyRevision",
+                "",
+                Some(&cache)
+            )
+            .is_none(),
+            "an empty revision is not a version and can never key a hit"
+        );
+        let unknown = TrackRef {
+            id: "1memoCCCCCCCCCCCCCCCCC".to_owned(),
+            ..TrackRef::default()
+        };
+        remember_playlist_tracks(
+            &policy,
+            "memo-user",
+            "1memoUnknownTrack",
+            "rev-c",
+            &playlist_items(1),
+            &[unknown],
+        );
+        let unknown_row = fresh_playlist_tracks(
+            &policy,
+            "memo-user",
+            "1memoUnknownTrack",
+            "rev-c",
+            Some(&cache),
+        );
+        assert!(
+            unknown_row.is_none(),
+            "a row the index has never parsed has no mark, so the memo cannot stand in"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A revision proves which items a playlist holds. It does not prove that
+    /// a resolve saw all of them, and a failed metadata batch leaves a list
+    /// that is short a few rows. Served to the open that made it, yes — that
+    /// is what a resolve returning what it could place has always done — but
+    /// never stored: the hit path can only re-check the rows it has, so the
+    /// missing ones would stay missing for as long as the revision stands.
+    #[test]
+    fn a_partial_resolve_is_served_but_never_memoized() {
+        let _guard = memo_guard();
+        let policy = AvailabilityPolicy {
+            country: "US".to_owned(),
+            catalogue: "premium".to_owned(),
+            filter_explicit: false,
+        };
+        let rows: Vec<TrackRef> = ["1partialAAAAAAAAAAAAAAA", "1partialBBBBBBBBBBBBBBB"]
+            .into_iter()
+            .map(|id| TrackRef {
+                id: id.to_owned(),
+                ..TrackRef::default()
+            })
+            .collect();
+        let items = playlist_items(rows.len());
+
+        // Two items, one resolved row: the half that a metadata batch lost.
+        remember_playlist_tracks(
+            &policy,
+            "partial-user",
+            "1partialPlaylist",
+            "rev-a",
+            &items,
+            &rows[..1],
+        );
+        assert!(
+            fresh_playlist_tracks(&policy, "partial-user", "1partialPlaylist", "rev-a", None)
+                .is_none(),
+            "a partial resolve must leave the revision unresolved for the next open"
+        );
+
+        // The same items with every row placed are the revision's list.
+        remember_playlist_tracks(
+            &policy,
+            "partial-user",
+            "1partialPlaylist",
+            "rev-a",
+            &items,
+            &rows,
+        );
+        assert!(
+            fresh_playlist_tracks(&policy, "partial-user", "1partialPlaylist", "rev-a", None)
+                .is_some(),
+            "a resolve that placed every item is what the memo is for"
+        );
+
+        // A playlist repeats tracks, and the resolve restores one row per
+        // source item, so duplicates neither hide a loss nor fake completeness.
+        let duplicated_items = playlist_items(3);
+        let duplicated_rows = vec![rows[0].clone(), rows[0].clone(), rows[1].clone()];
+        remember_playlist_tracks(
+            &policy,
+            "partial-user",
+            "1partialDuplicates",
+            "rev-a",
+            &duplicated_items,
+            &duplicated_rows,
+        );
+        assert!(
+            fresh_playlist_tracks(&policy, "partial-user", "1partialDuplicates", "rev-a", None)
+                .is_some(),
+            "every source item placed is complete however often it repeats"
+        );
+        remember_playlist_tracks(
+            &policy,
+            "partial-user",
+            "1partialDuplicatedLoss",
+            "rev-a",
+            &duplicated_items,
+            &duplicated_rows[..2],
+        );
+        assert!(
+            fresh_playlist_tracks(
+                &policy,
+                "partial-user",
+                "1partialDuplicatedLoss",
+                "rev-a",
+                None
+            )
+            .is_none(),
+            "a duplicate does not stand in for the item that was lost"
+        );
+    }
+
+    /// Availability verdicts are the session's policy, and the policy moves
+    /// under the same username: librespot re-reads the country and the user's
+    /// catalogue attribute on a reconnect, and the explicit filter is an
+    /// account setting. The playlist's revision says nothing about any of it,
+    /// so the policy that produced the verdicts keys the entry too.
+    #[test]
+    fn a_memoized_list_is_only_answered_for_the_policy_that_resolved_it() {
+        let _guard = memo_guard();
+        let policy = |country: &str, catalogue: &str, filter_explicit: bool| AvailabilityPolicy {
+            country: country.to_owned(),
+            catalogue: catalogue.to_owned(),
+            filter_explicit,
+        };
+        let us = policy("US", "premium", false);
+        let rows = [TrackRef {
+            id: "1policyAAAAAAAAAAAAAAA".to_owned(),
+            ..TrackRef::default()
+        }];
+        remember_playlist_tracks(
+            &us,
+            "policy-user",
+            "1policyPlaylist",
+            "rev-a",
+            &playlist_items(1),
+            &rows,
+        );
+        assert!(
+            fresh_playlist_tracks(&us, "policy-user", "1policyPlaylist", "rev-a", None).is_some(),
+            "the policy that resolved the list still answers for it"
+        );
+        for changed in [
+            policy("DE", "premium", false),
+            policy("US", "free", false),
+            policy("US", "premium", true),
+        ] {
+            assert!(
+                fresh_playlist_tracks(
+                    &changed,
+                    "policy-user",
+                    "1policyPlaylist",
+                    "rev-a",
+                    None
+                )
+                .is_none(),
+                "a changed policy is not the one these verdicts were resolved under: \
+                 country {}, catalogue {}, filter {}",
+                changed.country,
+                changed.catalogue,
+                changed.filter_explicit,
+            );
+        }
+    }
+
+    /// The one verdict time alone overturns. A row that is not out yet becomes
+    /// playable with nothing else moving — no revision, no policy change — so
+    /// its list is resolved again rather than answered from here. Every other
+    /// verdict is a property of the metadata and the policy, and the policy is
+    /// in the key.
+    #[test]
+    fn a_list_holding_an_unreleased_row_is_not_memoized() {
+        let _guard = memo_guard();
+        let policy = AvailabilityPolicy {
+            country: "US".to_owned(),
+            catalogue: "premium".to_owned(),
+            filter_explicit: false,
+        };
+        let row = |reason: &str| TrackRef {
+            id: "1embargoAAAAAAAAAAAAAA".to_owned(),
+            unavailable: true,
+            unavailable_reason: Some(reason.to_owned()),
+            ..TrackRef::default()
+        };
+        let embargoed = [row(RELEASE_EMBARGO_REASON)];
+        remember_playlist_tracks(
+            &policy,
+            "embargo-user",
+            "1embargoPlaylist",
+            "rev-a",
+            &playlist_items(1),
+            &embargoed,
+        );
+        assert!(
+            fresh_playlist_tracks(&policy, "embargo-user", "1embargoPlaylist", "rev-a", None)
+                .is_none(),
+            "a row that is not out yet can flip with nothing but the clock"
+        );
+
+        let settled = [row("not available in your country")];
+        remember_playlist_tracks(
+            &policy,
+            "embargo-user",
+            "1embargoSettled",
+            "rev-a",
+            &playlist_items(1),
+            &settled,
+        );
+        assert!(
+            fresh_playlist_tracks(&policy, "embargo-user", "1embargoSettled", "rev-a", None)
+                .is_some(),
+            "a verdict the clock cannot overturn is kept"
+        );
     }
 }

@@ -28,6 +28,7 @@
    ===================================================================== */
 
 import { resolveCoverUrl } from "./state.svelte.js";
+import { boundedReads } from "./cover-work.js";
 
 /* --- Oklab. Small enough to inline; the alternative is a dependency for
        twelve lines of matrix arithmetic. -------------------------------- */
@@ -335,6 +336,28 @@ function readHue(url) {
   });
 }
 
+/**
+ * One image, one decode.
+ *
+ * `coverTone`'s own cache is keyed by the whole pool, which is right — four
+ * cells are one answer — and it means a cover that appears both on its own and
+ * as one of a playlist's four cells answers to two keys and had the identical
+ * file decoded twice: 2.5ms of main-thread work for a 640px sleeve, on the
+ * common path, because a playlist's cells ARE the covers the album cards show.
+ * Keyed per url here, so the second ask shares the first one's promise instead
+ * of decoding the same picture again.
+ *
+ * The queue is the other half of the same measurement. A library page asks for
+ * two hundred covers at once, and left alone the browser starts all two
+ * hundred decodes in the order they were asked for rather than the order they
+ * are looked at. Four at a time, drained in that order, keeps the top of the
+ * page — the part on screen — at the front.
+ */
+const readHueOnce = boundedReads((local) => readHue(local), {
+  max: 256, // a session walks a whole library; the oldest sample leaves first
+  limit: 4,
+});
+
 /* --- Store ----------------------------------------------------------- */
 
 /** key → palette. Reactive so a late extraction repaints the header. */
@@ -389,7 +412,7 @@ export function coverTone(covers, seed = "") {
     Promise.all(
       pool.map((url) =>
         resolveCoverUrl(url)
-          .then((local) => (local ? readHue(local) : null))
+          .then((local) => (local ? readHueOnce(url, local) : null))
           .catch(() => null),
       ),
     )

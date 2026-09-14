@@ -279,13 +279,25 @@
     }
   }
 
+  /**
+   * The track the bar is looking at, as the one thing the saved-in lookup
+   * depends on.
+   *
+   * `current` is a fresh row object whenever the queue array is replaced — a
+   * cached mark landing, a queue edit, a state event that carries rows — so an
+   * effect reading the row would re-ask the index for a track that never
+   * stopped playing. The URI is that row's identity, and it is equal across
+   * all of those replacements.
+   */
+  const currentUri = $derived(current?.uri ?? null);
+
   /* Track changes re-ask; index changes (an add while this track plays,
      an external like picked up by reconciliation) arrive as one event. */
   $effect(() => {
-    lookupSavedIn(current?.uri);
+    lookupSavedIn(currentUri);
   });
   $effect(() => {
-    const event = listen("memberships_changed", () => lookupSavedIn(current?.uri));
+    const event = listen("memberships_changed", () => lookupSavedIn(currentUri));
     return () => event.then((off) => off()).catch(() => {});
   });
 

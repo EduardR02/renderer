@@ -59,6 +59,13 @@ impl Default for AppSettings {
 
 pub const PLAYBACK_STATE_VERSION: u32 = 3;
 
+/// Version of the playhead sidecar. Versioned apart from the snapshot it
+/// refines: the two files are written on different cadences and either can be
+/// replaced without the other. Version 2 added `queue_identity`; a version-1
+/// sidecar carries no token and is therefore never applied (the snapshot's own
+/// playhead is used and the next drift rewrites the sidecar).
+pub const PLAYBACK_PLAYHEAD_VERSION: u32 = 2;
+
 /// App-owned durable playback state. Deliberately excludes `playing`: every
 /// normal process start restores paused, while crash-only resume intent stays
 /// in memory in `EngineClient`.
@@ -117,6 +124,64 @@ impl PlaybackSnapshot {
                 None => self.position_ms == 0,
             }
     }
+
+    /// Identity of the queue this snapshot carries: the token a playhead
+    /// sidecar is stamped with to say which snapshot it belongs to.
+    ///
+    /// FNV-1a over the row count and every row's uri, in order, so a queue
+    /// edit (add, remove, reorder) changes it and two snapshots that agree on
+    /// it describe the same rows. Written to a file that outlives the process,
+    /// which is why the algorithm is spelled out here rather than taken from
+    /// `DefaultHasher`: the next launch has to recompute the same number.
+    ///
+    /// Only the uris are folded in: they are what identifies a row, they
+    /// round-trip through JSON verbatim, and the sidecar is never a restore
+    /// source on its own — it can only move the playhead of a queue that is
+    /// already known to be this one.
+    pub fn queue_identity(&self) -> u64 {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        fn fold(mut hash: u64, bytes: &[u8]) -> u64 {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(PRIME);
+            }
+            hash
+        }
+        // The length is folded in first so that no two different row counts
+        // can collide on a concatenation of uris, and each uri is followed by
+        // a byte a uri cannot contain (the engine only ever sends
+        // `spotify:track:...`), so `["ab", "c"]` and `["a", "bc"]` differ.
+        let mut hash = fold(OFFSET, &(self.queue.len() as u64).to_le_bytes());
+        for track in &self.queue {
+            hash = fold(hash, track.uri.as_bytes());
+            hash = fold(hash, &[0xff]);
+        }
+        hash
+    }
+}
+
+/// The playhead half of the durable state: which queue row is playing and how
+/// far into it.
+///
+/// Written on its own far more often than [`PlaybackSnapshot`], because a
+/// fifteen-second position change must not rewrite and fsync the whole queue
+/// to record one integer. It is only ever read as an overlay on the snapshot
+/// it trails — a playhead with no queue says nothing about what to restore.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+pub struct PlayheadSnapshot {
+    pub version: u32,
+    /// [`PlaybackSnapshot::queue_identity`] of the snapshot this playhead was
+    /// written for.
+    ///
+    /// File timestamps alone cannot say which snapshot a sidecar belongs to:
+    /// two writes inside one filesystem tick tie, and a clock that steps back
+    /// makes the newer file look older. A sidecar whose token disagrees with
+    /// the snapshot beside it describes another queue — restoring it would
+    /// silently seek the wrong row — so the snapshot's own playhead wins.
+    pub queue_identity: u64,
+    pub current_index: Option<usize>,
+    pub position_ms: u32,
 }
 
 /// Managed application state. Only the contract fields are serialized; the
@@ -137,10 +202,10 @@ pub struct AppState {
     /// This is process-local bookkeeping and is deliberately not serialized.
     #[serde(skip)]
     playlist_refreshing: HashSet<String>,
-    /// Set when a refresh trigger arrives while another is out for the same
-    /// playlist; the running refresh re-runs once more instead of the trigger
-    /// being dropped (an edit committed mid-fetch would otherwise never be
-    /// seen until the next open).
+    /// Set when an edit lands while another fetch for the same playlist is
+    /// out; the running refresh re-runs once more instead of the edit being
+    /// dropped (it would otherwise never be seen until the next open). A
+    /// re-open while a fetch is out is not queued: that fetch answers it.
     #[serde(skip)]
     playlist_refresh_queued: HashSet<String>,
     /// Serializes playlist state mutation with its bounded atomic cache write.
@@ -203,13 +268,18 @@ impl AppState {
         }
     }
 
-    pub(crate) fn start_playlist_refresh(&mut self, id: &str) -> bool {
+    pub(crate) fn start_playlist_refresh(&mut self, id: &str, cause: RefreshCause) -> bool {
         if self.playlist_refreshing.insert(id.to_owned()) {
             return true;
         }
-        // Another fetch is out for this playlist; remember the trigger so
-        // its completion can run one more pass instead of dropping this one.
-        self.playlist_refresh_queued.insert(id.to_owned());
+        // Another fetch is out for this playlist. Only an edit behind it
+        // needs one more pass: it would otherwise be answered by a read that
+        // predates it, and never seen until the next open. A re-open carries
+        // no such news — the fetch in flight already answers it, and queuing
+        // it would spend a second round trip only to drop the first payload.
+        if cause == RefreshCause::Edit {
+            self.playlist_refresh_queued.insert(id.to_owned());
+        }
         false
     }
 
@@ -221,6 +291,17 @@ impl AppState {
     pub(crate) fn take_playlist_refresh_queued(&mut self, id: &str) -> bool {
         self.playlist_refresh_queued.remove(id)
     }
+}
+
+/// Why a playlist refresh was triggered. An edit committed while a fetch is
+/// out must not be spoken over by that older read, so it queues one more
+/// pass; a plain re-open of the same playlist is already answered by the
+/// fetch in flight, which is about to emit exactly the payload the second
+/// pass would have fetched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefreshCause {
+    Reopen,
+    Edit,
 }
 
 /// One cached playlist tracks payload, matching the on-disk entry shape.
@@ -288,10 +369,65 @@ fn playback_state_path(dir: &Path) -> PathBuf {
     dir.join("playback_state.json")
 }
 
+fn playback_playhead_path(dir: &Path) -> PathBuf {
+    dir.join("playback_playhead.json")
+}
+
+/// Loads the durable snapshot with the fresher of the two playheads applied.
+///
+/// The sidecar carries no queue, so it is never a restore source on its own:
+/// it only moves the playhead of the snapshot it belongs to, and only while it
+/// is at least as new as that snapshot and names the same queue. A queue edit
+/// (or a clean exit) rewrites the snapshot with the live position, and that
+/// snapshot then outranks a sidecar the previous playhead left behind.
 fn load_playback_snapshot_from(dir: &Path) -> Option<PlaybackSnapshot> {
-    let snapshot: PlaybackSnapshot =
+    let mut snapshot: PlaybackSnapshot =
         serde_json::from_slice(&std::fs::read(playback_state_path(dir)).ok()?).ok()?;
-    snapshot.is_valid().then_some(snapshot)
+    if !snapshot.is_valid() {
+        return None;
+    }
+    if let Some(playhead) = load_playhead(dir, &snapshot) {
+        snapshot.current_index = playhead.current_index;
+        snapshot.position_ms = playhead.position_ms;
+    }
+    Some(snapshot)
+}
+
+/// Reads the sidecar when it names `snapshot`'s queue, is at least as new as
+/// it, and its playhead resolves inside those rows.
+fn load_playhead(dir: &Path, snapshot: &PlaybackSnapshot) -> Option<PlayheadSnapshot> {
+    let path = playback_playhead_path(dir);
+    let written = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let snapshot_written = std::fs::metadata(playback_state_path(dir))
+        .ok()?
+        .modified()
+        .ok()?;
+    if written < snapshot_written {
+        return None;
+    }
+    let playhead: PlayheadSnapshot = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    (playhead.version == PLAYBACK_PLAYHEAD_VERSION
+        // The token is what makes the sidecar belong to *this* snapshot: the
+        // bounds checks below cannot tell one queue from another of the same
+        // shape, and the timestamps above cannot tell two writes apart inside
+        // one filesystem tick or across a clock that stepped back.
+        && playhead.queue_identity == snapshot.queue_identity()
+        && playhead_resolves(&playhead, snapshot))
+    .then_some(playhead)
+}
+
+/// Whether a sidecar's playhead can be applied to a snapshot's queue. An
+/// index that does not exist there means the sidecar belongs to another
+/// queue, and a stray position inside a row that cannot hold it means the
+/// same; both fall back to the snapshot's own playhead.
+fn playhead_resolves(playhead: &PlayheadSnapshot, snapshot: &PlaybackSnapshot) -> bool {
+    match playhead.current_index {
+        Some(index) => snapshot
+            .queue
+            .get(index)
+            .is_some_and(|track| playhead.position_ms <= track.duration_ms),
+        None => playhead.position_ms == 0,
+    }
 }
 
 pub fn load_playback_snapshot() -> Option<PlaybackSnapshot> {
@@ -311,12 +447,50 @@ pub fn save_playback_snapshot(snapshot: &PlaybackSnapshot) -> Result<(), String>
     save_playback_snapshot_to(&data_dir(), snapshot)
 }
 
+fn save_playhead_snapshot_to(
+    dir: &Path,
+    current_index: Option<usize>,
+    position_ms: u32,
+    queue_identity: u64,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("could not create playback state directory: {error}"))?;
+    write_json_atomic_result(
+        playback_playhead_path(dir),
+        &PlayheadSnapshot {
+            version: PLAYBACK_PLAYHEAD_VERSION,
+            queue_identity,
+            current_index,
+            position_ms,
+        },
+    )
+}
+
+/// Persists the playhead alone. The writer only reaches this when the queue,
+/// the volume and every other persisted field already match the snapshot on
+/// disk, so the two files together still describe one coherent state — and
+/// `queue_identity` is that snapshot's own token, taken from the copy the
+/// comparison ran against rather than recomputed here.
+pub fn save_playhead_snapshot(
+    current_index: Option<usize>,
+    position_ms: u32,
+    queue_identity: u64,
+) -> Result<(), String> {
+    save_playhead_snapshot_to(&data_dir(), current_index, position_ms, queue_identity)
+}
+
 pub fn clear_playback_snapshot() -> Result<(), String> {
-    match std::fs::remove_file(playback_state_path(&data_dir())) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("could not clear playback state: {error}")),
+    // The sidecar is cleared with the snapshot: a playhead left behind would
+    // otherwise outlive the queue it belongs to and refine the next one.
+    let dir = data_dir();
+    for path in [playback_state_path(&dir), playback_playhead_path(&dir)] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not clear playback state: {error}")),
+        }
     }
+    Ok(())
 }
 
 /// Diagnostic logs: `%LOCALAPPDATA%\SpotifyRenderer\logs` — the app's own
@@ -403,21 +577,74 @@ pub fn load_tracks_cache(dir: &Path) -> Vec<PlaylistTracksEntry> {
     }
 }
 
-pub fn save_tracks_cache(dir: &Path, playlists: &[PlaylistTracksEntry]) {
-    let cache = PlaylistTracksCacheRef {
+fn tracks_cache_ref(playlists: &[PlaylistTracksEntry]) -> PlaylistTracksCacheRef<'_> {
+    PlaylistTracksCacheRef {
         version: 1,
         saved_at: Some(now_secs()),
         playlists,
-    };
-    write_json_atomic(dir.join("playlist_tracks_cache.json"), &cache);
+    }
+}
+
+pub fn save_tracks_cache(dir: &Path, playlists: &[PlaylistTracksEntry]) {
+    write_json_atomic(
+        dir.join("playlist_tracks_cache.json"),
+        &tracks_cache_ref(playlists),
+    );
+}
+
+/// The cache serialized to the exact bytes [`write_tracks_cache_bytes`]
+/// writes. Split from the write because the caller holds the state lock while
+/// the cache is borrowed — serializing into a buffer costs a fraction of the
+/// clone that handing the rows to another thread would — and because this
+/// cache is 1.5 MB of the app's disk churn. Failures are reported and skipped
+/// exactly as [`save_tracks_cache`] treats them: best-effort cache IO.
+pub fn tracks_cache_bytes(playlists: &[PlaylistTracksEntry]) -> Option<Vec<u8>> {
+    match serde_json::to_vec(&tracks_cache_ref(playlists)) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            eprintln!("SpotifyRenderer: could not serialize the playlist tracks cache: {error}");
+            None
+        }
+    }
+}
+
+/// Writes bytes from [`tracks_cache_bytes`], with the same atomic replacement
+/// and failure reporting as [`save_tracks_cache`].
+pub fn write_tracks_cache_bytes(dir: &Path, bytes: &[u8]) {
+    let path = dir.join("playlist_tracks_cache.json");
+    if let Err(error) = write_bytes_atomic_result(path.clone(), bytes) {
+        eprintln!(
+            "SpotifyRenderer: could not write cache {}: {error}",
+            path.display()
+        );
+    }
 }
 
 /// Inserts (or refreshes) one playlist's tracks at the front of the cache,
-/// dropping the oldest entries beyond the cap.
-pub fn upsert_tracks_cache(entries: &mut Vec<PlaylistTracksEntry>, entry: PlaylistTracksEntry) {
+/// dropping the oldest entries beyond the cap, and reports whether the stored
+/// entry actually changed.
+///
+/// The comparison is what keeps an open from rewriting — and fsyncing — the
+/// whole cache to store what it already holds. `fetched_at` is deliberately
+/// not part of it: nothing reads that field back, and counting it would make
+/// every browse a change. Moving an unchanged entry to the front is not worth
+/// a write either; the next real change persists the list in this order.
+pub fn upsert_tracks_cache(
+    entries: &mut Vec<PlaylistTracksEntry>,
+    entry: PlaylistTracksEntry,
+) -> bool {
+    let changed = entries
+        .iter()
+        .find(|existing| existing.id == entry.id)
+        .is_none_or(|existing| {
+            existing.revision != entry.revision
+                || existing.tracks != entry.tracks
+                || existing.excluded_track_ids != entry.excluded_track_ids
+        });
     entries.retain(|existing| existing.id != entry.id);
     entries.insert(0, entry);
     entries.truncate(TRACKS_CACHE_MAX);
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -774,14 +1001,18 @@ fn write_json_atomic<T: Serialize>(path: PathBuf, value: &T) {
 }
 
 fn write_json_atomic_result<T: Serialize>(path: PathBuf, value: &T) -> Result<(), String> {
-    use std::io::Write as _;
-
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("could not serialize {}: {error}", path.display()))?;
+    write_bytes_atomic_result(path, &bytes)
+}
+
+fn write_bytes_atomic_result(path: PathBuf, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
     let temp = path.with_extension("json.tmp");
     let mut file = std::fs::File::create(&temp)
         .map_err(|error| format!("could not create {}: {error}", temp.display()))?;
-    file.write_all(&bytes)
+    file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
     replace_file_atomically(&temp, &path)
@@ -982,6 +1213,236 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Sets a file's LastWriteTime, so a test can order the two durable files
+    /// without sleeping through filesystem timestamp granularity.
+    fn stamp_modified(path: &Path, when: SystemTime) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    #[test]
+    fn playhead_sidecar_refines_the_snapshot_it_is_not_older_than() {
+        let dir = std::env::temp_dir().join(format!(
+            "renderer-playhead-state-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let snapshot = PlaybackSnapshot {
+            version: PLAYBACK_STATE_VERSION,
+            queue: vec![
+                Track {
+                    duration_ms: 240_000,
+                    ..track("a")
+                },
+                Track {
+                    duration_ms: 180_000,
+                    ..track("b")
+                },
+            ],
+            current_index: Some(0),
+            position_ms: 30_000,
+            volume: 50,
+            shuffle: false,
+            repeat: "off".to_owned(),
+            playback_speed: 1.0,
+        };
+        save_playback_snapshot_to(&dir, &snapshot).unwrap();
+
+        // With no sidecar the snapshot is its own playhead.
+        assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
+
+        // A sidecar written after it carries what playback has moved on to,
+        // including a track change the snapshot never saw.
+        save_playhead_snapshot_to(&dir, Some(1), 12_000, snapshot.queue_identity()).unwrap();
+        assert_eq!(
+            load_playback_snapshot_from(&dir),
+            Some(PlaybackSnapshot {
+                current_index: Some(1),
+                position_ms: 12_000,
+                ..snapshot.clone()
+            })
+        );
+
+        // A snapshot rewritten after the sidecar — a queue edit, or the exit
+        // flush — carries the live playhead itself and outranks the sidecar.
+        let older = std::fs::metadata(playback_state_path(&dir))
+            .unwrap()
+            .modified()
+            .unwrap()
+            - std::time::Duration::from_secs(60);
+        stamp_modified(&playback_playhead_path(&dir), older);
+        assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
+
+        // Written in the same filesystem tick counts as no older, and this
+        // sidecar names this snapshot's own queue, so the tie still goes to
+        // the sidecar. A tie alone is not enough: see
+        // `a_sidecar_from_another_queue_never_moves_this_snapshots_playhead`.
+        let together = std::fs::metadata(playback_state_path(&dir))
+            .unwrap()
+            .modified()
+            .unwrap();
+        stamp_modified(&playback_playhead_path(&dir), together);
+        assert_eq!(
+            load_playback_snapshot_from(&dir),
+            Some(PlaybackSnapshot {
+                current_index: Some(1),
+                position_ms: 12_000,
+                ..snapshot.clone()
+            })
+        );
+
+        // A playhead that cannot belong to this queue falls back to the
+        // snapshot's own, however fresh it is.
+        save_playhead_snapshot_to(&dir, Some(7), 1_000, snapshot.queue_identity()).unwrap();
+        assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
+        save_playhead_snapshot_to(&dir, Some(0), 240_001, snapshot.queue_identity()).unwrap();
+        assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar belongs to one snapshot, and the file timestamps cannot say
+    /// which: two writes inside one filesystem tick tie, and a clock that steps
+    /// back makes the newer file look older. Without the token, a playhead
+    /// written for the queue the user left behind is applied to the queue that
+    /// replaced it whenever its index and position happen to fit — silently
+    /// restoring the wrong row and position.
+    #[test]
+    fn a_sidecar_from_another_queue_never_moves_this_snapshots_playhead() {
+        let dir = std::env::temp_dir().join(format!(
+            "renderer-playhead-identity-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let first = PlaybackSnapshot {
+            version: PLAYBACK_STATE_VERSION,
+            queue: vec![
+                Track {
+                    duration_ms: 240_000,
+                    ..track("a")
+                },
+                Track {
+                    duration_ms: 180_000,
+                    ..track("b")
+                },
+            ],
+            current_index: Some(0),
+            position_ms: 30_000,
+            volume: 50,
+            shuffle: false,
+            repeat: "off".to_owned(),
+            playback_speed: 1.0,
+        };
+        save_playback_snapshot_to(&dir, &first).unwrap();
+        save_playhead_snapshot_to(&dir, Some(1), 12_000, first.queue_identity()).unwrap();
+
+        // The user opens another playlist: the snapshot now holds rows the
+        // sidecar knows nothing about. Both of them are long enough for index
+        // 1 and 12s to fit, which is what used to make this silent.
+        let second = PlaybackSnapshot {
+            queue: vec![
+                Track {
+                    duration_ms: 200_000,
+                    ..track("c")
+                },
+                Track {
+                    duration_ms: 210_000,
+                    ..track("d")
+                },
+            ],
+            ..first.clone()
+        };
+        save_playback_snapshot_to(&dir, &second).unwrap();
+
+        // Even with the sidecar's timestamp made equal to the snapshot's — the
+        // tie that used to hand it the snapshot's playhead — the token rejects
+        // it: the snapshot's own playhead stands.
+        let together = std::fs::metadata(playback_state_path(&dir))
+            .unwrap()
+            .modified()
+            .unwrap();
+        stamp_modified(&playback_playhead_path(&dir), together);
+        assert_eq!(
+            load_playback_snapshot_from(&dir),
+            Some(second),
+            "a sidecar for another queue must not seek inside this one"
+        );
+
+        // And it is still the sidecar for the queue it *does* name: the guard
+        // is the identity, not the freshness.
+        save_playback_snapshot_to(&dir, &first).unwrap();
+        let together = std::fs::metadata(playback_state_path(&dir))
+            .unwrap()
+            .modified()
+            .unwrap();
+        stamp_modified(&playback_playhead_path(&dir), together);
+        assert_eq!(
+            load_playback_snapshot_from(&dir),
+            Some(PlaybackSnapshot {
+                current_index: Some(1),
+                position_ms: 12_000,
+                ..first.clone()
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sidecar's token is the snapshot's own: the writer stamps what it
+    /// compared against, and the loader recomputes it from the rows it read,
+    /// so the same queue always yields the same number — across a JSON
+    /// round-trip, and regardless of which row is current.
+    #[test]
+    fn the_queue_identity_survives_a_round_trip_and_ignores_the_playhead() {
+        let dir = std::env::temp_dir().join(format!(
+            "renderer-playhead-token-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let snapshot = PlaybackSnapshot {
+            version: PLAYBACK_STATE_VERSION,
+            queue: vec![
+                Track {
+                    duration_ms: 240_000,
+                    ..track("a")
+                },
+                Track {
+                    duration_ms: 180_000,
+                    ..track("b")
+                },
+            ],
+            current_index: Some(0),
+            position_ms: 30_000,
+            volume: 50,
+            shuffle: false,
+            repeat: "off".to_owned(),
+            playback_speed: 1.0,
+        };
+        save_playback_snapshot_to(&dir, &snapshot).unwrap();
+        let loaded = load_playback_snapshot_from(&dir).expect("snapshot reads back");
+        assert_eq!(loaded.queue_identity(), snapshot.queue_identity());
+
+        // The playhead is not part of the identity: it moves constantly, and a
+        // token that moved with it would reject the sidecar it belongs to.
+        let mut moved = snapshot.clone();
+        moved.current_index = Some(1);
+        moved.position_ms = 90_000;
+        assert_eq!(moved.queue_identity(), snapshot.queue_identity());
+
+        // A different queue is a different identity, and so is a reorder of
+        // the same rows: the token names the rows this snapshot describes.
+        let mut reordered = snapshot.clone();
+        reordered.queue.swap(0, 1);
+        assert_ne!(reordered.queue_identity(), snapshot.queue_identity());
+        let mut shorter = snapshot.clone();
+        shorter.queue.pop();
+        shorter.current_index = Some(0);
+        assert_ne!(shorter.queue_identity(), snapshot.queue_identity());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn malformed_or_unknown_playback_snapshots_are_ignored() {
         let dir = std::env::temp_dir().join(format!(
@@ -1029,18 +1490,27 @@ mod tests {
     fn playlist_refresh_state_coalesces_same_id_but_allows_other_ids() {
         let mut state = AppState::new(PathBuf::from("unused"));
 
-        assert!(state.start_playlist_refresh("p1"));
-        // A second trigger while p1 is out is refused but queued for a
-        // single re-run, so an edit landing mid-fetch is never dropped.
-        assert!(!state.start_playlist_refresh("p1"));
-        assert!(state.start_playlist_refresh("p2"));
+        assert!(state.start_playlist_refresh("p1", RefreshCause::Reopen));
+        // An edit landing mid-fetch is refused but queued for a single
+        // re-run: the read in flight may predate it and must not speak for it.
+        assert!(!state.start_playlist_refresh("p1", RefreshCause::Edit));
+        // A re-open is refused too, but queues nothing: the fetch in flight
+        // already answers it, and a second round trip would only discard the
+        // payload that fetch is about to emit.
+        assert!(!state.start_playlist_refresh("p1", RefreshCause::Reopen));
+        assert!(state.start_playlist_refresh("p2", RefreshCause::Reopen));
 
         state.finish_playlist_refresh("p1");
         assert!(state.take_playlist_refresh_queued("p1"));
         assert!(!state.take_playlist_refresh_queued("p1"));
 
-        assert!(state.start_playlist_refresh("p1"));
+        assert!(state.start_playlist_refresh("p1", RefreshCause::Reopen));
+        assert!(!state.start_playlist_refresh("p1", RefreshCause::Reopen));
         state.finish_playlist_refresh("p1");
+        assert!(
+            !state.take_playlist_refresh_queued("p1"),
+            "a re-open behind a fetch leaves no second pass behind it"
+        );
         state.finish_playlist_refresh("p2");
     }
 
@@ -1109,6 +1579,44 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert_eq!(cache[0].revision, "new");
         assert_eq!(cache[0].tracks[0].id, "b");
+    }
+
+    #[test]
+    fn a_browse_that_confirms_the_cached_entry_is_not_a_change() {
+        let mut cache = Vec::new();
+        let entry = |revision: &str, track_id: &str| PlaylistTracksEntry {
+            id: "p1".into(),
+            fetched_at: Some(1),
+            revision: revision.into(),
+            tracks: vec![track(track_id)],
+            excluded_track_ids: Vec::new(),
+        };
+
+        assert!(upsert_tracks_cache(&mut cache, entry("rev1", "a")));
+        assert!(
+            !upsert_tracks_cache(&mut cache, entry("rev1", "a")),
+            "a re-browse only refreshes fetched_at, which is never read back"
+        );
+
+        assert!(
+            upsert_tracks_cache(&mut cache, entry("rev2", "a")),
+            "a new revision is a change"
+        );
+        assert!(
+            upsert_tracks_cache(&mut cache, entry("rev2", "b")),
+            "a replaced row is a change"
+        );
+        assert!(
+            !upsert_tracks_cache(&mut cache, entry("rev2", "b")),
+            "the same revision and rows are not a change"
+        );
+
+        let mut excluded = entry("rev2", "b");
+        excluded.excluded_track_ids = vec!["b".into()];
+        assert!(
+            upsert_tracks_cache(&mut cache, excluded),
+            "an exclusion edit is a change"
+        );
     }
 
     #[test]

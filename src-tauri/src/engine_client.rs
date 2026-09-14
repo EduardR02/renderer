@@ -25,7 +25,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::app::{
     clear_playback_snapshot, engine_state_dir, load_app_settings, load_playback_snapshot,
-    save_playback_snapshot, PlaybackSnapshot,
+    save_playback_snapshot, save_playhead_snapshot, PlaybackSnapshot,
 };
 use crate::log;
 use crate::types::{PlaybackState, Track};
@@ -245,45 +245,132 @@ impl RestoreSnapshot {
 struct PersistedSnapshot {
     written_at: Instant,
     snapshot: PlaybackSnapshot,
+    /// [`EngineClient::queue_generation`] at the last comparison of the live
+    /// queue against `snapshot.queue`. A later pass that reads the same
+    /// generation knows no state line has replaced the retained queue since,
+    /// and skips the row scan — the one comparison that costs a walk of the
+    /// whole queue. Without it the 2-second heartbeat alone would re-walk
+    /// those rows thirty times a minute to answer "still the same".
+    queue_generation: u64,
 }
 
 impl PersistedSnapshot {
-    /// Position alone is exempt until it has drifted far enough to be worth a
-    /// write. Everything is compared directly against the live retained
-    /// state, so the writer's periodic deadline check never clones the queue.
-    fn superseded_by_state(&self, next: &PlaybackState) -> bool {
+    /// Whether anything needs the whole snapshot rewritten: the queue, or a
+    /// setting it carries. The playhead is deliberately not here — a moved
+    /// playhead owes the sidecar, not 0.9 MB of queue.
+    fn differs_structurally_from(&self, next: &PlaybackState, queue_generation: u64) -> bool {
         let previous = &self.snapshot;
-        previous.current_index != next.current_index
-            || previous.volume != next.volume
+        previous.volume != next.volume
             || previous.shuffle != next.shuffle
             || previous.repeat != next.repeat
             || previous.playback_speed != next.playback_speed
-            || !normalized_rows_match(&previous.queue, &next.queue)
+            || self.queue_differs_from(next, queue_generation)
+    }
+
+    /// Row equality against the live queue, skipped when the queue cannot
+    /// have been replaced since it was last compared. The generation is
+    /// bumped under the same lock that installs a state line, so equal
+    /// generations mean equal rows.
+    fn queue_differs_from(&self, next: &PlaybackState, queue_generation: u64) -> bool {
+        self.queue_generation != queue_generation
+            && !normalized_rows_match(&self.snapshot.queue, &next.queue)
+    }
+
+    /// The playhead alone: a different current row, or a position that has
+    /// drifted far enough to be worth restoring to.
+    fn playhead_differs_from(&self, next: &PlaybackState) -> bool {
+        let previous = &self.snapshot;
+        previous.current_index != next.current_index
             || next.position_ms.abs_diff(previous.position_ms) >= PERSIST_POSITION_DRIFT_MS
     }
 }
 
 /// Queue equality under `PlaybackSnapshot::from_playback`'s normalization
 /// (it clears the session-live `cached` mark), without cloning the queue: a
-/// row whose only difference is that mark counts as equal, and only such a
-/// row costs a single-row copy to confirm.
+/// row whose only difference is that mark counts as equal.
 fn normalized_rows_match(a: &[Track], b: &[Track]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| {
-            x == y
-                || (x.cached != y.cached && {
-                    // The persisted queue strips the session-live download
-                    // mark, so exactly one side carries it; clear that side
-                    // (a single-row copy) before comparing.
-                    let mut cleared = if x.cached { x.clone() } else { y.clone() };
-                    cleared.cached = false;
-                    if x.cached {
-                        &cleared == y
-                    } else {
-                        cleared == *x
-                    }
-                })
-        })
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x == y || (x.cached != y.cached && same_row_ignoring_cached(x, y)))
+}
+
+/// Row equality for the one difference the persisted copy is allowed to
+/// carry: the `cached` mark `from_playback` clears from every row.
+///
+/// Written out field by field rather than by cloning a row to clear the mark
+/// in it — the deadline arm compares the live queue against the committed
+/// snapshot on every pass, so a `Track` copy per downloaded row (about fifteen
+/// allocations each) is exactly the cost this comparison exists to avoid. The
+/// destructuring is exhaustive on purpose: a field added to `Track` must be
+/// considered here rather than silently escaping the writer's comparison.
+fn same_row_ignoring_cached(x: &Track, y: &Track) -> bool {
+    let Track {
+        id,
+        uri,
+        name,
+        artist_names,
+        artist_ids,
+        artist_id,
+        album_id,
+        album_name,
+        cover_url,
+        duration_ms,
+        play_count,
+        added_at,
+        unavailable,
+        unavailable_reason,
+        cached: _,
+        context,
+        effective_edit,
+    } = x;
+    id == &y.id
+        && uri == &y.uri
+        && name == &y.name
+        && artist_names == &y.artist_names
+        && artist_ids == &y.artist_ids
+        && artist_id == &y.artist_id
+        && album_id == &y.album_id
+        && album_name == &y.album_name
+        && cover_url == &y.cover_url
+        && duration_ms == &y.duration_ms
+        && play_count == &y.play_count
+        && added_at == &y.added_at
+        && unavailable == &y.unavailable
+        && unavailable_reason == &y.unavailable_reason
+        && context == &y.context
+        && effective_edit == &y.effective_edit
+}
+
+/// The one write the deadline arm owes, if any.
+#[derive(Debug)]
+enum PersistWrite {
+    /// The queue or a setting differs: replace the durable snapshot.
+    Snapshot(PlaybackSnapshot),
+    /// Only the playhead moved: the sidecar carries it, and the snapshot's
+    /// queue is left untouched rather than rewritten to record two integers.
+    Playhead {
+        current_index: Option<usize>,
+        position_ms: u32,
+        /// Identity of the queue in the snapshot this playhead trails. The
+        /// sidecar is stamped with it so a later launch can tell which
+        /// snapshot it belongs to instead of trusting file timestamps alone.
+        queue_identity: u64,
+    },
+}
+
+/// The deadline arm's verdict: what to write, and the queue generation the
+/// comparison was taken against so a pass that found nothing new can record
+/// that this queue has already been looked at.
+#[derive(Debug)]
+struct PersistDecision {
+    /// The generation the verdict was taken against, or `None` when this
+    /// pass never reached a live queue (a restore in flight, no ready state
+    /// yet). Only a queue that was actually compared may be recorded as
+    /// compared — recording one that was not would let the next pass skip a
+    /// scan it still owes.
+    compared: Option<u64>,
+    write: Option<PersistWrite>,
 }
 
 #[derive(Debug, Default)]
@@ -315,7 +402,18 @@ impl PersistenceSchedule {
         })
     }
 
-    fn record_unchanged(&mut self, attempted_generation: u64, latest_generation: u64) {
+    /// Records a pass that found nothing to write. `compared` is the queue
+    /// generation the rows were compared against, when that comparison ran:
+    /// keeping it lets the next heartbeat-only pass skip the row scan.
+    fn record_unchanged(
+        &mut self,
+        attempted_generation: u64,
+        latest_generation: u64,
+        compared: Option<u64>,
+    ) {
+        if let (Some(committed), Some(compared)) = (self.committed.as_mut(), compared) {
+            committed.queue_generation = compared;
+        }
         self.committed_generation = self.committed_generation.max(attempted_generation);
         self.pending_generation =
             (latest_generation > self.committed_generation).then_some(latest_generation);
@@ -324,15 +422,40 @@ impl PersistenceSchedule {
 
     fn record_success(
         &mut self,
-        snapshot: PlaybackSnapshot,
+        write: PersistWrite,
         attempted_generation: u64,
         latest_generation: u64,
+        queue_generation: u64,
         written_at: Instant,
     ) {
-        self.committed = Some(PersistedSnapshot {
-            written_at,
-            snapshot,
-        });
+        match write {
+            PersistWrite::Snapshot(snapshot) => {
+                self.committed = Some(PersistedSnapshot {
+                    written_at,
+                    snapshot,
+                    queue_generation,
+                });
+            }
+            // The sidecar holds the playhead of the snapshot already on disk.
+            // That snapshot was found unchanged (the only way this arm is
+            // reached), so its queue stands as written and only its recorded
+            // playhead moves forward — otherwise the next pass would compare
+            // the live playhead against a playhead that has been persisted.
+            PersistWrite::Playhead {
+                current_index,
+                position_ms,
+                // Only the sidecar carries the identity (see `save_playhead_snapshot`):
+                // the snapshot already on disk is the one it names.
+                queue_identity: _,
+            } => {
+                if let Some(committed) = self.committed.as_mut() {
+                    committed.written_at = written_at;
+                    committed.snapshot.current_index = current_index;
+                    committed.snapshot.position_ms = position_ms;
+                    committed.queue_generation = queue_generation;
+                }
+            }
+        }
         self.committed_generation = attempted_generation;
         self.pending_generation =
             (latest_generation > attempted_generation).then_some(latest_generation);
@@ -368,6 +491,114 @@ struct RestorePlan {
     preview_lease_id: Option<u64>,
 }
 
+/// Whether a payload carried its queue rows.
+///
+/// A fact about the wire, not about the parsed fields: the engine sends
+/// `queue` and `upcoming` only for a generation it has not handed over yet,
+/// and an omitted pair deserializes to the same two empty vectors an empty
+/// queue does. Losing the bit turns "the engine is still playing the rows you
+/// hold" into "the queue is empty".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadRows {
+    Sent,
+    Omitted,
+}
+
+/// What the wire delta base says about one incoming payload.
+#[derive(Debug)]
+enum DeltaAdoption {
+    /// The payload describes its own queue: it carried the rows.
+    AsSent,
+    /// The payload omitted its rows and the base names the revision they
+    /// belong to.
+    Fill {
+        queue: Vec<Track>,
+        upcoming: Vec<usize>,
+    },
+    /// The payload omitted rows for a revision nothing retained.
+    Unresolvable { revision: u64 },
+}
+
+/// The wire delta base: the rows of the newest payload that carried a queue,
+/// keyed by the revision it named.
+///
+/// Deliberately not the same thing as the client's `last_state`, which is the
+/// *durability* half of those payloads. Preview states and crash-restore
+/// intermediates are never installed there — a draft must not overwrite the
+/// crash snapshot, and a state the restore gate has not matched yet is not
+/// what the next process should resume — yet their rows are exactly what the
+/// payloads after them lean on. The sharp case is a crash resume: the engine
+/// restores the queue paused (a full state that cannot match `resume_playing`,
+/// so it is not adopted either), then the `Play` that follows changes no
+/// revision and therefore travels without rows. A base that dropped the
+/// restored rows turns that `Play` into an emptied queue: the restore gate
+/// never matches again, the window loses the rows, media keys read Stopped and
+/// the writer is handed the emptiness as the live queue. Following the wire
+/// instead of the durability policy is what makes [`DeltaAdoption::Fill`]
+/// total.
+#[derive(Debug, Default)]
+struct DeltaBase {
+    /// The revision the retained rows belong to, or `None` before a payload
+    /// has carried any.
+    revision: Option<u64>,
+    queue: Vec<Track>,
+    upcoming: Vec<usize>,
+    /// The revision whose missing rows the engine was already asked to
+    /// re-send, so one shed payload costs at most one request.
+    resynced: Option<u64>,
+}
+
+impl DeltaBase {
+    /// Decides how `state` gets its queue, and records the base it leaves.
+    fn adopt(&mut self, state: &PlaybackState, rows: PayloadRows) -> DeltaAdoption {
+        match rows {
+            PayloadRows::Sent => {
+                self.retain(state);
+                DeltaAdoption::AsSent
+            }
+            PayloadRows::Omitted => {
+                if state.queue_revision != 0 && self.revision == Some(state.queue_revision) {
+                    DeltaAdoption::Fill {
+                        queue: self.queue.clone(),
+                        upcoming: self.upcoming.clone(),
+                    }
+                } else {
+                    DeltaAdoption::Unresolvable {
+                        revision: state.queue_revision,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retains the rows a payload carried as the base for its revision.
+    ///
+    /// Revision `0` is the pre-revision payload — "assume changed", see
+    /// `PlaybackState::queue_revision` — and is never retained: a base keyed
+    /// on it would replace the second of two explicit revision-0 queues with
+    /// the first, and a revision-0 engine sends its rows with every state
+    /// anyway, which is what "assume changed" means.
+    fn retain(&mut self, state: &PlaybackState) {
+        if state.queue_revision == 0 {
+            return;
+        }
+        self.revision = Some(state.queue_revision);
+        self.queue = state.queue.clone();
+        self.upcoming = state.upcoming.clone();
+        self.resynced = None;
+    }
+
+    /// Records that the missing rows of `revision` are being re-requested,
+    /// reporting whether that was the first time.
+    fn mark_resynced(&mut self, revision: u64) -> bool {
+        if self.resynced == Some(revision) {
+            return false;
+        }
+        self.resynced = Some(revision);
+        true
+    }
+}
+
 pub struct EngineClient {
     state_dir: PathBuf,
     pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<EngineReply>>>,
@@ -376,6 +607,12 @@ pub struct EngineClient {
     state_tx: tokio::sync::broadcast::Sender<StateLine>,
     exit_tx: watch::Sender<bool>,
     last_state: Mutex<Option<PlaybackState>>,
+    /// The rows of the newest payload that carried a queue, for filling the
+    /// ones that omit it. Kept apart from `last_state` on purpose: the
+    /// durability filter below refuses previews and restore intermediates,
+    /// and a delta base that followed it would lose the very rows the next
+    /// payload leans on. See [`DeltaBase`].
+    delta_base: Mutex<DeltaBase>,
     /// The latest full engine state is a draft preview. Scalar heartbeats carry
     /// no mode bit, so this keeps them from advancing the retained real queue
     /// snapshot while a preview is live.
@@ -383,6 +620,12 @@ pub struct EngineClient {
     restore_pending: Mutex<Option<RestorePlan>>,
     persist_tx: SyncSender<PersistCommand>,
     persist_generation: AtomicU64,
+    /// Bumped under the retained-state lock whenever a state line installs a
+    /// queue there. The persistence writer treats an unchanged value as proof
+    /// that the retained rows are unchanged and skips its row scan, which is
+    /// what keeps a heartbeat-only pass from walking (and, before, cloning)
+    /// the whole queue every two seconds.
+    queue_generation: AtomicU64,
     persist_thread: Mutex<Option<JoinHandle<()>>>,
     next_request_id: AtomicU64,
     shutting_down: AtomicBool,
@@ -410,10 +653,12 @@ impl EngineClient {
             state_tx,
             exit_tx,
             last_state: Mutex::new(None),
+            delta_base: Mutex::new(DeltaBase::default()),
             preview_active: AtomicBool::new(false),
             restore_pending: Mutex::new(restore_pending),
             persist_tx,
             persist_generation: AtomicU64::new(0),
+            queue_generation: AtomicU64::new(0),
             persist_thread: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
@@ -1412,27 +1657,63 @@ impl EngineClient {
     }
 
     /// The writer's deadline arm: borrows the retained state under the lock,
-    /// consults the committed snapshot's throttle, and clones into an owned
-    /// snapshot only when a write is actually due. The 2-second heartbeat
-    /// must never deep-copy the queue just to decide against writing.
+    /// consults the committed snapshot, and clones into an owned snapshot only
+    /// when the whole queue is actually due. The 2-second heartbeat must never
+    /// deep-copy the queue just to decide against writing — and must never
+    /// re-walk it either, so a playhead-only difference answers with the
+    /// sidecar.
     /// Restore intermediates are never durable state, mirroring
     /// [`Self::playback_snapshot_for_shutdown`]'s eligibility.
-    fn writable_snapshot(&self, committed: Option<&PersistedSnapshot>) -> Option<PlaybackSnapshot> {
+    fn due_write(&self, committed: Option<&PersistedSnapshot>) -> PersistDecision {
         if self.restore_pending.lock().is_some() {
-            return None;
+            return PersistDecision {
+                compared: None,
+                write: None,
+            };
         }
         let last_state = self.last_state.lock();
-        let state = last_state.as_ref().filter(|state| state.auth_state == "ready")?;
-        committed
-            .is_none_or(|committed| committed.superseded_by_state(state))
-            .then(|| PlaybackSnapshot::from_playback(state))
+        let Some(state) = last_state.as_ref().filter(|state| state.auth_state == "ready") else {
+            return PersistDecision {
+                compared: None,
+                write: None,
+            };
+        };
+        // Read under the same lock that installs a state line: a generation
+        // read beside a queue is a claim about that queue, and the writer's
+        // next pass may skip the row scan on the strength of it.
+        let queue_generation = self.queue_generation.load(Ordering::Acquire);
+        let write = match committed {
+            // Nothing durable yet: the first commit has to carry the queue.
+            None => Some(PersistWrite::Snapshot(PlaybackSnapshot::from_playback(
+                state,
+            ))),
+            Some(committed) if committed.differs_structurally_from(state, queue_generation) => {
+                Some(PersistWrite::Snapshot(PlaybackSnapshot::from_playback(
+                    state,
+                )))
+            }
+            Some(committed) if committed.playhead_differs_from(state) => {
+                Some(PersistWrite::Playhead {
+                    current_index: state.current_index,
+                    position_ms: state.position_ms,
+                    // Taken from the snapshot this pass compared against, which
+                    // is the snapshot the sidecar will trail on disk.
+                    queue_identity: committed.snapshot.queue_identity(),
+                })
+            }
+            Some(_) => None,
+        };
+        PersistDecision {
+            compared: Some(queue_generation),
+            write,
+        }
     }
 
     // ------------------------------------------------------------------
     // Reader-thread callbacks
     // ------------------------------------------------------------------
 
-    fn on_state(&self, state: &PlaybackState) {
+    fn on_state(&self, state: &PlaybackState, rows: PayloadRows) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
@@ -1440,6 +1721,51 @@ impl EngineClient {
         // observed the engine in preview mode. An unrelated false state
         // arriving before activation must not clear a freshly claimed lease.
         let was_preview = self.preview_active.swap(state.preview, Ordering::AcqRel);
+        // A state line carries the queue only when the queue it describes has
+        // changed: the engine drops `queue` and `upcoming` and leaves the
+        // revision behind. Merge the retained rows back in before anything
+        // compares, stores or forwards this state — the restore gate, the
+        // durable snapshot and the window all describe one queue, and an
+        // omitted queue must never read as an emptied one. (The persistence
+        // comparison would call that a queue edit, and write it to disk.)
+        //
+        // The rows come from the wire base, which every payload carrying rows
+        // installs whatever the durability filter below decides about the
+        // state as a whole.
+        let adoption = self.delta_base.lock().adopt(state, rows);
+        let merged;
+        let state = match adoption {
+            DeltaAdoption::AsSent => state,
+            DeltaAdoption::Fill { queue, upcoming } => {
+                merged = PlaybackState {
+                    queue,
+                    upcoming,
+                    ..state.clone()
+                };
+                &merged
+            }
+            DeltaAdoption::Unresolvable { revision } => {
+                // The engine hands the rows of a revision over exactly once,
+                // and that payload never made it here, so there is no base to
+                // merge from and no honest queue to publish: filling the gap
+                // from the retained frame of another revision would publish
+                // rows the engine never named, and forwarding the parsed
+                // (empty) vectors would read downstream as "the queue is
+                // gone" — media keys would report Stopped and the window
+                // would drop the rows it holds. So the payload is withheld,
+                // and the engine is asked to re-send its state once per
+                // revision. A fresh engine process answers with the rows (it
+                // has handed nothing over yet); otherwise the shell stays on
+                // its last complete frame until the next queue change, which
+                // always carries rows, and the scalars it withheld are the
+                // ones that state replaces anyway.
+                log::warn(&format!(
+                    "engine state omitted the queue of revision {revision}, which was never received: withholding it and asking the engine to re-send"
+                ));
+                self.request_state_resync(revision);
+                return;
+            }
+        };
         let mut pending = self.restore_pending.lock();
         if was_preview
             && !state.preview
@@ -1458,11 +1784,40 @@ impl EngineClient {
                 .as_ref()
                 .is_some_and(|plan| !plan.only_if_preview && state.auth_state == "ready");
         if !suppress_snapshot {
-            *self.last_state.lock() = Some(state.clone());
+            let mut last = self.last_state.lock();
+            *last = Some(state.clone());
+            // Bumped under the same lock that installs the rows: the writer
+            // treats an unchanged generation as proof that the retained queue
+            // is unchanged, so every install has to count as one.
+            self.queue_generation.fetch_add(1, Ordering::AcqRel);
+            drop(last);
             self.mark_persistence_dirty();
         }
         drop(pending);
         let _ = self.state_tx.send(StateLine::State(state.clone()));
+    }
+
+    /// Asks the engine to re-emit its state after a payload arrived without
+    /// rows this client never received (see [`Self::on_state`]).
+    ///
+    /// `status` is the protocol's re-sync request — the supervisor sends the
+    /// same one after a respawn — and its answer re-emits the whole state. The
+    /// reply is deliberately not awaited: this runs on the reader thread, and
+    /// the state it produces comes back through the normal lane.
+    ///
+    /// Asked at most once per revision: an engine that has already handed that
+    /// generation over would answer with the same row-less payload, and asking
+    /// again would be a request loop.
+    fn request_state_resync(&self, revision: u64) {
+        if !self.delta_base.lock().mark_resynced(revision) {
+            return;
+        }
+        let line = build_line(&self.next_request_id(), "status", Value::Null);
+        if let Err(error) = self.write_line(&line) {
+            log::warn(&format!(
+                "could not ask the engine to re-send the state of revision {revision}: {error}"
+            ));
+        }
     }
 
     /// Applies a scalar position heartbeat to the heartbeat-fresh last real
@@ -1625,24 +1980,46 @@ fn run_persistence_writer(client: Weak<EngineClient>, receiver: Receiver<Persist
                 };
                 // The queued wake may represent an older generation because
                 // the bounded channel coalesces bursts. Snapshot the current
-                // generation at the deadline, and let the borrowed throttle
-                // check under the lock decide before anything is cloned.
+                // generation at the deadline, and let the borrowed decision
+                // under the lock decide before anything is cloned.
                 let attempted_generation = client.persist_generation.load(Ordering::Acquire);
-                let Some(snapshot) = client.writable_snapshot(schedule.committed.as_ref()) else {
+                let decision = client.due_write(schedule.committed.as_ref());
+                let Some(queue_generation) = decision.compared else {
+                    // A restore is in flight, or no ready state has been seen
+                    // yet: no live queue was compared, so none may be recorded
+                    // as compared.
                     let latest = client.persist_generation.load(Ordering::Acquire);
-                    schedule.record_unchanged(attempted_generation, latest);
+                    schedule.record_unchanged(attempted_generation, latest, None);
+                    continue;
+                };
+                let Some(write) = decision.write else {
+                    let latest = client.persist_generation.load(Ordering::Acquire);
+                    schedule.record_unchanged(attempted_generation, latest, Some(queue_generation));
                     continue;
                 };
 
                 let written_at = Instant::now();
-                match save_playback_snapshot(&snapshot) {
+                let result = match &write {
+                    PersistWrite::Snapshot(snapshot) => save_playback_snapshot(snapshot),
+                    PersistWrite::Playhead {
+                        current_index,
+                        position_ms,
+                        queue_identity,
+                    } => save_playhead_snapshot(*current_index, *position_ms, *queue_identity),
+                };
+                let latest = client.persist_generation.load(Ordering::Acquire);
+                match result {
                     Ok(()) => {
-                        let latest = client.persist_generation.load(Ordering::Acquire);
-                        schedule.record_success(snapshot, attempted_generation, latest, written_at);
+                        schedule.record_success(
+                            write,
+                            attempted_generation,
+                            latest,
+                            queue_generation,
+                            written_at,
+                        );
                     }
                     Err(error) => {
                         log::warn(&format!("could not persist playback state: {error}"));
-                        let latest = client.persist_generation.load(Ordering::Acquire);
                         schedule.record_failure(latest.max(attempted_generation), written_at);
                     }
                 }
@@ -1676,7 +2053,7 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
                             Err(_) => continue,
                         };
                         match parse_line(value) {
-                            Some(Line::State(state)) => client.on_state(&state),
+                            Some(Line::State { state, rows }) => client.on_state(&state, rows),
                             Some(Line::Position(heartbeat)) => client.on_position(heartbeat),
                             Some(Line::Volume(volume)) => client.on_volume(volume),
                             Some(Line::Reply {
@@ -1702,7 +2079,11 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
 /// are fanned out; every other line is a reply to a pending request.
 #[derive(Debug)]
 enum Line {
-    State(PlaybackState),
+    State {
+        state: PlaybackState,
+        /// Whether the payload carried its queue rows; see [`PayloadRows`].
+        rows: PayloadRows,
+    },
     Position(PositionHeartbeat),
     Volume(u8),
     Reply {
@@ -1727,13 +2108,24 @@ struct VolumeLine {
 /// fall through to reply routing.
 fn parse_line(value: Value) -> Option<Line> {
     match value.get("type").and_then(Value::as_str) {
-        Some("state") => match serde_json::from_value::<PlaybackState>(value) {
-            Ok(state) => Some(Line::State(state)),
-            Err(error) => {
-                log::error(&format!("could not parse engine state line: {error}"));
-                None
+        Some("state") => {
+            // Whether the rows are on the wire has to be read off the raw
+            // object: once parsed, an omitted `queue` and an empty one are the
+            // same two empty vectors. The engine omits the pair exactly when
+            // the revision is one it has already handed over.
+            let rows = if value.get("queue").is_some() {
+                PayloadRows::Sent
+            } else {
+                PayloadRows::Omitted
+            };
+            match serde_json::from_value::<PlaybackState>(value) {
+                Ok(state) => Some(Line::State { state, rows }),
+                Err(error) => {
+                    log::error(&format!("could not parse engine state line: {error}"));
+                    None
+                }
             }
-        },
+        }
         Some("position") => match serde_json::from_value::<PositionHeartbeat>(value) {
             Ok(heartbeat) => Some(Line::Position(heartbeat)),
             Err(error) => {
@@ -1849,6 +2241,12 @@ mod tests {
         let (state_tx, _) = tokio::sync::broadcast::channel(64);
         let (exit_tx, _) = tokio::sync::watch::channel(false);
         let (persist_tx, _persist_rx) = mpsc::sync_channel(1);
+        // The state stands for a full payload this client has already seen, so
+        // it also seeds the wire base: without it nothing could merge a later
+        // payload that omits its rows, exactly as in production, where the
+        // base is installed by the first payload that carries them.
+        let mut delta_base = DeltaBase::default();
+        delta_base.adopt(&state, PayloadRows::Sent);
         Arc::new(EngineClient {
             state_dir: PathBuf::new(),
             pending: tokio::sync::Mutex::new(HashMap::new()),
@@ -1857,20 +2255,23 @@ mod tests {
             state_tx,
             exit_tx,
             last_state: Mutex::new(Some(state)),
+            delta_base: Mutex::new(delta_base),
             preview_active: AtomicBool::new(false),
             restore_pending: Mutex::new(None),
             persist_tx,
             persist_generation: AtomicU64::new(0),
+            queue_generation: AtomicU64::new(0),
             persist_thread: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         })
     }
 
-    fn persisted(snapshot: PlaybackSnapshot) -> PersistedSnapshot {
+    fn persisted(snapshot: PlaybackSnapshot, queue_generation: u64) -> PersistedSnapshot {
         PersistedSnapshot {
             written_at: Instant::now(),
             snapshot,
+            queue_generation,
         }
     }
 
@@ -2010,9 +2411,10 @@ mod tests {
 
     /// Heartbeats notify the writer several times a second. Rewriting the
     /// queue each time would be pure churn, so only a real change — or a
-    /// playhead that has moved far enough to be worth restoring to — counts.
+    /// playhead that has moved far enough to be worth restoring to — counts;
+    /// and a playhead alone owes the sidecar, not the snapshot.
     #[test]
-    fn only_a_real_change_or_a_drifted_playhead_supersedes_the_written_snapshot() {
+    fn only_a_real_change_or_a_drifted_playhead_owes_a_write() {
         let mut state = PlaybackState::default();
         state.queue = vec![Track {
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
@@ -2021,10 +2423,10 @@ mod tests {
         }];
         state.current_index = Some(0);
         state.position_ms = 30_000;
-        let written = persisted(PlaybackSnapshot::from_playback(&state));
+        let written = persisted(PlaybackSnapshot::from_playback(&state), 7);
 
         assert!(
-            !written.superseded_by_state(&state),
+            !written.differs_structurally_from(&state, 7) && !written.playhead_differs_from(&state),
             "an identical snapshot is not worth a write"
         );
 
@@ -2033,27 +2435,407 @@ mod tests {
         let mut marked = state.clone();
         marked.queue[0].cached = true;
         assert!(
-            !written.superseded_by_state(&marked),
+            !written.differs_structurally_from(&marked, 8),
             "a download mark alone is not worth a write"
+        );
+        assert!(
+            !written.playhead_differs_from(&marked),
+            "nor is it a playhead move worth the sidecar"
+        );
+
+        // A pass that cannot have seen a new state line skips the row scan
+        // entirely, which is only sound because every install of a queue
+        // bumps the generation it is compared under.
+        let mut edited = state.clone();
+        edited.queue.push(Track {
+            uri: "spotify:track:0VjIjW4GlUZAMYd2vXMi3b".to_owned(),
+            duration_ms: 200_000,
+            ..Track::default()
+        });
+        assert!(
+            !written.differs_structurally_from(&edited, 7),
+            "the same generation cannot have replaced the queue"
+        );
+        assert!(
+            written.differs_structurally_from(&edited, 8),
+            "a queue edit is still detected by the scan that a new generation unlocks"
         );
 
         let mut nudged = state.clone();
         nudged.position_ms = 30_000 + PERSIST_POSITION_DRIFT_MS - 1;
         assert!(
-            !written.superseded_by_state(&nudged),
+            !written.playhead_differs_from(&nudged),
             "the playhead alone is exempt until it has drifted far enough"
         );
 
         let mut drifted = state.clone();
         drifted.position_ms = 30_000 + PERSIST_POSITION_DRIFT_MS;
-        assert!(written.superseded_by_state(&drifted));
+        assert!(written.playhead_differs_from(&drifted));
+        assert!(
+            !written.differs_structurally_from(&drifted, 8),
+            "a drifted playhead never rewrites the queue"
+        );
+
+        // A track change is a playhead move, not a queue rewrite: the sidecar
+        // carries the current row index for exactly this.
+        let mut next_track = state.clone();
+        next_track.current_index = Some(1);
+        next_track.position_ms = 0;
+        assert!(written.playhead_differs_from(&next_track));
+        assert!(
+            !written.differs_structurally_from(&next_track, 8),
+            "a new current row never rewrites the queue"
+        );
 
         let mut paused_elsewhere = state.clone();
         paused_elsewhere.position_ms = 30_100;
         paused_elsewhere.volume = 41;
         assert!(
-            written.superseded_by_state(&paused_elsewhere),
+            written.differs_structurally_from(&paused_elsewhere, 8),
             "anything but the playhead is worth a write immediately"
+        );
+        assert!(
+            !written.playhead_differs_from(&paused_elsewhere),
+            "a volume change is not a playhead move, however small its drift"
+        );
+    }
+
+    /// The deadline arm's split, as the writer sees it: a heartbeat that has
+    /// only moved the position owes the sidecar, a state line that replaces
+    /// the queue owes the snapshot, and the row scan runs only for the latter.
+    #[test]
+    fn a_heartbeat_owes_the_sidecar_and_a_state_line_the_snapshot() {
+        let mut state = PlaybackState::default();
+        state.auth_state = "ready".to_owned();
+        state.queue = vec![Track {
+            uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        state.current_index = Some(0);
+        state.position_ms = 30_000;
+        let client = client_with_last_state(state.clone());
+        let written = persisted(
+            PlaybackSnapshot::from_playback(&state),
+            client.queue_generation.load(Ordering::Acquire),
+        );
+
+        assert!(
+            client.due_write(Some(&written)).write.is_none(),
+            "an untouched pass writes nothing"
+        );
+
+        client.on_position(PositionHeartbeat {
+            position_ms: 33_000,
+            duration_ms: 240_000,
+        });
+        assert!(
+            client.due_write(Some(&written)).write.is_none(),
+            "a heartbeat that has not drifted far enough writes nothing"
+        );
+
+        client.on_position(PositionHeartbeat {
+            position_ms: 46_000,
+            duration_ms: 240_000,
+        });
+        let decision = client.due_write(Some(&written));
+        assert_eq!(
+            decision.compared,
+            Some(client.queue_generation.load(Ordering::Acquire)),
+            "the queue was compared: the generation is recorded against it"
+        );
+        match decision.write {
+            Some(PersistWrite::Playhead {
+                current_index,
+                position_ms,
+                queue_identity,
+            }) => {
+                assert_eq!(current_index, Some(0));
+                assert_eq!(position_ms, 46_000);
+                assert_eq!(
+                    queue_identity,
+                    written.snapshot.queue_identity(),
+                    "the sidecar is stamped with the queue of the snapshot it trails"
+                );
+            }
+            other => panic!("a drifted playhead owes the sidecar, got {other:?}"),
+        }
+
+        // A state line that replaces the queue needs the whole snapshot, even
+        // though its playhead happens to match what was last written.
+        let mut edited = state.clone();
+        edited.queue_revision = state.queue_revision + 1;
+        edited.queue.push(Track {
+            uri: "spotify:track:0VjIjW4GlUZAMYd2vXMi3b".to_owned(),
+            duration_ms: 200_000,
+            ..Track::default()
+        });
+        client.on_state(&edited, PayloadRows::Sent);
+        match client.due_write(Some(&written)).write {
+            Some(PersistWrite::Snapshot(snapshot)) => {
+                assert_eq!(snapshot.queue.len(), 2, "the snapshot carries the new row");
+            }
+            other => panic!("a replaced queue owes the snapshot, got {other:?}"),
+        }
+    }
+
+    /// A state line carries the queue only when the queue it describes has
+    /// changed: the engine drops `queue` and `upcoming` and leaves the
+    /// revision behind. Nothing downstream may read that as an emptied queue —
+    /// the restore gate would never match again, and the persistence
+    /// comparison would write the emptiness to disk.
+    #[test]
+    fn a_revision_matched_state_keeps_the_retained_queue() {
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.auth_state = "ready".to_owned();
+        state.queue_revision = 41;
+        state.queue = vec![Track {
+            id: "kept".to_owned(),
+            uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        state.upcoming = vec![7];
+        let client = client_with_last_state(state.clone());
+        let mut lines = client.subscribe_lines();
+
+        let mut resumed = PlaybackState::default();
+        resumed.ready = true;
+        resumed.auth_state = "ready".to_owned();
+        resumed.queue_revision = 41;
+        resumed.playing = true;
+        resumed.position_ms = 12_000;
+        client.on_state(&resumed, PayloadRows::Omitted);
+
+        let retained = client.last_state.lock().clone().expect("state retained");
+        assert_eq!(retained.queue, state.queue, "the omitted queue is the held one");
+        assert_eq!(retained.upcoming, state.upcoming);
+        assert_eq!(retained.position_ms, 12_000, "the scalars still move");
+        match lines.try_recv().expect("state fanned out") {
+            StateLine::State(fanned) => assert_eq!(fanned.queue, state.queue),
+            StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
+            StateLine::Volume(_) => panic!("nor the volume lane"),
+            StateLine::Disconnected => panic!("the reader stays connected"),
+        }
+
+        // A new revision carries its own rows even when they are none: the
+        // engine sends the full queue whenever the revision moves, so an
+        // empty array is authoritative rather than an omission.
+        let mut emptied = state.clone();
+        emptied.queue_revision = 42;
+        emptied.queue = Vec::new();
+        emptied.current_index = None;
+        emptied.upcoming = Vec::new();
+        client.on_state(&emptied, PayloadRows::Sent);
+        let retained = client.last_state.lock().clone().expect("state retained");
+        assert!(retained.queue.is_empty(), "a new revision's rows stand as sent");
+        assert!(retained.upcoming.is_empty());
+    }
+
+    /// The base an omitted queue is merged from is the *wire's* last full
+    /// payload, not the last state the durability filter agreed to keep. A
+    /// crash resume is what separates the two: the engine comes back, restores
+    /// the queue and publishes it PAUSED at a revision of its own — a state
+    /// the restore gate cannot match yet (`resume_playing` is what a crashed
+    /// player meant), so it is deliberately never adopted — and the `Play`
+    /// after it changes no revision, so its payload omits the rows. Merged
+    /// against durable state there are no rows for that revision, and the
+    /// resumed state arrives with an emptied queue: the gate never matches
+    /// again and keeps suppressing every ready state while audio plays.
+    #[test]
+    fn a_restore_intermediate_carries_its_rows_into_the_play_that_follows() {
+        let mut previous = PlaybackState::default();
+        previous.ready = true;
+        previous.auth_state = "ready".to_owned();
+        previous.playing = true;
+        previous.queue_revision = 7;
+        previous.queue = vec![Track {
+            id: "restored".to_owned(),
+            uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        previous.current_index = Some(0);
+        previous.position_ms = 42_000;
+        let client = client_with_last_state(previous.clone());
+        *client.restore_pending.lock() = Some(RestorePlan {
+            snapshot: RestoreSnapshot::from_playback(&previous, true),
+            sent: true,
+            attempts: 0,
+            only_if_preview: false,
+            preview_lease_id: None,
+        });
+        let mut lines = client.subscribe_lines();
+
+        // `restore_queue` landed: the restored queue is published paused.
+        let mut restored = previous.clone();
+        restored.queue_revision = 8;
+        restored.playing = false;
+        client.on_state(&restored, PayloadRows::Sent);
+        assert!(
+            client.restore_is_pending(),
+            "a paused restore state does not match resume intent"
+        );
+
+        // `Play` follows without touching the queue: no rows on the wire.
+        let mut playing = restored.clone();
+        playing.playing = true;
+        playing.queue = Vec::new();
+        playing.upcoming = Vec::new();
+        client.on_state(&playing, PayloadRows::Omitted);
+
+        assert!(
+            !client.restore_is_pending(),
+            "the resumed state completes the restore"
+        );
+        assert_eq!(
+            client.last_state.lock().as_ref().unwrap().queue,
+            previous.queue,
+            "the durable state holds the restored rows"
+        );
+        let _ = lines.try_recv().expect("the paused restore state fans out");
+        match lines.try_recv().expect("the playing state fans out") {
+            StateLine::State(fanned) => {
+                assert_eq!(fanned.queue, previous.queue, "with the engine's rows");
+                assert!(fanned.playing);
+            }
+            StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
+            StateLine::Volume(_) => panic!("nor the volume lane"),
+            StateLine::Disconnected => panic!("the reader stays connected"),
+        }
+    }
+
+    /// Draft previews are the other half of the same rule: their full states
+    /// never become durable state either, so a pause, play or seek inside the
+    /// editor would reach the window — and media keys, which read an empty
+    /// queue as Stopped — with no rows at all.
+    #[test]
+    fn a_preview_delta_keeps_the_draft_rows_its_full_state_carried() {
+        let mut real = PlaybackState::default();
+        real.ready = true;
+        real.auth_state = "ready".to_owned();
+        real.playing = true;
+        real.queue_revision = 12;
+        real.queue = vec![Track {
+            id: "real".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        real.current_index = Some(0);
+        let client = client_with_last_state(real.clone());
+        let mut lines = client.subscribe_lines();
+
+        let mut preview = real.clone();
+        preview.preview = true;
+        preview.queue_revision = 13;
+        preview.queue = vec![Track {
+            id: "draft".to_owned(),
+            uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
+            duration_ms: 200_000,
+            ..Track::default()
+        }];
+        client.on_state(&preview, PayloadRows::Sent);
+        let _ = lines.try_recv().expect("the preview state fans out");
+
+        // A transport change inside the draft: same revision, no rows.
+        let mut paused = preview.clone();
+        paused.playing = false;
+        paused.queue = Vec::new();
+        paused.upcoming = Vec::new();
+        client.on_state(&paused, PayloadRows::Omitted);
+
+        match lines.try_recv().expect("the paused draft fans out") {
+            StateLine::State(fanned) => {
+                assert_eq!(fanned.queue, preview.queue, "the draft keeps its rows");
+                assert!(!fanned.playing);
+                assert!(fanned.preview);
+            }
+            StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
+            StateLine::Volume(_) => panic!("nor the volume lane"),
+            StateLine::Disconnected => panic!("the reader stays connected"),
+        }
+        assert_eq!(
+            client.last_state.lock().as_ref().unwrap().queue,
+            real.queue,
+            "a draft is still never the durable state"
+        );
+    }
+
+    /// Revision `0` is the pre-revision payload — "assume changed", see
+    /// `PlaybackState::queue_revision` — so it is never merged into: two
+    /// explicit revision-0 queues both stand as sent, and a base keyed on that
+    /// revision would replace the second of them with the first.
+    #[test]
+    fn revision_zero_payloads_stand_as_sent() {
+        let mut first = PlaybackState::default();
+        first.ready = true;
+        first.auth_state = "ready".to_owned();
+        first.queue = vec![Track {
+            id: "first".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 240_000,
+            ..Track::default()
+        }];
+        let client = client_with_last_state(first);
+
+        let mut second = PlaybackState::default();
+        second.ready = true;
+        second.auth_state = "ready".to_owned();
+        second.queue = vec![Track {
+            id: "second".to_owned(),
+            uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
+            duration_ms: 200_000,
+            ..Track::default()
+        }];
+        client.on_state(&second, PayloadRows::Sent);
+
+        let retained = client.last_state.lock().clone().expect("state retained");
+        assert_eq!(
+            retained.queue, second.queue,
+            "an explicit queue is never replaced by a revision-0 base"
+        );
+        assert_eq!(retained.queue_revision, 0);
+    }
+
+    /// A payload that omits rows for a revision nothing retained cannot be
+    /// published as a queue: there is no base to merge from, and the parsed
+    /// (empty) vectors would read downstream as a cleared queue. It is
+    /// withheld and the engine is asked to re-send its state — once, so an
+    /// engine with nothing new to say cannot turn the recovery into a request
+    /// loop.
+    #[test]
+    fn a_payload_without_retained_rows_is_withheld_and_re_requested_once() {
+        let mut state = PlaybackState::default();
+        state.ready = true;
+        state.auth_state = "ready".to_owned();
+        let client = client_with_last_state(state);
+        let mut lines = client.subscribe_lines();
+
+        let mut omitted = PlaybackState::default();
+        omitted.ready = true;
+        omitted.auth_state = "ready".to_owned();
+        omitted.playing = true;
+        omitted.queue_revision = 12;
+        client.on_state(&omitted, PayloadRows::Omitted);
+
+        assert!(
+            lines.try_recv().is_err(),
+            "an unmergeable payload is not published"
+        );
+        assert!(
+            !client.last_state.lock().as_ref().unwrap().playing,
+            "nor installed as the live state"
+        );
+        assert_eq!(
+            client.delta_base.lock().resynced,
+            Some(12),
+            "the engine was asked to re-send that revision"
+        );
+        assert!(
+            !client.delta_base.lock().mark_resynced(12),
+            "and only once: a second payload for it asks for nothing"
         );
     }
 
@@ -2068,7 +2850,7 @@ mod tests {
         assert_eq!(schedule.pending_generation, Some(2));
         assert_eq!(schedule.wait_for(started), Some(Duration::ZERO));
 
-        schedule.record_success(snapshot, 2, 2, started);
+        schedule.record_success(PersistWrite::Snapshot(snapshot), 2, 2, 0, started);
         schedule.mark_dirty(3);
         schedule.mark_dirty(4);
         assert_eq!(schedule.pending_generation, Some(4));
@@ -2089,7 +2871,7 @@ mod tests {
         let mut changed_state = PlaybackState::default();
         changed_state.volume = 42;
         let mut schedule = PersistenceSchedule::default();
-        schedule.record_success(original.clone(), 1, 1, started);
+        schedule.record_success(PersistWrite::Snapshot(original.clone()), 1, 1, 0, started);
         schedule.mark_dirty(2);
 
         let failed_at = started + PERSIST_MIN_INTERVAL;
@@ -2100,12 +2882,20 @@ mod tests {
             Some(&original)
         );
         assert_eq!(schedule.wait_for(failed_at), Some(PERSIST_RETRY_INTERVAL));
-        assert!(schedule.committed.as_ref().unwrap().superseded_by_state(&changed_state));
+        assert!(
+            schedule
+                .committed
+                .as_ref()
+                .unwrap()
+                .differs_structurally_from(&changed_state, 0),
+            "a volume change is structural even on a pass that skips the row scan"
+        );
 
         schedule.record_success(
-            PlaybackSnapshot::from_playback(&changed_state),
+            PersistWrite::Snapshot(PlaybackSnapshot::from_playback(&changed_state)),
             2,
             2,
+            0,
             failed_at + PERSIST_RETRY_INTERVAL,
         );
         assert_eq!(schedule.committed_generation, 2);
@@ -2121,7 +2911,7 @@ mod tests {
         let mut schedule = PersistenceSchedule::default();
         let snapshot = PlaybackSnapshot::from_playback(&PlaybackState::default());
         schedule.mark_dirty(1);
-        schedule.record_success(snapshot, 1, 3, Instant::now());
+        schedule.record_success(PersistWrite::Snapshot(snapshot), 1, 3, 0, Instant::now());
         assert_eq!(schedule.committed_generation, 1);
         assert_eq!(schedule.pending_generation, Some(3));
     }
@@ -2257,7 +3047,32 @@ mod tests {
             "repeat": "off",
             "queue": [],
         }));
-        assert!(matches!(state, Some(Line::State(_))));
+        assert!(matches!(
+            state,
+            Some(Line::State {
+                rows: PayloadRows::Sent,
+                ..
+            })
+        ));
+
+        // The rows travel with the revision that names them: a payload that
+        // leaves `queue` out is one whose generation this client already
+        // holds, and the empty vector it parses into must never be read as the
+        // queue itself.
+        let omitted = parse_line(serde_json::json!({
+            "type": "state",
+            "ready": true,
+            "auth_state": "ready",
+            "position_ms": 4_000,
+            "queue_revision": 9,
+        }));
+        assert!(matches!(
+            omitted,
+            Some(Line::State {
+                rows: PayloadRows::Omitted,
+                ..
+            })
+        ));
 
         let reply = parse_line(serde_json::json!({
             "type": "response",
@@ -2390,7 +3205,11 @@ mod tests {
         preview.preview = true;
         preview.position_ms = 80_000;
         preview.queue[0].id = "draft-track".to_owned();
-        client.on_state(&preview);
+        // A draft that changed rows carries a new queue revision, exactly as
+        // the engine emits it: it is the payload that proves the editor can
+        // never speak for the retained queue.
+        preview.queue_revision = normal.queue_revision + 1;
+        client.on_state(&preview, PayloadRows::Sent);
         client.on_position(PositionHeartbeat {
             position_ms: 90_000,
             duration_ms: 180_000,
@@ -2484,17 +3303,17 @@ mod tests {
         assert!(client.capture_preview_restore(17));
 
         // An unrelated real state before activation cannot consume the lease.
-        client.on_state(&real);
+        client.on_state(&real, PayloadRows::Sent);
         assert!(client.restore_pending.lock().is_some());
 
         let mut preview = real.clone();
         preview.preview = true;
-        client.on_state(&preview);
+        client.on_state(&preview, PayloadRows::Sent);
         assert!(client.restore_pending.lock().is_some());
 
         let mut restored = preview;
         restored.preview = false;
-        client.on_state(&restored);
+        client.on_state(&restored, PayloadRows::Sent);
         assert!(
             client.restore_pending.lock().is_none(),
             "authoritative preview exit reconciles a dropped restore reply"
@@ -2527,7 +3346,7 @@ mod tests {
         let mut blank = PlaybackState::default();
         blank.ready = true;
         blank.auth_state = "ready".to_owned();
-        client.on_state(&blank);
+        client.on_state(&blank, PayloadRows::Sent);
         assert_eq!(
             client.last_state.lock().as_ref().unwrap().queue,
             previous.queue,
@@ -2541,7 +3360,7 @@ mod tests {
 
         let mut restored = previous;
         restored.playing = false;
-        client.on_state(&restored);
+        client.on_state(&restored, PayloadRows::Sent);
         assert!(!client.restore_is_pending());
         assert_eq!(
             client.last_state.lock().as_ref().unwrap().position_ms,

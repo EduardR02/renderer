@@ -210,7 +210,13 @@ pub fn run() {
             } else {
                 path
             };
-            covers::serve_cover(hex)
+            // A revalidation of a cover the webview already holds; the handler
+            // answers it with the tag alone rather than the picture.
+            let if_none_match = request
+                .headers()
+                .get("If-None-Match")
+                .and_then(|value| value.to_str().ok());
+            covers::serve_cover(hex, if_none_match)
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

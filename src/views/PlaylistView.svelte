@@ -1,3 +1,17 @@
+<script module>
+  /**
+   * ONE collator, not one per comparison.
+   *
+   * `String#localeCompare` builds a collator on every call when it is handed
+   * an options object, and the text sort made tens of thousands of those calls
+   * to order a 5,000-row playlist. Collation is pure and these options never
+   * change, so a single instance serves every sort — module scope rather than
+   * the component's own script, because opening the next playlist should not
+   * build another one.
+   */
+  const SORT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+</script>
+
 <script>
   import {
     detail,
@@ -100,7 +114,7 @@
       // Missing metadata stays at the end in either direction.
       return leftMissing ? 1 : -1;
     }
-    return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" }) * direction;
+    return SORT_COLLATOR.compare(left, right) * direction;
   }
 
   function compareOptionalNumber(left, right, direction) {
@@ -113,38 +127,55 @@
     return (left - right) * direction;
   }
 
+  /**
+   * The sort key for one row, built ONCE per row instead of inside the
+   * comparator.
+   *
+   * The comparator used to rebuild both operands' keys on every comparison —
+   * tens of thousands of string builds to sort a 5,000-row playlist, measured
+   * at ~80ms for an artist sort. A key is a function of the row alone, so it
+   * belongs in the same pass that decorates the row with its original index:
+   * the work is then proportional to the rows, and the comparator does
+   * nothing but compare.
+   */
+  function sortKeyFor(track, key) {
+    switch (key) {
+      case "title":
+      case "artist":
+      case "album":
+        return textSortValue(track, key);
+      case "added":
+        return Number(track?.added_at);
+      case "duration":
+        return Number(track?.duration_ms);
+      default:
+        return 0;
+    }
+  }
+
   const sortedTracks = $derived.by(() => {
     // No sort is the common case and the list can be thousands long; the
     // comparator below would run and decide nothing.
     if (sortState.key === null || (sortState.key === "order" && sortState.direction === "asc")) return tracks;
+    const sortKey = sortState.key;
     const direction = sortState.direction === "asc" ? 1 : -1;
     return tracks
-      .map((track, originalIndex) => ({ track, originalIndex }))
+      .map((track, originalIndex) => ({
+        track,
+        originalIndex,
+        sortValue: sortKeyFor(track, sortKey),
+      }))
       .sort((left, right) => {
         let comparison = 0;
-        switch (sortState.key) {
+        switch (sortKey) {
           case "title":
           case "artist":
           case "album":
-            comparison = compareOptionalText(
-              textSortValue(left.track, sortState.key),
-              textSortValue(right.track, sortState.key),
-              direction,
-            );
+            comparison = compareOptionalText(left.sortValue, right.sortValue, direction);
             break;
           case "added":
-            comparison = compareOptionalNumber(
-              Number(left.track?.added_at),
-              Number(right.track?.added_at),
-              direction,
-            );
-            break;
           case "duration":
-            comparison = compareOptionalNumber(
-              Number(left.track?.duration_ms),
-              Number(right.track?.duration_ms),
-              direction,
-            );
+            comparison = compareOptionalNumber(left.sortValue, right.sortValue, direction);
             break;
           case "order":
           default:

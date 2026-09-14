@@ -967,10 +967,37 @@ pub struct PlaybackState {
     #[serde(deserialize_with = "string_or_default")]
     pub current_uri: String,
     pub queue: Vec<Track>,
+    /// The queue generation this payload describes.
+    ///
+    /// The engine sends the queue rows with every payload whose revision is
+    /// new and omits them entirely when they are the ones it already sent, so
+    /// a receiver can tell "these rows are unchanged" from "the queue is
+    /// empty". The parsed fields cannot: an omitted pair deserializes to the
+    /// same two empty vectors an empty queue does. A receiver has to note
+    /// whether `queue` was on the wire at all — `EngineClient::parse_line`
+    /// reads that off the raw message and hands it to `on_state` as
+    /// `PayloadRows` — and keep the rows of the newest payload that carried
+    /// any, keyed by the revision it named, which is what the client's wire
+    /// delta base is for. That base is deliberately not the durability copy
+    /// (`last_state`): previews and crash-restore intermediates carry rows a
+    /// later payload leans on, and they are exactly the ones never persisted.
+    /// The webview, which holds its own array across the states of one track
+    /// change, keys that copy off this number rather than re-adopting
+    /// identical rows.
+    ///
+    /// `0` is the pre-revision payload: an engine that does not speak this
+    /// field, or a snapshot written before it existed, means "assume changed".
+    /// It is never a generation to compare against — two payloads that both
+    /// leave it at `0` describe unrelated queues, so a receiver must take the
+    /// rows such a payload carries rather than merge them against the ones it
+    /// holds under the same number.
+    #[serde(default)]
+    pub queue_revision: u64,
     /// Queue indexes in the order automatic playback will actually reach them,
     /// current row excluded. Derived by the engine from shuffle's live bag or
     /// the sequential walk, with exclusions and unavailable rows removed, so it
-    /// is never restored or persisted — only forwarded.
+    /// is never restored or persisted — only forwarded. Omitted together with
+    /// `queue`, and for the same reason.
     pub upcoming: Vec<usize>,
     #[serde(deserialize_with = "string_or_default")]
     pub error: String,
@@ -997,6 +1024,7 @@ impl Default for PlaybackState {
             current_index: None,
             current_uri: String::new(),
             queue: Vec::new(),
+            queue_revision: 0,
             upcoming: Vec::new(),
             error: String::new(),
         }
@@ -1481,5 +1509,29 @@ mod tests {
         assert_eq!(json["interval_ms"], 1);
         assert_eq!(json["bin_count"], 3);
         assert_eq!(json["peaks_base64"], "AAAAAAAAAAAAAAAA");
+    }
+
+    /// The shell's half of the revision contract, which is about the number
+    /// surviving the wire rather than about anything this struct computes.
+    ///
+    /// The engine's seed is an epoch in milliseconds, and the webview reads the
+    /// value out of JSON as a JavaScript number; an integer has to come out of
+    /// this type as the same integer, or two generations compare equal at the
+    /// far end and the webview keeps the rows of the first. A payload that does
+    /// not speak the field at all — a pre-revision engine, or a snapshot from
+    /// before it existed — reads as `0`, the "assume changed" value, and still
+    /// says `0` when it is written back out.
+    #[test]
+    fn a_queue_revision_round_trips_exactly_and_a_missing_one_reads_as_zero() {
+        let state: PlaybackState =
+            serde_json::from_str(r#"{"queue_revision":1789402727699}"#).unwrap();
+        assert_eq!(state.queue_revision, 1_789_402_727_699);
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["queue_revision"], 1_789_402_727_699u64);
+
+        let legacy: PlaybackState = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.queue_revision, 0);
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(json["queue_revision"], 0);
     }
 }

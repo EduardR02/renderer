@@ -351,6 +351,11 @@ pub enum Command {
         offset: usize,
         #[serde(default = "default_catalogue_release_page_size")]
         limit: usize,
+        /// Ask the engine for release references (id/name/year/cover) without
+        /// resolving per-track metadata. Off by default so every existing
+        /// caller keeps today's fully-resolved page.
+        #[serde(default)]
+        refs_only: bool,
     },
     /// One authenticated page of the user's Saved Tracks collection.
     BrowseLikedSongs {
@@ -1216,13 +1221,35 @@ pub struct StateEvent<'a> {
     pub playback_speed: f32,
     pub current_index: Option<usize>,
     pub current_uri: Option<&'a str>,
-    pub queue: &'a [TrackRef],
+    /// The queue rows this state describes. Present whenever [`Self::queue_revision`]
+    /// names a generation the receiver has not been given, and omitted when it
+    /// is the generation it already holds — the shell keeps the rows it has
+    /// (see `EngineClient::on_state`) and the webview keeps its own array, so
+    /// row identity survives the several states of one track change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<&'a [TrackRef]>,
+    /// The generation of the queue rows and of the plan derived from them.
+    ///
+    /// Always sent, because it is the only thing that tells an omitted `queue`
+    /// from an empty one. Monotonic within a process and seeded so it cannot
+    /// repeat across one, so "same number" always means "same rows".
+    ///
+    /// The webview reads this field as a JavaScript number, which holds
+    /// integers exactly only to 2^53: the seed is an epoch in milliseconds
+    /// (~1.75e12) and a change adds one, so every value that goes out — and the
+    /// value one bump after it — arrives at the far end as itself. A seed in
+    /// nanoseconds would sit where representable numbers are 256 apart, and one
+    /// bump would leave the number unchanged.
+    pub queue_revision: u64,
     /// Queue indexes in the order automatic playback will actually reach them,
     /// current row excluded: shuffle's live bag when shuffle is on, the
     /// sequential walk when it is off, exclusions and unavailable rows already
     /// removed. Derived state, never restored or persisted — the UI would
-    /// otherwise have to guess at a plan only the engine holds.
-    pub upcoming: Vec<usize>,
+    /// otherwise have to guess at a plan only the engine holds. Travels with
+    /// `queue` and is omitted with it: the plan is derived from the rows and
+    /// from the current row, and the revision covers both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upcoming: Option<Vec<usize>>,
     pub error: Option<&'a str>,
 }
 
@@ -1481,8 +1508,9 @@ mod tests {
             playback_speed: 1.0,
             current_index: Some(0),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
-            queue: &queue,
-            upcoming: vec![2, 1],
+            queue: Some(&queue),
+            queue_revision: 7,
+            upcoming: Some(vec![2, 1]),
             error: None,
         })
         .unwrap();
@@ -1494,11 +1522,48 @@ mod tests {
         assert_eq!(state["current_uri"], queue[0].uri);
         assert_eq!(state["queue"][0]["artist_names"], json!(["Artist"]));
         assert_eq!(state["queue"][0]["duration_ms"], 123_456);
+        assert_eq!(state["queue_revision"], 7);
         // The plan is queue indexes in play order, not a second copy of rows.
         assert_eq!(state["upcoming"], json!([2, 1]));
         assert!(state["error"].is_null());
         // The authorize URL is only present while a login attempt is pending.
         assert!(state["auth_url"].is_null());
+    }
+
+    #[test]
+    fn a_state_that_keeps_its_queue_omits_the_rows_and_the_plan() {
+        // The shell and the webview keep the copy they hold when the revision
+        // says the rows have not moved, so an unchanged payload must not carry
+        // them at all — and the revision it does carry is what tells that
+        // "unchanged" apart from an empty queue.
+        let state = serde_json::to_value(StateEvent {
+            kind: "state",
+            ready: true,
+            auth_state: AuthState::Ready,
+            auth_url: None,
+            username: None,
+            playing: true,
+            buffering: false,
+            preview: false,
+            position_ms: 1_000,
+            duration_ms: 10_000,
+            volume: 50,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            playback_speed: 1.0,
+            current_index: Some(3),
+            current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
+            queue: None,
+            queue_revision: 7,
+            upcoming: None,
+            error: None,
+        })
+        .unwrap();
+
+        assert!(!state.as_object().unwrap().contains_key("queue"));
+        assert!(!state.as_object().unwrap().contains_key("upcoming"));
+        assert_eq!(state["queue_revision"], 7);
+        assert_eq!(state["current_index"], 3);
     }
 
     #[test]
@@ -1520,8 +1585,9 @@ mod tests {
             playback_speed: 1.0,
             current_index: None,
             current_uri: None,
-            queue: &[],
-            upcoming: Vec::new(),
+            queue: Some(&[]),
+            queue_revision: 1,
+            upcoming: Some(Vec::new()),
             error: None,
         })
         .unwrap();
@@ -2071,8 +2137,9 @@ mod tests {
             playback_speed: 1.0,
             current_index: None,
             current_uri: None,
-            queue: &[],
-            upcoming: Vec::new(),
+            queue: Some(&[]),
+            queue_revision: 1,
+            upcoming: Some(Vec::new()),
             error: None,
         })
         .unwrap();
@@ -2094,8 +2161,9 @@ mod tests {
             playback_speed: 1.0,
             current_index: None,
             current_uri: None,
-            queue: &[],
-            upcoming: Vec::new(),
+            queue: Some(&[]),
+            queue_revision: 2,
+            upcoming: Some(Vec::new()),
             error: None,
         })
         .unwrap();

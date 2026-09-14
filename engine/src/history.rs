@@ -605,26 +605,45 @@ fn ensure_ordering(
     }
 
     let live_active = core.live_active();
+    // Folded once per row here, not once per comparison. The comparator this
+    // replaces asked `artist_key` for both sides (a join plus a lowercase
+    // each) and folded both titles on every comparison, so a name sort over
+    // the whole archive was ~2n·log n allocations — tens of millions at the
+    // ceiling — and it runs inline on the engine's command loop, where every
+    // transport and browse reply waits behind it. The filter reads the same
+    // folded title rather than folding the row a second time.
+    //
+    // `page` only builds a projection when there is a needle or the order is
+    // a name order, so the title fold always has a reader; the artist join is
+    // asked for by the artist order alone.
+    let name_sort = matches!(sort, HistorySort::Title | HistorySort::Artist);
     let mut slots = Vec::new();
+    let mut keys = Vec::new();
+    let mut consider = |item: &HistoryItem, slot: Slot| {
+        let title = item.track.name.to_lowercase();
+        if !matches_folded(&title, item, needle) {
+            return;
+        }
+        if !name_sort {
+            slots.push(slot);
+            return;
+        }
+        keys.push(NameKey {
+            slot,
+            title,
+            artists: matches!(sort, HistorySort::Artist).then(|| artist_key(item)),
+            started_at: item.row.started_at,
+        });
+    };
     if active_qualified {
         if let Some(item) = &live_active {
-            if matches(item, needle) {
-                slots.push(Slot::Active);
-            }
+            consider(item, Slot::Active);
         }
     }
     for (index, item) in core.finalized.iter().enumerate() {
-        if matches(item, needle) {
-            slots.push(Slot::Finalized(index as u32));
-        }
+        consider(item, Slot::Finalized(index as u32));
     }
 
-    let item_of = |slot: &Slot| -> Option<&HistoryItem> {
-        match slot {
-            Slot::Active => live_active.as_ref(),
-            Slot::Finalized(index) => core.finalized.get(*index as usize),
-        }
-    };
     match sort {
         // The scan above walks oldest-first with the in-progress row ahead of
         // it, so newest-first is that walk read backwards.
@@ -638,18 +657,19 @@ fn ensure_ordering(
             }
         }
         HistorySort::Title | HistorySort::Artist => {
-            slots.sort_by(|left, right| {
-                let (Some(left), Some(right)) = (item_of(left), item_of(right)) else {
-                    return std::cmp::Ordering::Equal;
-                };
+            keys.sort_by(|left, right| {
                 let primary = match sort {
-                    HistorySort::Artist => artist_key(left).cmp(&artist_key(right)),
+                    HistorySort::Artist => left.artists.cmp(&right.artists),
                     _ => std::cmp::Ordering::Equal,
                 };
                 primary
-                    .then_with(|| left.track.name.to_lowercase().cmp(&right.track.name.to_lowercase()))
-                    .then_with(|| right.row.started_at.cmp(&left.row.started_at))
+                    .then_with(|| left.title.cmp(&right.title))
+                    .then_with(|| right.started_at.cmp(&left.started_at))
             });
+            // The folded keys are dropped with the rebuild that made them:
+            // paging reads slots, and the next query is what pays for the next
+            // projection.
+            slots = keys.into_iter().map(|key| key.slot).collect();
         }
     }
 
@@ -662,15 +682,39 @@ fn ensure_ordering(
     });
 }
 
+/// One row's place in a name order, with its folded sort values.
+///
+/// The values are folded once per rebuild so the comparator allocates nothing:
+/// it only compares what is already here, which is what turns a name sort from
+/// a fold per comparison into a fold per row.
+struct NameKey {
+    slot: Slot,
+    /// `track.name`, lowercased — the filter's haystack and the title
+    /// tie-break.
+    title: String,
+    /// `artist_names` joined and lowercased, the artist order's primary
+    /// comparison. `None` in the title order, whose comparator never reads it:
+    /// folding it there would be one allocation per row for nothing.
+    artists: Option<String>,
+    started_at: i64,
+}
+
 fn artist_key(item: &HistoryItem) -> String {
     item.track.artist_names.join(", ").to_lowercase()
 }
 
-fn matches(item: &HistoryItem, needle: &str) -> bool {
+/// Whether a row answers the query, against a title that has already been
+/// folded.
+///
+/// The artists are folded here, one at a time and short-circuiting, because
+/// the artist order's single joined key is not what the filter compares:
+/// `any` over the individual names and `contains` over their join disagree
+/// across a comma, so the join cannot be reused for this.
+fn matches_folded(folded_title: &str, item: &HistoryItem, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    item.track.name.to_lowercase().contains(needle)
+    folded_title.contains(needle)
         || item
             .track
             .artist_names
@@ -1566,6 +1610,58 @@ mod tests {
             .map(|item| item.row.track_id.as_str())
             .collect();
         assert_eq!(names, ["alpaca", "alpha", "beta", "gamma"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The name orders fold case-insensitively and break ties on the title,
+    /// then on the newest play — the artist order had no test at all, and the
+    /// folded keys the comparator now compares are only correct if all three
+    /// still come out the same.
+    #[test]
+    fn the_artist_order_folds_names_and_keeps_both_tie_breaks() {
+        let root = scratch();
+        let history = ListeningHistory::new(root.clone());
+        {
+            let mut core = history.lock_core();
+            for (id, artist, title, started_at) in [
+                ("same-old", "Beta Band", "Same", 1i64),
+                ("same-new", "beta band", "SAME", 2),
+                ("zzz", "Alpha", "zzz", 3),
+                ("aaa", "Beta Band", "aaa", 4),
+            ] {
+                let mut track = track(id);
+                track.name = title.to_owned();
+                track.artist_names = vec![artist.to_owned()];
+                core.finalized.push_back(HistoryItem {
+                    row: HistoryRow {
+                        track_id: id.to_owned(),
+                        started_at,
+                        ..HistoryRow::default()
+                    },
+                    track: sanitize_track(&track),
+                });
+            }
+        }
+
+        let ids = |sort: HistorySort| -> Vec<String> {
+            history
+                .page(&HistoryQuery {
+                    limit: usize::MAX,
+                    sort,
+                    ..HistoryQuery::default()
+                })
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|item| item.row.track_id)
+                .collect()
+        };
+        assert_eq!(
+            ids(HistorySort::Artist),
+            ["zzz", "aaa", "same-new", "same-old"],
+            "artist first, then title, then the newest tie"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

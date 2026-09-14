@@ -190,6 +190,22 @@ pub struct Engine {
     credentials_file: std::path::PathBuf,
     track_edits: TrackEditStore,
     state: PlaybackState,
+    /// The generation of the queue rows and of the plan derived from them.
+    ///
+    /// Every writer that changes what a state event says about the queue has
+    /// to bump this through [`Engine::queue_changed`]: the rows themselves,
+    /// the current row, the shuffle bag, the shuffle and repeat modes, and a
+    /// playlist exclusion. [`Engine::emit_state`] sends the rows and the plan
+    /// only when the generation is newer than the one the last state carried,
+    /// and the shell and the webview keep the copy they already have
+    /// otherwise — so this number is the entire contract for "the queue did
+    /// not move": a writer that forgets it leaves both of them rendering a
+    /// queue the engine no longer has.
+    queue_revision: u64,
+    /// The generation [`Engine::emit_state`] last published rows under. `None`
+    /// until the first state of this process, because a fresh engine has not
+    /// handed its queue to anyone yet.
+    emitted_queue_revision: Option<u64>,
     player: Option<Arc<Player>>,
     mixer: Option<Arc<SoftMixer>>,
     session: Option<librespot_core::Session>,
@@ -488,6 +504,8 @@ impl Engine {
             mixer: None,
             session: None,
             play_request_id: None,
+            queue_revision: initial_queue_revision(),
+            emitted_queue_revision: None,
             loading_failed: false,
             current_needs_load: false,
             preview_mode: false,
@@ -587,13 +605,38 @@ impl Engine {
         Ok(())
     }
 
-    pub fn emit_state(&self) -> Result<(), String> {
+    /// Marks the queue rows, or the plan derived from them, as moved.
+    ///
+    /// See [`Engine::queue_revision`]: the revision is the only thing that
+    /// tells the shell and the webview that the rows they hold are still the
+    /// rows this engine means, so every writer of the queue, of the current
+    /// row, of the shuffle bag, of the shuffle/repeat modes, or of an
+    /// exclusion that automatic playback respects must call this.
+    fn queue_changed(&mut self) {
+        self.queue_revision = self.queue_revision.wrapping_add(1);
+    }
+
+    /// Emits the full state, with the queue rows and the derived plan only
+    /// when their revision is one this process has not already handed over.
+    ///
+    /// The shell and the webview keep the rows they hold across the several
+    /// states of one track change (that is what preserves row identity, and
+    /// with it every consumer keyed on a row object), so re-sending identical
+    /// rows would be serializing a megabyte of queue to say nothing. What the
+    /// revision cannot express — the playhead, the modes, the current row, the
+    /// track — still travels in every state, which is why a changed revision,
+    /// not a changed row, is what puts the rows on the wire.
+    pub fn emit_state(&mut self) -> Result<(), String> {
         let current_uri = self
             .state
             .current_index
             .and_then(|index| self.state.queue.get(index))
             .map(|track| track.uri.as_str());
         let (position_ms, duration_ms) = self.transport_position_and_duration();
+        let queue_revision = self.queue_revision;
+        let sending_queue = self.emitted_queue_revision != Some(queue_revision);
+        let queue = sending_queue.then_some(self.state.queue.as_slice());
+        let upcoming = sending_queue.then(|| self.upcoming_indices());
         self.writer.send(&StateEvent {
             kind: "state",
             ready: self.state.ready,
@@ -620,10 +663,15 @@ impl Engine {
             playback_speed: self.state.playback_speed,
             current_index: self.state.current_index,
             current_uri,
-            queue: &self.state.queue,
-            upcoming: self.upcoming_indices(),
+            queue,
+            queue_revision,
+            upcoming,
             error: self.state.error.as_deref(),
-        })
+        })?;
+        if sending_queue {
+            self.emitted_queue_revision = Some(queue_revision);
+        }
+        Ok(())
     }
 
     /// Serializes only the playhead scalars the frontend projects and clamps
@@ -815,6 +863,9 @@ impl Engine {
                 track.cached = true;
                 changed = true;
             }
+        }
+        if changed {
+            self.queue_changed();
         }
         changed
     }
@@ -1142,6 +1193,7 @@ impl Engine {
         self.state.duration_ms = 0;
         self.state.current_index = None;
         self.state.queue.clear();
+        self.queue_changed();
         self.current_needs_load = false;
         self.preview_mode = false;
         self.preview_lease_id = 0;
@@ -2218,6 +2270,7 @@ impl Engine {
         self.player()?.stop();
         self.invalidate_audio_signals();
         self.state.queue = queue;
+        self.queue_changed();
         self.state.current_index = None;
         self.state.position_ms = 0;
         self.state.duration_ms = 0;
@@ -2339,6 +2392,7 @@ impl Engine {
         }
 
         self.state.queue = queue;
+        self.queue_changed();
         self.state.current_index = Some(playable_index);
         self.state.duration_ms = self.state.queue[playable_index].duration_ms;
         let position_ms = if playable_index == index {
@@ -2406,6 +2460,7 @@ impl Engine {
             first_available_wrapping(&queue, index)
         };
         self.state.queue = queue;
+        self.queue_changed();
         self.state.current_index = playable_index;
         self.state.duration_ms = playable_index
             .map(|current| self.state.queue[current].duration_ms)
@@ -2476,6 +2531,7 @@ impl Engine {
             }
         }
         self.state.current_index = Some(index);
+        self.queue_changed();
         self.state.duration_ms = duration_ms;
         self.update_transport_position(0);
         self.state.error = None;
@@ -2673,6 +2729,7 @@ impl Engine {
                 self.shuffle_pool.push(current);
             }
             self.state.current_index = Some(index);
+            self.queue_changed();
             self.state.duration_ms = self.state.queue[index].duration_ms;
             self.update_transport_position(0);
             self.state.error = None;
@@ -2729,6 +2786,9 @@ impl Engine {
         skip_current_for_repeat: bool,
         resume: bool,
     ) -> Result<bool, String> {
+        // Every path out of here moves the published plan: the row that plays,
+        // the row the bag popped, or the end of the queue itself.
+        self.queue_changed();
         if at_end {
             // Flush delayed speed/cut output before changing configuration.
             // The queue itself remains live so the tail can drain audibly.
@@ -2750,6 +2810,7 @@ impl Engine {
                     self.history.push(current);
                 }
                 self.state.current_index = Some(index);
+                self.queue_changed();
                 self.state.duration_ms = self.state.queue[index].duration_ms;
                 self.update_transport_position(0);
                 self.state.error = None;
@@ -2845,6 +2906,7 @@ impl Engine {
             return Ok(false);
         }
         self.state.shuffle = enabled;
+        self.queue_changed();
         self.history.clear();
         // Switching shuffle on is the one place a full draw is the point: there
         // is no earlier plan to preserve. Switching it off empties the bag by
@@ -2859,6 +2921,7 @@ impl Engine {
             return Ok(false);
         }
         self.state.repeat = mode;
+        self.queue_changed();
         self.preload_next();
         Ok(true)
     }
@@ -2867,6 +2930,7 @@ impl Engine {
         self.resolve_queue_edits(std::slice::from_mut(&mut track));
         parse_track_uri(&track)?;
         self.state.queue.push(track);
+        self.queue_changed();
         self.history.clear();
         self.splice_new_rows_into_shuffle_pool(self.state.queue.len() - 1);
         self.preload_next();
@@ -2888,6 +2952,7 @@ impl Engine {
         }
         let first_new = self.state.queue.len();
         self.state.queue.extend(tracks);
+        self.queue_changed();
         self.history.clear();
         self.splice_new_rows_into_shuffle_pool(first_new);
         self.preload_next();
@@ -2904,6 +2969,7 @@ impl Engine {
             self.leave_preview_mode();
         }
         self.state.queue.remove(index);
+        self.queue_changed();
         self.history.clear();
         let mut reload = false;
 
@@ -2973,6 +3039,7 @@ impl Engine {
         }
         let track = self.state.queue.remove(from);
         self.state.queue.insert(to, track);
+        self.queue_changed();
         if let Some(current) = self.state.current_index {
             self.state.current_index = Some(remap_current_index_after_move(current, from, to));
         }
@@ -3390,6 +3457,8 @@ impl Engine {
     /// `state.queue`, never repeats an index, and is empty whenever shuffle is
     /// off.
     fn rebuild_shuffle_pool(&mut self) {
+        // A redraw replaces the published plan wholesale.
+        self.queue_changed();
         self.shuffle_pool.clear();
         if !self.state.shuffle {
             return;
@@ -3430,6 +3499,8 @@ impl Engine {
     /// arithmetic, because a bag entry that no longer indexes the queue is a
     /// panic waiting in `take_next_index_with_skip`.
     fn repair_shuffle_pool(&mut self, remap: impl Fn(usize) -> Option<usize>) {
+        // The bag *is* the published plan: any repair moves rows in it.
+        self.queue_changed();
         if !self.state.shuffle {
             // `rebuild_shuffle_pool` empties the bag when shuffle goes off, and
             // a repair must never be the thing that resurrects entries into it.
@@ -3460,6 +3531,9 @@ impl Engine {
     /// part an append can have changed — the indices already in the bag still
     /// name the same tracks.
     fn splice_new_rows_into_shuffle_pool(&mut self, first_new: usize) {
+        // Appended rows enter the published plan, so the revision moves even
+        // when the bag is empty because shuffle is off.
+        self.queue_changed();
         if !self.state.shuffle {
             self.shuffle_pool.clear();
             return;
@@ -3477,6 +3551,10 @@ impl Engine {
     /// position. It walks the queue rather than a single index because one
     /// track id can occupy several queue rows.
     fn repair_shuffle_pool_for_eligibility(&mut self) {
+        // Eligibility is part of the published plan even with shuffle off — a
+        // row that just became excluded leaves the sequential walk too — so the
+        // bump happens before the bag's own early return.
+        self.queue_changed();
         if !self.state.shuffle {
             self.shuffle_pool.clear();
             return;
@@ -3551,10 +3629,20 @@ impl Engine {
                         self.start_listening(&track);
                     }
                 }
+                // librespot answers every play it is sent, including the ones
+                // the engine has already reported as its own command's result.
+                // Those echoes carry the engine's own intent back with the same
+                // playhead, and a full state for one would put the queue on the
+                // wire again to say nothing. Only the two things a state event
+                // can actually show — the playing flag and a cleared error —
+                // count as a change; the playhead it also carries has a lane of
+                // its own.
+                let was_playing = self.state.playing;
+                let was_failed = self.state.error.is_some();
                 self.state.playing = true;
                 self.update_position(position_ms);
                 self.state.error = None;
-                true
+                !was_playing || was_failed
             }
             // The Paused produced by a seek's own pause() is transient: the
             // engine already reported the requested play/pause intent and
@@ -3573,6 +3661,10 @@ impl Engine {
             } if self.is_current_event(play_request_id, &track_id) => {
                 self.loading_failed = false;
                 let was_playing = self.state.playing;
+                // What the state event would say that it does not say already:
+                // the clamped playhead it reports, or the flag itself.
+                let position_moved =
+                    self.state.position_ms != position_ms.min(self.state.duration_ms);
                 self.state.playing = false;
                 if was_playing {
                     // Command-driven pause already stopped and persisted the
@@ -3581,7 +3673,12 @@ impl Engine {
                     self.pause_listening();
                 }
                 self.update_position(position_ms);
-                true
+                // `Engine::pause` reports its own transition before librespot
+                // answers it, so the answer itself is worth a state event only
+                // when it says something the report did not. The anchor still
+                // moves either way: that is what the projection reads, and the
+                // position lane carries it out at the next heartbeat.
+                was_playing || position_moved
             }
             PlayerEvent::PositionChanged {
                 play_request_id,
@@ -3598,8 +3695,16 @@ impl Engine {
                 track_id,
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
+                // A position librespot reports that is the one the engine
+                // already holds is not news: the engine anchors its projection
+                // from its own commands, and the 2-second position lane is what
+                // carries a playhead the UI has not seen. A genuinely different
+                // position is a change the state event reports, so it still
+                // emits one.
+                let position_moved =
+                    self.state.position_ms != position_ms.min(self.state.duration_ms);
                 self.update_position(position_ms);
-                true
+                position_moved
             }
             PlayerEvent::EndOfTrack {
                 play_request_id,
@@ -3773,6 +3878,30 @@ impl Engine {
         self.preload_armed = false;
         self.mixer = None;
     }
+}
+
+/// The first queue revision of a process.
+///
+/// The revision is the shell's and the webview's only way to tell an omitted
+/// queue from an empty one, so it must name one set of rows and nothing else —
+/// including across a respawn. A counter starting at one would let a fresh
+/// engine's first, empty queue be mistaken for rows a previous engine had
+/// already published under the same number; the wall clock costs one call at
+/// construction and cannot repeat that way within any plausible uptime.
+///
+/// Milliseconds, not nanoseconds, because the webview reads this field as a
+/// JSON number — a double, which holds integers exactly only to 2^53. An epoch
+/// in nanoseconds is ~1.79e18, where the numbers that are representable are 256
+/// apart: two generations one bump apart arrive as the same number, and the
+/// webview keeps the rows of the first. Milliseconds are ~1.75e12, exact for
+/// every value, and a bump of one stays exact through any uptime — so a
+/// revision in flight always names one set of rows and no other.
+fn initial_queue_revision() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis() as u64)
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn fill_queue_context(queue: &mut [TrackRef], fallback: &str) {
@@ -4724,7 +4853,10 @@ mod tests {
         assert!(!rows[0].row.completed);
 
         engine.play_request_id = Some(8);
-        assert!(engine.on_player_event(PlayerEvent::Playing {
+        // The preview install already reported this row as playing, so its
+        // Playing event is an echo: it cannot append a draft row, and it is
+        // not a change either.
+        assert!(!engine.on_player_event(PlayerEvent::Playing {
             play_request_id: 8,
             track_id: uri,
             position_ms: 5_000,
@@ -4753,7 +4885,7 @@ mod tests {
         assert!(engine.preview_mode);
 
         engine.play_request_id = Some(8);
-        assert!(engine.on_player_event(PlayerEvent::Playing {
+        assert!(!engine.on_player_event(PlayerEvent::Playing {
             play_request_id: 8,
             track_id: track_uri(),
             position_ms: 5_000,
@@ -4773,7 +4905,7 @@ mod tests {
         );
         assert!(engine.preview_mode);
         engine.play_request_id = Some(9);
-        assert!(engine.on_player_event(PlayerEvent::Playing {
+        assert!(!engine.on_player_event(PlayerEvent::Playing {
             play_request_id: 9,
             track_id: track_uri(),
             position_ms: 7_000,
@@ -6467,8 +6599,9 @@ mod tests {
         engine.state = five_track_state();
         engine.state.playing = true;
         // Exactly what librespot reports for a keyless track: loaded, playing,
-        // and then three seconds later, over.
-        assert!(engine.on_player_event(PlayerEvent::Playing {
+        // and then three seconds later, over. The report itself is the echo of
+        // a play this engine already calls playing, so it is not a change.
+        assert!(!engine.on_player_event(PlayerEvent::Playing {
             play_request_id: 7,
             track_id: track_uri(),
             position_ms: 0,
@@ -6500,7 +6633,9 @@ mod tests {
         let (mut engine, _probe) = engine_with_player();
         engine.state = five_track_state();
         engine.state.playing = true;
-        assert!(engine.on_player_event(PlayerEvent::Playing {
+        // The engine is already playing this row, so librespot's report of the
+        // same thing says nothing a state event would have to carry.
+        assert!(!engine.on_player_event(PlayerEvent::Playing {
             play_request_id: 7,
             track_id: track_uri(),
             position_ms: 0,
@@ -7277,6 +7412,140 @@ mod tests {
         assert_eq!(value["type"], "state");
         assert_eq!(value["playing"], true);
         assert_eq!(value["position_ms"], 12_345);
+    }
+
+    /// Every message the capture buffer has accumulated, parsed. A test that
+    /// reads the wire has to empty it first, so this takes the bytes.
+    fn captured_messages(buffer: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
+        let mut bytes = buffer.lock().expect("buffer lock");
+        std::mem::take(&mut *bytes)
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("every line is one json message"))
+            .collect()
+    }
+
+    /// The queue rows ride one state per generation, not one per state.
+    ///
+    /// One track change used to publish four or five full states, each of them
+    /// re-serializing the whole queue — a megabyte at playlist scale — to say
+    /// nothing about it. The revision is what makes dropping that affordable:
+    /// the rows travel with it, every other state travels without them, and a
+    /// receiver holding that generation keeps the rows it already has.
+    #[test]
+    fn a_state_carries_the_queue_rows_only_when_the_revision_moved() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = two_track_state();
+
+        engine.emit_state().expect("first state emits");
+        engine.emit_state().expect("idle state emits");
+        assert!(engine.move_queue(1, 0).expect("the move is legal"));
+        engine.emit_state().expect("moved state emits");
+
+        let values = captured_messages(&buffer);
+        assert_eq!(values.len(), 3, "one line per emit_state");
+        let revision = values[0]["queue_revision"].as_u64().expect("a revision");
+        assert_eq!(values[0]["queue"].as_array().map(Vec::len), Some(2));
+        assert!(values[0]["upcoming"].is_array());
+
+        // The second state says exactly what the first said about the queue, so
+        // it does not say it again — and it still says everything else.
+        assert_eq!(values[1]["queue_revision"].as_u64(), Some(revision));
+        assert!(
+            !values[1].as_object().expect("object").contains_key("queue"),
+            "an unchanged queue must not be serialized"
+        );
+        assert!(!values[1].as_object().expect("object").contains_key("upcoming"));
+        assert_eq!(values[1]["current_index"], values[0]["current_index"]);
+
+        // The move is a new generation, so the rows come back with it: the
+        // reordered list, under a revision the receiver has not been given.
+        let moved = values[2]["queue"].as_array().expect("rows after the move");
+        assert_eq!(moved[0]["id"], values[0]["queue"][1]["id"]);
+        assert!(
+            values[2]["queue_revision"].as_u64().expect("a revision") > revision,
+            "a change publishes a newer generation"
+        );
+    }
+
+    /// The revision has to be exact in the number the webview reads it as.
+    ///
+    /// The wire carries it as a JSON number, and the webview parses that as a
+    /// JavaScript number — a double, exact only for integers up to 2^53. A seed
+    /// above that bound does not merely round: the increments disappear into
+    /// the rounding, so a state offering a changed queue arrives under the
+    /// number of the queue the webview already has and its rows are dropped.
+    #[test]
+    fn a_revision_and_its_successor_are_different_numbers_to_the_webview() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = two_track_state();
+
+        let seed = engine.queue_revision;
+        engine.emit_state().expect("first state emits");
+        engine.queue_changed();
+        engine.emit_state().expect("bumped state emits");
+
+        // `as_f64` is the rounding JavaScript's `Number` applies to a JSON
+        // integer, so this is what `Number(payload.queue_revision)` holds.
+        let values = captured_messages(&buffer);
+        let read = |value: &serde_json::Value| {
+            value["queue_revision"].as_f64().expect("a revision")
+        };
+        let first = read(&values[0]);
+        let second = read(&values[1]);
+        assert_eq!(first, seed as f64, "the seed arrives unchanged");
+        assert_eq!(second, (seed + 1) as f64, "and so does the next revision");
+        assert_ne!(
+            first, second,
+            "one bump has to be a different number to the webview"
+        );
+        assert_eq!(second as u64, seed + 1, "the number names exactly one row set");
+    }
+
+    /// librespot answers every transport command, including the ones the engine
+    /// has already reported as its own command's result. Such an event is worth
+    /// a state only when it moves something a state carries.
+    #[test]
+    fn a_player_echo_is_not_a_state_change() {
+        let (mut engine, _buffer) = test_engine();
+        engine.state = two_track_state();
+        engine.play_request_id = Some(7);
+        let uri = track_uri();
+        let position = engine.state.position_ms;
+
+        // The engine calls itself playing and librespot agrees with it, at the
+        // playhead the engine already holds.
+        engine.state.playing = true;
+        assert!(!engine.on_player_event(PlayerEvent::Playing {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: position,
+        }));
+        assert!(!engine.on_player_event(PlayerEvent::Seeked {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: position,
+        }));
+
+        // A pause the engine never asked for is a real transition, and its own
+        // echo — same position, already paused — is not.
+        assert!(engine.on_player_event(PlayerEvent::Paused {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: position,
+        }));
+        assert!(!engine.on_player_event(PlayerEvent::Paused {
+            play_request_id: 7,
+            track_id: uri.clone(),
+            position_ms: position,
+        }));
+
+        // A playhead that actually moved is still reported.
+        assert!(engine.on_player_event(PlayerEvent::PositionChanged {
+            play_request_id: 7,
+            track_id: uri,
+            position_ms: position + 500,
+        }));
     }
 
     #[test]

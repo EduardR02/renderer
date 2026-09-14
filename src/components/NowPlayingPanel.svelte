@@ -28,6 +28,12 @@
   let canvasStageRatio = $state(100);
   let canvasRetiring = $state(false);
   let canvasEl = $state(null);
+  let panelEl = $state(null);
+  let stageEl = $state(null);
+  /* Starts true: before the observer's first callback arrives, a panel that
+     just opened must run its Canvas exactly as it did before this gate
+     existed. */
+  let stageVisible = $state(true);
   let pageVisible = $state(!document.hidden);
   let reducedMotion = $state(false);
 
@@ -92,6 +98,24 @@
       });
   });
 
+  /* The stage is the top of a column that scrolls, so the whole 720x1280
+     frame can sit outside the panel — above the credits and the up-next block
+     the reader is actually on — while every other gate still says yes and the
+     decoder runs with nothing on screen to show for it. This watches the
+     stage inside the panel's own scrollport: leaving it pauses, coming back
+     resumes, and the panel unmounting tears the observer down with it. */
+  $effect(() => {
+    const stage = stageEl;
+    const panel = panelEl;
+    if (!stage || !panel) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => (stageVisible = Boolean(entry?.isIntersecting)),
+      { root: panel },
+    );
+    observer.observe(stage);
+    return () => observer.disconnect();
+  });
+
   /**
    * Whether the Canvas video may run its decoder right now.
    *
@@ -99,14 +123,20 @@
    * avoid, and the element being off screen is not enough to stop it: a
    * `<video autoplay>` in a window that merely lost focus keeps decoding every
    * frame. So playback is driven from here rather than from the `autoplay`
-   * attribute, and it stops on all three of the things that mean nobody is
+   * attribute, and it stops on every one of the things that mean nobody is
    * watching — the panel closed (this component unmounts), the window
-   * backgrounded or minimised, and the music paused. The last one is not only
-   * about cost: a Canvas is the record's motion, and it standing still while
-   * the record does is what the official client shows too.
+   * backgrounded or minimised, the stage scrolled out of the panel, and the
+   * music paused. The last one is not only about cost: a Canvas is the
+   * record's motion, and it standing still while the record does is what the
+   * official client shows too.
    */
   const canvasPlaying = $derived(
-    Boolean(canvasUrl) && !canvasRetiring && pageVisible && ui.windowFocused && playback.playing,
+    Boolean(canvasUrl) &&
+      !canvasRetiring &&
+      stageVisible &&
+      pageVisible &&
+      ui.windowFocused &&
+      playback.playing,
   );
 
   $effect(() => {
@@ -139,7 +169,7 @@
        effect above already restarted the swapped element, and this is the
        moment a start can actually succeed, so re-arm it under exactly the
        same gates. A redundant play() on a running element resolves quietly. */
-    if (!canvasRetiring && pageVisible && ui.windowFocused && playback.playing) {
+    if (!canvasRetiring && stageVisible && pageVisible && ui.windowFocused && playback.playing) {
       canvasEl?.play()?.catch(() => {});
     }
   }
@@ -227,6 +257,7 @@
 
 <aside
   class="np-panel"
+  bind:this={panelEl}
   aria-label="Now playing details"
   style:--tone-wash={tone.wash}
   style:--tone-glow={tone.glow}
@@ -244,6 +275,7 @@
          frame to the video's natural ratio; it never becomes rail chrome. -->
     <div
       class="np-stage"
+      bind:this={stageEl}
       class:play={canvasReady}
       class:settle={canvasRetiring}
       style:--stage-open={`${canvasStageRatio.toFixed(4)}%`}
