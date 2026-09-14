@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch, playback } from "../lib/state.svelte.js";
+  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, submitSearch, retrySearch, playback } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById, cardPlay } from "../lib/play.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
@@ -58,11 +58,13 @@
        rest of the list rather than a one-track queue that stops dead. */
     const at = tracks.findIndex((t) => t.id === top.id);
     const queue = at >= 0 ? tracks : [top];
-    api.playQueue(queue, Math.max(at, 0), "search").catch(() => {});
+    playError = "";
+    api.playQueue(queue, Math.max(at, 0), "search").catch((error) => { playError = String(error); });
   }
 
   function playTrack(i) {
-    if (tracks.length) api.playQueue(tracks, i, "search").catch(() => {});
+    playError = "";
+    if (tracks.length) api.playQueue(tracks, i, "search").catch((error) => { playError = String(error); });
   }
 
   const busy = $state({ id: "" });
@@ -85,6 +87,7 @@
   const searchCause = $derived.by(() => {
     const raw = search.error;
     if (!raw) return "";
+    if (search.link?.error) return raw;
     if (!(playback.ready === true && playback.auth_state === "ready")) {
       return "Spotify hasn't finished connecting.";
     }
@@ -138,7 +141,7 @@
      reads and writes `recents` and tracking that would make this effect
      re-trigger itself forever. */
   $effect(() => {
-    if (!search.results) return;
+    if (!search.results || search.link) return;
     untrack(() => {
       const q = search.query.trim();
       if (q) remember(q);
@@ -149,16 +152,28 @@
 <section class="view page">
   <div class="search-intro">
     <h1 class="page-title">
-      {search.submitted && search.query ? `Results for “${search.query}”` : "Find something to play"}
+      {search.link ? (search.results?.tracks?.[0]?.name ?? "Open a Spotify link") : search.submitted && search.query ? `Results for “${search.query}”` : "Find something to play"}
     </h1>
     <!-- Refining a query keeps the previous results on screen, which is right
          — but then nothing on the page says a newer answer is coming. One
          quiet line does, and it occupies a fixed slot so the results below it
          do not shift when it appears. -->
-    <p class="search-status" class:on={search.busy && !!search.results}>Searching…</p>
+    <p class="search-status" class:on={search.busy && (!!search.results || !!search.link)} role="status">
+      {search.busy ? (search.link ? "Opening song…" : "Searching…") : ""}
+    </p>
   </div>
 
-  {#if !search.submitted}
+  {#if search.link && !search.submitted}
+    <div class="empty" role="status">
+      <p class="h">Spotify {search.link.kind === "track" ? "song" : search.link.kind} link</p>
+      <p class="sub">Open it here in the app. Nothing plays until you choose Play.</p>
+      <div class="actions">
+        <button class="btn-ghost" onclick={() => submitSearch(search.query)}>
+          Open {search.link.kind === "track" ? "song" : search.link.kind}
+        </button>
+      </div>
+    </div>
+  {:else if !search.submitted}
     {#if recents.length}
       <div class="section" style="margin-top:0">
         <div class="section-head">
@@ -189,12 +204,16 @@
     {/if}
   {:else if search.error && !search.results}
     <div class="empty failed" role="alert">
-      <p class="h">Search couldn't load.</p>
+      <p class="h">{search.link ? "This link couldn't open." : "Search couldn't load."}</p>
       <!-- One fact per line: the heading names the failure, the cause line
            (when there is one) says why, the button owns the retry. -->
       {#if searchCause}<p class="why">{searchCause}</p>{/if}
       <div class="actions">
-        <button class="btn-ghost" onclick={retrySearch}>Try again</button>
+        {#if search.link?.error}
+          <button class="btn-ghost" onclick={focusSearch}>Edit link</button>
+        {:else}
+          <button class="btn-ghost" onclick={retrySearch}>Try again</button>
+        {/if}
       </div>
     </div>
   {:else if !search.results}
@@ -295,6 +314,7 @@
             style:--tone-wash={topTone.wash}
             style:--tone-glow={topTone.glow}
             onclick={openTop}
+            aria-label={search.link?.kind === "track" ? `Play ${top.name}` : undefined}
           >
             <Cover
               src={top.cover_url}
@@ -308,6 +328,9 @@
             <span style="min-width:0">
               <span class="tr-name">{top.name}</span>
               <span class="tr-sub">{top.sub ? `${top.label} / ${top.sub}` : top.label}</span>
+              {#if search.link?.kind === "track"}
+                <span class="tr-sub"><Icon name="play" size={11} /> Play song</span>
+              {/if}
             </span>
           </button>
         </div>
@@ -326,7 +349,7 @@
           <TrackList
             tracks={visibleTracks}
             playFrom={playTrack}
-            showAlbum={false}
+            showAlbum={search.link?.kind === "track"}
             disableWindowing
             queueContext="search"
           />

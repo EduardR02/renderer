@@ -48,11 +48,14 @@ Audio is 320 kbps and gapless. Media keys work when the app isn't focused, and
 it shows up in Windows Quick Settings and on the lock screen. Played tracks are
 cached, so replaying them uses no network. It can launch at login, minimized if
 you want. Playlists can be created, renamed, deleted and reordered, and tracks
-added or removed by drag and drop. Settings has an audio cache size limit and a
-volume normalisation toggle.
+added or removed by drag and drop or in bulk by rules — artist, album, title,
+length — with a preview of exactly which entries go. Settings has an audio cache
+size limit and a volume normalisation toggle.
 
 Some extra things I added because we control playback here:
 
+- Paste a shared Spotify link — song, album, artist, playlist — into search and
+  it opens here instead of the web player.
 - Cut a section out of a song, or loop an exact range. Set per playlist, edited
   in a waveform view.
 - Playback speed from 0.5× to 2×, pitch preserving.

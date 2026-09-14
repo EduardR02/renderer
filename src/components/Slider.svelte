@@ -1,7 +1,7 @@
 <script>
   /**
    * Pointer-driven slider for seek and volume. Holds a local value while
-   * dragging and reports on release, so the playhead does not fight the drag.
+   * dragging; callers choose live drag updates or a release-only commit.
    *
    * The fill is driven by `--p` (0..1) and animated with `transform: scaleX`
    * rather than `width: %`. Width would force layout and paint on every
@@ -26,6 +26,7 @@
   let trackWidth = $state(0);
   let drag = $state(null);
   let hover = $state(null);
+  let pointerId = null;
   const display = $derived(drag !== null ? drag : value);
   const p = $derived(max > min ? Math.min(1, Math.max(0, (display - min) / (max - min))) : 0);
   const hoverP = $derived(
@@ -63,6 +64,12 @@
     resizeObserver.observe(element);
     return () => {
       resizeObserver.disconnect();
+      const capturedPointer = pointerId;
+      pointerId = null;
+      drag = null;
+      if (capturedPointer !== null && element.hasPointerCapture(capturedPointer)) {
+        element.releasePointerCapture(capturedPointer);
+      }
       trackGeometry = null;
       trackWidth = 0;
     };
@@ -73,8 +80,11 @@
   }
 
   function onPointerDown(e) {
+    if (pointerId !== null || e.button !== 0 || !e.isPrimary) return;
     e.preventDefault();
     refreshGeometry();
+    track.focus({ preventScroll: true });
+    pointerId = e.pointerId;
     drag = fromClientX(e.clientX);
     hover = drag;
     onDragStart?.(drag);
@@ -82,6 +92,7 @@
   }
 
   function onPointerMove(e) {
+    if (pointerId !== null && e.pointerId !== pointerId) return;
     hover = fromClientX(e.clientX);
     if (drag === null) return;
     drag = hover;
@@ -92,10 +103,12 @@
     hover = fromClientX(e.clientX);
   }
 
-  function onPointerUp() {
-    if (drag === null) return;
-    const v = drag;
+  function onPointerUp(e) {
+    if (drag === null || e.pointerId !== pointerId) return;
+    const v = e.type === "pointerup" ? fromClientX(e.clientX) : drag;
     drag = null;
+    pointerId = null;
+    if (track.hasPointerCapture(e.pointerId)) track.releasePointerCapture(e.pointerId);
     commit(v);
   }
 
@@ -104,8 +117,8 @@
     const small = step ?? Math.max(1, span / 20);
     const big = span / 5;
     let next = null;
-    if (e.key === "ArrowRight") next = display + small;
-    else if (e.key === "ArrowLeft") next = display - small;
+    if (e.key === "ArrowRight" || e.key === "ArrowUp") next = display + small;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowDown") next = display - small;
     else if (e.key === "PageUp") next = display + big;
     else if (e.key === "PageDown") next = display - big;
     else if (e.key === "Home") next = min;
@@ -135,6 +148,7 @@
   onpointerleave={() => (hover = null)}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
+  onlostpointercapture={onPointerUp}
   onkeydown={onKeyDown}
 >
   {#if kind === "vol"}
@@ -153,3 +167,17 @@
     </span>
   {/if}
 </span>
+
+<style>
+  [role="slider"] {
+    touch-action: none;
+  }
+  .vol {
+    height: 28px;
+    border-radius: var(--r1);
+  }
+  .vol:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 4px;
+  }
+</style>

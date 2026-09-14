@@ -102,6 +102,7 @@ pub fn run() {
             commands::browse_playlist,
             commands::browse_radio,
             commands::browse_playlist_recommendations,
+            commands::browse_track,
             commands::browse_album,
             commands::browse_artist,
             commands::browse_artist_songwriter,

@@ -11,3 +11,15 @@ members = ["engine", "src-tauri"]
 lto = true
 codegen-units = 1
 strip = true
+
+# The engine is DSP: one WSOLA search is hundreds of thousands of multiply-
+# accumulates, and a second of audio needs dozens of them. An unoptimised build
+# runs that roughly two orders of magnitude slower than the binary that ships,
+# which turned `cargo test` into a minutes-long CPU storm on a laptop.
+#
+# Optimising the test profile changes nothing about what the tests prove:
+# `debug-assertions` and `overflow-checks` default to on here exactly as they do
+# in `dev`, so every assertion and every arithmetic check still fires. Only the
+# arithmetic between them gets compiled properly.
+[profile.test]
+opt-level = 2

@@ -103,6 +103,13 @@ fixtures.playlistDetail = {
   tracks: makeTracks(12),
   excluded_track_ids: [],
 };
+fixtures.sharedTrack = {
+  ...makeTracks(1)[0],
+  id: "3TxKtkCNR1yQARsvHxvNnP",
+  uri: "spotify:track:3TxKtkCNR1yQARsvHxvNnP",
+  name: "Shared Song",
+  artist_names: ["Shared Artist"],
+};
 fixtures.longTrack = {
   ...makeTracks(1, 99)[0],
   name: "A Deliberately Long Track Title for Truncation and Overflow Checks",
@@ -768,6 +775,9 @@ window.__TAURI_INTERNALS__ = {
         return clone(fixtures.artist);
       case "browse_artist_songwriter":
         return clone(fixtures.songwriterPlaylist);
+      case "browse_track":
+        if (args.id !== fixtures.sharedTrack.id) throw new Error("This song is no longer available on Spotify.");
+        return clone(fixtures.sharedTrack);
       case "browse_album":
         return clone(fixtures.album);
       case "browse_artist_catalogue": {
@@ -894,6 +904,9 @@ window.__TAURI_INTERNALS__ = {
         updateMemberships(args, true);
         return null;
       case "remove_playlist_tracks":
+        if (args.expectedSnapshotId != null && args.expectedSnapshotId !== detailFor(playlistIdFrom(args)).snapshot_id) {
+          throw new Error("This playlist changed since your preview. Reload it and review the matches before removing songs.");
+        }
         updateMemberships(args, false);
         return null;
       case "set_playlist_track_excluded": {

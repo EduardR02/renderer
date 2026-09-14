@@ -950,6 +950,7 @@ pub struct PlaybackState {
     #[serde(deserialize_with = "string_or_default")]
     pub auth_url: String,
     pub playing: bool,
+    pub buffering: bool,
     /// True only while the engine queue is an editor draft preview. Preview
     /// state is forwarded to the window but excluded from durable restore.
     pub preview: bool,
@@ -982,6 +983,7 @@ impl Default for PlaybackState {
             auth_state: "needs_login".to_owned(),
             auth_url: String::new(),
             playing: false,
+            buffering: false,
             preview: false,
             username: String::new(),
             position_ms: 0,

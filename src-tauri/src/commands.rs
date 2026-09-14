@@ -381,6 +381,14 @@ pub async fn browse_playlist_recommendations(
 }
 
 #[tauri::command]
+pub async fn browse_track(
+    client: State<'_, Arc<EngineClient>>,
+    id: String,
+) -> Result<Track, String> {
+    Ok(client.browse_track(&id).await?.into())
+}
+
+#[tauri::command]
 pub async fn browse_album(
     client: State<'_, Arc<EngineClient>>,
     id: String,
@@ -583,8 +591,9 @@ pub async fn remove_playlist_tracks(
     client: State<'_, Arc<EngineClient>>,
     id: String,
     uris: Vec<String>,
+    expected_snapshot_id: Option<String>,
 ) -> Result<(), String> {
-    client.remove_playlist_tracks(&id, &uris).await?;
+    client.remove_playlist_tracks(&id, &uris, expected_snapshot_id.as_deref()).await?;
     spawn_refresh_playlist(app, id);
     Ok(())
 }

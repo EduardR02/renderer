@@ -23,7 +23,7 @@ use librespot_core::cache::Cache;
 use renderer_engine::protocol::{
     AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistRef, Canvas, Command, HistoryQuery,
     LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
-    RadioBrowse, Response, SearchBrowse, SongwriterPlaylist, TrackCredits, TrackWaveform,
+    RadioBrowse, Response, SearchBrowse, SongwriterPlaylist, TrackCredits, TrackRef, TrackWaveform,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -51,6 +51,10 @@ enum BrowseOutcome {
     PlaylistRecommendations {
         request_id: String,
         result: Result<PlaylistRecommendations, String>,
+    },
+    Track {
+        request_id: String,
+        result: Result<TrackRef, String>,
     },
     Album {
         request_id: String,
@@ -435,6 +439,20 @@ async fn run(
                                     }
                                 }
                             }
+                            Command::BrowseTrack { id } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::track_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::Track { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Track { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
                             Command::BrowseAlbum { id } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -669,12 +687,12 @@ async fn run(
                                     }
                                 }
                             }
-                            Command::EditRemovePlaylistTracks { id, uris } => {
+                            Command::EditRemovePlaylistTracks { id, uris, expected_snapshot_id } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
                                         let sender = browse_sender.clone();
                                         tokio::spawn(async move {
-                                            let result = edits::remove_tracks(&session, &id, &uris).await;
+                                            let result = edits::remove_tracks(&session, &id, &uris, expected_snapshot_id.as_deref()).await;
                                             let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_remove_playlist_tracks", result });
                                         });
                                     }
@@ -769,6 +787,9 @@ async fn run(
                                 &result,
                             )?;
                         }
+                        BrowseOutcome::Track { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_track", &result)?;
+                        }
                         BrowseOutcome::Album { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_album", &result)?;
                         }
@@ -829,6 +850,12 @@ async fn run(
                 // Catches a session librespot invalidated on its own, which is
                 // otherwise invisible until a track refuses to load.
                 if engine.tick_session_health(&auth_sender) {
+                    engine.emit_state()?;
+                }
+                // Arms the next-track preload once the current track nears its
+                // end, ends a failure run once audio is out again, and fires
+                // the one retry a failed row is owed.
+                if engine.tick_playback_health() {
                     engine.emit_state()?;
                 }
                 // A track finishes caching mid-listen, so the download mark has

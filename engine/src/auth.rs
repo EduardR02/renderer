@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::sync::{Arc, LazyLock, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
 use librespot_core::Session;
@@ -70,6 +70,21 @@ const OAUTH_FAILED_ACCENT: &str = "#eb6f92";
 /// still working through that costs them the whole attempt; waiting an extra
 /// quarter of an hour for one that really was abandoned costs a held port.
 const OAUTH_LISTENER_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// How long one connection to the callback port may hold the flow open without
+/// sending a request line.
+///
+/// [`OAUTH_LISTENER_TIMEOUT`] bounds how long the *redirect* is waited for;
+/// this bounds a single socket that has already connected. They are different
+/// waits and only one of them used to exist. An accepted socket that never
+/// writes blocks the request-line read, and that read had no clock at all, so
+/// one silent connection — a browser holding a speculative socket, a scanner —
+/// kept the flow (and the port) for as long as the socket lived, while the
+/// engine sat in `Authenticating` believing the deadline still protected it.
+///
+/// A real redirect sends its request line with the connection: the browser has
+/// the URL and opens the socket to use it. Ten seconds is far past that and
+/// far short of a wait anyone notices.
+const OAUTH_CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct PlaybackHandles {
@@ -201,12 +216,12 @@ pub async fn connect_cached(
 #[derive(Debug)]
 pub struct OauthListener {
     listener: TcpListener,
-    address: SocketAddr,
 }
 
 impl OauthListener {
+    #[cfg(test)]
     pub fn address(&self) -> SocketAddr {
-        self.address
+        self.listener.local_addr().expect("bound OAuth listener has an address")
     }
 }
 
@@ -234,7 +249,7 @@ pub fn bind_oauth_listener() -> Result<OauthListener, String> {
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("could not configure the OAuth callback listener: {error}"))?;
-    Ok(OauthListener { listener, address })
+    Ok(OauthListener { listener })
 }
 
 /// Runs the OAuth flow for a prepared attempt on an already-bound listener:
@@ -334,53 +349,113 @@ fn oauth_failed_response() -> String {
 /// and deserves a page rather than a tab that hangs until the browser gives up
 /// on a connection nobody ever wrote to.
 fn wait_for_oauth_code(listener: OauthListener) -> Result<AuthorizationCode, String> {
-    let deadline = Instant::now() + OAUTH_LISTENER_TIMEOUT;
-    let (mut stream, _) = loop {
-        match listener.listener.accept() {
-            Ok(accepted) => break accepted,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+    wait_for_oauth_code_within(
+        listener,
+        OAUTH_LISTENER_TIMEOUT,
+        OAUTH_CALLBACK_READ_TIMEOUT,
+    )
+}
+
+/// [`wait_for_oauth_code`] with both of its clocks named, so the behaviour
+/// that depends on them — a socket that says nothing, a connection that is
+/// not the callback, the deadline itself — is reachable from a test without
+/// waiting out the production durations.
+///
+/// A connection arriving is not the callback arriving. `accept` hands over
+/// whatever connected to the port: a browser's speculative socket, a scanner,
+/// on Windows an aborted pending connection that surfaces as an error rather
+/// than as a stream. None of those is the redirect, and none of them may end
+/// the sign-in — the wait therefore continues until a request line actually
+/// names the redirect path, and the deadline is what ends it either way. The
+/// read is bounded separately: without [`OAUTH_CALLBACK_READ_TIMEOUT`] one
+/// socket that connects and never writes blocks this blocking task forever,
+/// holding the port and leaving the engine in `Authenticating` past the
+/// deadline below, which only ever bounded `accept`.
+fn wait_for_oauth_code_within(
+    listener: OauthListener,
+    total: Duration,
+    read_timeout: Duration,
+) -> Result<AuthorizationCode, String> {
+    let deadline = Instant::now() + total;
+    loop {
+        if Instant::now() >= deadline {
+            return Err("Spotify login timed out; click Log in to start again".to_owned());
+        }
+        let mut stream = match listener.listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
                 if Instant::now() >= deadline {
                     return Err("Spotify login timed out; click Log in to start again".to_owned());
                 }
                 std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
             Err(error) => return Err(format!("Spotify OAuth callback failed: {error}")),
+        };
+
+        stream
+            .set_read_timeout(Some(read_timeout.min(deadline.saturating_duration_since(Instant::now())).max(Duration::from_millis(1))))
+            .map_err(|error| {
+                format!("could not configure the Spotify OAuth callback socket: {error}")
+            })?;
+        stream.set_write_timeout(Some(read_timeout))
+            .map_err(|error| format!("could not configure the Spotify OAuth callback socket: {error}"))?;
+        let mut request_line = String::new();
+        match BufReader::new(&stream).read_line(&mut request_line) {
+            // Connected and said nothing, went quiet mid-line, or sent bytes
+            // that are not a request line at all. The socket is closed by
+            // dropping it and the wait goes on: none of those is the redirect
+            // arriving, and the deadline — not any one connection — is what
+            // ends the wait.
+            Ok(0) => continue,
+            Err(_) => continue,
+            Ok(_) => {}
         }
-    };
 
-    let mut reader = BufReader::new(&stream);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|error| format!("could not read the Spotify OAuth callback: {error}"))?;
-    let outcome = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "the Spotify OAuth callback carried no request path".to_owned())
-        .and_then(extract_oauth_code);
+        let Some(path) = request_line.split_whitespace().nth(1) else {
+            continue;
+        };
+        if path.split(['?', '#']).next() != Some(oauth_callback_path()) {
+            // Not the redirect: the port answers to a fixed address, so
+            // anything on the machine can knock, and a browser asks for
+            // things on its own (a favicon, a preconnect). Answering one of
+            // those would end an attempt that has not happened yet.
+            continue;
+        }
+        let outcome = extract_oauth_code(path);
 
-    let response = if outcome.is_ok() {
-        oauth_success_response()
-    } else {
-        oauth_failed_response()
-    };
-    // A browser that hung up before reading the page cannot take the login
-    // back: the code in hand is still redeemable, and discarding it over a
-    // dead socket would fail an attempt that actually succeeded. The write is
-    // reported only when there is no code to lose.
-    if let Err(error) = stream
-        .write_all(response.as_bytes())
-        .and_then(|()| stream.flush())
-    {
-        if outcome.is_ok() {
-            eprintln!("could not answer the Spotify OAuth callback tab: {error}");
+        let response = if outcome.is_ok() {
+            oauth_success_response()
         } else {
-            return Err(format!(
-                "could not answer the Spotify OAuth callback: {error}"
-            ));
+            oauth_failed_response()
+        };
+        // A browser that hung up before reading the page cannot take the login
+        // back: the code in hand is still redeemable, and discarding it over a
+        // dead socket would fail an attempt that actually succeeded. The write
+        // is reported only when there is no code to lose.
+        if let Err(error) = stream
+            .write_all(response.as_bytes())
+            .and_then(|()| stream.flush())
+        {
+            if outcome.is_ok() {
+                eprintln!("could not answer the Spotify OAuth callback tab: {error}");
+            } else {
+                return Err(format!(
+                    "could not answer the Spotify OAuth callback: {error}"
+                ));
+            }
         }
+        return outcome;
     }
-    outcome
 }
 
 /// Reads the authorization code out of the redirect path, or says what came
@@ -425,6 +500,22 @@ fn oauth_listener_addr() -> Result<SocketAddr, String> {
         .ok()
         .and_then(|mut addresses| addresses.pop())
         .ok_or_else(|| format!("OAuth redirect URI has no listenable socket: {OAUTH_REDIRECT_URI}"))
+}
+
+/// The path part of `OAUTH_REDIRECT_URI`: what a request line has to name to
+/// be the redirect rather than something else that reached the port.
+///
+/// Derived from the redirect URI rather than written out again, because the
+/// two have to agree and only one of them is registered with Spotify. Parsed
+/// once; the fallback keeps this total without a panic path on a literal this
+/// crate owns and the test below pins.
+fn oauth_callback_path() -> &'static str {
+    static PATH: LazyLock<String> = LazyLock::new(|| {
+        Url::parse(OAUTH_REDIRECT_URI)
+            .map(|url| url.path().to_owned())
+            .unwrap_or_else(|_| "/login".to_owned())
+    });
+    PATH.as_str()
 }
 
 fn basic_client() -> Result<
@@ -578,12 +669,14 @@ fn volume_to_percent(volume: u16) -> u8 {
 mod tests {
     use super::{
         OAUTH_LISTENER_TIMEOUT, OAUTH_REDIRECT_URI, bind_oauth_listener, extract_oauth_code,
-        lock_oauth_port, mixer_config, oauth_failed_response, oauth_listener_addr,
-        oauth_success_response, player_config, prepare_oauth,
+        lock_oauth_port, mixer_config, oauth_callback_path, oauth_failed_response,
+        oauth_listener_addr, oauth_success_response, player_config, prepare_oauth,
+        wait_for_oauth_code_within,
     };
     use librespot_playback::config::VolumeCtrl;
     use librespot_playback::mixer::Mixer;
     use librespot_playback::mixer::softmixer::SoftMixer;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
 
@@ -677,6 +770,10 @@ mod tests {
         let address = oauth_listener_addr().expect("redirect URI has a socket");
         assert_eq!(address.to_string(), "127.0.0.1:5588");
         assert!(OAUTH_REDIRECT_URI.contains("127.0.0.1:5588"));
+        // The flow recognises the redirect by this path, and the redirect is
+        // the address registered against the client id: a mismatch would make
+        // the sign-in arrive as a connection that is not the callback.
+        assert_eq!(oauth_callback_path(), "/login");
     }
 
     #[test]
@@ -737,6 +834,56 @@ mod tests {
         assert_eq!(listener.address().to_string(), "127.0.0.1:5588");
         TcpStream::connect("127.0.0.1:5588")
             .expect("the browser's redirect would connect at this instant");
+    }
+
+    /// A connection is not a callback. The port answers to a fixed address, so
+    /// whatever is on the machine can knock, and `accept` hands it over all the
+    /// same: a socket that says nothing, something asking for a path that is
+    /// not the redirect, a connection that vanishes before it can be read.
+    /// Each of those used to end the sign-in — the first two as a fatal read
+    /// error, the third by consuming the one callback the flow reads — and a
+    /// socket that never wrote could hold the flow (and the port) open behind
+    /// a deadline that only ever bounded `accept`. The wait has to keep its
+    /// patience for exactly one thing: the request line naming the redirect.
+    #[test]
+    fn a_connection_that_is_not_the_callback_does_not_end_the_sign_in() {
+        let _serialized = lock_oauth_port();
+        let listener = bind_oauth_listener().expect("the callback port is free");
+        let flow = std::thread::spawn(move || {
+            // Short clocks, same behaviour: the redirect still has to be found
+            // behind two connections that are not it.
+            wait_for_oauth_code_within(
+                listener,
+                Duration::from_secs(10),
+                Duration::from_millis(150),
+            )
+        });
+
+        // First a socket that connects and says nothing at all.
+        let silent = TcpStream::connect("127.0.0.1:5588").expect("connect");
+        // Then one asking for something the callback port never serves.
+        let mut stray = TcpStream::connect("127.0.0.1:5588").expect("connect");
+        let _ = stray.write_all(b"GET /favicon.ico HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n");
+
+        let mut callback = TcpStream::connect("127.0.0.1:5588").expect("connect");
+        callback
+            .write_all(b"GET /login?code=abc123&state=xyz HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+            .expect("write the redirect");
+        let mut response = String::new();
+        callback
+            .read_to_string(&mut response)
+            .expect("the callback tab is answered");
+
+        let code = flow
+            .join()
+            .expect("the flow thread finishes")
+            .expect("the redirect still carries its code");
+        assert_eq!(code.secret(), "abc123");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "the tab must be answered with the success page: {response}"
+        );
+        drop(silent);
     }
 
     #[test]

@@ -10,11 +10,22 @@ const SEARCH_INTERVAL_MS: i64 = 30;
 /// block; re-picking it repeats audio and reads as buzz. Heuristic constant
 /// from Chromium.
 const EXCLUDE_HALF_FRAMES: i64 = 80;
-/// Candidate positions and correlation samples are both decimated during the
-/// broad search. The winning neighbourhood is then evaluated at full
-/// resolution, reducing the normal search from roughly 2.3 million stereo
-/// multiply-accumulates to under 170,000 without quantising the final offset.
-const SEARCH_DECIMATION: usize = 4;
+/// Chromium's `kSearchDecimation`. The broad pass evaluates every fifth
+/// *candidate position* at full correlation resolution, interpolates the peak,
+/// and then sweeps ±`SEARCH_DECIMATION` around it exhaustively. Chromium's own
+/// note on the value: it is "a compromise between complexity reduction and
+/// search accuracy", with no proof of optimality, and larger factors made "the
+/// rate of missing the optimal index ... significant".
+///
+/// Only candidate *positions* are decimated. The correlation itself is never
+/// subsampled: an earlier revision of this port also stepped over samples
+/// inside the similarity measure, which aliases the similarity curve and can
+/// hand back an offset that is not the true peak. See `Search::similarity`.
+const SEARCH_DECIMATION: usize = 5;
+/// Chromium's `kEpsilon` in `MultiChannelSimilarityMeasure`. It sits *inside*
+/// the square root, so a silent block normalises by 1e-6 rather than by the
+/// clamped 1e-12 an outside-the-root guard would give.
+const SIMILARITY_EPSILON: f32 = 1.0e-12;
 
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
@@ -202,19 +213,30 @@ fn frames_for_ms(ms: i64) -> usize {
 /// from the rolling input buffer, zero-filling anything before the start of
 /// the stream. Free function so callers can mutably borrow other `Wsola`
 /// scratch buffers without borrow-splitting fights.
+///
+/// This is Chromium's `PeekAudioWithZeroPrepend`: a block that *straddles* the
+/// stream start keeps its real tail and only its leading frames are zeroed. An
+/// earlier revision returned an all-zero block for any straddling read, which
+/// disagreed with the similarity measure — that one did prepend only the
+/// missing frames — so the block that won the search was not the block that
+/// got overlap-added.
 fn extract(input: &[f32], input_start: usize, abs_start: i64, frames: usize, dest: &mut Vec<f32>) {
     dest.clear();
     dest.resize(frames * CHANNELS, 0.0);
     let rel = abs_start - input_start as i64;
-    if rel < 0 {
-        return; // Entirely before the stream: zeros.
+    let (prepend, start) = if rel < 0 {
+        (((-rel) as usize).min(frames), 0)
+    } else {
+        (0, rel as usize)
+    };
+    let total = input.len() / CHANNELS;
+    if start >= total {
+        return;
     }
-    let start = rel as usize;
-    let available = input.len() / CHANNELS - start;
-    let copy = frames.min(available);
+    let copy = (frames - prepend).min(total - start);
     if copy > 0 {
-        dest[..copy * CHANNELS]
-            .copy_from_slice(&input[start * CHANNELS..start * CHANNELS + copy * CHANNELS]);
+        dest[prepend * CHANNELS..(prepend + copy) * CHANNELS]
+            .copy_from_slice(&input[start * CHANNELS..(start + copy) * CHANNELS]);
     }
 }
 
@@ -228,9 +250,11 @@ fn frame_to_ms(frame: u64) -> u32 {
 /// 3-Clause, Copyright The Chromium Authors). Same structure: a 20 ms OLA
 /// window at half-overlap with a periodic-Hann crossfade, a 30 ms search
 /// region for the block that best continues the output, an exclusion band
-/// around the previously chosen block (re-picking it buzzes), a decimated
-/// correlation search, and a target-to-optimal transition blend so the
-/// natural continuation always leads. Adapted to a push-based packet stream;
+/// around the previously chosen block (re-picking it buzzes), a
+/// position-decimated search over full-resolution correlations against
+/// precomputed moving block energies, and a target-to-optimal transition blend
+/// so the natural continuation always leads. Adapted to a push-based packet
+/// stream;
 /// both channels share one search and one set of weights, so phase cannot
 /// drift between them. The exact 1.0 transport path never constructs this
 /// type.
@@ -270,10 +294,36 @@ pub struct Wsola {
     target_buf: Vec<f32>,
     opt_buf: Vec<f32>,
     work_buf: Vec<f32>,
-    /// Scalar candidate/target sample pairs evaluated. Kept as a cheap integer
-    /// so tests can pin the work reduction instead of timing noisy CI hosts.
-    search_comparisons: usize,
+    /// The search region, materialised contiguously once per search so the
+    /// correlation inner loop is a straight walk over two slices and the
+    /// candidate energies can roll across it. Chromium's `search_block_`.
+    search_buf: Vec<f32>,
+    /// Energy of every candidate block in `search_buf`, interleaved as
+    /// `[candidate][channel]`. Chromium's `energy_candidate_blocks`.
+    candidate_energy: Vec<f32>,
+    /// Scalar multiply-accumulates performed inside the search. Kept as a
+    /// cheap integer so tests can bound the work instead of timing noisy CI
+    /// hosts.
+    search_macs: usize,
     search_count: usize,
+    /// What every search chose, next to what an exhaustive full-resolution
+    /// sweep of the same region would have chosen. The coarse pass is a
+    /// heuristic, so this is the only way a test can pin how close to the true
+    /// optimum it stays.
+    #[cfg(test)]
+    search_audit: Vec<SearchAudit>,
+}
+
+/// One search's outcome measured against an exhaustive reference. Both
+/// similarities are full-resolution, so they are directly comparable even when
+/// the two passes land on different offsets.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct SearchAudit {
+    chosen: usize,
+    exhaustive: usize,
+    chosen_similarity: f32,
+    best_similarity: f32,
 }
 
 impl Wsola {
@@ -322,8 +372,12 @@ impl Wsola {
             target_buf: vec![0.0; window * CHANNELS],
             opt_buf: vec![0.0; window * CHANNELS],
             work_buf: vec![0.0; window * CHANNELS],
-            search_comparisons: 0,
+            search_buf: vec![0.0; (num_candidates + window - 1) * CHANNELS],
+            candidate_energy: vec![0.0; num_candidates * CHANNELS],
+            search_macs: 0,
             search_count: 0,
+            #[cfg(test)]
+            search_audit: Vec::new(),
         }
     }
 
@@ -337,8 +391,10 @@ impl Wsola {
         self.search_idx = -self.center_offset;
         self.staged.clear();
         self.staged_complete = 0;
-        self.search_comparisons = 0;
+        self.search_macs = 0;
         self.search_count = 0;
+        #[cfg(test)]
+        self.search_audit.clear();
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
@@ -377,14 +433,14 @@ impl Wsola {
         self.staged_complete = 0;
     }
 
+    /// Chromium's `CanPerformWsola`: both blocks must end inside the buffered
+    /// input. Neither index has to be non-negative — a block that reaches
+    /// before the start of the stream is zero-prepended by `extract`.
     fn can_perform(&self) -> bool {
         let avail = self.input.len() / CHANNELS;
         let origin = self.input_start as i64;
-        let rel_target = self.target_idx - origin;
-        let rel_search = self.search_idx - origin;
-        rel_target >= 0
-            && rel_target + self.window as i64 <= avail as i64
-            && rel_search + self.search_size() as i64 <= avail as i64
+        self.target_idx - origin + self.window as i64 <= avail as i64
+            && self.search_idx - origin + self.search_size() as i64 <= avail as i64
     }
 
     fn search_size(&self) -> usize {
@@ -415,9 +471,10 @@ impl Wsola {
             // it again repeats audio and reads as buzz. Heuristic constant
             // from Chromium.
             let exclude_center = self.target_idx - hop as i64 - self.search_idx;
-            let exclude_low = exclude_center - EXCLUDE_HALF_FRAMES;
-            let exclude_high = exclude_center + EXCLUDE_HALF_FRAMES;
-            let best = self.find_optimal_candidate(exclude_low, exclude_high);
+            let best = self.find_optimal_candidate((
+                exclude_center - EXCLUDE_HALF_FRAMES,
+                exclude_center + EXCLUDE_HALF_FRAMES,
+            ));
             let optimal_abs = self.search_idx + best as i64;
             extract(
                 &self.input,
@@ -497,126 +554,301 @@ impl Wsola {
         );
     }
 
-    fn find_optimal_candidate(&mut self, exclude_low: i64, exclude_high: i64) -> usize {
+    /// Chromium's `internal::OptimalIndex`: precompute the energies both
+    /// passes normalise by, take a position-decimated pass with quadratic peak
+    /// interpolation, then sweep ±`SEARCH_DECIMATION` around the winner at
+    /// full resolution.
+    fn find_optimal_candidate(&mut self, exclude: (i64, i64)) -> usize {
         self.search_count += 1;
-        let mut best = None;
-        let mut best_similarity = f32::NEG_INFINITY;
-        let last = self.num_candidates - 1;
-        let mut candidate = 0;
-        while candidate < self.num_candidates {
-            self.consider_candidate(
-                candidate,
-                SEARCH_DECIMATION,
-                exclude_low,
-                exclude_high,
-                &mut best,
-                &mut best_similarity,
-            );
-            candidate += SEARCH_DECIMATION;
-        }
-        if last % SEARCH_DECIMATION != 0 {
-            self.consider_candidate(
-                last,
-                SEARCH_DECIMATION,
-                exclude_low,
-                exclude_high,
-                &mut best,
-                &mut best_similarity,
-            );
-        }
 
-        let coarse = best.unwrap_or(0);
-        let low = coarse.saturating_sub(SEARCH_DECIMATION - 1);
-        let high = (coarse + SEARCH_DECIMATION - 1).min(last);
-        best = None;
-        best_similarity = f32::NEG_INFINITY;
-        for candidate in low..=high {
-            self.consider_candidate(
-                candidate,
-                1,
-                exclude_low,
-                exclude_high,
-                &mut best,
-                &mut best_similarity,
-            );
-        }
-        best.unwrap_or(coarse)
-    }
-
-    fn consider_candidate(
-        &mut self,
-        candidate: usize,
-        sample_step: usize,
-        exclude_low: i64,
-        exclude_high: i64,
-        best: &mut Option<usize>,
-        best_similarity: &mut f32,
-    ) {
-        let candidate_i = candidate as i64;
-        if candidate_i >= exclude_low && candidate_i <= exclude_high {
-            return;
-        }
-        let (similarity, comparisons) = similarity(
+        // Materialise the search region once. Chromium fills `search_block_`
+        // the same way, and having it contiguous is what makes both the
+        // rolling energies and the correlation inner loop cheap.
+        extract(
             &self.input,
             self.input_start,
             self.search_idx,
-            candidate_i,
-            self.window,
-            &self.target_buf,
-            sample_step,
+            self.search_size(),
+            &mut self.search_buf,
         );
-        self.search_comparisons += comparisons;
-        if similarity > *best_similarity {
-            *best_similarity = similarity;
-            *best = Some(candidate);
+
+        let mut macs = 0usize;
+        let mut energy_target = [0.0f32; CHANNELS];
+        for frame in 0..self.window {
+            for (channel, energy) in energy_target.iter_mut().enumerate() {
+                let sample = self.target_buf[frame * CHANNELS + channel];
+                *energy += sample * sample;
+            }
         }
+        macs += self.window * CHANNELS;
+        moving_block_energies(
+            &self.search_buf,
+            self.window,
+            self.num_candidates,
+            &mut self.candidate_energy,
+            &mut macs,
+        );
+
+        let search = Search {
+            target: &self.target_buf,
+            region: &self.search_buf,
+            energy_target,
+            energy_candidates: &self.candidate_energy,
+            block_frames: self.window,
+            num_candidates: self.num_candidates,
+        };
+        let coarse = decimated_search(&search, exclude, &mut macs);
+        let low = coarse.saturating_sub(SEARCH_DECIMATION);
+        let high = (coarse + SEARCH_DECIMATION).min(search.num_candidates - 1);
+        // Chromium falls back to candidate 0 when every candidate in the sweep
+        // is excluded; the coarse winner is already known to be a good match,
+        // so prefer it over an arbitrary index.
+        let refined = full_search(&search, low, high, exclude, &mut macs);
+        let chosen = refined.map_or(coarse, |(candidate, _)| candidate);
+
+        #[cfg(test)]
+        {
+            let mut ignored = 0;
+            let last = search.num_candidates - 1;
+            let exhaustive = full_search(&search, 0, last, exclude, &mut ignored);
+            self.search_audit.push(SearchAudit {
+                chosen,
+                exhaustive: exhaustive.map_or(chosen, |(candidate, _)| candidate),
+                chosen_similarity: refined
+                    .map_or_else(|| search.similarity(chosen, &mut ignored), |(_, s)| s),
+                best_similarity: exhaustive.map_or(f32::NEG_INFINITY, |(_, s)| s),
+            });
+        }
+
+        self.search_macs += macs;
+        chosen
     }
 
     #[cfg(test)]
-    fn search_comparisons(&self) -> usize {
-        self.search_comparisons
+    fn search_macs(&self) -> usize {
+        self.search_macs
     }
 }
 
-/// Per-channel normalized cross-similarity between the target block and a
-/// candidate. `sample_step` decimates only the broad measurement; refinement
-/// always calls this with one.
-fn similarity(
-    input: &[f32],
-    input_start: usize,
-    search_abs: i64,
-    candidate: i64,
-    window: usize,
-    target: &[f32],
-    sample_step: usize,
-) -> (f32, usize) {
-    let origin = input_start as i64;
-    let first = search_abs + candidate;
-    let zero_frames = ((origin - first).clamp(0, window as i64)) as usize;
-    let first_sample = zero_frames.div_ceil(sample_step) * sample_step;
-    let mut sum = 0.0f32;
-    let mut comparisons = 0;
+/// Chromium's `internal::MultiChannelMovingBlockEnergies`: the energy of every
+/// candidate block in one rolling pass — the first block by direct summation,
+/// each later one by sliding a sample out and a sample in.
+///
+/// This is the piece the original port dropped, and dropping it is what made
+/// the search look expensive: recomputing both energies per candidate turns a
+/// single dot product into three, so the per-candidate cost tripled. A later
+/// revision then bought that back by subsampling the correlation, trading
+/// accuracy for speed that this function recovers for free — the whole sweep
+/// costs O(region) instead of O(block) per candidate.
+///
+/// The running sum is carried in `f64` where Chromium carries it in `f32`.
+/// Sliding a squared sample in and out ~1300 times accumulates rounding drift
+/// that ends up scaling the similarity of later candidates against that of
+/// earlier ones; the wider accumulator removes it for one extra add per slide.
+fn moving_block_energies(
+    region: &[f32],
+    block_frames: usize,
+    num_blocks: usize,
+    energy: &mut [f32],
+    macs: &mut usize,
+) {
+    debug_assert_eq!(energy.len(), num_blocks * CHANNELS);
     for channel in 0..CHANNELS {
-        let mut dot = 0.0f32;
-        let mut energy_target = 0.0f32;
-        let mut energy_candidate = 0.0f32;
-        for n in (0..zero_frames).step_by(sample_step) {
-            let t = target[n * CHANNELS + channel];
-            energy_target += t * t;
-            comparisons += 1;
+        let mut sum = 0.0f64;
+        for frame in 0..block_frames {
+            let sample = f64::from(region[frame * CHANNELS + channel]);
+            sum += sample * sample;
         }
-        for n in (first_sample..window).step_by(sample_step) {
-            let t = target[n * CHANNELS + channel];
-            let index = ((first - origin + n as i64) as usize) * CHANNELS + channel;
-            let c = input[index];
-            dot += t * c;
-            energy_target += t * t;
-            energy_candidate += c * c;
-            comparisons += 1;
+        energy[channel] = sum.max(0.0) as f32;
+        for block in 1..num_blocks {
+            let leaving = f64::from(region[(block - 1) * CHANNELS + channel]);
+            let entering = f64::from(region[(block - 1 + block_frames) * CHANNELS + channel]);
+            sum = sum - leaving * leaving + entering * entering;
+            energy[block * CHANNELS + channel] = sum.max(0.0) as f32;
         }
-        sum += dot / (energy_target * energy_candidate).sqrt().max(1.0e-12);
     }
-    (sum, comparisons)
+    *macs += (block_frames + 2 * num_blocks.saturating_sub(1)) * CHANNELS;
+}
+
+/// One WSOLA search: the target block, the materialised search region, and the
+/// precomputed energies that normalise every candidate.
+struct Search<'a> {
+    target: &'a [f32],
+    region: &'a [f32],
+    energy_target: [f32; CHANNELS],
+    energy_candidates: &'a [f32],
+    block_frames: usize,
+    num_candidates: usize,
+}
+
+impl Search<'_> {
+    /// Chromium's `MultiChannelDotProduct` followed by
+    /// `MultiChannelSimilarityMeasure`: a full-resolution dot product per
+    /// channel, normalised by the precomputed energies.
+    ///
+    /// Every sample of the block is correlated, on the coarse pass as much as
+    /// on the refinement pass. Stepping over samples here would decimate the
+    /// correlation in the *lag* dimension, which aliases the similarity curve:
+    /// for periodic material the aliased peak can sit a full period away from
+    /// the true one, and the block that gets overlap-added then does not
+    /// actually continue the output. Chromium never does this, and with the
+    /// energies precomputed there is nothing to gain from it.
+    fn similarity(&self, candidate: usize, macs: &mut usize) -> f32 {
+        let samples = self.block_frames * CHANNELS;
+        let base = candidate * CHANNELS;
+        let target = &self.target[..samples];
+        let region = &self.region[base..base + samples];
+
+        // Accumulate `LANES` interleaved samples at a time. `LANES` is a
+        // multiple of `CHANNELS`, so every lane only ever sees one channel and
+        // folding the lanes down at the end recovers a per-channel dot
+        // product. The shape matters: a frame-at-a-time loop over an
+        // interleaved buffer does not vectorise, and this correlation is the
+        // whole cost of the search. Chromium hand-writes SSE and AVX2 kernels
+        // (`MultiChannelDotProduct_SSE`/`_AVX2`) for precisely this loop, and
+        // its lane-wise accumulation reassociates the sum exactly the way this
+        // does — so this is closer to what Chromium actually computes than a
+        // strictly sequential sum would be.
+        const LANES: usize = 8;
+        const _: () = assert!(LANES % CHANNELS == 0);
+        let mut lanes = [0.0f32; LANES];
+        let target_chunks = target.chunks_exact(LANES);
+        let region_chunks = region.chunks_exact(LANES);
+        let target_tail = target_chunks.remainder();
+        let region_tail = region_chunks.remainder();
+        for (target, region) in target_chunks.zip(region_chunks) {
+            for (lane, (target, region)) in lanes.iter_mut().zip(target.iter().zip(region)) {
+                *lane += target * region;
+            }
+        }
+        let mut dot = [0.0f32; CHANNELS];
+        for (lane, value) in lanes.iter().enumerate() {
+            dot[lane % CHANNELS] += value;
+        }
+        for (index, (target, region)) in target_tail.iter().zip(region_tail).enumerate() {
+            dot[index % CHANNELS] += target * region;
+        }
+        *macs += samples;
+
+        let energies = &self.energy_candidates[base..base + CHANNELS];
+        let mut measure = 0.0f32;
+        for channel in 0..CHANNELS {
+            let product = self.energy_target[channel] * energies[channel];
+            measure += dot[channel] / (product + SIMILARITY_EPSILON).sqrt();
+        }
+        measure
+    }
+}
+
+fn in_interval(candidate: i64, exclude: (i64, i64)) -> bool {
+    candidate >= exclude.0 && candidate <= exclude.1
+}
+
+/// Chromium's `internal::QuadraticInterpolation`. Fits `a x^2 + b x + c` to
+/// `f(-1), f(0), f(1)` and returns `(extremum, value)`.
+fn quadratic_interpolation(y: [f32; 3]) -> (f32, f32) {
+    let a = 0.5 * (y[2] + y[0]) - y[1];
+    let b = 0.5 * (y[2] - y[0]);
+    let c = y[1];
+    if a == 0.0 {
+        // Colinear within floating-point error: the middle point is the peak.
+        (0.0, y[1])
+    } else {
+        let extremum = -b / (2.0 * a);
+        (extremum, a * extremum * extremum + b * extremum + c)
+    }
+}
+
+/// Chromium's `internal::DecimatedSearch`: sample the similarity curve every
+/// `SEARCH_DECIMATION` candidates and return the best interpolated *local
+/// maximum*, not merely the best sampled point. Quadratic interpolation across
+/// the three-point neighbourhood recovers a sub-decimation estimate of where
+/// the peak actually sits, which is what lets the following full-resolution
+/// sweep be only ±`SEARCH_DECIMATION` wide.
+fn decimated_search(search: &Search<'_>, exclude: (i64, i64), macs: &mut usize) -> usize {
+    let last = search.num_candidates - 1;
+    let mut similarity = [0.0f32; 3];
+    similarity[0] = search.similarity(0, macs);
+    let mut best_similarity = similarity[0];
+    let mut optimal = 0usize;
+
+    let mut n = SEARCH_DECIMATION;
+    if n >= search.num_candidates {
+        return 0;
+    }
+    similarity[1] = search.similarity(n, macs);
+
+    n += SEARCH_DECIMATION;
+    if n >= search.num_candidates {
+        // Nothing left to sample: pick the better of the two we have.
+        return if similarity[1] > similarity[0] {
+            SEARCH_DECIMATION
+        } else {
+            0
+        };
+    }
+
+    while n < search.num_candidates {
+        similarity[2] = search.similarity(n, macs);
+
+        if (similarity[1] > similarity[0] && similarity[1] >= similarity[2])
+            || (similarity[1] >= similarity[0] && similarity[1] > similarity[2])
+        {
+            let (offset, value) = quadratic_interpolation(similarity);
+            // The local-maximum test guarantees a <= 0, which bounds `offset`
+            // to ±0.5; the clamp is only a guard against a degenerate fit.
+            let candidate = ((n - SEARCH_DECIMATION) as i64
+                + (offset * SEARCH_DECIMATION as f32 + 0.5) as i64)
+                .clamp(0, last as i64);
+            if value > best_similarity && !in_interval(candidate, exclude) {
+                optimal = candidate as usize;
+                best_similarity = value;
+            }
+        } else if n + SEARCH_DECIMATION >= search.num_candidates
+            && similarity[2] > best_similarity
+            && !in_interval(n as i64, exclude)
+        {
+            // End point with no local maximum before it: accept it.
+            optimal = n;
+            best_similarity = similarity[2];
+        }
+
+        similarity[0] = similarity[1];
+        similarity[1] = similarity[2];
+        n += SEARCH_DECIMATION;
+    }
+    optimal
+}
+
+/// Chromium's `internal::FullSearch` over `[low, high]`, at full correlation
+/// resolution. Returns the winning candidate and its similarity, or `None`
+/// when the exclusion band swallows the whole range; Chromium silently returns
+/// candidate 0 there instead.
+///
+/// Chromium seeds its running best with `std::numeric_limits<float>::min()`,
+/// the smallest positive normal rather than the lowest finite value, so a
+/// range whose candidates all correlate *negatively* leaves its answer at
+/// candidate 0 regardless of what the sweep measured. Seeding with negative
+/// infinity instead makes the least-bad candidate win, which is what the
+/// function is documented to return.
+fn full_search(
+    search: &Search<'_>,
+    low: usize,
+    high: usize,
+    exclude: (i64, i64),
+    macs: &mut usize,
+) -> Option<(usize, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    for candidate in low..=high {
+        if in_interval(candidate as i64, exclude) {
+            continue;
+        }
+        let similarity = search.similarity(candidate, macs);
+        if best.is_none_or(|(_, best)| similarity > best) {
+            best = Some((candidate, similarity));
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -1008,21 +1240,267 @@ mod tests {
         }
     }
 
-    #[test]
-    fn coarse_search_materially_reduces_correlation_work() {
-        let input = stereo_tone(SAMPLE_RATE as usize * 2, 440.0, 0.7);
-        let mut stretcher = Wsola::new(2.0);
+    /// Runs the 2x path over `input` and returns the stretcher so the caller
+    /// can inspect what its searches did.
+    fn searched(input: &[f32], speed: f32) -> Wsola {
+        let mut stretcher = Wsola::new(speed);
         let mut output = Vec::new();
-        stretcher.process(&input, &mut output);
+        stretcher.process(input, &mut output);
+        assert!(stretcher.search_count > 0, "speed {speed} must search");
+        stretcher
+    }
 
-        let exhaustive_per_search = stretcher.num_candidates * stretcher.window * CHANNELS;
-        assert!(stretcher.search_count > 0, "the 2x path must search");
-        let average = stretcher.search_comparisons() / stretcher.search_count;
+    /// A harmonic stack: a fundamental plus two partials, the right channel
+    /// scaled and the phase offset per partial. Unlike a single sine this has
+    /// a similarity curve with one clearly dominant peak per period rather
+    /// than a hundred numerically indistinguishable ones, so "did the search
+    /// find the right block" is a well-posed question.
+    fn stereo_harmonics(frames: usize, fundamental: f32, right_scale: f32) -> Vec<f32> {
+        let mut samples = Vec::with_capacity(frames * CHANNELS);
+        for frame in 0..frames {
+            let phase = std::f32::consts::TAU * fundamental * frame as f32 / SAMPLE_RATE as f32;
+            let value = phase.sin() + 0.6 * (2.0 * phase + 0.7).sin() + 0.35 * (3.0 * phase).sin();
+            samples.push(value);
+            samples.push(value * right_scale);
+        }
+        samples
+    }
+
+    /// The quality property, and the one correlation subsampling breaks.
+    ///
+    /// Position decimation samples the *true* similarity curve sparsely, so
+    /// the refinement pass can walk back to the peak; the worst it costs is a
+    /// slightly different offset of equal merit. Subsampling the correlation
+    /// instead corrupts the measured value at every position, so the coarse
+    /// pass hunts in the wrong neighbourhood entirely and refinement cannot
+    /// recover. Comparing offsets alone cannot tell those apart — periodic
+    /// material has many equally good offsets — so compare what actually
+    /// matters: the full-resolution similarity of the block we picked against
+    /// the best any block in the region could have scored.
+    ///
+    /// The measure sums a normalised per-channel correlation over `CHANNELS`,
+    /// so 2.0 is a perfect stereo match and the tolerance below is 0.5% of
+    /// full scale. Measured worst case across these cases is 0.0036.
+    #[test]
+    fn the_search_picks_a_block_as_good_as_an_exhaustive_search_would() {
+        for (fundamental, speed) in [(220.0, 2.0), (147.0, 0.6), (330.0, 1.37)] {
+            let input = stereo_harmonics(SAMPLE_RATE as usize * 2, fundamental, 0.7);
+            let stretcher = searched(&input, speed);
+            let worst = stretcher
+                .search_audit
+                .iter()
+                .max_by(|a, b| {
+                    let gap = |audit: &SearchAudit| audit.best_similarity - audit.chosen_similarity;
+                    gap(a).total_cmp(&gap(b))
+                })
+                .copied()
+                .expect("a search was recorded");
+            let gap = worst.best_similarity - worst.chosen_similarity;
+            assert!(
+                gap < 0.01,
+                "{fundamental} Hz at {speed}x: worst search gave up {gap} of \
+                 similarity versus an exhaustive sweep ({worst:?})"
+            );
+        }
+    }
+
+    /// Matching the exhaustive result is only interesting if we are not simply
+    /// doing the exhaustive search. Chromium's structure costs one dot product
+    /// per sampled position against precomputed energies, so the whole search
+    /// must stay well under the cost of correlating every candidate.
+    #[test]
+    fn the_search_costs_a_fraction_of_an_exhaustive_sweep() {
+        let input = stereo_tone(SAMPLE_RATE as usize * 2, 440.0, 0.7);
+        let stretcher = searched(&input, 2.0);
+
+        let exhaustive = stretcher.num_candidates * stretcher.window * CHANNELS;
+        let average = stretcher.search_macs() / stretcher.search_count;
+        // Positions are decimated by 5 and refined over 11, so the dot
+        // products alone are ~(1/5 + 11/1323) of exhaustive; the rolling
+        // energies add ~1.5% on top. Assert half as a stable ceiling.
         assert!(
-            average * 8 < exhaustive_per_search,
-            "decimation/refinement averaged {average} comparisons versus \
-             {exhaustive_per_search} for exhaustive search"
+            average * 2 < exhaustive,
+            "search averaged {average} multiply-accumulates versus \
+             {exhaustive} for an exhaustive sweep"
         );
+    }
+
+    fn legacy_similarity(
+        region: &[f32],
+        target: &[f32],
+        window: usize,
+        candidate: usize,
+        sample_step: usize,
+    ) -> f32 {
+        let base = candidate * CHANNELS;
+        let mut sum = 0.0f32;
+        for channel in 0..CHANNELS {
+            let mut dot = 0.0f32;
+            let mut energy_target = 0.0f32;
+            let mut energy_candidate = 0.0f32;
+            for n in (0..window).step_by(sample_step) {
+                let t = target[n * CHANNELS + channel];
+                let c = region[base + n * CHANNELS + channel];
+                dot += t * c;
+                energy_target += t * t;
+                energy_candidate += c * c;
+            }
+            sum += dot / (energy_target * energy_candidate).sqrt().max(1.0e-12);
+        }
+        sum
+    }
+
+    fn legacy_search(region: &[f32], target: &[f32], window: usize, num_candidates: usize) -> usize {
+        const D: usize = 4;
+        let last = num_candidates - 1;
+        let mut best = None;
+        let mut best_similarity = f32::NEG_INFINITY;
+        let mut candidate = 0;
+        while candidate < num_candidates {
+            let s = legacy_similarity(region, target, window, candidate, D);
+            if s > best_similarity {
+                best_similarity = s;
+                best = Some(candidate);
+            }
+            candidate += D;
+        }
+        if last % D != 0 {
+            // The winning similarity is deliberately not carried forward: the
+            // refinement below restarts the comparison from scratch, so writing it
+            // here would be a store nothing reads.
+            let s = legacy_similarity(region, target, window, last, D);
+            if s > best_similarity {
+                best = Some(last);
+            }
+        }
+        let coarse = best.unwrap_or(0);
+        let low = coarse.saturating_sub(D - 1);
+        let high = (coarse + D - 1).min(last);
+        best = None;
+        best_similarity = f32::NEG_INFINITY;
+        for candidate in low..=high {
+            let s = legacy_similarity(region, target, window, candidate, 1);
+            if s > best_similarity {
+                best_similarity = s;
+                best = Some(candidate);
+            }
+        }
+        best.unwrap_or(coarse)
+    }
+
+    /// Wall-clock cost of one search against the decimated search this replaced.
+    /// Reports; asserts nothing — a timing number is a property of the machine it
+    /// ran on, and asserting one would fail whenever the laptop was busy. Ignored
+    /// so a routine `cargo test` pays nothing for it.
+    ///
+    ///     cargo test --release -- --ignored --nocapture bench_search_cost
+    #[test]
+    #[ignore = "instrument, not a test: reports timings and asserts nothing"]
+    fn bench_search_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let input = stereo_harmonics(SAMPLE_RATE as usize * 2, 220.0, 0.7);
+        let stretcher = searched(&input, 2.0);
+        let window = stretcher.window;
+        let num_candidates = stretcher.num_candidates;
+        let region = &stretcher.search_buf;
+        let target = &stretcher.target_buf;
+        let exclude = (-1i64, -1i64);
+        let reps = 300;
+
+        let mut energies = vec![0.0f32; num_candidates * CHANNELS];
+        let mut macs = 0usize;
+        // Warm up both.
+        for _ in 0..20 {
+            black_box(legacy_search(region, target, window, num_candidates));
+        }
+
+        let start = Instant::now();
+        for _ in 0..reps {
+            let mut energy_target = [0.0f32; CHANNELS];
+            for frame in 0..window {
+                for (channel, energy) in energy_target.iter_mut().enumerate() {
+                    let s = target[frame * CHANNELS + channel];
+                    *energy += s * s;
+                }
+            }
+            moving_block_energies(region, window, num_candidates, &mut energies, &mut macs);
+            let search = Search {
+                target,
+                region,
+                energy_target,
+                energy_candidates: &energies,
+                block_frames: window,
+                num_candidates,
+            };
+            let coarse = decimated_search(&search, exclude, &mut macs);
+            let low = coarse.saturating_sub(SEARCH_DECIMATION);
+            let high = (coarse + SEARCH_DECIMATION).min(num_candidates - 1);
+            black_box(full_search(&search, low, high, exclude, &mut macs));
+        }
+        let fixed = start.elapsed();
+
+        let start = Instant::now();
+        for _ in 0..reps {
+            black_box(legacy_search(region, target, window, num_candidates));
+        }
+        let legacy = start.elapsed();
+
+        println!(
+            "BENCH per search: chromium={:?} legacy={:?} speedup={:.2}x",
+            fixed / reps,
+            legacy / reps,
+            legacy.as_secs_f64() / fixed.as_secs_f64()
+        );
+    }
+
+    /// How close the search lands to an exhaustive sweep, per waveform and speed.
+    /// The bound this exists to inform is asserted by
+    /// `the_search_picks_a_block_as_good_as_an_exhaustive_search_would`; this
+    /// prints the whole distribution so a regression can be read rather than
+    /// inferred from a single failing bound.
+    ///
+    ///     cargo test --release -- --ignored --nocapture report_search_quality
+    #[test]
+    #[ignore = "instrument, not a test: reports quality and asserts nothing"]
+    fn report_search_quality() {
+        for (fundamental, speed) in [(220.0f32, 2.0f32), (147.0, 0.6), (330.0, 1.37)] {
+            let input = stereo_harmonics(SAMPLE_RATE as usize * 2, fundamental, 0.7);
+            let s = searched(&input, speed);
+            let n = s.search_audit.len();
+            let exact = s
+                .search_audit
+                .iter()
+                .filter(|a| a.chosen == a.exhaustive)
+                .count();
+            let worst = s
+                .search_audit
+                .iter()
+                .map(|a| a.best_similarity - a.chosen_similarity)
+                .fold(0.0f32, f32::max);
+            let avg_macs = s.search_macs() / s.search_count;
+            let exhaustive = s.num_candidates * s.window * CHANNELS;
+            println!(
+                "HARM f={fundamental} speed={speed}: searches={n} exact={exact} worst_gap={worst:.6} avg_macs={avg_macs} exhaustive={exhaustive} ratio={:.4}",
+                avg_macs as f64 / exhaustive as f64
+            );
+        }
+        for (freq, speed) in [(440.0f32, 2.0f32), (147.0, 0.6), (997.0, 1.37)] {
+            let input = stereo_tone(SAMPLE_RATE as usize * 2, freq, 0.7);
+            let s = searched(&input, speed);
+            let n = s.search_audit.len();
+            let exact = s
+                .search_audit
+                .iter()
+                .filter(|a| a.chosen == a.exhaustive)
+                .count();
+            let worst = s
+                .search_audit
+                .iter()
+                .map(|a| a.best_similarity - a.chosen_similarity)
+                .fold(0.0f32, f32::max);
+            println!("TONE f={freq} speed={speed}: searches={n} exact={exact} worst_gap={worst:.6}");
+        }
     }
 
     #[test]

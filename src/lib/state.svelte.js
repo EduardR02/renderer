@@ -6,6 +6,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { normalizeCanonicalPlaylistDescription } from "./artist.js";
+import { parseSpotifyLink } from "./spotify-link.js";
 
 /* ---------------- Navigation ---------------- */
 
@@ -252,6 +253,7 @@ export const playback = $state({
   auth_state: null,
   auth_url: null,
   playing: false,
+  buffering: false,
   username: null,
   position_ms: 0,
   duration_ms: 0,
@@ -272,6 +274,8 @@ let playingRequestGeneration = 0;
 let playingAuthorityGeneration = 0;
 let volumeRequestGeneration = 0;
 let volumeAuthorityGeneration = 0;
+let volumePendingGeneration = null;
+let confirmedVolume = playback.volume;
 
 
 const lazyQueue = $state({ generation: 0, source: null, cursor: null, loading: false, retryAfter: 0 });
@@ -431,7 +435,7 @@ function stopPlayheadTicker() {
 }
 
 function syncPlayheadTicker(playing) {
-  if (playing) startPlayheadTicker();
+  if (playing && !playback.buffering) startPlayheadTicker();
   else stopPlayheadTicker();
 }
 
@@ -451,7 +455,7 @@ export function positionMs() {
   const now = Math.max(playhead.now, performance.now());
   const speed = Number(playback.playback_speed);
   const playbackSpeed = Number.isFinite(speed) && speed > 0 ? speed : 1;
-  const elapsed = playback.playing ? Math.max(0, now - playhead.at) * playbackSpeed : 0;
+  const elapsed = playback.playing && !playback.buffering ? Math.max(0, now - playhead.at) * playbackSpeed : 0;
   const projected = playhead.base_ms + elapsed;
   return playback.duration_ms > 0
     ? Math.min(projected, playback.duration_ms)
@@ -461,10 +465,15 @@ export function positionMs() {
 export function applyPlayback(payload) {
   if (!payload) return;
   if ("playing" in payload) playingAuthorityGeneration += 1;
-  if ("volume" in payload) volumeAuthorityGeneration += 1;
+  if ("volume" in payload) {
+    volumeAuthorityGeneration += 1;
+    confirmedVolume = payload.volume;
+  }
   const loggedOut = observeSearchSession(payload);
-  const wasPlaying = playback.playing;
+  const wasAdvancing = playback.playing && !playback.buffering;
   for (const key of Object.keys(playback)) {
+    // A full state for an older drag position must not undo the live intent.
+    if (key === "volume" && volumePendingGeneration !== null) continue;
     if (key in payload) playback[key] = payload[key];
   }
   if (loggedOut) {
@@ -472,7 +481,7 @@ export function applyPlayback(payload) {
     session.username = null;
   }
   if ("position_ms" in payload) anchorPlayhead(payload.position_ms);
-  if (playback.playing !== wasPlaying) syncPlayheadTicker(playback.playing);
+  if ((playback.playing && !playback.buffering) !== wasAdvancing) syncPlayheadTicker(playback.playing);
   if ("queue" in payload) propagateCachedMarks(payload.queue);
   maybeStartDeferredSearch();
 }
@@ -673,7 +682,7 @@ function resetFollowsForSession() {
   followed.error = "";
 }
 
-export const search = $state({ query: "", results: null, submitted: false, busy: false, error: null });
+export const search = $state({ query: "", results: null, submitted: false, busy: false, error: null, link: null });
 
 /**
  * On-demand track credits surface state. The payload is kept as the backend
@@ -783,6 +792,7 @@ function resetSearchForSession() {
   search.submitted = false;
   search.busy = false;
   search.error = null;
+  search.link = null;
 }
 
 /**
@@ -888,7 +898,15 @@ function runSearch(query, seq, epoch) {
 
   let promise;
   try {
-    promise = api.search(query);
+    const link = parseSpotifyLink(query);
+    promise = link?.kind === "track"
+      ? api.browseTrack(link.id).then((track) => {
+        if (track?.id !== link.id || track.uri !== `spotify:track:${link.id}`) {
+          throw new Error("Spotify couldn't resolve this song. Check the link and try again.");
+        }
+        return { tracks: [track], albums: [], artists: [], playlists: [], top: { ...track, kind: "track" } };
+      })
+      : api.search(query);
   } catch (reason) {
     promise = Promise.reject(reason);
   }
@@ -941,6 +959,7 @@ function maybeStartDeferredSearch() {
 
 function enqueueSearch(query, force = false) {
   const q = String(query ?? "").trim();
+  search.link = parseSpotifyLink(q);
   const current = currentSearch;
 
   // Input events may call this for the same value more than once. A retry for
@@ -998,6 +1017,16 @@ function enqueueSearch(query, force = false) {
 }
 
 export function queueSearch(query) {
+  const link = parseSpotifyLink(query);
+  if (link) {
+    // A paste cancels older text requests but never navigates or starts playback.
+    enqueueSearch("");
+    search.link = link;
+    search.error = link.error ?? null;
+    search.submitted = !!link.error;
+    return;
+  }
+  if (search.link) search.results = null;
   enqueueSearch(query);
 }
 
@@ -1006,6 +1035,15 @@ export function submitSearch(query) {
   const raw = String(query ?? "");
   search.query = raw;
   const q = raw.trim();
+  const link = parseSpotifyLink(q);
+  if (link?.error || (link && link.kind !== "track")) {
+    enqueueSearch("");
+    search.link = link;
+    search.error = link.error ?? null;
+    search.submitted = !!link.error;
+    if (!link.error) navigate(link.kind, link.id);
+    return;
+  }
   if (!q) {
     enqueueSearch("");
     return;
@@ -1015,6 +1053,7 @@ export function submitSearch(query) {
     currentSearch.q !== q ||
     currentSearch.epoch !== searchSessionEpoch
   ) {
+    if (link) search.results = null;
     enqueueSearch(q);
   }
   clearTimeout(searchTimer);
@@ -1032,7 +1071,8 @@ export function submitSearch(query) {
 
 export function retrySearch() {
   const q = search.query.trim();
-  if (q) enqueueSearch(q, true);
+  if (search.link) submitSearch(q);
+  else if (q) enqueueSearch(q, true);
 }
 
 /**
@@ -1636,16 +1676,22 @@ function requestPlaying(target) {
 }
 
 function requestVolume(percent) {
+  if (!Number.isFinite(percent)) return Promise.reject(new Error("Volume must be a number."));
   const target = Math.min(100, Math.max(0, Math.round(percent)));
-  const previous = playback.volume;
   const generation = ++volumeRequestGeneration;
   const authority = volumeAuthorityGeneration;
+  volumePendingGeneration = generation;
   playback.volume = target;
-  return invoke("set_volume", { percent: target }).catch((error) => {
-    if (generation === volumeRequestGeneration && authority === volumeAuthorityGeneration) {
-      playback.volume = previous;
+  return invoke("set_volume", { percent: target }).then(() => {
+    if (generation !== volumeRequestGeneration) return;
+    // A newer engine event wins, including an external volume adjustment.
+    // A successful no-op need not emit state, so retain its confirmed target.
+    if (authority === volumeAuthorityGeneration) confirmedVolume = target;
+  }).finally(() => {
+    if (volumePendingGeneration === generation) {
+      volumePendingGeneration = null;
+      playback.volume = confirmedVolume;
     }
-    throw error;
   });
 }
 
@@ -1677,12 +1723,7 @@ export const api = {
       throw error;
     });
   },
-  setVolume: (percent) => {
-    // Optimistic for the same reason as `seek`: the volume slider is driven by
-    // `playback.volume`, so between releasing the drag and the engine's next
-    // state event it would fall back to the pre-drag value and flick forward.
-    return requestVolume(percent);
-  },
+  setVolume: (percent) => requestVolume(percent),
   setShuffle: (enabled) => invoke("set_shuffle", { enabled: !!enabled }),
   setRepeat: (mode) => invoke("set_repeat", { mode }),
   setPlaybackSpeed: (speed) => {
@@ -1784,6 +1825,7 @@ export const api = {
    * asks for ~30 instead of ~120. Both halves of the win come from this number.
    */
   search: (query, limit = SEARCH_LIMIT) => invoke("search", { query, limit }),
+  browseTrack: (id) => invoke("browse_track", { id }),
   browseArtistCatalogue: (id, releaseTypes = ["albums", "singles"], offset = 0, limit = 4) =>
     invoke("browse_artist_catalogue", { id, releaseTypes, offset, limit }),
   touchPlaylist: (id) => invoke("touch_playlist", { id }),
@@ -1817,7 +1859,8 @@ export const api = {
   renamePlaylist: (id, name) => invoke("rename_playlist", { id, name }),
   deletePlaylist: (id) => invoke("delete_playlist", { id }),
   addPlaylistTracks: (id, uris) => invoke("add_playlist_tracks", { id, uris }),
-  removePlaylistTracks: (id, uris) => invoke("remove_playlist_tracks", { id, uris }),
+  removePlaylistTracks: (id, uris, expectedSnapshotId = null) =>
+    invoke("remove_playlist_tracks", { id, uris, expectedSnapshotId }),
   reorderPlaylistTracks: (id, from, to) =>
     invoke("reorder_playlist_tracks", { id, from, to }),
   status: () => invoke("status"),

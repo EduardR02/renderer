@@ -17,6 +17,7 @@
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
+  import PlaylistCleanup from "../components/PlaylistCleanup.svelte";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { formatTotal } from "../lib/time.js";
   import { detailArtSize } from "../lib/layout.js";
@@ -261,6 +262,13 @@
   let deleteOpen = $state(false);
   let deleting = $state(false);
   let deleteError = $state("");
+  let cleanupId = $state(null);
+
+  $effect(() => {
+    if (cleanupId && (route.name !== "playlist" || route.id !== cleanupId || pl?.id !== cleanupId || !editable)) {
+      cleanupId = null;
+    }
+  });
   let recommendations = $state([]);
   const recommendationAdds = $state({});
   const recommendationState = $state({
@@ -580,6 +588,7 @@
   }
 
   function requestDelete() {
+    cleanupId = null;
     if (!editable) return;
     closeMenu();
     deleteError = "";
@@ -750,6 +759,7 @@
                 onkeydown={onMenuKeyDown}
               >
                 <button class="menu-item" role="menuitem" onclick={startRename}>Rename playlist</button>
+                <button class="menu-item" role="menuitem" disabled={!tracks.length} onclick={() => { closeMenu(); cleanupId = pl.id; }}>Remove songs by rules…</button>
                 <div class="menu-sep" role="separator"></div>
                 <button class="menu-item danger" role="menuitem" onclick={requestDelete}>Delete playlist…</button>
               </div>
@@ -854,4 +864,9 @@
       deleteError = "";
     }}
   />
+{/if}
+{#if cleanupId && cleanupId === pl?.id && route.name === "playlist" && route.id === cleanupId && editable}
+  {#key cleanupId}
+    <PlaylistCleanup playlist={pl} onClose={() => { cleanupId = null; queueMicrotask(() => menuButton?.focus()); }} />
+  {/key}
 {/if}

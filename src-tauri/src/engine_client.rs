@@ -1091,6 +1091,14 @@ impl EngineClient {
         parse_data(reply, "browse_playlist_recommendations")
     }
 
+    pub async fn browse_track(
+        &self,
+        id: &str,
+    ) -> Result<renderer_engine::protocol::TrackRef, String> {
+        let reply = self.request("browse_track", json!({"id": id})).await?;
+        parse_data(reply, "browse_track")
+    }
+
     pub async fn browse_album(
         &self,
         id: &str,
@@ -1300,11 +1308,16 @@ impl EngineClient {
         Ok(())
     }
 
-    pub async fn remove_playlist_tracks(&self, id: &str, uris: &[String]) -> Result<(), String> {
+    pub async fn remove_playlist_tracks(
+        &self,
+        id: &str,
+        uris: &[String],
+        expected_snapshot_id: Option<&str>,
+    ) -> Result<(), String> {
         let _ = self
             .request(
                 "edit_remove_playlist_tracks",
-                json!({"id": id, "uris": uris}),
+                json!({"id": id, "uris": uris, "expected_snapshot_id": expected_snapshot_id}),
             )
             .await?;
         Ok(())

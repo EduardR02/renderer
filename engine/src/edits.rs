@@ -19,9 +19,9 @@
 //! Wire format: protobuf binary (`application/x-protobuf`), using the
 //! official-client `playlist4_external.proto` types from librespot-protocol
 //! 0.8.0. Responses parse as `SelectedListContent` (playlist changes) or
-//! `CreateListReply` (create). All checksums (revisions) are fetched fresh
-//! from the server before each edit rather than trusting a caller-supplied
-//! snapshot, so a stale UI cannot fail the optimistic-concurrency check.
+//! `CreateListReply` (create). Most edits fetch the latest revision;
+//! previewed removals additionally require that it matches the reviewed
+//! snapshot, so concurrent changes cannot silently expand a destructive edit.
 //!
 //! MOV semantics are settled against two independent references: the Web
 //! API documents `insert_before` in pre-move coordinates ("first item of a
@@ -225,8 +225,12 @@ async fn post_playlist_changes(
     session: &Session,
     id: &str,
     ops: Vec<p4::Op>,
+    expected_snapshot_id: Option<&str>,
 ) -> Result<(), String> {
     let revision = playlist_revision(session, id).await?;
+    if let Some(expected) = expected_snapshot_id {
+        require_reviewed_revision(&revision, expected)?;
+    }
     let mut changes = list_changes(&revision, ops);
     if let Some(delta) = changes.deltas.first_mut() {
         delta.info = protobuf::MessageField::some(change_info(session));
@@ -243,6 +247,23 @@ async fn post_playlist_changes(
     p4::SelectedListContent::parse_from_bytes(&body)
         .map_err(|error| format!("unparseable playlist change response: {error}"))?;
     Ok(())
+}
+
+fn require_reviewed_revision(revision: &[u8], expected: &str) -> Result<(), String> {
+    let matches = !revision.is_empty()
+        && expected.len() == revision.len() * 2
+        && expected.as_bytes().chunks_exact(2).zip(revision).all(|(pair, byte)| {
+            let digit = |value: u8| (value as char).to_digit(16);
+            match (digit(pair[0]), digit(pair[1])) {
+                (Some(high), Some(low)) => ((high << 4) | low) as u8 == *byte,
+                _ => false,
+            }
+        });
+    if matches {
+        Ok(())
+    } else {
+        Err("This playlist changed since your preview. Reload it and review the matches before removing songs.".to_owned())
+    }
 }
 
 /// Applies ops to the user's rootlist via
@@ -329,7 +350,7 @@ pub async fn rename_playlist(session: &Session, id: &str, name: &str) -> Result<
     if name.is_empty() {
         return Err("playlist name must not be empty".to_owned());
     }
-    post_playlist_changes(session, id, vec![rename_op(name)]).await
+    post_playlist_changes(session, id, vec![rename_op(name)], None).await
 }
 
 /// Unfollows (removes) a playlist from the user's rootlist.
@@ -344,16 +365,21 @@ pub async fn add_tracks(session: &Session, id: &str, uris: &[String]) -> Result<
         return Err("no tracks to add".to_owned());
     }
     validate_track_uris(uris)?;
-    post_playlist_changes(session, id, vec![add_tracks_op(uris)]).await
+    post_playlist_changes(session, id, vec![add_tracks_op(uris)], None).await
 }
 
 /// Removes tracks by URI via a REM change (`items_as_key`).
-pub async fn remove_tracks(session: &Session, id: &str, uris: &[String]) -> Result<(), String> {
+pub async fn remove_tracks(
+    session: &Session,
+    id: &str,
+    uris: &[String],
+    expected_snapshot_id: Option<&str>,
+) -> Result<(), String> {
     if uris.is_empty() {
         return Err("no tracks to remove".to_owned());
     }
     validate_track_uris(uris)?;
-    post_playlist_changes(session, id, vec![remove_tracks_op(uris)]).await
+    post_playlist_changes(session, id, vec![remove_tracks_op(uris)], expected_snapshot_id).await
 }
 
 /// Moves one track so that it lands at index `to` of the resulting list.
@@ -370,7 +396,7 @@ pub async fn reorder_tracks(
     if from == to {
         return Ok(());
     }
-    post_playlist_changes(session, id, vec![move_op(from, to)]).await
+    post_playlist_changes(session, id, vec![move_op(from, to)], None).await
 }
 
 #[cfg(test)]
@@ -378,6 +404,17 @@ mod tests {
     use protobuf::Message;
 
     use super::*;
+
+    #[test]
+    fn reviewed_removal_rejects_changed_or_missing_revision() {
+        let revision = [0x01, 0xab, 0xff];
+        assert!(require_reviewed_revision(&revision, "01abff").is_ok());
+        assert!(require_reviewed_revision(&revision, "01ABFF").is_ok());
+        for stale in ["01abfe", "", "01ab", "01abffff", "01abzz"] {
+            assert!(require_reviewed_revision(&revision, stale).is_err());
+        }
+        assert!(require_reviewed_revision(&[], "").is_err());
+    }
 
     /// Round-trips an op through protobuf encoding and asserts the interesting
     /// fields, proving the builder wires the official-client field numbers.

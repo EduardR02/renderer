@@ -824,6 +824,20 @@ pub async fn fetch_tracks<'a>(
     .await
 }
 
+/// Resolves an explicitly opened song without fetching recommendations.
+pub async fn track_browse(session: &Session, id: &str) -> Result<TrackRef, String> {
+    if id.len() != 22 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err("invalid Spotify track id".to_owned());
+    }
+    let uri = SpotifyUri::from_uri(&format!("spotify:track:{id}"))
+        .map_err(|error| format!("invalid Spotify track id: {error}"))?;
+    fetch_tracks(session, [&uri])
+        .await?
+        .into_iter()
+        .find(|track| track.id == id)
+        .ok_or_else(|| "This song is no longer available on Spotify.".to_owned())
+}
+
 /// Playlist item attributes carry the only trustworthy "added" timestamp.
 /// A protobuf default of zero means the field was absent, not January 1970,
 /// so it must remain missing in the browse payload.

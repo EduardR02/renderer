@@ -178,7 +178,25 @@ static AUDIO_SIGNAL_SENDER: Mutex<Option<mpsc::UnboundedSender<AudioSignal>>> = 
 
 #[derive(Clone, Copy, Debug)]
 pub enum AudioSignal {
-    LoopBoundary { position_ms: u32, revision: u64 },
+    LoopBoundary {
+        position_ms: u32,
+        revision: u64,
+    },
+    /// The decoder handed this pipeline its first packet, i.e. the track the
+    /// engine last configured is genuinely producing audio.
+    ///
+    /// This exists because librespot's events cannot answer the question. It
+    /// reports a track `loaded` and then `Playing` before a single sample has
+    /// been decoded, so a track whose audio key the service refused — which
+    /// librespot deliberately loads anyway, undecrypted (`player.rs`: "Unable
+    /// to load key, continuing without decryption") — announces itself exactly
+    /// like a track that works. Everything downstream of that announcement,
+    /// the playhead included, is then a fiction until the decoder chokes on
+    /// the ciphertext seconds later. Only the sink knows the difference, so
+    /// the sink is what says so.
+    Output {
+        revision: u64,
+    },
 }
 
 struct Customization {
@@ -770,6 +788,12 @@ pub struct RodioSink {
     /// runs.
     pipeline_scratch: Vec<f32>,
     resampler_scratch: Vec<f32>,
+    /// The customization revision [`AudioSignal::Output`] was last sent for.
+    /// One signal per revision is all the engine needs — it asks whether this
+    /// load produced audio at all, not how much — and a revision changes on
+    /// every load, seek and loop jump, so this re-arms wherever the engine
+    /// starts caring about a new stretch of audio. Only `write` touches it.
+    signalled_revision: Option<u64>,
     _stream: rodio::OutputStream,
 }
 
@@ -940,6 +964,7 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> RodioSink {
         processing,
         pipeline_scratch: Vec::new(),
         resampler_scratch: Vec::new(),
+        signalled_revision: None,
         _stream: stream,
     }
 }
@@ -1026,6 +1051,20 @@ impl Sink for RodioSink {
         }
 
         let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
+        // Before any processing, because the question this answers is about
+        // the decoder, not about what the edit pipeline does with its output:
+        // a packet the cuts remove entirely still proves the track decodes.
+        if self.signalled_revision != Some(revision) {
+            self.signalled_revision = Some(revision);
+            if let Some(sender) = AUDIO_SIGNAL_SENDER
+                .lock()
+                .expect("audio signal sender should not be poisoned")
+                .as_ref()
+            {
+                let _ = sender.send(AudioSignal::Output { revision });
+            }
+        }
+
         let processing = Arc::clone(&self.processing);
         let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
         processing.synchronize_pipeline(revision);

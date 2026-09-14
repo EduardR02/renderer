@@ -19,6 +19,7 @@ Common checks:
 cargo test -p renderer-engine
 cargo test -p renderer
 bun run build
+bun test
 bun tauri build
 ```
 

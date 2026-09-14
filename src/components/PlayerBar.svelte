@@ -18,6 +18,109 @@
 
   let dragPos = $state(null);
 
+  const VOLUME_INTERVAL_MS = 50;
+  let volumeControl = $state(null);
+  let volumeDraft = $state(null);
+  let volumeError = $state("");
+  let restoreVolume = $state(70);
+  let pendingVolume = null;
+  let activeVolume = null;
+  let volumeTimer = null;
+  let volumeUrgent = false;
+  let volumeSentAt = -Infinity;
+  let volumeDisposed = false;
+  const volumePercent = $derived(volumeDraft ?? playback.volume);
+
+  $effect(() => {
+    const percent = playback.volume;
+    if (percent > 0) restoreVolume = percent;
+  });
+
+  // At most one command is in flight and one latest value is waiting.
+  // Leading/trailing updates keep a held drag audible, unlike a debounce.
+  async function flushVolume() {
+    clearTimeout(volumeTimer);
+    volumeTimer = null;
+    if (volumeDisposed || activeVolume !== null || pendingVolume === null) return;
+    const delay = VOLUME_INTERVAL_MS - (performance.now() - volumeSentAt);
+    if (!volumeUrgent && delay > 0) {
+      volumeTimer = setTimeout(flushVolume, delay);
+      return;
+    }
+    const target = pendingVolume;
+    pendingVolume = null;
+    activeVolume = target;
+    volumeUrgent = false;
+    volumeSentAt = performance.now();
+    try {
+      await api.setVolume(target);
+    } catch (error) {
+      if (!volumeDisposed && pendingVolume === null) {
+        volumeError = `Could not change volume: ${String(error)}`;
+      }
+    } finally {
+      activeVolume = null;
+      if (!volumeDisposed) {
+        if (pendingVolume === null) volumeDraft = null;
+        else flushVolume();
+      }
+    }
+  }
+
+  function changeVolume(percent, final = false) {
+    const next = Math.min(100, Math.max(0, Math.round(percent)));
+    volumeError = "";
+    volumeDraft = next;
+    pendingVolume = next === activeVolume
+      || (activeVolume === null && next === playback.volume) ? null : next;
+    volumeUrgent = final;
+    if (pendingVolume === null && activeVolume === null) volumeDraft = null;
+    flushVolume();
+  }
+
+  function toggleMute() {
+    if (volumePercent > 0) {
+      restoreVolume = volumePercent;
+      changeVolume(0, true);
+    } else {
+      changeVolume(restoreVolume, true);
+    }
+  }
+
+  $effect(() => {
+    volumeDisposed = false;
+    return () => {
+      volumeDisposed = true;
+      clearTimeout(volumeTimer);
+      pendingVolume = null;
+    };
+  });
+
+  $effect(() => {
+    const node = volumeControl;
+    if (!node) return;
+    let remainder = 0;
+    let lastWheelAt = -Infinity;
+    const onWheel = (event) => {
+      // Leave pinch-to-zoom and horizontal navigation to the browser.
+      if (event.ctrlKey || event.metaKey || !event.deltaY
+        || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+      event.preventDefault();
+      const now = performance.now();
+      const pixels = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 100 : 1);
+      const delta = Math.max(-10, Math.min(10, -pixels / 20));
+      if (now - lastWheelAt > 200 || Math.sign(remainder) !== Math.sign(delta)) remainder = 0;
+      lastWheelAt = now;
+      remainder += delta;
+      const steps = Math.trunc(remainder);
+      if (!steps) return;
+      remainder -= steps;
+      untrack(() => changeVolume(volumePercent + steps));
+    };
+    node.addEventListener("wheel", onWheel, { passive: false });
+    return () => node.removeEventListener("wheel", onWheel);
+  });
+
   function numberMs(value) {
     const ms = Number(value);
     return Number.isFinite(ms) ? Math.max(0, ms) : 0;
@@ -543,22 +646,58 @@
     >
       <Icon name="queue" size={18} />
     </button>
-    <button class="btn-icon" title="Mute" onclick={() => api.setVolume(playback.volume ? 0 : 70).catch(() => {})}>
-      <Icon name="volume" size={18} />
-    </button>
-    <Slider
-      min={0}
-      max={100}
-      value={playback.volume}
-      label="Volume"
-      step={5}
-      kind="vol"
-      onCommit={(v) => api.setVolume(v).catch(() => {})}
-    />
+    <div class="p-volume" bind:this={volumeControl}>
+      <button
+        class="btn-icon"
+        class:on={volumePercent === 0}
+        title={volumePercent === 0 ? `Unmute (${restoreVolume}%)` : `Mute (${volumePercent}%)`}
+        aria-label={volumePercent === 0 ? `Unmute to ${restoreVolume}%` : "Mute"}
+        aria-pressed={volumePercent === 0}
+        onclick={toggleMute}
+      >
+        <Icon name="volume" size={18} />
+      </button>
+      <Slider
+        min={0}
+        max={100}
+        value={volumePercent}
+        label="Volume"
+        step={5}
+        kind="vol"
+        formatValue={(v) => `${Math.round(v)}%`}
+        onDragStart={(v) => changeVolume(v)}
+        onDragChange={(v) => changeVolume(v)}
+        onCommit={(v) => changeVolume(v, true)}
+      />
+      {#if volumeError}
+        <span class="p-volume-error" role="status">{volumeError}</span>
+      {/if}
+    </div>
   </div>
 </footer>
 
 <style>
+  .p-volume {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--s3);
+    flex: none;
+  }
+  .p-volume-error {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 8px);
+    width: max-content;
+    max-width: 280px;
+    padding: var(--s2) var(--s3);
+    border: 1px solid var(--line-2);
+    border-radius: var(--r1);
+    background: var(--bg-2);
+    color: var(--fg-2);
+    font-size: var(--t-12);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  }
   .p-speed {
     min-width: 46px;
     height: 28px;

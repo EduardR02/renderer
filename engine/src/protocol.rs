@@ -318,6 +318,11 @@ pub enum Command {
     BrowsePlaylistRecommendations {
         id: String,
     },
+    /// One exact track, resolved on demand for a shared song link.
+    /// Responded to with a `browse_track` message containing a `TrackRef`.
+    BrowseTrack {
+        id: String,
+    },
     /// Album metadata/tracks plus play counts from the official pathfinder
     /// album query.
     /// Responded to with a `browse_album` message.
@@ -410,6 +415,9 @@ pub enum Command {
     EditRemovePlaylistTracks {
         id: String,
         uris: Vec<String>,
+        /// Hex revision reviewed before a destructive batch; absent for
+        /// immediate single-track actions without a preview.
+        expected_snapshot_id: Option<String>,
     },
     /// Moves one track so that it lands at index `to` of the resulting list
     /// (the engine converts the final position into the playlist4 MOV wire's
@@ -1191,6 +1199,9 @@ pub struct StateEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     pub playing: bool,
+    /// Playback is requested, but this load has not produced audio or is
+    /// waiting to retry. Keep the playhead still without losing pause intent.
+    pub buffering: bool,
     /// Draft editor previews are live transport state but never durable queue
     /// state. The Tauri supervisor uses this bit to keep crash/quit restore
     /// snapshots on the last real queue.
@@ -1442,6 +1453,7 @@ mod tests {
             auth_url: None,
             username: Some("alice".to_owned()),
             playing: true,
+            buffering: false,
             preview: false,
             position_ms: 7_500,
             duration_ms: 123_456,
@@ -1480,6 +1492,7 @@ mod tests {
             auth_url: Some("https://accounts.spotify.com/authorize?state=abc"),
             username: None,
             playing: false,
+            buffering: false,
             preview: false,
             position_ms: 0,
             duration_ms: 0,
@@ -2012,6 +2025,7 @@ mod tests {
             auth_url: None,
             username: Some("alice".to_owned()),
             playing: false,
+            buffering: false,
             preview: false,
             position_ms: 0,
             duration_ms: 0,
@@ -2034,6 +2048,7 @@ mod tests {
             auth_url: None,
             username: None,
             playing: false,
+            buffering: false,
             preview: false,
             position_ms: 0,
             duration_ms: 0,
