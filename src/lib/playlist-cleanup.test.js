@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import {
-  addedCutoff, cleanupChoices, cleanupDuration, filterCleanupChoices, cleanupPreview,
-  parseLocalDate, ruleLabel,
+  addedCutoff, cleanupChoices, cleanupDuration, cleanupMatches, cleanupSelection,
+  filterCleanupChoices, cleanupPreview, parseLocalDate, ruleLabel,
 } from "./playlist-cleanup.js";
 
 const tracks = [
@@ -239,6 +239,23 @@ test("unticking one occurrence keeps the whole URI, and every copy with it", () 
     rows: [], uris: [], keptUris: [], removalCount: 0, duplicateCount: 0,
     extraCount: 0, missingCount: 0, undatedCount: 0,
   });
+});
+
+test("one match run serves every selection, and no selection can change it", () => {
+  // The dialog keeps a run open while the reader ticks rows. That is the whole
+  // point of the split — a tick costs a pass over the entries instead of a
+  // re-run of every rule over every entry — and it also means a run must not
+  // carry a mark from the tick before it into the next selection.
+  const run = cleanupMatches(tracks, [{ field: "song", text: "live", operator: "contains" }], "all");
+  const untouched = cleanupSelection(run, new Set());
+  expect(untouched.removalCount).toBe(3);
+  const unticked = cleanupSelection(run, new Set(["spotify:track:a"]));
+  expect(unticked.removalCount).toBe(1);
+  expect(unticked.keptUris).toEqual(["spotify:track:a"]);
+  // Read, never written: the same run answers the first selection again, and
+  // the one-shot call agrees with both.
+  expect(cleanupSelection(run, new Set())).toEqual(untouched);
+  expect(cleanupPreview(tracks, [{ field: "song", text: "live", operator: "contains" }], "all")).toEqual(untouched);
 });
 
 test("chips read the rule back, negation and units included", () => {

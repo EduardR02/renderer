@@ -130,6 +130,26 @@ function addedAt(track) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+/**
+ * A title folded once per track, not once per rule.
+ *
+ * `normalize` is an NFKC pass and a new string: asked inside the predicate, a
+ * sheet with fifteen rules over a five-thousand-song playlist folded the same
+ * five thousand titles fifteen times, and two hundred rules took 292ms on a
+ * synthetic playlist of that size — all of it the same fold. The keys are the
+ * track objects, which the playlist payload owns and keeps for as long as the
+ * sheet is open, so nothing is retained once it closes.
+ */
+const FOLDED_TITLES = new WeakMap();
+function foldedTitle(track) {
+  let folded = FOLDED_TITLES.get(track);
+  if (folded === undefined) {
+    folded = normalize(track.name);
+    FOLDED_TITLES.set(track, folded);
+  }
+  return folded;
+}
+
 function rulePredicate(rule, lenient) {
   if (rule.field === "artist" || rule.field === "album") {
     // The rule's own name is folded once per matcher, not once per track.
@@ -150,13 +170,13 @@ function rulePredicate(rule, lenient) {
   if (rule.field === "song") {
     const text = normalize(rule.text);
     if (rule.operator !== "words" && rule.operator !== "not-words") {
-      return (track) => normalize(track.name).includes(text);
+      return (track) => foldedTitle(track).includes(text);
     }
     // User text is always literal. Unicode boundaries avoid treating accented
     // letters as punctuation, unlike JavaScript's ASCII-only word boundary.
     const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const words = new RegExp(`(?<![\\p{L}\\p{N}\\p{M}_])${escaped}(?![\\p{L}\\p{N}\\p{M}_])`, "u");
-    return (track) => words.test(normalize(track.name));
+    return (track) => words.test(foldedTitle(track));
   }
   if (rule.field === "unavailable") return (track) => track.unavailable === true;
   if (rule.field === "older") {
@@ -185,24 +205,23 @@ function ruleMatcher(rule, lenient = false) {
   return NEGATED.has(rule.operator) ? (track) => !matches(track) : matches;
 }
 
-/** Rows and counts of an empty preview: nothing to remove, nothing to explain. */
-const NO_MATCHES = {
-  rows: [], uris: [], keptUris: [], removalCount: 0, duplicateCount: 0,
-  extraCount: 0, missingCount: 0, undatedCount: 0,
-};
+/** The empty run: no rules, so nothing is a candidate and nothing to explain. */
+const NO_CANDIDATES = new Set();
 const NOTHING_KEPT = new Set();
 
 /**
- * Every entry removal would take, and exactly what it would do to them.
+ * What the rules select, and nothing about what happens to it.
  *
- * Spotify removes by URI, so one entry selected takes all of its copies with
- * it. `kept` holds the URIs the reader unticked in this preview: a mark is a
- * statement about a song, not about a row, so every row of a kept URI is kept
- * with it and none of them leaves the preview — they are shown, marked, so the
- * count above the table and the copies below it never disagree.
+ * `direct` is the verdict per entry as the rules read it, `candidates` the
+ * URIs removal would take (Spotify deletes by URI, so one entry selects all of
+ * its copies), and the two counts explain what the rules could not judge. Split
+ * from `cleanupSelection` because the rules and the reader's unticking are two
+ * different clocks: the rules change when a chip is added or removed, while a
+ * tick changes on every click — and re-running every rule over every entry to
+ * account for one unticked song is work the answer does not depend on.
  */
-export function cleanupPreview(tracks, rules, grouping, kept = NOTHING_KEPT) {
-  if (!rules.length) return NO_MATCHES;
+export function cleanupMatches(tracks, rules, grouping) {
+  if (!rules.length) return { tracks, direct: [], candidates: NO_CANDIDATES, missingCount: 0, undatedCount: 0 };
   const matches = grouping === "all"
     ? (matchers, track) => matchers.every((one) => one(track))
     : (matchers, track) => matchers.some((one) => one(track));
@@ -227,6 +246,20 @@ export function cleanupPreview(tracks, rules, grouping, kept = NOTHING_KEPT) {
     if (!track.uri) missingCount += 1;
     else candidates.add(track.uri);
   });
+  return { tracks, direct, candidates, missingCount, undatedCount };
+}
+
+/**
+ * What removal would do to a run, given the URIs the reader kept.
+ *
+ * `kept` holds the songs unticked in this preview: a mark is a statement about
+ * a song, not about a row, so every row of a kept URI is kept with it and none
+ * of them leaves the preview — they are shown, marked, so the count above the
+ * table and the copies below it never disagree. A run is only read here, never
+ * written, so the same run can answer for any number of selections.
+ */
+export function cleanupSelection(run, kept = NOTHING_KEPT) {
+  const { tracks, direct, candidates } = run;
   const rows = [];
   let removalCount = 0;
   let extraCount = 0;
@@ -249,6 +282,17 @@ export function cleanupPreview(tracks, rules, grouping, kept = NOTHING_KEPT) {
        Spotify will delete, which is what the reader is being asked to allow. */
     removalCount,
     duplicateCount: removalCount - uris.length,
-    extraCount, missingCount, undatedCount,
+    extraCount,
+    missingCount: run.missingCount,
+    undatedCount: run.undatedCount,
   };
+}
+
+/**
+ * Every entry removal would take, and exactly what it would do to them. Both
+ * halves in one call, for the unit tests and for any reader that has no reason
+ * to hold a run open across selections.
+ */
+export function cleanupPreview(tracks, rules, grouping, kept = NOTHING_KEPT) {
+  return cleanupSelection(cleanupMatches(tracks, rules, grouping), kept);
 }

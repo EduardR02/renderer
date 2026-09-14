@@ -5,7 +5,7 @@
   import { api } from "../lib/state.svelte.js";
   import { formatTime } from "../lib/time.js";
   import {
-    addedCutoff, cleanupChoices, filterCleanupChoices, cleanupDuration, cleanupPreview,
+    addedCutoff, cleanupChoices, filterCleanupChoices, cleanupDuration, cleanupMatches, cleanupSelection,
     parseLocalDate, ruleLabel,
   } from "../lib/playlist-cleanup.js";
 
@@ -139,7 +139,11 @@
   const choices = $derived(field === "artist" || field === "album" ? cleanupChoices(tracks, field) : []);
   const suggestionMatches = $derived(filterCleanupChoices(choices, query));
   const suggestions = $derived(suggestionMatches.slice(0, SUGGESTION_LIMIT));
-  const preview = $derived(cleanupPreview(tracks, rules, grouping, keptUris));
+  /* Two clocks, two derivations: the rules decide what is selected, the ticks
+     decide what is kept. One derivation over both would re-run every rule over
+     every entry to account for a single unticked song. */
+  const matching = $derived(cleanupMatches(tracks, rules, grouping));
+  const preview = $derived(cleanupSelection(matching, keptUris));
   const pageCount = $derived(Math.max(1, Math.ceil(preview.rows.length / PREVIEW_PAGE_SIZE)));
   const page = $derived(Math.min(previewPage, pageCount - 1));
   const pageRows = $derived(preview.rows.slice(page * PREVIEW_PAGE_SIZE, (page + 1) * PREVIEW_PAGE_SIZE));
@@ -748,6 +752,11 @@
      popups now live inside the band that scrolls — `overflow-y: auto` clips
      them at the actions rather than under them. */
   .cleanup-dialog {
+    /* The scrollbar this sheet reserves room for. Mirrors the global
+       `::-webkit-scrollbar` width: the head, the body and the action band all
+       end at the same right edge, so the reserve has to be a number they can
+       share rather than one band's private padding. */
+    --sheet-gutter: 10px;
     display: flex; flex-direction: column;
     width: min(860px, calc(100vw - var(--s8)));
     max-height: calc(100dvh - var(--s8));
@@ -758,7 +767,7 @@
   /* --- head. Fixed, so the thing you are about to do never scrolls away. */
   .cleanup-head {
     position: relative; flex: none;
-    padding: var(--s5) var(--s8) var(--s4) var(--s6);
+    padding: var(--s5) calc(var(--s8) + var(--sheet-gutter)) var(--s4) var(--s6);
     border-bottom: 1px solid var(--line);
   }
   .cleanup-head h2 {
@@ -767,13 +776,18 @@
     font-weight: var(--w-bold); letter-spacing: -0.02em; line-height: 1.15;
   }
   .cleanup-head > p { margin-top: var(--s2); max-width: 66ch; color: var(--fg-1); font-size: var(--t-13); }
-  .cleanup-close { position: absolute; top: var(--s4); right: var(--s5); color: var(--fg-2); }
+  .cleanup-close { position: absolute; top: var(--s4); right: calc(var(--s5) + var(--sheet-gutter)); color: var(--fg-2); }
 
   /* --- body. The only scroller. The rule builder is fixed and the preview
      takes the slack, so a crowded rule list scrolls the body while a short one
      leaves the dialog exactly as tall as its content. */
   .cleanup-body {
     flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    /* Reserved, not borrowed: with the preview floor below, this band always
+       scrolls on a short window, and a scrollbar that appears only once the
+       preview has rows would shift the table sideways under its own reader.
+       The same reserve the app's other scrollers keep (see app.css). */
+    scrollbar-gutter: stable;
     display: flex; flex-direction: column; gap: var(--s4);
     padding: var(--s4) var(--s6) var(--s5);
   }
@@ -810,9 +824,29 @@
   .cleanup-help { margin-top: var(--s2); color: var(--fg-2); font-size: var(--t-12); }
 
   /* The chips are the app's shared pill (see .chip in app.css) rather than a
-     local rectangle: same height, same fill, same round × plate as the search
-     filters. `title` carries the label a 220px cap ellipsises. */
-  .cleanup-chips { margin-top: var(--s3); }
+     local rectangle: same height, same round × plate as the search filters.
+     `title` carries the label a 220px cap ellipsises.
+     A `ul` arrives with the browser's own 40px inline padding, which put the
+     rules 40px right of every section label on this sheet; it is a flex row,
+     so the marker box has nothing to do either. */
+  .cleanup-chips { margin: var(--s3) 0 0; padding: 0; list-style: none; }
+  /* Rose, not foam. A chip here is a constraint the owner typed, and foam on
+     this sheet already means the one action that removes songs; the shared
+     grey pill, in a dark sheet with this many controls, read as disabled
+     chrome rather than as the rules the whole dialog is about. Rose-ink under
+     the tint and rose for the text, for the reason --saved-wash gives: a
+     pale warm at 15% over near-black loses its chroma and goes brown. */
+  .cleanup-chips .chip {
+    background: var(--saved-wash);
+    border-color: color-mix(in srgb, var(--rose-ink) 32%, transparent);
+    color: color-mix(in srgb, var(--rose) 86%, var(--fg));
+  }
+  .cleanup-chips .chip:hover {
+    background: color-mix(in srgb, var(--rose-ink) 22%, transparent);
+    color: var(--rose);
+  }
+  .cleanup-chips .chip .x { color: color-mix(in srgb, var(--rose) 60%, transparent); }
+  .cleanup-chips .chip .x:hover { color: var(--rose); background: color-mix(in srgb, var(--rose-ink) 26%, transparent); }
 
   .cleanup-builder { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s3); margin-top: var(--s4); }
   .cleanup-field { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
@@ -864,11 +898,12 @@
 
   /* --- preview. The rule that opens it leads with the accent and fades into
      the ordinary hairline, the way every structural rule in this app does.
-     Shrinkable on purpose: on a short window the table is what gives way, so
-     its own paging row stays above the actions instead of below the fold. */
+     Not shrinkable: the preview is what the sheet is for, and the body around
+     it is the scroller. */
   .cleanup-preview {
+    --preview-floor: 252px;
     display: flex; flex-direction: column;
-    flex: 0 1 auto; min-height: 0;
+    flex: none;
     padding-top: var(--s4);
     border-top: 1px solid transparent;
     border-image: var(--rule-accent) 1;
@@ -884,9 +919,18 @@
   /* Capped, then scrolled: 250 entries must not push the actions off the
      bottom, and the head stays put while the rows move under it. The inset
      rule closes the region and marks the row a scroll cut mid-height as a
-     cut, rather than as a clipping accident. */
+     cut, rather than as a clipping accident.
+
+     The floor is four rows and their head. It used to be 96px, which is one
+     row and a half: on a window shorter than the sheet, the region gave way
+     to its minimum, the body never overflowed, and the result was a preview
+     that showed one song with no scrollbar anywhere on the sheet — the one
+     thing the dialog exists to show, traded away to keep the dialog short.
+     Now the floor holds, the sheet grows past the window, and the body
+     scrolls: `32dvh` was the old cap, which is what let a short window
+     squeeze the region down to that 96px. */
   .cleanup-results {
-    flex: 1 1 auto; min-height: 96px; max-height: min(320px, 32dvh); overflow: auto;
+    flex: 1 1 auto; min-height: var(--preview-floor); max-height: 320px; overflow: auto;
     margin-top: var(--s3);
     box-shadow: inset 0 -1px 0 var(--line);
   }
@@ -970,26 +1014,29 @@
 
   /* Reserved height, message centred in it. The block is the whole preview
      until rows exist, so it holds the space the table will take — and that
-     space is what the suggestion list above it drops into. */
-  .cleanup-empty { display: flex; flex-direction: column; justify-content: center; min-height: 132px; padding: 0; }
+     space is what the suggestion list above it drops into. The floor is the
+     region's own: the message sits in the middle of the box it is standing
+     in for, and opening the sheet does not resize it. */
+  .cleanup-empty { display: flex; flex-direction: column; justify-content: center; min-height: var(--preview-floor); padding: 0; }
   .cleanup-pagination { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); margin-top: var(--s3); }
 
   /* The failure of the one irreversible action, edge to edge: it belongs to
      the whole sheet, not to the section the rules happen to be in. */
   .cleanup-error {
     flex: none; display: flex; align-items: center; justify-content: space-between;
-    gap: var(--s4); padding: var(--s3) var(--s6);
+    gap: var(--s4); padding: var(--s3) calc(var(--s6) + var(--sheet-gutter)) var(--s3) var(--s6);
     background: var(--danger-wash); color: var(--love); font-size: var(--t-13);
   }
   .cleanup-error button { flex: none; }
 
-  .cleanup-foot { flex: none; margin-top: 0; padding: var(--s4) var(--s6); border-top: 1px solid var(--line); flex-wrap: wrap; }
+  .cleanup-foot { flex: none; margin-top: 0; padding: var(--s4) calc(var(--s6) + var(--sheet-gutter)) var(--s4) var(--s6); border-top: 1px solid var(--line); flex-wrap: wrap; }
 
   @media (max-width: 600px) {
     .cleanup-dialog { width: calc(100vw - var(--s4)); max-height: calc(100dvh - var(--s4)); }
-    .cleanup-head, .cleanup-error, .cleanup-foot { padding-inline: var(--s4); }
+    /* Left inset shrinks with the sheet; the reserved gutter does not, and the
+       three bands keep ending on the same edge. */
+    .cleanup-head, .cleanup-error, .cleanup-foot { padding-inline: var(--s4) calc(var(--s4) + var(--sheet-gutter)); }
     .cleanup-body { padding-inline: var(--s4); }
     .cleanup-field { flex: 1 1 100%; }
-    .cleanup-results { max-height: 46dvh; }
   }
 </style>
