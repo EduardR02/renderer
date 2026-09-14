@@ -4,7 +4,7 @@
   import { api } from "../lib/state.svelte.js";
   import { formatTime, formatExactTime } from "../lib/time.js";
   import {
-    cleanupChoices, filterCleanupChoices, cleanupDuration, cleanupPreview, cleanupVersion,
+    cleanupChoices, filterCleanupChoices, cleanupDuration, cleanupPreview,
   } from "../lib/playlist-cleanup.js";
 
   /**
@@ -41,12 +41,19 @@
    */
   const SUGGESTION_ROOM = 200;
   const SUGGESTION_MIN = 120;
+  /**
+   * How many matches the dropdown will render. It is a six-row scroller and
+   * typing is the way to narrow it, so past this point the rows are only a
+   * larger DOM and a longer walk for the arrow keys. The cap lands in
+   * `suggestions` itself rather than in the markup, so the row an arrow key
+   * names and the row on screen are always the same list.
+   */
+  const SUGGESTION_LIMIT = 50;
 
   let { playlist, onClose } = $props();
   let dialog = $state(null);
   let firstInput = $state(null);
   let source = $state.raw(null);
-  let sourceVersion = $state("");
   let rules = $state([]);
   let grouping = $state("all");
   let field = $state("artist");
@@ -67,18 +74,36 @@
   const PREVIEW_PAGE_SIZE = 100;
   let previewPage = $state(0);
 
-  const currentVersion = $derived(cleanupVersion(playlist));
-  const stale = $derived(!!source && sourceVersion !== currentVersion);
+  /**
+   * Whether the playlist has moved past the revision this preview was built
+   * from. The snapshot id answers it: the preview renders the frozen `source`
+   * below, so a refresh that only moves metadata cannot change what it
+   * computes, and the engine re-checks the same id at removal
+   * (`expected_snapshot_id`). That check is the barrier — this is the warning
+   * the reader sees. `tracks_total` is the one other field a refresh can move
+   * in place without replacing the detail.
+   *
+   * Asked with those two fields, never with a serialised copy of the
+   * playlist: the old fingerprint rebuilt a 7-field tuple for every track on
+   * every evaluation to answer the same question.
+   */
+  function playlistMoved() {
+    return !!source && (
+      playlist?.snapshot_id !== source.snapshot_id
+      || playlist?.tracks_total !== source.tracks_total
+    );
+  }
+  const stale = $derived(playlistMoved());
   const tracks = $derived(source?.tracks ?? []);
-  const incomplete = $derived(Number(source?.tracks_total) > tracks.length);
   const choices = $derived(field === "artist" || field === "album" ? cleanupChoices(tracks, field) : []);
-  const suggestions = $derived(filterCleanupChoices(choices, query));
+  const suggestionMatches = $derived(filterCleanupChoices(choices, query));
+  const suggestions = $derived(suggestionMatches.slice(0, SUGGESTION_LIMIT));
   const preview = $derived(cleanupPreview(tracks, rules, grouping));
   const pageCount = $derived(Math.max(1, Math.ceil(preview.rows.length / PREVIEW_PAGE_SIZE)));
   const page = $derived(Math.min(previewPage, pageCount - 1));
   const pageRows = $derived(preview.rows.slice(page * PREVIEW_PAGE_SIZE, (page + 1) * PREVIEW_PAGE_SIZE));
   const frozen = $derived(reviewing || busy || removed !== null || stale);
-  const ready = $derived(rules.length > 0 && preview.rows.length > 0 && !stale && !incomplete && !!source?.snapshot_id);
+  const ready = $derived(rules.length > 0 && preview.rows.length > 0 && !stale && !!source?.snapshot_id);
 
   $effect(() => {
     if (!dialog || dialog.open) return;
@@ -89,7 +114,6 @@
 
   function useLatest() {
     source = $state.snapshot(playlist);
-    sourceVersion = cleanupVersion(playlist);
     reviewing = false;
     error = "";
     previewPage = 0;
@@ -118,9 +142,11 @@
 
   /** Measures only when a list is about to open, never per keystroke: which
       side it hangs on and how tall it may be are properties of the scroll
-      position, not of the query. */
+      position, not of the query, and a list already on screen was measured
+      when it opened. */
   function openSuggestions() {
     if (field !== "artist" && field !== "album") return;
+    if (suggestionsOpen) return;
     let up = false;
     let room = SUGGESTION_ROOM;
     const wrap = firstInput?.closest(".cleanup-input-wrap");
@@ -215,7 +241,7 @@
   async function remove() {
     if (busy || !reviewing || !ready || removed !== null) return;
     // Recheck synchronously at the destructive boundary, not just in the UI.
-    if (sourceVersion !== cleanupVersion(playlist)) return;
+    if (playlistMoved()) return;
     const count = preview.rows.length;
     busy = true;
     error = "";
@@ -269,9 +295,9 @@
             <p>This playlist changed. Your preview is out of date; nothing more can be removed from it.</p>
             <button type="button" class="btn-ghost" onclick={useLatest}>Review latest playlist</button>
           </div>
-        {:else if !source?.snapshot_id || incomplete}
+        {:else if !source?.snapshot_id}
           <div class="cleanup-notice" role="status">
-            <p>{incomplete ? "The full playlist is not loaded yet." : "Waiting for a verified playlist revision."} Reload before reviewing removals.</p>
+            <p>Waiting for a verified playlist revision. Reload before reviewing removals.</p>
             <button type="button" class="btn-ghost" disabled={reloading} onclick={reload}>{reloading ? "Reloading…" : "Reload playlist"}</button>
           </div>
         {/if}
@@ -347,7 +373,7 @@
                 onkeydown={suggestionKey}
               />
               {#if suggestionsOpen && !frozen && (field === "artist" || field === "album")}
-                <div class="cleanup-suggestions" class:up={suggestionsUp} style:max-height="{suggestionsRoom}px" id="cleanup-suggestions" role="listbox" aria-label={`${field === "artist" ? "Artists" : "Albums"} in this playlist`}>
+                <div class="cleanup-suggestions" class:up={suggestionsUp} style:max-height="{suggestionsRoom}px" id="cleanup-suggestions" role="listbox" aria-label={`${field === "artist" ? "Artists" : "Albums"} in this playlist${suggestionMatches.length > suggestions.length ? `, showing the first ${suggestions.length} of ${suggestionMatches.length} matches` : ""}`}>
                   {#each suggestions as choice, index (choice.key)}
                     {@const highlightStart = choice.name.toLowerCase().indexOf(query.trim().toLowerCase())}
                     {@const highlightEnd = highlightStart + query.trim().length}
@@ -371,6 +397,9 @@
                   {:else}
                     <p>No {field === "artist" ? "artists" : "albums"} in this playlist match.</p>
                   {/each}
+                  {#if suggestionMatches.length > suggestions.length}
+                    <p>Showing the first {suggestions.length} of {suggestionMatches.length} matches — keep typing to narrow them.</p>
+                  {/if}
                 </div>
               {/if}
             </div>

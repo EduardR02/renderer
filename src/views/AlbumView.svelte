@@ -28,14 +28,19 @@
   let menuOpen = $state(false);
   let menuButton = $state(null);
   let menu = $state(null);
-  let copied = $state(false);
+  /* Idle, landed, refused — the copy item's three faces. */
+  let copyState = $state("idle");
   let copyTimer = 0;
+  /* The confirmation outlives the menu by design, so the timer has to die with
+     the page: a navigation inside its window would otherwise leave it writing
+     to a component that is gone. */
+  $effect(() => () => clearTimeout(copyTimer));
   $effect(() => {
     album?.id;
     actionError = "";
     shuffleBusy = false;
     menuOpen = false;
-    copied = false;
+    copyState = "idle";
   });
 
   /* The menu hangs off its button the way the playlist header's does: focus
@@ -53,9 +58,16 @@
     return () => document.removeEventListener("pointerdown", onPointerDown);
   });
 
+  /**
+   * Closes the menu. The button gets its focus back only when the menu was
+   * holding it: the copy confirmation's timer fires while the pointer may be
+   * anywhere by then, and a close that fires behind the user's back must not
+   * pull the caret out of whatever they moved to.
+   */
   function closeMenu(returnFocus = false) {
+    const menuHadFocus = !!menu?.contains(document.activeElement);
     menuOpen = false;
-    if (returnFocus) queueMicrotask(() => menuButton?.focus());
+    if (returnFocus && menuHadFocus) queueMicrotask(() => menuButton?.focus());
   }
 
   function toggleMenu() {
@@ -65,7 +77,7 @@
     }
     /* A copy still counting down must not close the menu that replaces it. */
     clearTimeout(copyTimer);
-    copied = false;
+    copyState = "idle";
     menuOpen = true;
   }
 
@@ -99,19 +111,18 @@
    * paste into our search lands back here.
    *
    * The menu STAYS OPEN on copy, because the confirmation is on the item
-   * itself and dismissing it would take the only feedback with it. It closes
-   * shortly after, which is also what reverts the label.
+   * itself and dismissing it would take the only feedback with it. A copy that
+   * landed closes it shortly after, through the same close the keyboard paths
+   * use, so the button gets its focus back. A refused write stays up and says
+   * so: the label that never changes is the dead control the confirmation
+   * exists to prevent, and the item is also the retry.
    */
   async function copyLink() {
     const link = spotifyLink("album", album?.id);
     if (!link) return;
-    copied = await writeClipboard(link);
-    if (!copied) return;
+    copyState = (await writeClipboard(link)) ? "copied" : "failed";
     clearTimeout(copyTimer);
-    copyTimer = setTimeout(() => {
-      menuOpen = false;
-      copied = false;
-    }, 900);
+    if (copyState === "copied") copyTimer = setTimeout(() => closeMenu(true), 900);
   }
 
 
@@ -244,8 +255,14 @@
                 <!-- The confirmation lives on the item, which is why the menu
                      does not close on click: a copy with no feedback is
                      indistinguishable from a dead control. -->
-                <button class="menu-item" role="menuitem" class:done={copied} onclick={copyLink}>
-                  {copied ? "Link copied" : "Copy link"}
+                <button
+                  class="menu-item"
+                  role="menuitem"
+                  class:done={copyState === "copied"}
+                  class:failed={copyState === "failed"}
+                  onclick={copyLink}
+                >
+                  {copyState === "copied" ? "Link copied" : copyState === "failed" ? "Copy failed" : "Copy link"}
                 </button>
               </div>
             {/if}
@@ -275,6 +292,9 @@
   /* Right-aligned because this button ends the row, and a 216px menu opening
      to the right of it would leave the pane. */
   .head-menu { position: absolute; z-index: 1; top: calc(100% + var(--s1)); right: 0; }
-  /* A copy that landed: the same label-and-colour pairing the row menu uses. */
+  /* A copy that landed: the same label-and-colour pairing the row menu uses.
+     A refused write takes the failure colour, so the two are never read as
+     the same event. */
   .menu-item.done { color: var(--accent); }
+  .menu-item.failed { color: var(--love); }
 </style>

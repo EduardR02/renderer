@@ -71,6 +71,11 @@ export async function writeClipboard(text) {
     return true;
   } catch {
     try {
+      /* `select()` moves focus into the field, and removing the field would
+         then drop the page's focus to `<body>` — mid-menu, while the item is
+         about to say whether the write landed. Whatever had focus gets it
+         back; a `<body>` that had none is a no-op. */
+      const active = document.activeElement;
       const field = document.createElement("textarea");
       field.value = text;
       field.setAttribute("readonly", "");
@@ -79,6 +84,7 @@ export async function writeClipboard(text) {
       field.select();
       const ok = document.execCommand("copy");
       field.remove();
+      if (active?.isConnected) active.focus?.();
       return ok;
     } catch {
       return false;

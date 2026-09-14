@@ -241,6 +241,7 @@ async fn run(
         state_directory,
         normalisation,
         audio::default_sink_opener(),
+        audio::default_device_presence(),
     );
     engine.start_authentication(auth_sender.clone());
     engine.emit_state()?;
@@ -848,6 +849,11 @@ async fn run(
                 }
             }
             _ = position_heartbeat.tick() => {
+                // Writes a volume change that has stopped moving to the
+                // librespot cache. `set_volume` defers it there — a slider drag
+                // paces that command at 50 ms and every write is a file create
+                // — so this is the tick that pays for the whole gesture, once.
+                engine.tick_volume_persist();
                 // Catches a session librespot invalidated on its own, which is
                 // otherwise invisible until a track refuses to load.
                 if engine.tick_session_health(&auth_sender) {
@@ -872,8 +878,9 @@ async fn run(
                 }
                 if engine.tick_position() {
                     // Scalar playhead sync: O(1) regardless of queue size.
-                    // Real changes (track, queue, volume, play/pause, ...)
-                    // still emit the full state through the other arms.
+                    // Real changes (track, queue, play/pause, ...) still emit
+                    // the full state through the other arms, and a volume step
+                    // has a scalar lane of its own.
                     engine.emit_position()?;
                 }
             }

@@ -2,9 +2,10 @@
 //!
 //! Owns the engine's stdin/stdout pipes, serializes requests with
 //! incrementing request ids, routes replies back through tokio oneshots, and
-//! fans `state` and `position` lines out on a broadcast channel in wire
-//! order. A supervisor task respawns the engine with backoff when its pipe
-//! closes and re-requests `status` so the session re-syncs after a restart.
+//! fans `state`, `position` and `volume` lines out on a broadcast channel in
+//! wire order. A supervisor task respawns the engine with backoff when its
+//! pipe closes and re-requests `status` so the session re-syncs after a
+//! restart.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -96,13 +97,19 @@ pub struct PositionHeartbeat {
 }
 
 /// One playback or lifecycle event, fanned out to subscribers in wire order.
-/// Heartbeats share the channel with full states so a consumer can never
-/// apply an older heartbeat after a newer full state; `Disconnected` marks
-/// the gap between an engine EOF and its replacement becoming ready.
+/// Scalar lines (heartbeats and volume) share the channel with full states so
+/// a consumer can never apply an older heartbeat after a newer full state;
+/// `Disconnected` marks the gap between an engine EOF and its replacement
+/// becoming ready.
 #[derive(Clone, Debug)]
 pub enum StateLine {
     State(PlaybackState),
     Position(PositionHeartbeat),
+    /// The transport volume, and nothing else. Its own lane because a slider
+    /// drag writes one of these per command (the frontend paces `set_volume`
+    /// at 50 ms), and a full state would re-parse the whole queue to say one
+    /// number.
+    Volume(u8),
     Disconnected,
 }
 
@@ -418,8 +425,8 @@ impl EngineClient {
         client
     }
 
-    /// Subscribes to the engine's playback lines (full `state` and scalar
-    /// `position` heartbeats) in wire order.
+    /// Subscribes to the engine's playback lines (full `state` plus the scalar
+    /// `position` and `volume` lanes) in wire order.
     pub fn subscribe_lines(&self) -> tokio::sync::broadcast::Receiver<StateLine> {
         self.state_tx.subscribe()
     }
@@ -1480,6 +1487,32 @@ impl EngineClient {
         let _ = self.state_tx.send(StateLine::Position(heartbeat));
     }
 
+    /// Applies a scalar volume line to the heartbeat-fresh last real state and
+    /// fans it out.
+    ///
+    /// Unlike a position heartbeat this is not a projection of something the
+    /// window already knows: the volume is the setting the engine actually
+    /// applied, so it freshens the retained snapshot — the one `status`,
+    /// `get_state` and the durable playback snapshot are built from — and is
+    /// worth a persistence check when it changes. The queue is never touched:
+    /// the line carries one number.
+    fn on_volume(&self, volume: u8) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let changed = match self.last_state.lock().as_mut() {
+            Some(last) => {
+                last.volume = volume;
+                true
+            }
+            None => false,
+        };
+        if changed {
+            self.mark_persistence_dirty();
+        }
+        let _ = self.state_tx.send(StateLine::Volume(volume));
+    }
+
     fn on_eof(&self) {
         if self.shutting_down.load(Ordering::SeqCst) {
             return;
@@ -1618,8 +1651,8 @@ fn run_persistence_writer(client: Weak<EngineClient>, receiver: Receiver<Persist
     }
 }
 
-/// Reader thread: parses one protocol line per iteration. `state` and
-/// `position` lines are fanned out to subscribers in wire order; every other
+/// Reader thread: parses one protocol line per iteration. `state`, `position`
+/// and `volume` lines are fanned out to subscribers in wire order; every other
 /// line is routed to the pending request with the matching id.
 fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
     let client = Arc::clone(client);
@@ -1645,6 +1678,7 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
                         match parse_line(value) {
                             Some(Line::State(state)) => client.on_state(&state),
                             Some(Line::Position(heartbeat)) => client.on_position(heartbeat),
+                            Some(Line::Volume(volume)) => client.on_volume(volume),
                             Some(Line::Reply {
                                 request_id,
                                 ok,
@@ -1664,12 +1698,13 @@ fn spawn_reader(stdout: ChildStdout, client: &Arc<EngineClient>) {
         .expect("could not start engine reader thread");
 }
 
-/// What one engine output line means. `state` and `position` lines are
-/// fanned out; every other line is a reply to a pending request.
+/// What one engine output line means. `state`, `position` and `volume` lines
+/// are fanned out; every other line is a reply to a pending request.
 #[derive(Debug)]
 enum Line {
     State(PlaybackState),
     Position(PositionHeartbeat),
+    Volume(u8),
     Reply {
         request_id: String,
         ok: bool,
@@ -1678,11 +1713,18 @@ enum Line {
     },
 }
 
-/// Classifies and parses one protocol line. Position heartbeats are parsed
-/// into their two scalars only — never into a [`PlaybackState`], so a
-/// heartbeat can never cost a queue parse. Malformed `state`/`position`
-/// lines are logged and dropped (`None`), matching the reader's old
-/// tolerance; unknown lines fall through to reply routing.
+/// The engine's scalar volume line. One number, so parsing it never costs a
+/// queue parse — which is the whole point of the lane.
+#[derive(Debug, serde::Deserialize)]
+struct VolumeLine {
+    volume: u8,
+}
+
+/// Classifies and parses one protocol line. Scalar lanes are parsed into
+/// their own shapes only — never into a [`PlaybackState`], so a heartbeat or a
+/// volume step can never cost a queue parse. Malformed scalar lines are logged
+/// and dropped (`None`), matching the reader's old tolerance; unknown lines
+/// fall through to reply routing.
 fn parse_line(value: Value) -> Option<Line> {
     match value.get("type").and_then(Value::as_str) {
         Some("state") => match serde_json::from_value::<PlaybackState>(value) {
@@ -1696,6 +1738,13 @@ fn parse_line(value: Value) -> Option<Line> {
             Ok(heartbeat) => Some(Line::Position(heartbeat)),
             Err(error) => {
                 log::error(&format!("could not parse engine position line: {error}"));
+                None
+            }
+        },
+        Some("volume") => match serde_json::from_value::<VolumeLine>(value) {
+            Ok(volume) => Some(Line::Volume(volume.volume)),
+            Err(error) => {
+                log::error(&format!("could not parse engine volume line: {error}"));
                 None
             }
         },
@@ -2266,7 +2315,57 @@ mod tests {
                 assert_eq!(heartbeat.duration_ms, 240_000);
             }
             StateLine::State(_) => panic!("heartbeat must not arrive as a full state"),
+            StateLine::Volume(_) => panic!("nor as a volume step"),
             StateLine::Disconnected => panic!("heartbeat path must stay connected"),
+        }
+    }
+
+    /// The volume lane: the engine answers a volume step with a scalar line
+    /// instead of a full state, so the shell has to parse it, keep the cached
+    /// volume right (that snapshot is what `status`/`get_state` and the durable
+    /// playback snapshot are built from) and fan it out as its own line — never
+    /// as a full state, which would defeat the point of the lane.
+    #[test]
+    fn volume_lines_freshen_the_last_state_volume_and_fan_out_as_scalars() {
+        let mut state = PlaybackState::default();
+        state.auth_state = "ready".to_owned();
+        state.volume = 50;
+        state.position_ms = 12_000;
+        state.queue = vec![Track::default(); 3];
+        let client = client_with_last_state(state);
+        let queue_ptr = client.last_state.lock().as_ref().unwrap().queue.as_ptr();
+
+        // Subscribe before the send: broadcast messages sent with no active
+        // receiver are dropped, exactly like the production flow where
+        // consume_states subscribes before the engine produces lines.
+        let mut receiver = client.subscribe_lines();
+        let Some(Line::Volume(volume)) = parse_line(serde_json::json!({
+            "type": "volume",
+            "volume": 31,
+        })) else {
+            panic!("a volume line parses as a scalar");
+        };
+        client.on_volume(volume);
+
+        let last = client.last_state.lock();
+        let last = last.as_ref().expect("last state kept");
+        assert_eq!(last.volume, 31, "the cached volume is the engine's");
+        assert_eq!(
+            last.position_ms, 12_000,
+            "and the playhead is not part of a volume step"
+        );
+        assert_eq!(
+            last.queue.as_ptr(),
+            queue_ptr,
+            "a volume step must never clone the queue"
+        );
+        match receiver.try_recv().expect("volume fanned out") {
+            StateLine::Volume(fanned) => assert_eq!(fanned, 31),
+            StateLine::State(_) => {
+                panic!("a volume step must not arrive as a full state")
+            }
+            StateLine::Position(_) => panic!("nor as a position heartbeat"),
+            StateLine::Disconnected => panic!("the volume path must stay connected"),
         }
     }
 
@@ -2666,6 +2765,7 @@ mod tests {
         {
             StateLine::State(state) => state,
             StateLine::Position(_) => panic!("the initial line is a full state, not a heartbeat"),
+            StateLine::Volume(_) => panic!("nor a volume step"),
             StateLine::Disconnected => panic!("engine disconnected before its initial state"),
         };
         assert!(!first.auth_state.is_empty());
@@ -2683,6 +2783,7 @@ mod tests {
         {
             StateLine::State(state) => state,
             StateLine::Position(_) => panic!("status re-emits a full state"),
+            StateLine::Volume(_) => panic!("status re-emits a full state, not a volume step"),
             StateLine::Disconnected => panic!("engine disconnected before the status state"),
         };
         assert_eq!(after_status.auth_state, first.auth_state);

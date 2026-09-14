@@ -774,9 +774,27 @@ fn attach_live_source(sink: &rodio::Sink, ring: &Arc<SampleRing>, rate: rodio::S
     sink.append(LiveSource::new(ring.clone(), rate));
 }
 
-/// Points one live-pipeline entry (see [`LIVE_SINK`]) at this sink's half of it.
+/// Points one live-pipeline entry (the ring, the processing state) at this
+/// sink's half of it. [`LIVE_SINK`] is claimed by [`claim_live_sink`] instead,
+/// which hands the newcomer the transport volume in the same critical section.
 fn claim_live<T>(slot: &Mutex<Weak<T>>, value: &Arc<T>, poison: &str) {
     *slot.lock().expect(poison) = Arc::downgrade(value);
+}
+
+/// Registers the sink that is now feeding the device and hands it the
+/// remembered transport volume before releasing the registry.
+///
+/// Claimed and read in one critical section, which is the same one
+/// [`set_sink_volume`] stores and applies in. Reading the value first — as this
+/// used to — let a volume change land in between: the newcomer is not in the
+/// registry yet, so that change was not applied to it, and the gain it did
+/// read is then written over the newer one the change had just applied to
+/// whatever was live. The result is a sink audibly one step behind the volume
+/// every other component already agrees on.
+fn claim_live_sink(sink: &Arc<rodio::Sink>) {
+    let mut live = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG);
+    *live = Arc::downgrade(sink);
+    sink.set_volume(volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)));
 }
 
 /// Clears one live-pipeline entry, but only while it still names this sink. A
@@ -874,10 +892,18 @@ fn volume_to_gain(volume: u16) -> f32 {
 /// The sink's mixer gain multiplies every queued sample, so the audible
 /// change lands on the next audio callback (~10 ms) instead of after the
 /// write-ahead buffer plays out.
+///
+/// The remembered value and the apply happen inside the registry lock, which
+/// is also where [`claim_live_sink`] registers the next sink and reads the
+/// value it applies. Stored outside it, a sink that was being claimed could
+/// miss this change — it is not in the registry yet — and then hand the device
+/// the older gain it had already read: one step behind `state.volume`, the
+/// cache and the slider until the next change. Inside it, the two always move
+/// together.
 pub fn set_sink_volume(volume: u16) {
+    let live = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG);
     SINK_VOLUME.store(volume, Ordering::Release);
-    let sink = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG).upgrade();
-    if let Some(sink) = sink {
+    if let Some(sink) = live.upgrade() {
         sink.set_volume(volume_to_gain(volume));
     }
 }
@@ -984,6 +1010,28 @@ pub fn default_sink_opener() -> SinkOpener {
     Arc::new(|format| Ok(Box::new(open(cpal::default_host(), format)?)))
 }
 
+/// Answers whether the machine currently has a default output device, and
+/// nothing else.
+///
+/// One entry in this machine's device list, with no stream, mixer or player
+/// thread behind it — the question a device probe asks before deciding that a
+/// full construction is worth starting. Held next to [`SinkOpener`], and
+/// injectable for the same reason: a machine with no output device is a state
+/// the engine has to reach on demand, and no real hardware can be asked to
+/// provide one.
+pub type DevicePresence = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The presence check the engine uses in production: whether Windows has a
+/// default output device at all right now.
+///
+/// Deliberately not the whole truth — a device that is present can still
+/// refuse to open, and that failure keeps its typed reason and its message by
+/// going through [`SinkOpener`]. All this answers is whether a construction
+/// could find anything to open.
+pub fn default_device_presence() -> DevicePresence {
+    Arc::new(|| cpal::default_host().default_output_device().is_some())
+}
+
 /// The sink librespot is handed when the device step has already failed.
 ///
 /// It exists because the failure cannot travel back through the builder: the
@@ -1073,11 +1121,12 @@ impl Sink for RodioSink {
         if self.rodio_sink.is_none() {
             let sink = Arc::new(rodio::Sink::connect_new(self._stream.mixer()));
             sink.pause();
-            sink.set_volume(volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)));
-            attach_live_source(&sink, &self.ring, self.output_rate);
             // This sink is about to be the one feeding the device, so the whole
-            // pipeline changes hands here rather than at construction.
-            claim_live(&LIVE_SINK, &sink, LIVE_SINK_POISON_MSG);
+            // pipeline changes hands here rather than at construction — and the
+            // claim hands it the remembered transport volume as it registers
+            // it, before anything can change that volume again.
+            claim_live_sink(&sink);
+            attach_live_source(&sink, &self.ring, self.output_rate);
             claim_live(&LIVE_RING, &self.ring, LIVE_RING_POISON_MSG);
             claim_live(
                 &LIVE_PROCESSING,
@@ -1237,6 +1286,7 @@ impl RodioSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::percent_to_volume;
     use rodio::Source as _;
 
     /// Every test here models the reference rig: a 48 kHz device, which is what
@@ -1900,5 +1950,51 @@ mod tests {
             );
             previous = gain;
         }
+    }
+
+    /// The sink that joins the registry is handed the remembered transport
+    /// volume as it is claimed, and a change afterwards lands on the same sink:
+    /// the two are one critical section, which is what keeps the audible gain
+    /// and the volume every other component agrees on from drifting apart.
+    ///
+    /// Both readings are taken under the registry lock on purpose: a change
+    /// made by another test in this binary is serialized by that lock, so the
+    /// pair can be compared without a torn read.
+    #[test]
+    fn the_claimed_sink_is_handed_the_volume_the_registry_remembers() {
+        let (sink, _queue) = rodio::Sink::new();
+        let sink = Arc::new(sink);
+        assert_eq!(
+            sink.volume(),
+            1.0,
+            "a fresh rodio sink starts at full gain, so a claim that does not \
+             apply the remembered volume is audible as a jump to full volume"
+        );
+
+        set_sink_volume(percent_to_volume(17));
+        claim_live_sink(&sink);
+        {
+            let live = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG);
+            assert_eq!(
+                sink.volume(),
+                volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)),
+                "the claim must hand the newcomer the remembered volume"
+            );
+            drop(live);
+        }
+
+        set_sink_volume(percent_to_volume(83));
+        {
+            let live = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG);
+            assert_eq!(
+                sink.volume(),
+                volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)),
+                "and a change after the claim reaches this sink"
+            );
+            drop(live);
+        }
+
+        // Leave the registry as this test found it.
+        release_live(&LIVE_SINK, &sink, LIVE_SINK_POISON_MSG);
     }
 }

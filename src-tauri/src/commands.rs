@@ -26,7 +26,7 @@ use crate::types::{
     TrackCreditsDetail, TrackPlaylistRef, TrackWaveform,
 };
 use parking_lot::Mutex;
-use serde_json::json;
+use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
@@ -956,10 +956,31 @@ fn apply_position_heartbeat(snapshot: &mut AppState, heartbeat: PositionHeartbea
     snapshot.playback.duration_ms = heartbeat.duration_ms;
 }
 
+/// Applies a scalar volume line to the shared snapshot: the one number, in
+/// place, with the queue and the playhead untouched — `get_state`/`status`
+/// then report the volume the engine actually has.
+fn apply_volume_line(snapshot: &mut AppState, volume: u8) {
+    snapshot.playback.volume = volume;
+}
+
+/// The window's event for a scalar volume line: a partial `state` carrying the
+/// one key that changed.
+///
+/// The frontend's `applyPlayback` applies whatever keys are present, so this
+/// reaches the slider's confirmed value without a queue payload, without
+/// touching the playing authority and without re-anchoring the playhead —
+/// which is what the full-state path there is for. A full state remains what a
+/// real transport change emits.
+fn volume_state_payload(volume: u8) -> Value {
+    json!({ "volume": volume })
+}
+
 /// Consumes engine state lines, mirrors them into `AppState`, and emits the
-/// `state`/`position`/`session` events. Scalar position heartbeats are
-/// forwarded directly as `position` — the playhead is projected in the
-/// frontend between engine heartbeats, so there is no periodic work here.
+/// `state`/`position`/`session` events. The scalar lanes are forwarded in the
+/// shape the window already applies: a position heartbeat goes out as the
+/// `position` number, and a volume step as a partial `state` carrying only the
+/// volume — the playhead is projected in the frontend between heartbeats and a
+/// drag is optimistic there, so neither needs the queue.
 pub async fn consume_states(app: AppHandle) {
     // Owned handle so spawned tasks do not borrow the AppHandle.
     let client = app.state::<Arc<EngineClient>>().inner().clone();
@@ -989,6 +1010,17 @@ pub async fn consume_states(app: AppHandle) {
                 media_keys::update_position(heartbeat.position_ms);
                 continue;
             }
+            Ok(StateLine::Volume(volume)) => {
+                // A volume step is one number: freshen the cached snapshot in
+                // place — never the queue — and forward it as a partial state,
+                // which `applyPlayback` applies as a volume-only update.
+                let managed = app.state::<Mutex<AppState>>();
+                let mut guard = managed.lock();
+                apply_volume_line(&mut guard, volume);
+                drop(guard);
+                let _ = app.emit("state", volume_state_payload(volume));
+                continue;
+            }
             Ok(StateLine::Disconnected) => {
                 let disconnected = {
                     let managed = app.state::<Mutex<AppState>>();
@@ -1013,10 +1045,22 @@ pub async fn consume_states(app: AppHandle) {
                 last_error = disconnected.error;
                 continue;
             }
-            // The engine out-ran this consumer; the next line re-syncs
-            // (a skipped full state gets re-emitted by the engine, and a
-            // skipped heartbeat is just one projection step).
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            // The engine out-ran this consumer. A skipped full state re-emits
+            // itself with the next real change and a skipped heartbeat is one
+            // projection step, but a skipped *volume* line is that change gone:
+            // the lane is change-driven, the window reads the volume from it
+            // and nowhere else, and a slider drag writes twenty of them a
+            // second while this loop is awaiting inside a state arm. Ask for a
+            // full state instead of hoping some later line carries the number.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                log::warn(&format!(
+                    "engine lines skipped ({skipped}); re-requesting state"
+                ));
+                if let Err(error) = client.status().await {
+                    log::warn(&format!("could not re-request engine state: {error}"));
+                }
+                continue;
+            }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
 
@@ -1081,8 +1125,8 @@ pub async fn consume_states(app: AppHandle) {
             }
         }
 
-        // Full states are reserved for real changes; heartbeats were already
-        // forwarded as scalar `position` events above.
+        // Full states are reserved for real changes; the scalar lanes were
+        // already forwarded above as their own events.
         let _ = app.emit("state", &state);
         media_keys::update_state(&state);
         if session_changed {
@@ -1667,5 +1711,37 @@ mod tests {
         assert_eq!(snapshot.playback.current_uri, "spotify:track:a");
         assert_eq!(snapshot.playback.volume, 50);
         assert_eq!(snapshot.playback.queue, vec![Track::default()]);
+    }
+
+    /// A volume step reaches the window as a partial `state`: the one key that
+    /// changed. That is the shape `applyPlayback` already applies — it copies
+    /// whichever keys are present — so the slider's confirmed value updates
+    /// without a queue payload, without touching the playing authority and
+    /// without re-anchoring the playhead, all of which a full state would do
+    /// twenty times a second during a drag.
+    #[test]
+    fn volume_lines_are_partial_states_and_update_only_the_snapshot_volume() {
+        let mut snapshot = AppState::new(std::path::PathBuf::new());
+        snapshot.playback = playing_state(1_000);
+        let queue_ptr = snapshot.playback.queue.as_ptr();
+
+        apply_volume_line(&mut snapshot, 37);
+
+        assert_eq!(snapshot.playback.volume, 37);
+        assert_eq!(
+            snapshot.playback.queue.as_ptr(),
+            queue_ptr,
+            "a volume step must not touch the queue"
+        );
+        assert_eq!(
+            snapshot.playback.position_ms, 1_000,
+            "nor the playhead: a volume step carries no position"
+        );
+        assert_eq!(snapshot.playback.playing, true, "nor the transport intent");
+        assert_eq!(
+            volume_state_payload(37),
+            serde_json::json!({ "volume": 37 }),
+            "the event carries one key and nothing else"
+        );
     }
 }

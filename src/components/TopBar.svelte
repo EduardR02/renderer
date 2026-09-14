@@ -90,9 +90,16 @@
    * you stop; firing only on Enter made every query start from zero.
    */
   function onInput(e) {
-    search.query = e.currentTarget.value;
+    const field = e.currentTarget;
+    search.query = field.value;
     if (route.name !== "search" && search.query.trim()) navigate("search");
     queueSearch(search.query);
+    /* A pasted link that opens its own route empties the surface inside
+       `queueSearch` — and it empties it back to the value this field started
+       from, so the one-way binding above has nothing to write and the box
+       would keep a link the route now owns. The field is the only thing that
+       can disagree, so the field is written here. */
+    if (field.value !== search.query) field.value = search.query;
   }
 
   /**

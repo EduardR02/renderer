@@ -303,21 +303,37 @@
     return { destroy: () => node.isConnected && node.hidePopover() };
   }
 
-  function closeMenus() {
+  /**
+   * Closes every menu surface. The kebab gets its focus back only when the
+   * menu was holding it — the copy confirmation's timer fires while the pointer
+   * may be anywhere by then, and a close behind the user's back must not pull
+   * the caret out of whatever they moved to.
+   */
+  function closeMenus(returnFocus = false) {
+    const menuHadFocus = !!menuEl?.contains(document.activeElement);
     menu.generation += 1;
     menu.open = false;
     picker.open = false;
     artistPicker.open = false;
+    if (returnFocus && menuHadFocus) {
+      /* The row the menu hung off may have been recycled by the windowing while
+         the confirmation was on screen; a detached kebab cannot take focus. */
+      const anchor = menu.anchor;
+      queueMicrotask(() => {
+        if (anchor?.isConnected) anchor.focus();
+      });
+    }
   }
 
   /* One shared menu instance for the whole table rather than one per row.
      `maxH` is part of the position, not decoration: see openRowMenu. */
   const menu = $state({
     open: false, x: 0, top: null, bottom: null, maxH: 0,
-    track: null, index: -1, copied: false, generation: 0,
+    track: null, index: -1, copyState: "idle", generation: 0,
     editDefined: false, editEnabled: false, editLoading: false, editError: "",
-    skipPending: false, skipError: "",
+    skipPending: false, skipError: "", anchor: null,
   });
+  let menuEl = $state(null);
   const picker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, track: null });
   /* Same shape and same placement rules as the playlist picker — a second
 
@@ -462,14 +478,17 @@
     const sourcePlaylist = playlistId;
     const r = e.currentTarget.getBoundingClientRect();
     const placed = placePopover(r, MENU_MAX_H);
+    /* A copy still counting down must not close the menu that replaces it. */
+    clearTimeout(copyResetTimer);
     menu.open = true;
+    menu.anchor = e.currentTarget;
     menu.x = Math.min(r.right - 216, window.innerWidth - 224);
     menu.top = placed.top;
     menu.bottom = placed.bottom;
     menu.maxH = placed.maxH;
     menu.track = track;
     menu.index = i;
-    menu.copied = false;
+    menu.copyState = "idle";
     menu.skipPending = false;
     menu.skipError = "";
     menu.editError = "";
@@ -602,18 +621,22 @@
   const menuLink = $derived(spotifyLink("track", menu.track?.id || menu.track?.uri));
 
   let copyResetTimer = 0;
+  /* The confirmation outlives the menu by design, so the timer has to die with
+     the list: a navigation inside its window would otherwise leave it writing
+     to a component that is gone. */
+  $effect(() => () => clearTimeout(copyResetTimer));
   /* The menu STAYS OPEN on copy, because the confirmation is on the item
-     itself and dismissing it would take the only feedback with it. It closes
-     shortly after, which is also what reverts the label. */
+     itself and dismissing it would take the only feedback with it. A copy that
+     landed closes it shortly after, through the close every other dismissal
+     uses, which also drops any status the open menu had asked for. A refused
+     write stays up and says so: the label that never changes is the dead
+     control the confirmation exists to prevent, and the item is also the
+     retry. */
   async function copyTrackLink() {
     if (!menuLink) return;
-    menu.copied = await writeClipboard(menuLink);
-    if (!menu.copied) return;
+    menu.copyState = (await writeClipboard(menuLink)) ? "copied" : "failed";
     clearTimeout(copyResetTimer);
-    copyResetTimer = setTimeout(() => {
-      menu.open = false;
-      menu.copied = false;
-    }, 900);
+    if (menu.copyState === "copied") copyResetTimer = setTimeout(() => closeMenus(true), 900);
   }
 
   /**
@@ -814,17 +837,20 @@
        resizing moves the row and not the menu, so the anchoring is stale the
        moment either happens — and a menu that follows a scrolling row is a
        per-frame layout read on the scroller, which this app does not do
-       anywhere. Dismissing is both cheaper and what the pointer is asking for. */
+       anywhere. Dismissing is both cheaper and what the pointer is asking for.
+       The wrapper is not decoration: registered directly, the Event would land
+       in `returnFocus` and the kebab would take focus back mid-scroll. */
+    const closeOnViewportChange = () => closeMenus();
     const scroller = rootEl?.closest(".scroll");
     window.addEventListener("pointerdown", onDown, true);
     window.addEventListener("keydown", onKey);
-    window.addEventListener("resize", closeMenus);
-    scroller?.addEventListener("scroll", closeMenus, { passive: true });
+    window.addEventListener("resize", closeOnViewportChange);
+    scroller?.addEventListener("scroll", closeOnViewportChange, { passive: true });
     return () => {
       window.removeEventListener("pointerdown", onDown, true);
       window.removeEventListener("keydown", onKey);
-      window.removeEventListener("resize", closeMenus);
-      scroller?.removeEventListener("scroll", closeMenus);
+      window.removeEventListener("resize", closeOnViewportChange);
+      scroller?.removeEventListener("scroll", closeOnViewportChange);
     };
   });
 </script>
@@ -1051,6 +1077,7 @@
     class="menu"
     popover="manual"
     use:topLayer
+    bind:this={menuEl}
     style:left="{menu.x}px"
     style:top={menu.top === null ? null : menu.top + "px"}
     style:bottom={menu.bottom === null ? null : menu.bottom + "px"}
@@ -1071,8 +1098,13 @@
            started 21px to the right of every other label and the column of text
            read as broken. The confirmation is the label itself changing, plus
            the foam colour, which is enough to show the copy happened. -->
-      <button class="menu-item" class:done={menu.copied} onclick={copyTrackLink}>
-        {menu.copied ? "Link copied" : "Copy link"}
+      <button
+        class="menu-item"
+        class:done={menu.copyState === "copied"}
+        class:failed={menu.copyState === "failed"}
+        onclick={copyTrackLink}
+      >
+        {menu.copyState === "copied" ? "Link copied" : menu.copyState === "failed" ? "Copy failed" : "Copy link"}
       </button>
     {/if}
     {#if menu.track?.id}
@@ -1216,5 +1248,8 @@
   }
   .menu-item.done { color: var(--accent); }
   .menu-item.done :global(.icon) { color: var(--accent); }
+  /* A refused write says so in the app's failure colour, distinct from the
+     accent that means "this one landed". */
+  .menu-item.failed { color: var(--love); }
   .edit-check { margin-left: auto; color: var(--accent); }
 </style>

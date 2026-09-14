@@ -11,11 +11,16 @@ export function cleanupChoices(tracks, field) {
     names.forEach((name, index) => {
       if (!name) return;
       const id = ids[index] || "";
-      const key = id ? `id:${id}` : `name:${normalize(name)}`;
+      /* Folded once, here, because this runs when the playlist or the field
+         changes while the filter below runs on every keystroke: stored, one
+         keystroke costs one `includes` per choice instead of a new folded
+         string for every artist in the playlist. */
+      const normalized = normalize(name);
+      const key = id ? `id:${id}` : `name:${normalized}`;
       const existing = choices.get(key);
       if (existing) existing.count += 1;
       else choices.set(key, {
-        key, id, name, count: 1,
+        key, id, name, normalized, count: 1,
         hint: field === "artist" ? track.name : (track.artist_names ?? []).join(", "),
       });
     });
@@ -23,9 +28,10 @@ export function cleanupChoices(tracks, field) {
   return [...choices.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** Matches on the folded name `cleanupChoices` stored, never on a fresh fold. */
 export function filterCleanupChoices(choices, query) {
   const text = normalize(query).trim();
-  return choices.filter((choice) => normalize(choice.name).includes(text));
+  return choices.filter((choice) => choice.normalized.includes(text));
 }
 
 export function cleanupDuration(value) {
@@ -35,12 +41,14 @@ export function cleanupDuration(value) {
 
 function ruleMatcher(rule) {
   if (rule.field === "artist" || rule.field === "album") {
+    // The rule's own name is folded once per matcher, not once per track.
+    const wanted = rule.choice.normalized;
     return (track) => {
       const names = rule.field === "artist" ? track.artist_names ?? [] : [track.album_name];
       const ids = rule.field === "artist" ? track.artist_ids ?? [] : [track.album_id];
       return names.some((name, index) => rule.choice.id
         ? ids[index] === rule.choice.id
-        : !ids[index] && normalize(name) === normalize(rule.choice.name));
+        : !ids[index] && normalize(name) === wanted);
     };
   }
   if (rule.field === "duration") {
@@ -80,17 +88,4 @@ export function cleanupPreview(tracks, rules, grouping) {
     if (uris.has(track.uri)) rows.push({ track, index, extra: !direct[index] });
   });
   return { rows, uris: [...uris], directCount, extraCount: rows.length - directCount, missingCount };
-}
-
-/** Ignore playback/cache bookkeeping, but invalidate any change relevant to this preview. */
-export function cleanupVersion(playlist) {
-  return JSON.stringify([
-    playlist?.id,
-    playlist?.snapshot_id,
-    playlist?.tracks_total,
-    (playlist?.tracks ?? []).map((track) => [
-      track.uri, track.name, track.artist_names, track.artist_ids,
-      track.album_id, track.album_name, track.duration_ms,
-    ]),
-  ]);
 }

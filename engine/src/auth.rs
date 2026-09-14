@@ -128,6 +128,18 @@ pub enum PlaybackError {
     /// The output device could not be opened. The string is what the user is
     /// shown, and it names the cause and the way out.
     NoOutputDevice(String),
+    /// The machine has a device, but opening it did not return within
+    /// [`AUDIO_START_TIMEOUT`].
+    ///
+    /// Separate from [`Self::NoOutputDevice`] because of what the retry costs.
+    /// The librespot player thread that ran that open is still inside cpal and
+    /// will not come back, so it is parked for the life of the process: every
+    /// further attempt leaves another one behind. The engine treats this as its
+    /// own condition and retries it on a much longer clock
+    /// (`engine::AUDIO_BLOCKED_PROBE_BACKOFF_MAX`) than an ordinary missing
+    /// device, which is retried in seconds. The message is the same kind of
+    /// user-facing text as the one above.
+    DeviceOpenBlocked(String),
     /// Anything else: the software mixer, the player thread, or librespot
     /// itself failing before the device was ever reached.
     Fatal(String),
@@ -136,7 +148,9 @@ pub enum PlaybackError {
 impl PlaybackError {
     pub fn message(&self) -> &str {
         match self {
-            Self::NoOutputDevice(message) | Self::Fatal(message) => message,
+            Self::NoOutputDevice(message) | Self::DeviceOpenBlocked(message) | Self::Fatal(message) => {
+                message
+            }
         }
     }
 }
@@ -168,6 +182,39 @@ fn no_output_device_message(error: &RodioError) -> String {
         error => format!(" ({error})"),
     };
     format!("no audio output device{detail}. {NO_OUTPUT_DEVICE_REMEDY}")
+}
+
+/// Turns the device step's answer into the failure the caller acts on.
+///
+/// `Ok(None)` is the only success — the sink asked for a device and got one.
+/// Every other answer is named for what it costs to *retry*, not for what it
+/// looked like: a refused open is an ordinary missing device, retried in
+/// seconds, while an open that never returned is a wedged driver whose player
+/// thread stays parked inside cpal for the life of the process, and is retried
+/// on a much longer clock (see [`PlaybackError::DeviceOpenBlocked`]). The
+/// builder never being reached is not about the device at all.
+fn device_step_failure(
+    answer: Result<Option<RodioError>, std_mpsc::RecvTimeoutError>,
+) -> Option<PlaybackError> {
+    match answer {
+        Ok(None) => None,
+        Ok(Some(error)) => Some(PlaybackError::NoOutputDevice(no_output_device_message(
+            &error,
+        ))),
+        Err(std_mpsc::RecvTimeoutError::Timeout) => Some(PlaybackError::DeviceOpenBlocked(
+            format!(
+                "no audio output device: opening one did not finish within {} s. \
+                 {NO_OUTPUT_DEVICE_REMEDY}",
+                AUDIO_START_TIMEOUT.as_secs()
+            ),
+        )),
+        // The builder was never reached, which means the player thread ended
+        // before it could ask for a device: a librespot or runtime failure, and
+        // a retry would meet the same one.
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => Some(PlaybackError::Fatal(
+            "the audio player terminated before it opened an output device".to_owned(),
+        )),
+    }
 }
 
 /// A prepared OAuth authorization-code + PKCE attempt. The authorize URL is
@@ -277,11 +324,16 @@ pub async fn connect_cached(
                 playback: Ok(playback),
             }),
             // The device is the machine's problem, not the account's: the
-            // session is left running and the engine retries the device.
-            Err(PlaybackError::NoOutputDevice(message)) => Ok(ConnectedSession {
-                session,
-                playback: Err(message),
-            }),
+            // session is left running and the engine retries the device. A
+            // device whose open hung is the same answer with a different retry
+            // clock, which the engine derives from the probe's own typed
+            // result.
+            Err(error @ (PlaybackError::NoOutputDevice(_) | PlaybackError::DeviceOpenBlocked(_))) => {
+                Ok(ConnectedSession {
+                    session,
+                    playback: Err(error.message().to_owned()),
+                })
+            }
             // Unchanged from when playback construction was one string: a
             // player that cannot be built at all is reported as a login
             // problem, session torn down, exactly as a refusal is.
@@ -382,11 +434,15 @@ pub async fn complete_oauth(
         }),
         // Signing in on a machine with no output device used to fail the whole
         // flow, which is a strange thing to tell someone whose password was
-        // accepted: the session is live, and the device is retried.
-        Err(PlaybackError::NoOutputDevice(message)) => Ok(ConnectedSession {
-            session,
-            playback: Err(message),
-        }),
+        // accepted: the session is live, and the device is retried. A device
+        // that hung instead of refusing is the same story with a longer retry
+        // clock.
+        Err(error @ (PlaybackError::NoOutputDevice(_) | PlaybackError::DeviceOpenBlocked(_))) => {
+            Ok(ConnectedSession {
+                session,
+                playback: Err(error.message().to_owned()),
+            })
+        }
         Err(PlaybackError::Fatal(message)) => {
             session.shutdown();
             Err(message)
@@ -765,29 +821,8 @@ pub async fn create_playback(
         .map_err(|error| {
             PlaybackError::Fatal(format!("audio initialization worker failed: {error}"))
         })?;
-    match device {
-        Ok(None) => {}
-        Ok(Some(error)) => {
-            return Err(PlaybackError::NoOutputDevice(no_output_device_message(&error)))
-        }
-        Err(std_mpsc::RecvTimeoutError::Timeout) => {
-            // A driver that blocks inside the open for ten seconds is a device
-            // the user can wait out or unplug, not a broken engine, so it is
-            // retried like the rest.
-            return Err(PlaybackError::NoOutputDevice(format!(
-                "no audio output device: opening one did not finish within {} s. \
-                 {NO_OUTPUT_DEVICE_REMEDY}",
-                AUDIO_START_TIMEOUT.as_secs()
-            )));
-        }
-        // The builder was never reached, which means the player thread ended
-        // before it could ask for a device: a librespot or runtime failure, and
-        // a retry would meet the same one.
-        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(PlaybackError::Fatal(
-                "the audio player terminated before it opened an output device".to_owned(),
-            ))
-        }
+    if let Some(failure) = device_step_failure(device) {
+        return Err(failure);
     }
     if player.is_invalid() {
         return Err(PlaybackError::Fatal(
@@ -832,11 +867,12 @@ pub fn stored_volume_percent(cache: &Cache) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OAUTH_LISTENER_TIMEOUT, OAUTH_REDIRECT_URI, bind_oauth_listener, extract_oauth_code,
-        lock_oauth_port, mixer_config, oauth_callback_path, oauth_failed_response,
-        oauth_listener_addr, oauth_success_response, player_config, prepare_oauth,
-        wait_for_oauth_code_within,
+        AUDIO_START_TIMEOUT, OAUTH_LISTENER_TIMEOUT, OAUTH_REDIRECT_URI, PlaybackError,
+        bind_oauth_listener, device_step_failure, extract_oauth_code, lock_oauth_port,
+        mixer_config, oauth_callback_path, oauth_failed_response, oauth_listener_addr,
+        oauth_success_response, player_config, prepare_oauth, std_mpsc, wait_for_oauth_code_within,
     };
+    use crate::audio::RodioError;
     use librespot_playback::config::VolumeCtrl;
     use librespot_playback::mixer::Mixer;
     use librespot_playback::mixer::softmixer::SoftMixer;
@@ -1087,5 +1123,55 @@ mod tests {
         // 2FA prompt on another device, and possibly signing up. Five minutes
         // expired under people who were still typing.
         assert!(OAUTH_LISTENER_TIMEOUT >= Duration::from_secs(15 * 60));
+    }
+
+    /// The device step's answer decides how hard the engine retries it, so it
+    /// has to be classified for what the retry costs rather than for what it
+    /// looked like. A refused open is a missing device, seconds away from
+    /// working; an open that never returned is a wedged driver whose player
+    /// thread is parked inside cpal for the life of the process. Treated as a
+    /// missing device, that second answer would leave a thread behind every ten
+    /// seconds.
+    #[test]
+    fn a_device_open_that_never_returned_is_its_own_failure() {
+        assert!(
+            device_step_failure(Ok(None)).is_none(),
+            "a device that opened is not a failure"
+        );
+
+        let refused = device_step_failure(Ok(Some(RodioError::NoDeviceAvailable)))
+            .expect("a refused open is a failure");
+        assert!(
+            matches!(refused, PlaybackError::NoOutputDevice(_)),
+            "a device that is simply gone retries in seconds: {refused:?}"
+        );
+        assert!(refused.message().contains("no audio output device"));
+        assert!(
+            refused.message().contains("Plug in or enable"),
+            "and still tells the user the way out: {}",
+            refused.message()
+        );
+
+        let blocked = device_step_failure(Err(std_mpsc::RecvTimeoutError::Timeout))
+            .expect("a hung open is a failure");
+        assert!(
+            matches!(blocked, PlaybackError::DeviceOpenBlocked(_)),
+            "the retry clock is chosen by this variant: {blocked:?}"
+        );
+        assert!(
+            blocked
+                .message()
+                .contains(&AUDIO_START_TIMEOUT.as_secs().to_string()),
+            "and the message still says how long the open was given: {}",
+            blocked.message()
+        );
+
+        let disconnected =
+            device_step_failure(Err(std_mpsc::RecvTimeoutError::Disconnected))
+                .expect("a player thread that never asked for a device is a failure");
+        assert!(
+            matches!(disconnected, PlaybackError::Fatal(_)),
+            "a thread that ended before the device step is not the device's: {disconnected:?}"
+        );
     }
 }

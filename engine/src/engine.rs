@@ -22,7 +22,7 @@ use crate::io::ProtocolWriter;
 use renderer_engine::protocol::{
     AuthState, BrowseResponse, Command, HistoryPage, HistoryQuery, LoopRange, PositionEvent,
     RepeatMode, Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
-    TrackRef,
+    TrackRef, VolumeEvent,
 };
 use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
@@ -154,14 +154,31 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// failed open, and the ceiling that wait doubles up to.
 ///
 /// These are short because this wait is the delay between the owner plugging
-/// the dongle back in and hearing music, and a probe costs one device
-/// enumeration when nothing has changed — no network, no audio key, no track
-/// load. The first retry is a heartbeat or two after the device would have
-/// landed; the ceiling keeps a machine that has been without audio since boot
-/// from enumerating WASAPI every tick, and is low enough that a dongle Windows
-/// recognises late still plays without anyone pressing anything.
+/// the dongle back in and hearing music. A probe that finds nothing is one
+/// device enumeration — the player construction only runs once a device is
+/// actually there (see [`Engine::tick_audio_device`]), so the no-device case
+/// costs no mixer, no player thread and no failed cpal open. The first retry
+/// is a heartbeat or two after the device would have landed; the ceiling keeps
+/// a machine that has been without audio since boot from enumerating WASAPI
+/// every tick, and is low enough that a dongle Windows recognises late still
+/// plays without anyone pressing anything.
 const AUDIO_PROBE_BACKOFF_MIN: Duration = Duration::from_secs(2);
 const AUDIO_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// The longest wait a probe may reach after an open that never returned. See
+/// [`PlayerFailure::Blocked`].
+const AUDIO_BLOCKED_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// How long a changed volume has to sit still before [`Engine::tick_volume_persist`]
+/// writes it to the librespot cache.
+///
+/// The write is a file create, and the UI paces `set_volume` at 50 ms while a
+/// slider is dragged, so it is deferred to the tick that follows the gesture
+/// rather than paid per step. A second of quiet is short enough that a value
+/// the user has settled on is on disk by the next heartbeat — the heartbeat
+/// itself is 2 s, so the cache is never more than a couple of seconds behind a
+/// stopped drag — and long enough that a continuing drag is one write instead
+/// of twenty a second.
+const VOLUME_PERSIST_QUIET: Duration = Duration::from_secs(1);
 
 pub struct Engine {
     writer: ProtocolWriter,
@@ -269,7 +286,16 @@ pub struct Engine {
     /// the loop end, and the final pass at or after it. Internal loop jumps
     /// preserve and increment this value.
     loop_pass: u32,
+    /// An authentication attempt is in flight; no second one may start, and
+    /// nothing may act on the session until it answers.
     auth_running: bool,
+    /// The generation [`Engine::auth_running`] belongs to: the attempt's own
+    /// generation, captured when it started. It is what lets a stale
+    /// `Complete` tell "the attempt I was abandoned for" from "the attempt the
+    /// engine is waiting on now" (see
+    /// [`Engine::abandon_cached_authentication`]). Meaningless while
+    /// `auth_running` is false.
+    auth_generation: u64,
     /// Track-gain volume normalisation (attenuation-only, see
     /// `auth::player_config`). Shared with in-flight authentication so it can
     /// build the latest preference without reconnecting the session.
@@ -283,30 +309,83 @@ pub struct Engine {
     /// can put the engine in (see [`audio::SinkOpener`]) — real hardware
     /// cannot be asked to boot without one.
     audio_device: audio::SinkOpener,
+    /// Whether the machine has a default output device at all. Held for the
+    /// same reason as [`Self::audio_device`], and asked before it: a machine
+    /// with nothing plugged in must not build a mixer, a player thread and a
+    /// failing open to learn what the device list already says.
+    audio_device_present: audio::DevicePresence,
     /// Set while the machine has no output device to open. See
     /// [`AudioUnavailable`].
     audio_unavailable: Option<AudioUnavailable>,
     /// How long the heartbeat waits before probing for an output device
-    /// again, doubling per failed probe up to [`AUDIO_PROBE_BACKOFF_MAX`].
+    /// again, doubling per failed probe up to the ceiling of the failure the
+    /// last probe answered with (see [`PlayerFailure`]).
     audio_probe_backoff: Duration,
+    /// The transport volume the librespot cache does not hold yet. See
+    /// [`VOLUME_PERSIST_QUIET`] for why the write is not paid per change.
+    pending_volume: Option<PendingVolume>,
 }
 
-/// The machine has no output device the engine can open.
+/// A volume change that is not in the librespot cache yet, in librespot's u16
+/// scale.
+struct PendingVolume {
+    /// The newest value. A drag overwrites this faster than any single write
+    /// could land, and only the value it stops at is worth writing.
+    volume: u16,
+    /// When it last changed, which is what [`VOLUME_PERSIST_QUIET`] measures.
+    changed_at: Instant,
+}
+
+/// The engine has no player, and the probe is what brings one back.
 ///
-/// This is deliberately not an error *state*: `state.ready` stays true, the
-/// session stays connected, and the only thing missing is the player. The
-/// device is a property of the machine that the user changes without telling
-/// the engine, so the engine asks again on its heartbeat until one answers.
+/// This is deliberately not an error *state*: `state.ready` stays true when
+/// the session is live, and the only thing missing is the player. Whether the
+/// machine has no output device, a device whose open failed, or a
+/// reconstruction that failed outright, the answer is the same — the device is
+/// a property of the machine that the user changes without telling the engine,
+/// so the engine asks again on its heartbeat until a player exists.
 struct AudioUnavailable {
     /// What the user is shown: the cause and the way out.
     message: String,
-    /// The next moment the heartbeat may open a device. A probe already running
-    /// holds this at the instant its own open must have finished by
+    /// The next moment the heartbeat may build a player. A probe already
+    /// running holds this at the instant its own open must have finished by
     /// ([`AUDIO_START_TIMEOUT`]), so one runs at a time — and a probe whose
     /// answer is dropped, because the session was replaced while it ran, is
     /// still replaced by another instead of leaving the device untried for
     /// good.
     retry_at: Instant,
+}
+
+/// Why the engine has no player, which is what its retry ladder is sized
+/// against.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlayerFailure {
+    /// An ordinary failure to get a player: no device is there, one refused
+    /// the open, or the construction itself failed. A short retry gets past
+    /// this — a dongle Windows recognised late, a device another application
+    /// is holding between tracks, a player thread that died on the way up.
+    Ordinary,
+    /// A device is there and opening it did not return within
+    /// [`AUDIO_START_TIMEOUT`]: the driver is wedged, not the machine's device
+    /// list. That open is still running on a librespot player thread, parked
+    /// inside cpal for the rest of the process, so every further probe leaks
+    /// one — and this answer is reached by *waiting* ten seconds, so retrying
+    /// it on the ordinary ten-second ceiling would park a thread per probe
+    /// forever, thousands a day, all of them waiting on the same driver.
+    /// Backing off on a much longer ladder bounds the accumulation while still
+    /// recovering without a restart if the driver wakes up or is replaced,
+    /// which is the only way this condition ends.
+    Blocked,
+}
+
+impl PlayerFailure {
+    /// The longest wait this failure lets the ladder reach.
+    fn ceiling(self) -> Duration {
+        match self {
+            Self::Ordinary => AUDIO_PROBE_BACKOFF_MAX,
+            Self::Blocked => AUDIO_BLOCKED_PROBE_BACKOFF_MAX,
+        }
+    }
 }
 
 struct PlaybackState {
@@ -374,6 +453,7 @@ impl Engine {
         state_directory: std::path::PathBuf,
         normalisation: bool,
         audio_device: audio::SinkOpener,
+        audio_device_present: audio::DevicePresence,
     ) -> Self {
         let history_root = state_directory.clone();
         let track_edits = TrackEditStore::load_or_empty(&state_directory);
@@ -438,11 +518,14 @@ impl Engine {
             loop_jump_pending: false,
             loop_pass: 1,
             auth_running: false,
+            auth_generation: 0,
             normalisation: Arc::new(AtomicBool::new(normalisation)),
             pending_auth: None,
             audio_device,
+            audio_device_present,
             audio_unavailable: None,
             audio_probe_backoff: AUDIO_PROBE_BACKOFF_MIN,
+            pending_volume: None,
         }
     }
 
@@ -546,10 +629,10 @@ impl Engine {
     /// Serializes only the playhead scalars the frontend projects and clamps
     /// against — never the queue — for the 2-second position heartbeat.
     /// [`Engine::emit_state`] stays reserved for real changes (track, queue,
-    /// volume, shuffle, repeat, duration, play/pause), so the steady-state
-    /// heartbeat cost is O(1) in queue length. The heartbeat is emitted only
-    /// while playing: paused positions are static and project from the last
-    /// full state.
+    /// shuffle, repeat, duration, play/pause), and volume has a scalar lane of
+    /// its own ([`Engine::emit_volume`]), so the steady-state heartbeat cost is
+    /// O(1) in queue length. The heartbeat is emitted only while playing:
+    /// paused positions are static and project from the last full state.
     pub fn emit_position(&self) -> Result<(), String> {
         let (position_ms, duration_ms) = self.transport_position_and_duration();
         self.writer.send(&PositionEvent {
@@ -557,6 +640,60 @@ impl Engine {
             position_ms,
             duration_ms,
         })
+    }
+
+    /// Serializes the one scalar a volume change moved — never the queue —
+    /// and is what makes the command answer `false` instead of asking the loop
+    /// for a full state.
+    ///
+    /// Volume travels on its own lane for the same reason the playhead does:
+    /// the UI paces `set_volume` at one command per 50 ms while a slider is
+    /// dragged, and a full state per step would serialize the queue and its
+    /// computed upcoming set twenty times a second to say one number.
+    pub fn emit_volume(&self) -> Result<(), String> {
+        self.writer.send(&VolumeEvent {
+            kind: "volume",
+            volume: self.state.volume,
+        })
+    }
+
+    /// Writes a volume that has stopped changing to the librespot cache.
+    ///
+    /// Called from the same heartbeat that advances the playhead, and the only
+    /// place a drag's cache write is paid: [`Engine::set_volume`] defers it, so
+    /// a gesture that would otherwise create and rewrite a file twenty times a
+    /// second costs one write, a second after the value stops moving.
+    pub fn tick_volume_persist(&mut self) {
+        let Some(pending) = self.pending_volume.as_ref() else {
+            return;
+        };
+        if pending.changed_at.elapsed() >= VOLUME_PERSIST_QUIET {
+            self.flush_pending_volume();
+        }
+    }
+
+    /// Hands the volume the cache is missing to librespot, which reports its
+    /// own write failures (`Cache::save_volume` returns nothing else). Called
+    /// by the heartbeat tick and by [`Engine::shutdown`].
+    fn flush_pending_volume(&mut self) {
+        if let Some(pending) = self.pending_volume.take() {
+            self.cache.save_volume(pending.volume);
+        }
+    }
+
+    /// The cache a player construction about to be started will read the
+    /// transport volume from, with any pending write flushed first.
+    ///
+    /// The deferred write is at most a couple of seconds behind (see
+    /// [`VOLUME_PERSIST_QUIET`]), and a construction that read the older value
+    /// would adopt it: [`Engine::on_auth_signal`] takes a fresh player's
+    /// `volume_percent` into `state.volume` for a session with no queue, and
+    /// the rebuild paths adopt `state.volume` as it stands. Flushing here
+    /// means a new player always starts from the volume the user had set when
+    /// the construction began, however recently they set it.
+    fn construction_cache(&mut self) -> Cache {
+        self.flush_pending_volume();
+        self.cache.clone()
     }
 
     fn current_timeline(&self) -> EditTimeline<'_> {
@@ -694,6 +831,10 @@ impl Engine {
     /// the handover without an artificial gap.
     pub fn tick_session_health(&mut self, sender: &mpsc::UnboundedSender<AuthSignal>) -> bool {
         if self.auth_running {
+            // An attempt is in flight; it clears this when it answers. An
+            // answer that arrives stale hands the flag back through
+            // [`Engine::abandon_cached_authentication`], so this guard can
+            // never be the reason reconnecting stops happening.
             return false;
         }
         let dead = self
@@ -742,11 +883,18 @@ impl Engine {
     ///
     /// Returns whether the engine's state changed and should be emitted.
     ///
-    /// A probe is one device enumeration, and the rebuild it eventually starts
-    /// is the same one a normalisation change performs; the only unusual thing
-    /// about it is that it runs while a session is already up. Its own answer
-    /// re-arms the clock — success clears the state, failure reschedules with
-    /// the next backoff — so nothing here needs a timer of its own.
+    /// A probe starts with the cheap question — is there a default output
+    /// device at all — because the construction behind it is not cheap: a
+    /// mixer, a librespot player thread and a cpal open, all of it spawned on
+    /// a machine that reported no device every two to ten seconds since boot.
+    /// With nothing plugged in the device list already answers no, so the
+    /// construction is skipped entirely and the wait stays on the same ladder;
+    /// the full construction runs once, when a device is really there. The
+    /// rebuild it starts is the same one a normalisation change performs, and
+    /// the only unusual thing about it is that it runs while a session is
+    /// already up. Its own answer re-arms the clock — success clears the
+    /// state, failure reschedules with the next backoff — so nothing here
+    /// needs a timer of its own.
     pub fn tick_audio_device(&mut self, sender: &mpsc::UnboundedSender<AuthSignal>) -> bool {
         let Some(unavailable) = self.audio_unavailable.as_ref() else {
             return false;
@@ -759,13 +907,24 @@ impl Engine {
             // decides when that changes.
             return false;
         };
+        // One enumeration of the device list, and no construction behind it
+        // when it says nothing is there. The miss waits on the same ladder a
+        // failed open does, so a dongle Windows recognises late is still
+        // picked up within [`AUDIO_PROBE_BACKOFF_MAX`].
+        if !(self.audio_device_present)() {
+            let retry_at = self.next_device_probe(PlayerFailure::Ordinary);
+            if let Some(unavailable) = self.audio_unavailable.as_mut() {
+                unavailable.retry_at = retry_at;
+            }
+            return false;
+        }
         // The probe now owns the clock for as long as its open may take, which
         // is what keeps a second one from starting beside it.
         if let Some(unavailable) = self.audio_unavailable.as_mut() {
             unavailable.retry_at = Instant::now() + AUDIO_START_TIMEOUT;
         }
         let generation = self.generation;
-        let cache = self.cache.clone();
+        let cache = self.construction_cache();
         let normalisation = Arc::clone(&self.normalisation);
         let audio = Arc::clone(&self.audio_device);
         let sender = sender.clone();
@@ -781,14 +940,37 @@ impl Engine {
         false
     }
 
-    /// Enters the recoverable no-output-device state: no player, the session
+    /// Arms the next probe at the current backoff, then lengthens the ladder.
+    ///
+    /// A miss from the cheap device check and a construction that came back
+    /// without a player are the same news to this clock — the machine has no
+    /// audio *yet* — and both return the deadline the caller stores. What
+    /// separates them is the ceiling: an ordinary failure may try again in ten
+    /// seconds, an open that never returned may not (see
+    /// [`PlayerFailure::Blocked`]). The ladder is clamped to that ceiling
+    /// *before* it is used, not only before it is stored: a wedged driver walks
+    /// the backoff up to five minutes, and the device that turns up missing or
+    /// refusing afterwards must not inherit that wait — otherwise the ordinary
+    /// failure that follows a blocked episode retries on the blocked clock,
+    /// which is the one thing the separate ceilings exist to prevent.
+    fn next_device_probe(&mut self, failure: PlayerFailure) -> Instant {
+        let ceiling = failure.ceiling();
+        let wait = self.audio_probe_backoff.min(ceiling);
+        self.audio_probe_backoff = (wait * 2).min(ceiling);
+        Instant::now() + wait
+    }
+
+    /// Enters the recoverable no-player state: no player, the session
     /// untouched, and the queue and playhead exactly as they were.
     ///
     /// Playback intent survives — `state.playing` is deliberately not touched —
-    /// so a track that was playing when the device went away plays again when
+    /// so a track that was playing when the player went away plays again when
     /// one comes back, which is the whole point of not treating this as a
     /// failure of the session.
-    fn enter_audio_unavailable(&mut self, message: String) {
+    ///
+    /// `failure` is why the player could not be had (see [`PlayerFailure`]), and
+    /// it sizes the retry ladder the next probe runs on.
+    fn enter_audio_unavailable(&mut self, message: String, failure: PlayerFailure) {
         self.detach_player();
         // Events still in flight from the detached player — the pause its own
         // stalled write caused, and the close that follows the player thread's
@@ -797,17 +979,26 @@ impl Engine {
         // session down, which is the very thing this state exists to undo.
         self.generation = self.generation.wrapping_add(1);
         self.pause_listening();
-        eprintln!("audio: {message}");
+        // Only the transition is log news. Every failed probe lands here
+        // again, and a machine that has been without audio since boot used to
+        // write one line per probe — thousands a day at the ceiling, into a log
+        // that rotates at 4 MiB — eating the history that would explain the
+        // outages worth reading. The message itself is not lost: it is
+        // `state.error`, which every state event carries and the UI shows.
+        if audio_unavailable_is_news(
+            self.audio_unavailable.as_ref().map(|previous| previous.message.as_str()),
+            &message,
+        ) {
+            eprintln!("audio: {message}");
+        }
         self.state.error = Some(message.clone());
-        self.audio_unavailable = Some(AudioUnavailable {
-            message,
-            retry_at: Instant::now() + self.audio_probe_backoff,
-        });
-        self.audio_probe_backoff = (self.audio_probe_backoff * 2).min(AUDIO_PROBE_BACKOFF_MAX);
+        let retry_at = self.next_device_probe(failure);
+        self.audio_unavailable = Some(AudioUnavailable { message, retry_at });
     }
 
-    /// A player exists, so whatever was wrong with the output device is over:
-    /// drop the message and start the next outage at the short backoff.
+    /// A player exists, so whatever was wrong with the device — or with the
+    /// construction that was replacing it — is over: drop the message and start
+    /// the next outage at the short backoff.
     fn clear_audio_unavailable(&mut self) {
         self.audio_unavailable = None;
         self.audio_probe_backoff = AUDIO_PROBE_BACKOFF_MIN;
@@ -870,7 +1061,7 @@ impl Engine {
         let Some(session) = self.session.clone() else {
             return true;
         };
-        let cache = self.cache.clone();
+        let cache = self.construction_cache();
         let sender = sender.clone();
         let generation = self.generation;
         let audio = Arc::clone(&self.audio_device);
@@ -906,7 +1097,7 @@ impl Engine {
             self.enter_needs_login();
             return;
         }
-        let cache = self.cache.clone();
+        let cache = self.construction_cache();
         let temporary_directory = self.temporary_directory.clone();
         let normalisation = Arc::clone(&self.normalisation);
         let audio = Arc::clone(&self.audio_device);
@@ -926,6 +1117,9 @@ impl Engine {
         }
         self.auth_running = true;
         self.generation = self.generation.wrapping_add(1);
+        // The attempt answers under the generation it started with, and that
+        // is what identifies it to a stale-answer check later.
+        self.auth_generation = self.generation;
         self.state.ready = false;
         self.state.auth_state = AuthState::Authenticating;
         if !preserve_active_playback {
@@ -994,7 +1188,7 @@ impl Engine {
         let (pending, listener) = self.begin_login_flow()?;
         let generation = self.generation;
         let auth_sender = auth_sender.clone();
-        let cache = self.cache.clone();
+        let cache = self.construction_cache();
         let temporary_directory = self.temporary_directory.clone();
         let normalisation = Arc::clone(&self.normalisation);
         let audio = Arc::clone(&self.audio_device);
@@ -1036,6 +1230,7 @@ impl Engine {
         self.shutdown_playback();
         self.auth_running = true;
         self.generation = self.generation.wrapping_add(1);
+        self.auth_generation = self.generation;
         self.state.ready = false;
         self.state.auth_state = AuthState::Authenticating;
         self.state.playing = false;
@@ -1085,6 +1280,12 @@ impl Engine {
         match signal {
             AuthSignal::Complete { generation, result } => {
                 if generation != self.generation {
+                    // The attempt this answer belongs to no longer exists: the
+                    // generation moved on while `connect_cached` was in flight.
+                    // Discarding the answer is right; discarding the
+                    // bookkeeping is not — see
+                    // [`Engine::abandon_cached_authentication`].
+                    self.abandon_cached_authentication(generation);
                     return false;
                 }
                 self.auth_running = false;
@@ -1154,7 +1355,13 @@ impl Engine {
                                 // for still happened — the queue, the volume,
                                 // the auth state — and the player arrives from
                                 // the heartbeat once the machine has one.
-                                self.enter_audio_unavailable(message);
+                                //
+                                // `playback` crosses this boundary as the
+                                // message alone, so a boot whose open timed out
+                                // is classified as a missing device here; the
+                                // probe re-derives the blocked condition from
+                                // its own typed answer, seconds later.
+                                self.enter_audio_unavailable(message, PlayerFailure::Ordinary);
                             }
                         }
                         true
@@ -1201,14 +1408,34 @@ impl Engine {
                     // session is fine and only the device is missing, so the
                     // engine stays exactly where it was and asks again later.
                     Err(PlaybackError::NoOutputDevice(message)) => {
-                        self.enter_audio_unavailable(message);
+                        self.enter_audio_unavailable(message, PlayerFailure::Ordinary);
+                        return true;
+                    }
+                    // A device that exists but did not answer: the driver is
+                    // the problem, and the open that hung is a player thread
+                    // this process will never get back. Retry it on the long
+                    // ladder so those do not accumulate.
+                    Err(PlaybackError::DeviceOpenBlocked(message)) => {
+                        self.enter_audio_unavailable(message, PlayerFailure::Blocked);
                         return true;
                     }
                     Err(error) => {
-                        self.state.error = Some(format!(
-                            "could not rebuild the audio player: {}",
-                            error.message()
-                        ));
+                        // The rebuild itself failed — the software mixer, the
+                        // player thread — rather than a device refusing an open.
+                        // The preference it was rebuilding for is already
+                        // swapped into the shared atomic every later rebuild
+                        // reads, so keeping the incumbent would leave the engine
+                        // playing a configuration it has just reported as not
+                        // applied; and the message saying so would be released
+                        // by the next command (`clear_error`) because no device
+                        // failure was in force, leaving a silent mismatch over
+                        // audio nobody described. So the player goes the way a
+                        // refused device's does: the reason stays in
+                        // `state.error`, and the probe re-arms to build one.
+                        self.enter_audio_unavailable(
+                            format!("could not rebuild the audio player: {}", error.message()),
+                            PlayerFailure::Ordinary,
+                        );
                         return true;
                     }
                 };
@@ -1239,6 +1466,43 @@ impl Engine {
             }
         }
     }
+    /// Hands the engine back its retry after an authentication attempt that will
+    /// never be answered.
+    ///
+    /// `connect_cached` is spawned with the generation it started under, and any
+    /// generation bump while it is in flight — a device failure detaching the
+    /// player, a rebuild installing one — makes its `Complete` arrive stale. The
+    /// answer is dropped; the flag it set must not be. `auth_running` gates
+    /// every later start: [`Engine::tick_session_health`] returns at its first
+    /// line, [`Engine::start_cached_authentication`] no-ops, [`Engine::login`]
+    /// answers `Ok` without binding the callback port, and even the device probe
+    /// is refused (`player_rebuild_is_current` needs `state.ready`). The app
+    /// would show "reconnecting" until the process was restarted.
+    ///
+    /// `attempt` is the generation the stale answer carries, and
+    /// [`Engine::auth_generation`] says whether that attempt is the one the
+    /// engine is still waiting on. It will not always be: an explicit logout
+    /// clears the flag and bumps the generation while a cached attempt is still
+    /// in flight, and the user may start a fresh OAuth flow before the old
+    /// answer lands. Clearing the flag then would take it from the live flow —
+    /// whose next click would fail on the callback port — so an answer that
+    /// belongs to some earlier attempt only clears its own.
+    fn abandon_cached_authentication(&mut self, attempt: u64) {
+        if !self.auth_running || self.auth_generation != attempt {
+            return;
+        }
+        self.auth_running = false;
+        // A reconnect attempt armed its own due time before starting, so this
+        // is a safety net rather than what makes the retry happen: it covers an
+        // attempt started with no due time armed at all (a first connect), so
+        // that a future caller of [`Engine::start_authentication`] cannot
+        // reintroduce the wedge this helper exists to undo.
+        if self.next_reconnect.is_none() {
+            self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
+            self.next_reconnect = Some(Instant::now() + self.reconnect_backoff);
+        }
+    }
+
     fn player_rebuild_is_current(&self, generation: u64, normalisation: bool) -> bool {
         self.state.ready
             && generation == self.generation
@@ -1755,7 +2019,7 @@ impl Engine {
                 let was_playing = self.state.current_index.is_some()
                     && (self.state.playing || self.current_load_produced_audio);
                 self.state.playing = was_playing;
-                self.enter_audio_unavailable(audio_stalled_message());
+                self.enter_audio_unavailable(audio_stalled_message(), PlayerFailure::Ordinary);
                 true
             }
         }
@@ -1764,6 +2028,11 @@ impl Engine {
         self.auth_running = false;
         self.generation = self.generation.wrapping_add(1);
         self.shutdown_playback();
+        // A clean exit must not lose the volume the heartbeat has not written
+        // yet. The write it was waiting for is never going to come, and the
+        // cache file is the engine's only copy — the shell's snapshot is a
+        // different file with a different clock.
+        self.flush_pending_volume();
         self.state.ready = false;
         self.state.playing = false;
     }
@@ -2549,13 +2818,26 @@ impl Engine {
         if let Some(mixer) = &self.mixer {
             mixer.set_volume(volume);
         }
-        self.cache.save_volume(volume);
+        // The cache write is deferred rather than paid here. A slider drag
+        // paces this command at 50 ms and `Cache::save_volume` creates and
+        // rewrites a file per call, so writing per step would mean twenty file
+        // creations a second for a number that has already moved on. The
+        // heartbeat writes the value the drag stops at
+        // ([`Engine::tick_volume_persist`]), and a clean exit writes whatever
+        // is still pending ([`Engine::shutdown`]).
+        self.pending_volume = Some(PendingVolume {
+            volume,
+            changed_at: Instant::now(),
+        });
         // The audible volume lives on the rodio sink (per-packet attenuation
         // is disabled); apply it there so the change is heard immediately.
         crate::audio::set_sink_volume(volume);
         self.state.volume = percent;
         self.clear_error();
-        Ok(true)
+        // The change travels on the scalar lane, and the `Ok(false)` below
+        // tells the command loop not to serialize the whole state for it.
+        self.emit_volume()?;
+        Ok(false)
     }
 
     fn set_shuffle(&mut self, enabled: bool) -> Result<bool, String> {
@@ -3600,12 +3882,28 @@ fn first_available_wrapping(queue: &[TrackRef], start: usize) -> Option<usize> {
 /// this point is that nothing has consumed the audio ring for a couple of
 /// seconds, and the device may still be there — a driver restart, a USB
 /// re-enumeration, a display that went to sleep. The probe that follows asks
-/// the device itself, and its answer replaces this one within seconds when
-/// there really is none.
+/// the device list before it builds anything: with nothing there it fixes
+/// nothing and says nothing, and with a device there the construction it starts
+/// either clears this message or replaces it with the reason the open failed.
 fn audio_stalled_message() -> String {
     "the audio output stopped responding; playback resumes by itself when an output device is \
      available"
         .to_owned()
+}
+
+/// Whether entering the no-output-device state is worth a log line.
+///
+/// Only the transition is news. Every failed probe re-enters this state, so a
+/// machine that has been without audio since boot used to write one line per
+/// probe — thousands a day at the ceiling, into a log that rotates at 4 MiB —
+/// and ate the history that would explain the outages worth reading. The
+/// steady-state retries stay silent; the message itself is not lost, because it
+/// lives in `state.error`, which every state event carries and the UI shows.
+/// A *different* message is a different condition worth a line: `no audio
+/// output device` after `the audio output stopped responding` says the driver
+/// finally answered, or that a plugged-back-in device refused the open.
+fn audio_unavailable_is_news(previous: Option<&str>, message: &str) -> bool {
+    previous != Some(message)
 }
 
 #[cfg(test)]
@@ -3668,17 +3966,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        AUDIO_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MIN, AudioSignal, AuthFailure, AuthSignal,
-        ConnectedSession, Engine, LOAD_RETRY_BACKOFF, PRELOAD_WATERMARK_MS, PlaybackHandles,
-        PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
-        TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL, UNAVAILABLE_BURST_WINDOW,
-        UNAVAILABLE_STOP_LIMIT, automatic_track_eligible, first_automatic_from,
+        AUDIO_BLOCKED_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MIN,
+        AudioSignal, AuthFailure, AuthSignal, ConnectedSession, Engine, LOAD_RETRY_BACKOFF,
+        PRELOAD_WATERMARK_MS, PlaybackHandles, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX,
+        RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
+        UNAVAILABLE_BURST_WINDOW, UNAVAILABLE_STOP_LIMIT, VOLUME_PERSIST_QUIET,
+        audio_unavailable_is_news, automatic_track_eligible, first_automatic_from,
         first_automatic_wrapping, first_available_from, first_available_wrapping,
         remap_current_index_after_move, sequential_automatic_index, sequential_available_index,
         sequential_next_index, track_change_wait, with_preview_edit,
     };
     use crate::audio::{self, RodioError};
-    use crate::auth::{PlaybackError, create_playback};
+    use crate::auth::{PlaybackError, create_playback, percent_to_volume};
     use crate::customization::TrackEditStore;
     use crate::io::ProtocolWriter;
     use librespot_core::SpotifyUri;
@@ -3695,7 +3994,7 @@ mod tests {
     }
 
     fn test_engine_in(state_directory: PathBuf) -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
-        test_engine_with_audio(state_directory, device_present())
+        test_engine_with_audio(state_directory, device_present(), device_always_present())
     }
 
     /// A machine that always has an output device, behind a sink that accepts
@@ -3706,18 +4005,32 @@ mod tests {
         Arc::new(|_| Ok(Box::new(TestSink)))
     }
 
+    /// The presence answer that goes with [`device_present`]: this machine has
+    /// a default output device, every time it is asked.
+    fn device_always_present() -> audio::DevicePresence {
+        Arc::new(|| true)
+    }
+
     fn test_engine_with_audio(
         state_directory: PathBuf,
         audio_device: audio::SinkOpener,
+        audio_device_present: audio::DevicePresence,
+    ) -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
+        test_engine_with_cache(
+            state_directory,
+            no_path_cache(),
+            audio_device,
+            audio_device_present,
+        )
+    }
+
+    fn test_engine_with_cache(
+        state_directory: PathBuf,
+        cache: librespot_core::cache::Cache,
+        audio_device: audio::SinkOpener,
+        audio_device_present: audio::DevicePresence,
     ) -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
         let (writer, buffer) = ProtocolWriter::capture();
-        let cache = librespot_core::cache::Cache::new(
-            None::<PathBuf>,
-            None::<PathBuf>,
-            None::<PathBuf>,
-            None,
-        )
-        .expect("cache with no paths");
         (
             Engine::new(
                 writer,
@@ -3727,6 +4040,7 @@ mod tests {
                 state_directory,
                 false,
                 audio_device,
+                audio_device_present,
             ),
             buffer,
         )
@@ -3743,12 +4057,16 @@ mod tests {
     }
 
     /// A machine whose output device can be unplugged and plugged back in, and
-    /// which counts the sinks the engine opened on it. Both directions of the
-    /// device bug turn on exactly these two facts, and neither is something
-    /// real hardware can be asked to provide on cue.
+    /// which counts what the engine asked of it. Both directions of the device
+    /// bug turn on exactly these facts, and none of them is something real
+    /// hardware can be asked to provide on cue.
     #[derive(Default)]
     struct TestAudioDevice {
         present: AtomicBool,
+        /// Every ask for a sink, whether or not one was handed back. This is
+        /// the observable form of "a player construction reached the device
+        /// step" — the engine only gets here through `auth::create_playback`.
+        asked: AtomicUsize,
         opened: AtomicUsize,
     }
 
@@ -3773,19 +4091,34 @@ mod tests {
             self.present.store(false, Ordering::Release);
         }
 
+        /// How many sinks were handed back.
         fn opened(&self) -> usize {
             self.opened.load(Ordering::Acquire)
+        }
+
+        /// How many times a player construction reached the device step.
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::Acquire)
         }
 
         fn opener(self: &Arc<Self>) -> audio::SinkOpener {
             let device = Arc::clone(self);
             Arc::new(move |_| {
+                device.asked.fetch_add(1, Ordering::AcqRel);
                 if !device.present.load(Ordering::Acquire) {
                     return Err(RodioError::NoDeviceAvailable);
                 }
                 device.opened.fetch_add(1, Ordering::AcqRel);
                 Ok(Box::new(TestSink))
             })
+        }
+
+        /// The cheap answer that goes with [`Self::opener`]: whether cpal would
+        /// find a default output device on this machine, asked without
+        /// building anything.
+        fn presence(self: &Arc<Self>) -> audio::DevicePresence {
+            let device = Arc::clone(self);
+            Arc::new(move || device.present.load(Ordering::Acquire))
         }
     }
 
@@ -5357,6 +5690,271 @@ mod tests {
         assert_eq!(engine.set_repeat(RepeatMode::Off), Ok(false));
         assert_eq!(engine.history, vec![3]);
         assert_eq!(engine.shuffle_pool, vec![4]);
+    }
+
+    /// Reads one protocol line and parses it, leaving the buffer empty for the
+    /// next emission.
+    fn take_line(buffer: &Arc<std::sync::Mutex<Vec<u8>>>) -> serde_json::Value {
+        let line = {
+            let mut bytes = buffer.lock().expect("buffer lock");
+            std::mem::take(&mut *bytes)
+        };
+        assert!(!line.is_empty(), "nothing was emitted");
+        serde_json::from_slice(&line).expect("protocol line is json")
+    }
+
+    /// Ages the pending volume the way a heartbeat arriving after the drag
+    /// would find it.
+    fn settle_volume(engine: &mut Engine) {
+        let pending = engine
+            .pending_volume
+            .as_mut()
+            .expect("a volume change is pending");
+        pending.changed_at = Instant::now() - VOLUME_PERSIST_QUIET - Duration::from_millis(1);
+    }
+
+    /// A temp cache directory whose volume file a test can read back, so
+    /// "persisted" means the bytes librespot would read on the next start.
+    struct VolumeCacheFixture {
+        directory: PathBuf,
+        cache: librespot_core::cache::Cache,
+    }
+
+    impl VolumeCacheFixture {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "renderer-engine-volume-cache-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            let _ = std::fs::remove_dir_all(&directory);
+            let cache = librespot_core::cache::Cache::new(
+                None::<PathBuf>,
+                Some(directory.clone()),
+                None::<PathBuf>,
+                None,
+            )
+            .expect("cache with a volume path");
+            Self { directory, cache }
+        }
+
+        /// What a player built right now would start from.
+        fn stored(&self) -> Option<u16> {
+            self.cache.volume()
+        }
+    }
+
+    impl Drop for VolumeCacheFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    /// A cache with no paths at all: nothing is ever read from or written to
+    /// disk, which is what most tests want.
+    fn no_path_cache() -> librespot_core::cache::Cache {
+        librespot_core::cache::Cache::new(
+            None::<PathBuf>,
+            None::<PathBuf>,
+            None::<PathBuf>,
+            None,
+        )
+        .expect("cache with no paths")
+    }
+
+    /// Ready with a real player, plus the protocol buffer the caller reads:
+    /// the shape a running app is in when the user drags the volume. `cache`
+    /// is separate so a persistence test can hand in one it can read back.
+    fn dragging_engine(
+        cache: librespot_core::cache::Cache,
+    ) -> (Engine, SinkProbe, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let probe = SinkProbe::new();
+        let (player, session) = probe_player(&probe);
+        let (mut engine, buffer) = test_engine_with_cache(
+            PathBuf::new(),
+            cache,
+            device_present(),
+            device_always_present(),
+        );
+        engine.state = playback_state(240_000);
+        engine.play_request_id = Some(7);
+        engine.player = Some(player);
+        engine.session = Some(session);
+        (engine, probe, buffer)
+    }
+
+    /// One volume step is one number, and the protocol must say so. The drag
+    /// path paces `set_volume` at 50 ms, so a step that serialized the queue
+    /// and its computed upcoming set would do that twenty times a second to
+    /// say what a single scalar says — and the `false` is what keeps the
+    /// command loop from following it with a full state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_volume_step_emits_the_scalar_lane_and_no_full_state() {
+        let (mut engine, _probe, buffer) = dragging_engine(no_path_cache());
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = engine
+            .process_command(Command::SetVolume { percent: 30 }, &auth_sender)
+            .await;
+        assert_eq!(
+            result,
+            Ok(false),
+            "a volume step must not ask the loop for a full state"
+        );
+        assert_eq!(engine.state.volume, 30, "the loudness still moves");
+
+        let line = take_line(&buffer);
+        assert_eq!(line["type"], "volume");
+        assert_eq!(line["volume"], 30);
+        assert_eq!(
+            line.as_object().expect("volume line is an object").len(),
+            2,
+            "type and volume, nothing else: {line:?}"
+        );
+
+        // A repeated value is not news, and costs nothing at all.
+        assert_eq!(
+            engine
+                .process_command(Command::SetVolume { percent: 30 }, &auth_sender)
+                .await,
+            Ok(false)
+        );
+        assert!(
+            buffer.lock().expect("buffer lock").is_empty(),
+            "the same value emits nothing"
+        );
+    }
+
+    /// The cache write is the drag's real cost — `Cache::save_volume` creates
+    /// and rewrites a file per call — so it waits for the value to settle and
+    /// is paid once per gesture rather than twenty times a second.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_volume_burst_reaches_the_cache_once_and_again_after_it_settles() {
+        let fixture = VolumeCacheFixture::new();
+        let (mut engine, _probe, _buffer) = dragging_engine(fixture.cache.clone());
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        for percent in [30u8, 31, 32, 33] {
+            engine
+                .process_command(Command::SetVolume { percent }, &auth_sender)
+                .await
+                .expect("volume applies");
+        }
+        // Still moving: the heartbeat tick that lands mid-drag writes nothing.
+        engine.tick_volume_persist();
+        assert_eq!(
+            fixture.stored(),
+            None,
+            "no step of a drag may cost a file write"
+        );
+
+        // The drag has stopped, and the next tick writes the value it stopped
+        // at — once for the whole gesture.
+        settle_volume(&mut engine);
+        engine.tick_volume_persist();
+        assert_eq!(fixture.stored(), Some(percent_to_volume(33)));
+
+        // Not a one-shot: the next settled value is written as well, and only
+        // after it settles.
+        engine
+            .process_command(Command::SetVolume { percent: 40 }, &auth_sender)
+            .await
+            .expect("volume applies");
+        engine.tick_volume_persist();
+        assert_eq!(
+            fixture.stored(),
+            Some(percent_to_volume(33)),
+            "a value that is still moving is not written"
+        );
+        settle_volume(&mut engine);
+        engine.tick_volume_persist();
+        assert_eq!(fixture.stored(), Some(percent_to_volume(40)));
+    }
+
+    /// A player construction reads the transport volume from the cache, and a
+    /// reconnect on a queue-less engine adopts what it finds there into
+    /// `state.volume`. So a change the heartbeat has not written yet must
+    /// reach the cache before the construction that follows it, or a network
+    /// blip inside the write-behind window would quietly put the volume back
+    /// the way it was.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_player_construction_is_given_the_volume_the_user_last_set() {
+        let fixture = VolumeCacheFixture::new();
+        let (mut engine, _probe, _buffer) = dragging_engine(fixture.cache.clone());
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        engine
+            .process_command(Command::SetVolume { percent: 62 }, &auth_sender)
+            .await
+            .expect("volume applies");
+        assert_eq!(
+            fixture.stored(),
+            None,
+            "the heartbeat has not written the change yet"
+        );
+
+        // A real construction entry point: the flush must land before the
+        // spawned task reads the cache.
+        assert!(engine.set_normalisation(true, &auth_sender));
+
+        assert_eq!(
+            fixture.stored(),
+            Some(percent_to_volume(62)),
+            "the player that is about to be built starts from the value the user set"
+        );
+    }
+
+    /// A quit must not lose a volume the heartbeat has not written yet: the
+    /// cache file is the engine's only copy, and a clean exit is exactly when
+    /// there is still time to write it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_volume_is_written_by_shutdown() {
+        let fixture = VolumeCacheFixture::new();
+        let (mut engine, _probe, _buffer) = dragging_engine(fixture.cache.clone());
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        engine
+            .process_command(Command::SetVolume { percent: 25 }, &auth_sender)
+            .await
+            .expect("volume applies");
+        assert_eq!(fixture.stored(), None, "the write is still pending");
+
+        engine.shutdown();
+
+        assert_eq!(
+            fixture.stored(),
+            Some(percent_to_volume(25)),
+            "the last volume survives a clean exit"
+        );
+    }
+
+    /// Only the transition into the no-device state is news. A machine that
+    /// has been without audio since boot re-enters this state on every probe,
+    /// and a line per probe would eat the rotating engine log the outages
+    /// worth reading are in.
+    #[test]
+    fn only_a_new_no_device_condition_is_worth_a_log_line() {
+        assert!(
+            audio_unavailable_is_news(None, "no audio output device"),
+            "the first entry into the state is the news"
+        );
+        assert!(
+            audio_unavailable_is_news(
+                Some("the audio output stopped responding"),
+                "no audio output device"
+            ),
+            "a different message is a different condition"
+        );
+        assert!(
+            !audio_unavailable_is_news(
+                Some("no audio output device"),
+                "no audio output device"
+            ),
+            "a steady-state retry of the same condition stays silent"
+        );
     }
 
     #[test]
@@ -7165,6 +7763,7 @@ mod tests {
                     fixture.directory.clone(),
                     false,
                     device_present(),
+                    device_always_present(),
                 ),
                 buffer,
             )
@@ -7216,6 +7815,7 @@ mod tests {
             fixture.directory.clone(),
             false,
             device_present(),
+            device_always_present(),
         );
         assert!(engine.logout().expect("first logout"));
         assert!(!fixture.credentials_exist());
@@ -7504,6 +8104,187 @@ mod tests {
         assert!(engine.reconnect_backoff > RECONNECT_BACKOFF_MIN);
     }
 
+    /// A generation bump from the audio path while a reconnect is in flight
+    /// must not leave the engine permanently mid-auth. The attempt's answer
+    /// arrives stale and is discarded — but the flag it set gates every later
+    /// start: the health tick returns at its first line, the cached attempt and
+    /// `login` both no-op (`login` answering `Ok` without binding the callback
+    /// port), and the device probe is refused because `state.ready` never comes
+    /// back. The app sat on "reconnecting" until the process was restarted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_audio_failure_during_a_reconnect_cannot_wedge_authentication() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state.playing = true;
+
+        // The session librespot invalidated, and the reconnect attempt the
+        // health tick left in flight.
+        let stale = librespot_core::Session::new(librespot_core::SessionConfig::default(), None);
+        stale.shutdown();
+        engine.session = Some(stale);
+        engine.state.ready = false;
+        engine.state.auth_state = renderer_engine::protocol::AuthState::Authenticating;
+        engine.auth_running = true;
+        engine.next_reconnect = Some(Instant::now() - Duration::from_millis(1));
+        let attempt = engine.generation;
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        // The device dies while the round trip is out.
+        assert!(engine.on_audio_signal(AudioSignal::OutputStalled {
+            revision: engine.audio_revision,
+        }));
+        assert_ne!(engine.generation, attempt, "the failure stales the attempt");
+        assert!(engine.audio_unavailable.is_some(), "and arms the device probe");
+
+        // The answer arrives for an attempt that no longer exists.
+        assert!(
+            !engine.on_auth_signal(
+                AuthSignal::Complete {
+                    generation: attempt,
+                    result: Err(AuthFailure::Unreachable("no such host".to_owned())),
+                },
+                player_sender,
+            ),
+            "a stale answer changes nothing"
+        );
+        assert!(
+            !engine.auth_running,
+            "and must hand the engine back its retry instead of squatting on the flag"
+        );
+
+        // The retry is reachable again: the next due tick runs the start path
+        // instead of returning at the flag. This cache holds no credentials, so
+        // the start path lands on the login prompt — the state the user can act
+        // on; an engine with cached credentials reconnects from here.
+        let generation = engine.generation;
+        assert!(
+            engine.tick_session_health(&auth_sender),
+            "the due retry runs the start path again"
+        );
+        assert_ne!(engine.generation, generation, "and it is a real attempt");
+        assert_eq!(
+            engine.state.auth_state,
+            renderer_engine::protocol::AuthState::NeedsLogin,
+            "the engine is out of 'reconnecting'"
+        );
+        assert!(
+            engine.state.auth_url.is_some(),
+            "with a URL the Log in button can use"
+        );
+    }
+
+    /// A stale answer may only clear its *own* attempt. An explicit logout
+    /// clears the flag and bumps the generation while a cached attempt is still
+    /// in flight, and the Log in click that follows starts the OAuth flow under
+    /// a newer generation. When the old answer finally lands it belongs to
+    /// neither, and clearing the live flow's flag would leave the next click
+    /// failing on the callback port the flow still holds.
+    #[test]
+    fn a_stale_answer_cannot_abandon_a_live_login_flow() {
+        let _serialized = crate::auth::lock_oauth_port();
+        let mut engine = test_engine().0;
+        engine.state = playback_state(240_000);
+        engine.auth_running = true;
+        engine.auth_generation = engine.generation;
+        let attempt = engine.generation;
+
+        assert!(engine.logout().expect("logout succeeds"));
+        assert!(
+            !engine.auth_running,
+            "the explicit logout ends the old attempt"
+        );
+
+        // The click's own bookkeeping. `login` adds only the spawn of the flow,
+        // which a test must not start: it waits on the loopback callback for
+        // twenty minutes.
+        let (_pending, _listener) = engine.begin_login_flow().expect("the flow starts");
+        assert!(engine.auth_running, "the flow owns the flag now");
+        let flow_generation = engine.auth_generation;
+        assert_ne!(flow_generation, attempt, "and answers under a newer one");
+
+        // The abandoned attempt's answer arrives at last.
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            !engine.on_auth_signal(
+                AuthSignal::Complete {
+                    generation: attempt,
+                    result: Err(AuthFailure::Unreachable("no such host".to_owned())),
+                },
+                player_sender,
+            ),
+            "a stale answer changes nothing"
+        );
+
+        assert!(
+            engine.auth_running,
+            "the live flow keeps its flag, so its next click is not refused a port it holds"
+        );
+        assert_eq!(
+            engine.auth_generation, flow_generation,
+            "the engine is still waiting on the attempt that is actually in flight"
+        );
+        assert_eq!(
+            engine.state.auth_state,
+            renderer_engine::protocol::AuthState::Authenticating,
+            "and the flow's state was not disturbed"
+        );
+    }
+
+    /// A rebuild that failed outright must not leave the old player running.
+    /// The preference it was rebuilding for is already swapped into the shared
+    /// atomic every later rebuild reads, so keeping the incumbent would play
+    /// the old configuration while the engine reports the new one as not
+    /// applied — and the message saying so was released by the next command
+    /// (`clear_error`) as soon as nothing was in force.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fatal_rebuild_failure_does_not_leave_the_old_player_running() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state.playing = true;
+        engine.normalisation.store(true, Ordering::Release);
+        let generation = engine.generation;
+
+        assert!(engine.on_auth_signal(
+            AuthSignal::PlayerRebuilt {
+                generation,
+                normalisation: true,
+                result: Err(PlaybackError::Fatal(
+                    "could not initialize software volume: test".to_owned(),
+                )),
+            },
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+
+        assert!(
+            engine.player.is_none(),
+            "a configuration reported as not applied must not keep playing"
+        );
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("could not rebuild the audio player")),
+            "and the reason is the user's to read: {:?}",
+            engine.state.error
+        );
+        assert!(
+            engine.audio_unavailable.is_some(),
+            "it lives in the state `clear_error` respects, and the probe re-arms"
+        );
+
+        // A command that succeeds while the failure is in force does not make
+        // it go away: nothing it did brought the player back.
+        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        engine
+            .process_command(Command::SetVolume { percent: 30 }, &auth_sender)
+            .await
+            .expect("volume applies");
+        assert!(
+            engine.state.error.is_some(),
+            "the message survives an unrelated command"
+        );
+    }
+
     /// The retry above leaves no session behind, so the health tick cannot look
     /// for a dead one; it has to notice the armed retry instead.
     #[test]
@@ -7620,7 +8401,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_output_device_leaves_a_live_session_browsing_and_says_why() {
         let device = TestAudioDevice::absent();
-        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener(), device.presence());
         let session = engine_without_output_device(&mut engine, &device).await;
 
         assert_eq!(device.opened(), 0, "nothing was opened on a machine with no device");
@@ -7673,7 +8454,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_device_that_appears_rebuilds_the_player_and_resumes_the_queue() {
         let device = TestAudioDevice::absent();
-        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener(), device.presence());
         engine.state = playback_state(240_000);
         engine.state.playing = true;
         engine.update_position(42_000);
@@ -7690,6 +8471,7 @@ mod tests {
             .as_mut()
             .expect("no device")
             .retry_at = Instant::now() - Duration::from_millis(1);
+        let constructions = device.asked();
         assert!(
             !engine.tick_audio_device(&auth_sender),
             "starting a probe is not itself a state change"
@@ -7697,6 +8479,11 @@ mod tests {
         let signal = receive_auth_signal(&mut auth_receiver).await;
         assert!(engine.on_auth_signal(signal, player_sender));
 
+        assert_eq!(
+            device.asked(),
+            constructions + 1,
+            "a device that appears is constructed once, not once per probe"
+        );
         assert_eq!(device.opened(), 1, "the probe opened the device");
         assert!(engine.player.is_some(), "the player is back");
         assert!(engine.audio_unavailable.is_none());
@@ -7725,7 +8512,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_device_lost_mid_playback_returns_to_the_recoverable_state() {
         let device = TestAudioDevice::present();
-        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener(), device.presence());
         let probe = SinkProbe::new();
         let (player, session) = probe_player(&probe);
         let player_handle = Arc::downgrade(&player);
@@ -7794,8 +8581,10 @@ mod tests {
             "and must not erase the intent to resume"
         );
 
-        // Still no device: the probe answers with the real cause, which
-        // replaces the stall's wording, and schedules the next attempt.
+        // Still no device, and the probe does not build one to find that out:
+        // the cheap check answers it. The stall's wording stands, because no
+        // construction ran to produce another — and nothing is lost, since it
+        // already says playback resumes when a device is available.
         device.unplug();
         let (auth_sender, mut auth_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (player_sender, mut player_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -7804,12 +8593,36 @@ mod tests {
             .as_mut()
             .expect("no device")
             .retry_at = Instant::now() - Duration::from_millis(1);
+        let constructions = device.asked();
         assert!(!engine.tick_audio_device(&auth_sender));
-        let signal = receive_auth_signal(&mut auth_receiver).await;
-        assert!(engine.on_auth_signal(signal, player_sender.clone()));
-        let message = engine.state.error.clone().expect("still no sound");
-        assert!(message.contains("no audio output device"), "{message}");
-        assert_eq!(device.opened(), 0);
+        assert_eq!(
+            device.asked(),
+            constructions,
+            "a machine with no device builds no player"
+        );
+        assert_eq!(device.opened(), 0, "and opens nothing");
+        assert!(
+            auth_receiver.try_recv().is_err(),
+            "and starts nothing that could answer later"
+        );
+        assert!(
+            engine
+                .audio_unavailable
+                .as_ref()
+                .expect("still no device")
+                .retry_at
+                > Instant::now(),
+            "the next attempt waits its backoff"
+        );
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("stopped responding")),
+            "the last established cause is not replaced by a probe that built nothing: {:?}",
+            engine.state.error
+        );
 
         // The dongle is plugged back in.
         device.plug_in();
@@ -7837,7 +8650,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_device_failure_never_stands_in_for_a_missing_session() {
         let device = TestAudioDevice::absent();
-        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener(), device.presence());
         let session = engine_without_output_device(&mut engine, &device).await;
         assert!(engine.audio_unavailable.is_some());
 
@@ -7864,14 +8677,17 @@ mod tests {
     /// The retry clock: one probe at a time, each failure waiting longer than
     /// the last, and a ceiling — a machine that has been without audio since
     /// boot must not enumerate devices on every heartbeat for the rest of the
-    /// day, and a device that lands must still be picked up in seconds.
+    /// day, and a device that lands must still be picked up in seconds. A
+    /// probe that finds no device must not build a player to confirm it: the
+    /// construction is a mixer, a player thread and a failed cpal open, paid
+    /// every few seconds for an answer the device list already has.
     #[tokio::test(flavor = "current_thread")]
-    async fn device_probes_back_off_to_a_ceiling_one_at_a_time() {
+    async fn device_probes_back_off_to_a_ceiling_without_building_anything() {
         let device = TestAudioDevice::absent();
-        let (mut engine, _) = test_engine_with_audio(PathBuf::new(), device.opener());
+        let (mut engine, _) =
+            test_engine_with_audio(PathBuf::new(), device.opener(), device.presence());
         engine_without_output_device(&mut engine, &device).await;
         let (auth_sender, mut auth_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(!engine.tick_audio_device(&auth_sender));
         assert!(
@@ -7888,9 +8704,19 @@ mod tests {
                 .as_mut()
                 .expect("no device")
                 .retry_at = Instant::now() - Duration::from_millis(1);
+            let constructions = device.asked();
             assert!(!engine.tick_audio_device(&auth_sender));
-            // The probe holds the clock while it runs, so a tick arriving
-            // during it cannot start a second one against the same device.
+            assert_eq!(
+                device.asked(),
+                constructions,
+                "a probe that finds no device constructs nothing"
+            );
+            assert!(
+                auth_receiver.try_recv().is_err(),
+                "and starts nothing that would answer later"
+            );
+            // The probe owns the clock until its next due time, so a tick
+            // arriving meanwhile cannot start a second one beside it.
             let held = engine.audio_unavailable.as_ref().expect("no device").retry_at;
             assert!(held > Instant::now(), "the probe holds the clock");
             assert!(!engine.tick_audio_device(&auth_sender));
@@ -7899,8 +8725,6 @@ mod tests {
                 held,
                 "and a second tick leaves it exactly where the probe put it"
             );
-            let signal = receive_auth_signal(&mut auth_receiver).await;
-            assert!(engine.on_auth_signal(signal, player_sender.clone()));
             assert_eq!(device.opened(), 0, "there is still nothing to open");
         }
 
@@ -7922,6 +8746,103 @@ mod tests {
             AUDIO_PROBE_BACKOFF_MIN >= Duration::from_secs(1)
                 && AUDIO_PROBE_BACKOFF_MAX <= Duration::from_secs(30),
             "the ceiling is what bounds how long a plugged-in device stays silent"
+        );
+    }
+
+    /// The driver that never answers is its own condition. The player thread
+    /// that ran that open stays parked inside cpal for the rest of the
+    /// process, so retrying it on the ordinary ten-second ceiling would leave
+    /// another one behind every ten seconds — thousands a day — while the
+    /// machine stayed just as silent. The blocked answer must climb to a much
+    /// longer ladder, and an ordinary failure afterwards must come back down
+    /// to the short one that picks a plugged-in device up in seconds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocked_device_open_backs_off_much_harder_than_a_missing_one() {
+        let (mut engine, _) = test_engine();
+        engine.state.ready = true;
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        // What the probe answers when the device is there but its open hung
+        // until `AUDIO_START_TIMEOUT`.
+        let blocked_answer = |engine: &Engine| AuthSignal::PlayerRebuilt {
+            generation: engine.generation,
+            normalisation: engine.normalisation.load(Ordering::Acquire),
+            result: Err(PlaybackError::DeviceOpenBlocked(
+                "no audio output device: opening one did not finish within 10 s".to_owned(),
+            )),
+        };
+
+        assert!(engine.on_auth_signal(blocked_answer(&engine), player_sender.clone()));
+        assert!(
+            engine.audio_unavailable.is_some(),
+            "a blocked open is still the recoverable device state"
+        );
+        assert!(
+            engine
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("did not finish within")),
+            "and the user is told what happened: {:?}",
+            engine.state.error
+        );
+
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            waits.push(
+                engine
+                    .audio_unavailable
+                    .as_ref()
+                    .expect("no device")
+                    .retry_at
+                    .saturating_duration_since(Instant::now()),
+            );
+            assert!(engine.on_auth_signal(blocked_answer(&engine), player_sender.clone()));
+        }
+        assert!(
+            waits
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1] + Duration::from_millis(1)),
+            "each blocked answer waits at least as long as the last: {waits:?}"
+        );
+        assert_eq!(
+            engine.audio_probe_backoff, AUDIO_BLOCKED_PROBE_BACKOFF_MAX,
+            "and the ladder ends at the blocked ceiling"
+        );
+        assert!(
+            AUDIO_BLOCKED_PROBE_BACKOFF_MAX >= AUDIO_PROBE_BACKOFF_MAX * 10,
+            "backing off barely harder would leave the parked player threads accumulating"
+        );
+
+        // The driver answers again, so this is an ordinary failure: the ladder
+        // returns to the ordinary clock that retries a missing device in
+        // seconds.
+        assert!(engine.on_auth_signal(
+            AuthSignal::PlayerRebuilt {
+                generation: engine.generation,
+                normalisation: engine.normalisation.load(Ordering::Acquire),
+                result: Err(PlaybackError::NoOutputDevice(
+                    "no audio output device".to_owned(),
+                )),
+            },
+            player_sender,
+        ));
+        assert_eq!(
+            engine.audio_probe_backoff, AUDIO_PROBE_BACKOFF_MAX,
+            "an ordinary failure stores the ordinary clock again"
+        );
+        // And the deadline it actually armed is the ordinary one: clamping
+        // only what gets stored would leave this failure — a plainly missing
+        // device — waiting out the five minutes the wedged driver earned.
+        let wait = engine
+            .audio_unavailable
+            .as_ref()
+            .expect("still no device")
+            .retry_at
+            .saturating_duration_since(Instant::now());
+        assert!(
+            wait <= AUDIO_PROBE_BACKOFF_MAX,
+            "the ordinary failure must not inherit the blocked wait: {wait:?}"
         );
     }
 }

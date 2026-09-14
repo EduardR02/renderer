@@ -1229,8 +1229,10 @@ pub struct StateEvent<'a> {
 /// The engine's 2-second position heartbeat: only the scalar playhead data
 /// the frontend projects and clamps against. Emitted only while playing.
 /// Full [`StateEvent`]s — queue included — are reserved for real changes
-/// (track/queue/volume/shuffle/repeat/duration, play/pause), so a heartbeat
-/// never serializes or clones the queue: its cost is O(1) in queue length.
+/// (track/queue/shuffle/repeat/duration, play/pause), so a heartbeat never
+/// serializes or clones the queue: its cost is O(1) in queue length. Volume
+/// changes have a scalar lane of their own ([`VolumeEvent`]) for the same
+/// reason.
 #[derive(Serialize)]
 pub struct PositionEvent {
     #[serde(rename = "type")]
@@ -1240,6 +1242,22 @@ pub struct PositionEvent {
     pub duration_ms: u32,
 }
 
+/// The engine's scalar volume lane: the transport volume, and nothing else.
+///
+/// Volume gets its own lane for the same reason the playhead did. The UI
+/// paces `set_volume` at one command per 50 ms while a slider is dragged, and
+/// a full [`StateEvent`] per step would serialize the queue and its computed
+/// upcoming set twenty times a second to say one number — while the webview
+/// discards that number anyway, because it is already showing the drag's own
+/// optimistic value. Full [`StateEvent`]s still carry `volume` for every
+/// caller that needs the whole picture.
+#[derive(Serialize)]
+pub struct VolumeEvent {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub volume: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1247,8 +1265,8 @@ mod tests {
     use super::{
         ArtistRef, AuthState, BrowseResponse, Command, LoopRange, PlaylistRecommendations,
         PlaylistRef, PositionEvent, RadioBrowse, RepeatMode, Request, Response, SearchBrowse,
-        SongwriterPlaylist, StateEvent, TrackRef, normalize_canonical_playlist_description,
-        sanitize_playlist_description,
+        SongwriterPlaylist, StateEvent, TrackRef, VolumeEvent,
+        normalize_canonical_playlist_description, sanitize_playlist_description,
     };
 
     #[test]
@@ -1531,6 +1549,24 @@ mod tests {
         assert_eq!(heartbeat["duration_ms"], 240_000);
         assert!(!object.contains_key("queue"), "no queue on a heartbeat");
         assert!(!object.contains_key("playing"), "no flags on a heartbeat");
+    }
+
+    #[test]
+    fn volume_serializes_as_a_scalar_line_without_queue() {
+        let event = serde_json::to_value(VolumeEvent {
+            kind: "volume",
+            volume: 42,
+        })
+        .unwrap();
+        let object = event.as_object().expect("volume line is an object");
+        // `type` plus the one number a drag changed, and nothing else: the
+        // whole point of the lane is that a volume step never pays for the
+        // queue or its upcoming set.
+        assert_eq!(object.len(), 2, "only type and volume");
+        assert_eq!(event["type"], "volume");
+        assert_eq!(event["volume"], 42);
+        assert!(!object.contains_key("queue"), "no queue on a volume line");
+        assert!(!object.contains_key("position_ms"), "no playhead either");
     }
 
     #[test]

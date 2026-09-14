@@ -434,8 +434,12 @@ function stopPlayheadTicker() {
   playheadTimer = null;
 }
 
-function syncPlayheadTicker(playing) {
-  if (playing && !playback.buffering) startPlayheadTicker();
+/** Reads the store rather than a caller's requested target: the ticker follows
+    playback as a whole, so a play request that arrives while the engine is
+    still loading cannot leave a 4 Hz invalidation running over a playhead that
+    has nothing to advance from. */
+function syncPlayheadTicker() {
+  if (playback.playing && !playback.buffering) startPlayheadTicker();
   else stopPlayheadTicker();
 }
 
@@ -470,7 +474,6 @@ export function applyPlayback(payload) {
     confirmedVolume = payload.volume;
   }
   const loggedOut = observeSearchSession(payload);
-  const wasAdvancing = playback.playing && !playback.buffering;
   for (const key of Object.keys(playback)) {
     // A full state for an older drag position must not undo the live intent.
     if (key === "volume" && volumePendingGeneration !== null) continue;
@@ -481,7 +484,10 @@ export function applyPlayback(payload) {
     session.username = null;
   }
   if ("position_ms" in payload) anchorPlayhead(payload.position_ms);
-  if ((playback.playing && !playback.buffering) !== wasAdvancing) syncPlayheadTicker(playback.playing);
+  /* Unconditional, not "only when the advancing flag changed": a payload that
+     reports no change then repairs any ticker that drifted, at the price of a
+     null check, and no caller has to remember the `buffering` term. */
+  syncPlayheadTicker();
   if ("queue" in payload) propagateCachedMarks(payload.queue);
   maybeStartDeferredSearch();
 }
@@ -1095,8 +1101,12 @@ function openLink(link, text) {
     if (route.name === link.kind && route.id === link.id) return;
     /* The surface is emptied rather than left holding the link: the route owns
        what that link shows now, and a heading still claiming a link is open
-       above a page that has searched nothing is a worse record than none. */
+       above a page that has searched nothing is a worse record than none. The
+       box is emptied with it — reaching for the box is what pushed `search`
+       onto the history in the first place — so Back lands on an empty search
+       page rather than on this link again. */
     enqueueSearch("");
+    search.query = "";
     navigate(link.kind, link.id);
     return;
   }
@@ -1732,13 +1742,13 @@ function requestPlaying(target) {
   const authority = playingAuthorityGeneration;
   playback.playing = target;
   anchorPlayhead(at);
-  syncPlayheadTicker(target);
+  syncPlayheadTicker();
   return invoke(target ? "play" : "pause").catch((error) => {
     if (generation === playingRequestGeneration && authority === playingAuthorityGeneration) {
       const rollbackAt = positionMs();
       playback.playing = previous;
       anchorPlayhead(rollbackAt);
-      syncPlayheadTicker(previous);
+      syncPlayheadTicker();
     }
     throw error;
   });
