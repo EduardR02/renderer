@@ -51,7 +51,7 @@ impl Default for AppSettings {
             audio_cache_limit_mb: DEFAULT_AUDIO_CACHE_LIMIT_MB,
             launch_at_login: false,
             start_minimized: false,
-            animated_canvas: false,
+            animated_canvas: true,
             normalisation: false,
         }
     }

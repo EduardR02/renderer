@@ -1,10 +1,12 @@
 <script>
+  import Cover from "./Cover.svelte";
   import Icon from "./Icon.svelte";
   import Select from "./Select.svelte";
   import { api } from "../lib/state.svelte.js";
-  import { formatTime, formatExactTime } from "../lib/time.js";
+  import { formatTime } from "../lib/time.js";
   import {
-    cleanupChoices, filterCleanupChoices, cleanupDuration, cleanupPreview,
+    addedCutoff, cleanupChoices, filterCleanupChoices, cleanupDuration, cleanupPreview,
+    parseLocalDate, ruleLabel,
   } from "../lib/playlist-cleanup.js";
 
   /**
@@ -18,19 +20,52 @@
     { value: "any", label: "any rule (OR)" },
   ];
   const FIELDS = [
-    { value: "artist", label: "Artist is" },
-    { value: "album", label: "Album is" },
+    { value: "artist", label: "Artist" },
+    { value: "album", label: "Album" },
     { value: "song", label: "Song title" },
     { value: "duration", label: "Duration" },
+    { value: "added-before", label: "Added before" },
+    { value: "added-after", label: "Added after" },
+    { value: "older", label: "Older than" },
+    { value: "unavailable", label: "No longer playable" },
+  ];
+  /** Artist and album carry the verb, so the rule reads `Artist is not X` on
+      its chip rather than leaving the reader to guess which way it goes. */
+  const IDENTITY_MATCHES = [
+    { value: "is", label: "is" },
+    { value: "is-not", label: "is not" },
   ];
   const TEXT_MATCHES = [
     { value: "contains", label: "Contains text" },
+    { value: "not-contains", label: "Doesn't contain" },
     { value: "words", label: "Whole words" },
+    { value: "not-words", label: "No whole words" },
   ];
   const DURATION_MATCHES = [
     { value: "shorter", label: "Shorter than" },
     { value: "longer", label: "Longer than" },
   ];
+  const AGE_UNITS = [
+    { value: "days", label: "days" },
+    { value: "weeks", label: "weeks" },
+    { value: "months", label: "months" },
+    { value: "years", label: "years" },
+  ];
+  /**
+   * One line under the builder per rule kind, because the comparisons are
+   * strict and two of them cannot see the whole playlist: a reader is owed the
+   * reason a song they expected is not in the list, before they go looking.
+   */
+  const FIELD_HELP = {
+    artist: "Select a suggestion, or use ↑ / ↓ and Enter. All suggestions come from this playlist.",
+    album: "Select a suggestion, or use ↑ / ↓ and Enter. All suggestions come from this playlist.",
+    song: "Text is case-insensitive and literal. Whole words matches “live”, not “alive”.",
+    duration: "Duration comparisons are strict. Songs with unknown duration do not match.",
+    "added-before": "Local midnight of that date, strictly: a song added at that instant does not match. Entries with no added date never match.",
+    "added-after": "Local midnight of that date, strictly: a song added at that instant does not match. Entries with no added date never match.",
+    older: "Counted back from today on the calendar, so a month is a calendar month and not 30 days. Entries with no added date never match.",
+    unavailable: "Entries Spotify reports as no longer playable on this account. A network or device failure is not this.",
+  };
   /**
    * The suggestion list's preferred height, mirroring its max-height. The list
    * is dropped above the field instead of below it when the scrolling body
@@ -58,8 +93,14 @@
   let grouping = $state("all");
   let field = $state("artist");
   let query = $state("");
+  let identityOperator = $state("is");
   let textOperator = $state("contains");
   let durationOperator = $state("shorter");
+  let dateValue = $state("");
+  let amount = $state(1);
+  let unit = $state("months");
+  /** Songs the reader unticked in the preview. Kept by URI, never by row. */
+  let keptUris = $state.raw(new Set());
   let activeChoice = $state(-1);
   let suggestionsOpen = $state(false);
   let suggestionsUp = $state(false);
@@ -98,12 +139,25 @@
   const choices = $derived(field === "artist" || field === "album" ? cleanupChoices(tracks, field) : []);
   const suggestionMatches = $derived(filterCleanupChoices(choices, query));
   const suggestions = $derived(suggestionMatches.slice(0, SUGGESTION_LIMIT));
-  const preview = $derived(cleanupPreview(tracks, rules, grouping));
+  const preview = $derived(cleanupPreview(tracks, rules, grouping, keptUris));
   const pageCount = $derived(Math.max(1, Math.ceil(preview.rows.length / PREVIEW_PAGE_SIZE)));
   const page = $derived(Math.min(previewPage, pageCount - 1));
   const pageRows = $derived(preview.rows.slice(page * PREVIEW_PAGE_SIZE, (page + 1) * PREVIEW_PAGE_SIZE));
   const frozen = $derived(reviewing || busy || removed !== null || stale);
-  const ready = $derived(rules.length > 0 && preview.rows.length > 0 && !stale && !!source?.snapshot_id);
+  /* The rules are frozen behind the confirmation, but unticking one more song
+     is the point of the confirmation: it can only ever shrink the removal, so
+     the ticks stay live until the playlist itself moves under them. */
+  const locked = $derived(busy || removed !== null || stale);
+  const ready = $derived(rules.length > 0 && preview.uris.length > 0 && !stale && !!source?.snapshot_id);
+
+  /* A mark outlives the rule that produced it only while its song is still a
+     candidate: once a rule change drops the URI there is nothing left to keep,
+     and the mark is forgotten rather than left to reappear if that rule comes
+     back. A refreshed revision is not a rule change, so marks that survive one
+     stay exactly where they were. */
+  $effect(() => {
+    if (preview.keptUris.length !== keptUris.size) keptUris = new Set(preview.keptUris);
+  });
 
   $effect(() => {
     if (!dialog || dialog.open) return;
@@ -164,41 +218,104 @@
     suggestionsOpen = true;
   }
 
-  function addRule(choice = null) {
-    if (frozen) return;
-    draftError = "";
-    let rule;
+  /**
+   * The rule the builder's controls describe right now, or null with the
+   * reason in `draftError`. Artist and album need a suggestion because their
+   * rule is the playlist's own choice, not the text being typed.
+   */
+  function draftRule(choice) {
     if (field === "artist" || field === "album") {
       if (!choice) {
         draftError = "Choose a suggestion from this playlist.";
-        return;
+        return null;
       }
-      rule = { field, choice, label: `${field === "artist" ? "Artist is" : "Album is"} ${choice.name}` };
-    } else if (field === "song") {
+      return { field, operator: identityOperator, choice };
+    }
+    if (field === "song") {
       const text = query.trim();
       if (!text) {
         draftError = "Enter some song title text first.";
-        return;
+        return null;
       }
-      rule = { field, text, operator: textOperator, label: `Song ${textOperator === "contains" ? "contains" : "has whole words"} “${text}”` };
-    } else {
+      return { field, text, operator: textOperator };
+    }
+    if (field === "duration") {
       const duration = cleanupDuration(query);
       if (duration === null) {
         draftError = "Enter a positive duration, such as 3:30 or 210 seconds.";
-        return;
+        return null;
       }
-      rule = { field, duration, operator: durationOperator, label: `${durationOperator === "shorter" ? "Shorter" : "Longer"} than ${duration % 1000 ? formatExactTime(duration) : formatTime(duration)}` };
+      return { field, duration, operator: durationOperator };
     }
-    const same = rules.some((existing) => existing.field === rule.field && (
-      rule.choice ? existing.choice?.key === rule.choice.key
-        : existing.operator === rule.operator && existing.text === rule.text && existing.duration === rule.duration
-    ));
-    if (!same) rules = [...rules, { ...rule, id: nextRule++ }];
+    if (field === "older") {
+      /* A fractional count of months has no calendar meaning, and a negative
+         one would run the comparison backwards into the future. */
+      if (!Number.isSafeInteger(amount) || amount < 1) {
+        draftError = "Enter a whole number of days, weeks, months or years.";
+        return null;
+      }
+      /* The cutoff is fixed here, when the reader picks it, not on every
+         evaluation: the moment is part of the rule they read back on the chip
+         and the one the preview is answering with. */
+      return { field, amount, unit, before: addedCutoff(amount, unit) };
+    }
+    if (field === "added-before" || field === "added-after") {
+      const date = parseLocalDate(dateValue);
+      if (date === null) {
+        draftError = "Pick a date, or type it as YYYY-MM-DD.";
+        return null;
+      }
+      return { field, date };
+    }
+    // No longer playable takes no parameters, so the field is the whole rule.
+    return { field };
+  }
+
+  /**
+   * Whether two rules are the same rule. Drives only the chip list — adding a
+   * rule twice would make the list longer, never the result smaller — so it
+   * compares what the rule reads back as, not the object it was built from.
+   */
+  function sameRule(a, b) {
+    if (a.field !== b.field) return false;
+    if (a.field === "artist" || a.field === "album") return a.choice.key === b.choice.key;
+    if (a.field === "song") return a.operator === b.operator && a.text === b.text;
+    if (a.field === "duration") return a.operator === b.operator && a.duration === b.duration;
+    if (a.field === "older") return a.amount === b.amount && a.unit === b.unit;
+    if (a.field === "unavailable") return true;
+    return a.date === b.date;
+  }
+
+  function addRule(choice = null) {
+    if (frozen) return;
+    draftError = "";
+    const drafted = draftRule(choice);
+    if (!drafted) return;
+    const rule = { ...drafted, label: ruleLabel(drafted) };
+    if (!rules.some((existing) => sameRule(existing, rule))) rules = [...rules, { ...rule, id: nextRule++ }];
     previewPage = 0;
     query = "";
     suggestionsOpen = false;
     activeChoice = -1;
     queueMicrotask(() => firstInput?.focus());
+  }
+
+  /**
+   * Unticking states something about a song, not about a row: Spotify removes
+   * by URI and takes every copy, so one untick drops the whole URI from the
+   * removal set and the song's other copies are shown kept along with it.
+   */
+  function toggleKept(uri) {
+    if (locked || !uri) return;
+    const next = new Set(keptUris);
+    if (next.has(uri)) next.delete(uri);
+    else next.add(uri);
+    keptUris = next;
+  }
+
+  function restoreAll() {
+    if (locked) return;
+    keptUris = new Set();
   }
 
   function suggestionKey(event) {
@@ -242,7 +359,7 @@
     if (busy || !reviewing || !ready || removed !== null) return;
     // Recheck synchronously at the destructive boundary, not just in the UI.
     if (playlistMoved()) return;
-    const count = preview.rows.length;
+    const count = preview.removalCount;
     busy = true;
     error = "";
     try {
@@ -275,7 +392,7 @@
           Removed {removed} {removed === 1 ? "playlist entry" : "playlist entries"} from “{source.name}”.
           The playlist refreshes automatically.
         {:else if reviewing}
-          Remove these {preview.rows.length} entries from “{source.name}”? This cannot be undone here.
+          Remove these {preview.removalCount} entries from “{source.name}”? This cannot be undone here.
           Your liked songs and other playlists stay unchanged.
         {:else}
           Choose rules for “{source?.name ?? playlist.name}”. Nothing is removed until you review and confirm.
@@ -342,7 +459,12 @@
               <span class="caps" aria-hidden="true">Rule</span>
               <Select label="Rule type" options={FIELDS} value={field} disabled={frozen} onchange={changeField} />
             </div>
-            {#if field === "song"}
+            {#if field === "artist" || field === "album"}
+              <div class="cleanup-field">
+                <span class="caps" aria-hidden="true">Match</span>
+                <Select label={`Match ${field}`} options={IDENTITY_MATCHES} value={identityOperator} disabled={frozen} onchange={(value) => (identityOperator = value)} />
+              </div>
+            {:else if field === "song"}
               <div class="cleanup-field">
                 <span class="caps" aria-hidden="true">Match text</span>
                 <Select label="Match text" options={TEXT_MATCHES} value={textOperator} disabled={frozen} onchange={(value) => (textOperator = value)} />
@@ -353,81 +475,132 @@
                 <Select label="Compare duration" options={DURATION_MATCHES} value={durationOperator} disabled={frozen} onchange={(value) => (durationOperator = value)} />
               </div>
             {/if}
-            <div class="cleanup-field cleanup-input-wrap">
-              <label class="caps" for="cleanup-value">{field === "artist" || field === "album" ? `Find ${field} in this playlist` : field === "song" ? "Song title text" : "Time (m:ss or seconds)"}</label>
-              <input
-                id="cleanup-value"
-                bind:this={firstInput}
-                bind:value={query}
-                role={field === "artist" || field === "album" ? "combobox" : undefined}
-                aria-autocomplete={field === "artist" || field === "album" ? "list" : undefined}
-                aria-expanded={field === "artist" || field === "album" ? suggestionsOpen : undefined}
-                aria-controls={field === "artist" || field === "album" ? "cleanup-suggestions" : undefined}
-                aria-activedescendant={suggestionsOpen && activeChoice >= 0 ? `cleanup-choice-${activeChoice}` : undefined}
-                aria-invalid={!!draftError}
-                autocomplete="off"
-                placeholder={field === "duration" ? "3:30" : field === "song" ? "e.g. live" : `Type an ${field} name…`}
-                oninput={() => { activeChoice = -1; openSuggestions(); draftError = ""; }}
-                onfocus={openSuggestions}
-                onblur={() => { suggestionsOpen = false; }}
-                onkeydown={suggestionKey}
-              />
-              {#if suggestionsOpen && !frozen && (field === "artist" || field === "album")}
-                <div class="cleanup-suggestions" class:up={suggestionsUp} style:max-height="{suggestionsRoom}px" id="cleanup-suggestions" role="listbox" aria-label={`${field === "artist" ? "Artists" : "Albums"} in this playlist${suggestionMatches.length > suggestions.length ? `, showing the first ${suggestions.length} of ${suggestionMatches.length} matches` : ""}`}>
-                  {#each suggestions as choice, index (choice.key)}
-                    {@const highlightStart = choice.name.toLowerCase().indexOf(query.trim().toLowerCase())}
-                    {@const highlightEnd = highlightStart + query.trim().length}
-                    <button
-                      type="button"
-                      role="option"
-                      id={`cleanup-choice-${index}`}
-                      aria-selected={activeChoice === index}
-                      tabindex="-1"
-                      onpointerdown={(event) => event.preventDefault()}
-                      onclick={() => addRule(choice)}
-                    >
-                      <span>
-                        {#if query.trim() && highlightStart >= 0}
-                          {choice.name.slice(0, highlightStart)}<mark>{choice.name.slice(highlightStart, highlightEnd)}</mark>{choice.name.slice(highlightEnd)}
-                        {:else}{choice.name}{/if}
-                        {#if choice.hint}<small>{field === "artist" ? `Including ${choice.hint}` : choice.hint}</small>{/if}
-                      </span>
-                      <span class="tnum">{choice.count} {choice.count === 1 ? "entry" : "entries"}</span>
-                    </button>
-                  {:else}
-                    <p>No {field === "artist" ? "artists" : "albums"} in this playlist match.</p>
-                  {/each}
-                  {#if suggestionMatches.length > suggestions.length}
-                    <p>Showing the first {suggestions.length} of {suggestionMatches.length} matches — keep typing to narrow them.</p>
-                  {/if}
-                </div>
-              {/if}
-            </div>
-            {#if field === "song" || field === "duration"}
+            {#if field === "added-before" || field === "added-after"}
+              <!-- The one native control the sheet keeps: a date picker is a
+                   calendar the reader already knows, and the app's own input
+                   material is enough to make it belong here. -->
+              <div class="cleanup-field">
+                <label class="caps" for="cleanup-value">Date</label>
+                <input
+                  id="cleanup-value"
+                  class="cleanup-input cleanup-date"
+                  bind:this={firstInput}
+                  bind:value={dateValue}
+                  type="date"
+                  aria-invalid={!!draftError}
+                  oninput={() => (draftError = "")}
+                />
+              </div>
+            {:else if field === "older"}
+              <div class="cleanup-field">
+                <label class="caps" for="cleanup-value">Count</label>
+                <input
+                  id="cleanup-value"
+                  class="cleanup-input cleanup-amount tnum"
+                  bind:this={firstInput}
+                  bind:value={amount}
+                  type="number"
+                  min="1"
+                  step="1"
+                  aria-invalid={!!draftError}
+                  oninput={() => (draftError = "")}
+                />
+              </div>
+              <div class="cleanup-field">
+                <span class="caps" aria-hidden="true">Unit</span>
+                <Select label="Age unit" options={AGE_UNITS} value={unit} disabled={frozen} onchange={(value) => (unit = value)} />
+              </div>
+            {:else if field !== "unavailable"}
+              <div class="cleanup-field cleanup-input-wrap">
+                <label class="caps" for="cleanup-value">{field === "artist" || field === "album" ? `Find ${field} in this playlist` : field === "song" ? "Song title text" : "Time (m:ss or seconds)"}</label>
+                <input
+                  id="cleanup-value"
+                  class="cleanup-input"
+                  bind:this={firstInput}
+                  bind:value={query}
+                  role={field === "artist" || field === "album" ? "combobox" : undefined}
+                  aria-autocomplete={field === "artist" || field === "album" ? "list" : undefined}
+                  aria-expanded={field === "artist" || field === "album" ? suggestionsOpen : undefined}
+                  aria-controls={field === "artist" || field === "album" ? "cleanup-suggestions" : undefined}
+                  aria-activedescendant={suggestionsOpen && activeChoice >= 0 ? `cleanup-choice-${activeChoice}` : undefined}
+                  aria-invalid={!!draftError}
+                  autocomplete="off"
+                  placeholder={field === "duration" ? "3:30" : field === "song" ? "e.g. live" : `Type an ${field} name…`}
+                  oninput={() => { activeChoice = -1; openSuggestions(); draftError = ""; }}
+                  onfocus={openSuggestions}
+                  onblur={() => { suggestionsOpen = false; }}
+                  onkeydown={suggestionKey}
+                />
+                {#if suggestionsOpen && !frozen && (field === "artist" || field === "album")}
+                  <div class="cleanup-suggestions" class:up={suggestionsUp} style:max-height="{suggestionsRoom}px" id="cleanup-suggestions" role="listbox" aria-label={`${field === "artist" ? "Artists" : "Albums"} in this playlist${suggestionMatches.length > suggestions.length ? `, showing the first ${suggestions.length} of ${suggestionMatches.length} matches` : ""}`}>
+                    {#each suggestions as choice, index (choice.key)}
+                      {@const highlightStart = choice.name.toLowerCase().indexOf(query.trim().toLowerCase())}
+                      {@const highlightEnd = highlightStart + query.trim().length}
+                      <button
+                        type="button"
+                        role="option"
+                        id={`cleanup-choice-${index}`}
+                        aria-selected={activeChoice === index}
+                        tabindex="-1"
+                        onpointerdown={(event) => event.preventDefault()}
+                        onclick={() => addRule(choice)}
+                      >
+                        <span>
+                          {#if query.trim() && highlightStart >= 0}
+                            {choice.name.slice(0, highlightStart)}<mark>{choice.name.slice(highlightStart, highlightEnd)}</mark>{choice.name.slice(highlightEnd)}
+                          {:else}{choice.name}{/if}
+                          {#if choice.hint}<small>{field === "artist" ? `Including ${choice.hint}` : choice.hint}</small>{/if}
+                        </span>
+                        <span class="tnum">{choice.count} {choice.count === 1 ? "entry" : "entries"}</span>
+                      </button>
+                    {:else}
+                      <p>No {field === "artist" ? "artists" : "albums"} in this playlist match.</p>
+                    {/each}
+                    {#if suggestionMatches.length > suggestions.length}
+                      <p>Showing the first {suggestions.length} of {suggestionMatches.length} matches — keep typing to narrow them.</p>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+            {#if field !== "artist" && field !== "album"}
               <button type="submit" class="btn-ghost cleanup-add">Add rule</button>
             {/if}
           </form>
           {#if draftError}<p class="inline-error" role="alert">{draftError}</p>{/if}
-          <p class="cleanup-help">{field === "artist" || field === "album" ? "Select a suggestion, or use ↑ / ↓ and Enter. All suggestions come from this playlist." : field === "song" ? "Text is case-insensitive and literal. Whole words matches “live”, not “alive”." : "Duration comparisons are strict. Songs with unknown duration do not match."}</p>
+          <p class="cleanup-help">{FIELD_HELP[field]}</p>
         </fieldset>
 
         <section class="cleanup-preview" aria-labelledby="cleanup-preview-title">
           <div class="cleanup-band">
             <h3 class="caps" id="cleanup-preview-title">{reviewing ? "Entries to remove" : "Removal preview"}</h3>
-            <span class="cleanup-count tnum" role="status">{preview.rows.length} of {tracks.length} entries</span>
+            <span class="cleanup-meta">
+              {#if preview.keptUris.length}
+                <button type="button" class="link-more cleanup-restore" disabled={locked} onclick={restoreAll}>
+                  {preview.keptUris.length} kept · Restore all
+                </button>
+              {/if}
+              <span class="cleanup-count tnum" role="status">{preview.removalCount} of {tracks.length} entries</span>
+            </span>
           </div>
-          {#if preview.rows.length > preview.uris.length || preview.extraCount || preview.missingCount}
+          {#if preview.duplicateCount || preview.extraCount || preview.undatedCount || preview.missingCount}
             <ul class="cleanup-notes">
-              {#if preview.rows.length > preview.uris.length}
+              {#if preview.duplicateCount}
                 <li class="warn">
                   <span class="dot" aria-hidden="true"></span>
-                  Includes {preview.rows.length - preview.uris.length} duplicate {preview.rows.length - preview.uris.length === 1 ? "entry" : "entries"}. Every copy of each selected song will be removed from this playlist.
+                  Includes {preview.duplicateCount} duplicate {preview.duplicateCount === 1 ? "entry" : "entries"}. Every copy of each song still going is removed from this playlist with it.
                 </li>
               {/if}
               {#if preview.extraCount}
                 <li class="warn">
                   <span class="dot" aria-hidden="true"></span>
-                  {preview.extraCount} {preview.extraCount === 1 ? "entry has" : "entries have"} different details but is another copy of a selected song. These are marked below and will also be removed.
+                  {preview.extraCount} {preview.extraCount === 1 ? "entry has" : "entries have"} different details but is another copy of a song being removed. These are marked below and will also be removed.
+                </li>
+              {/if}
+              {#if preview.undatedCount}
+                <li>
+                  <span class="dot" aria-hidden="true"></span>
+                  {preview.undatedCount} {preview.undatedCount === 1 ? "entry has" : "entries have"} no added date, and the added-date rules cannot match {preview.undatedCount === 1 ? "it" : "them"}. {preview.undatedCount === 1 ? "It is" : "They are"} left out of this preview.
                 </li>
               {/if}
               {#if preview.missingCount}
@@ -447,14 +620,25 @@
             {#if preview.rows.length}
               <table>
                 <colgroup>
+                  <col class="cleanup-col-keep" />
                   <col class="cleanup-col-idx" />
+                  <col class="cleanup-col-art" />
                   <col />
                   <col class="cleanup-col-album" />
                   <col class="cleanup-col-time" />
                 </colgroup>
                 <thead>
                   <tr>
+                    <!-- The tick column's head is its screen-reader name: the
+                         row it governs is the entry beside it. -->
+                    <th class="caps" scope="col"><span class="sr-only">Remove</span></th>
                     <th class="caps" scope="col">#</th>
+                    <!-- The artwork column has no visible heading, so the head
+                         keeps a blank cell where the rows keep their tile —
+                         which is what keeps “Song / artist” over the titles
+                         rather than over the artwork. Same gap the track
+                         table's own head leaves. -->
+                    <th class="caps" scope="col"><span class="sr-only">Artwork</span></th>
                     <th class="caps" scope="col">Song / artist</th>
                     <th class="caps" scope="col">Album</th>
                     <th class="caps" scope="col">Time</th>
@@ -462,12 +646,43 @@
                 </thead>
                 <tbody>
                   {#each pageRows as row (row.index)}
-                    <tr class:cleanup-extra={row.extra}>
+                    <tr class:cleanup-extra={row.extra && !row.kept} class:cleanup-kept={row.kept}>
+                      <!-- Ticked means going: the box is how a reader drops
+                           one song from the rule's result without touching the
+                           rule. It is a real checkbox, so it answers the
+                           keyboard, and it is named after the song it governs
+                           because the row's own text is not part of a label. -->
+                      <td class="cleanup-keep">
+                        <input
+                          type="checkbox"
+                          checked={!row.kept}
+                          disabled={locked}
+                          aria-label={`Remove ${row.track.name || "this entry"} from this playlist`}
+                          onchange={() => toggleKept(row.track.uri)}
+                        />
+                      </td>
                       <td class="cleanup-idx tnum">{row.index + 1}</td>
+                      <td class="cleanup-art">
+                        <!-- The track table's row art at the track table's
+                             size. A song is recognised by its sleeve before
+                             its name is read, which is the whole point of the
+                             preview. `cover_url` may be absent — a playlist
+                             entry need not carry one — and Cover falls back to
+                             its generated identity tile exactly as it does in
+                             TrackList. -->
+                        <Cover
+                          src={row.track.cover_url}
+                          id={row.track.album_id || row.track.uri}
+                          name={row.track.album_name || row.track.name}
+                          size={36}
+                          class="c-art"
+                        />
+                      </td>
                       <td class="cleanup-song">
                         <strong>{row.track.name || "Untitled song"}</strong>
                         <span>{(row.track.artist_names ?? []).join(", ") || "Unknown artist"}</span>
-                        {#if row.extra}<small>Another copy · also removed</small>{/if}
+                        {#if row.kept}<small class="kept">Kept · not removed</small>
+                        {:else if row.extra}<small>Another copy · also removed</small>{/if}
                       </td>
                       <td class="cleanup-album">{row.track.album_name || "Unknown album"}</td>
                       <td class="cleanup-time tnum">{row.track.duration_ms > 0 ? formatTime(row.track.duration_ms) : "—"}</td>
@@ -512,9 +727,9 @@
         <button class="btn-ghost" disabled={busy} onclick={close}>Cancel</button>
         {#if reviewing}
           <button class="btn-ghost" disabled={busy} onclick={() => { reviewing = false; error = ""; }}>Edit rules</button>
-          <button class="btn-danger" disabled={busy || !ready} onclick={remove}>{busy ? "Removing…" : `${error ? "Retry removing" : "Remove"} ${preview.rows.length} entries`}</button>
+          <button class="btn-danger" disabled={busy || !ready} onclick={remove}>{busy ? "Removing…" : `${error ? "Retry removing" : "Remove"} ${preview.removalCount} entries`}</button>
         {:else}
-          <button class="btn-accent" disabled={!ready} onclick={() => { reviewing = true; suggestionsOpen = false; }}>Review {preview.rows.length} removals</button>
+          <button class="btn-accent" disabled={!ready} onclick={() => { reviewing = true; suggestionsOpen = false; }}>Review {preview.removalCount} removals</button>
         {/if}
       {/if}
     </footer>
@@ -586,6 +801,11 @@
   .cleanup-band .caps { margin: 0; }
   .cleanup-match { display: flex; align-items: center; gap: var(--s2); }
   .cleanup-count { color: var(--count); font-weight: var(--w-med); font-size: var(--t-12); }
+  /* The kept reset sits beside the count it changes, in the app's quiet-link
+     register: it is a way back, not a second action competing with Review. */
+  .cleanup-meta { display: flex; align-items: center; gap: var(--s3); }
+  .cleanup-restore:disabled { opacity: 0.45; cursor: default; }
+  .cleanup-restore:disabled:hover { color: var(--fg-2); }
 
   .cleanup-help { margin-top: var(--s2); color: var(--fg-2); font-size: var(--t-12); }
 
@@ -599,13 +819,19 @@
   .cleanup-field .caps { margin: 0; }
   /* 34px tall, like every control it stands beside in this row. */
   .cleanup-input-wrap { flex: 1 1 260px; position: relative; }
-  .cleanup-input-wrap input {
-    width: 100%; height: 34px; padding: 0 var(--s3);
+  .cleanup-input-wrap .cleanup-input { width: 100%; }
+  .cleanup-input {
+    height: 34px; padding: 0 var(--s3);
     border: 1px solid var(--line-2); border-radius: var(--r2);
     background: var(--bg-2); color: var(--fg);
     font: inherit; font-size: var(--t-13);
   }
-  .cleanup-input-wrap input::placeholder { color: var(--fg-3); }
+  .cleanup-input::placeholder { color: var(--fg-3); }
+  /* A count and a date need no more room than they hold. `color-scheme: dark`
+     is set app-wide, which is what keeps the native calendar mark and the
+     number spinners light on this sheet rather than the OS's own grey. */
+  .cleanup-amount { width: 76px; }
+  .cleanup-date { width: 152px; }
   .cleanup-add { height: 34px; }
 
   /* The app's one menu material — the same fill, radius, hairline and shadow
@@ -678,9 +904,40 @@
   .cleanup-results th:first-child, .cleanup-results td:first-child { padding-left: 0; }
   .cleanup-results th:last-child, .cleanup-results td:last-child { padding-right: 0; }
   .cleanup-col-idx { width: 48px; }
+  /* Artwork: the 36px tile the track table gives a row, plus this table's own
+     12px column gutter. The cell spends its padding on the right only, so the
+     sleeve's left edge is the column's edge and the title keeps starting the
+     same 12px from it that every other column keeps from its neighbour. */
+  .cleanup-col-art { width: 48px; }
+  .cleanup-results td.cleanup-art { padding-left: 0; }
   .cleanup-col-album { width: 30%; }
   .cleanup-col-time { width: 62px; }
-  /* A column head sits over its values, and both of these are right-aligned. */
+  /* 16px of box, then the 12px gutter every other column keeps: the tick sits
+     at the dialog's own text edge, ahead of the row number. */
+  .cleanup-col-keep { width: 28px; }
+
+  /* The app's one checkbox, borrowed whole from Settings (.set-check): an
+     appearance-none plate the tokens can reach, which is the only reason a
+     native control belongs on this sheet. */
+  .cleanup-keep input {
+    appearance: none;
+    display: grid; place-items: center;
+    width: 16px; height: 16px; margin: 0;
+    border: 1px solid var(--line-2); border-radius: var(--r1);
+    background: var(--bg-2); cursor: pointer;
+    transition: background-color var(--d1) var(--ease), border-color var(--d1) var(--ease);
+  }
+  .cleanup-keep input:hover:enabled { border-color: var(--fg-3); }
+  .cleanup-keep input:checked { background: var(--accent); border-color: var(--accent); }
+  .cleanup-keep input:checked::before {
+    content: "";
+    width: 10px; height: 10px;
+    background: var(--accent-ink);
+    clip-path: polygon(13% 50%, 0 63%, 37% 100%, 100% 16%, 87% 3%, 37% 72%);
+  }
+  .cleanup-keep input:disabled { cursor: default; opacity: 0.45; }
+  /* A column head sits over its values, and both of these are right-aligned.
+     The first one is the tick head, which holds only screen-reader text. */
   .cleanup-results th:first-child, .cleanup-results th:last-child { text-align: right; }
 
   .cleanup-idx {
@@ -697,12 +954,19 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .cleanup-song small { display: block; margin-top: 1px; color: var(--love); font-size: var(--t-11); font-weight: var(--w-med); }
+  /* A kept row says so in grey, not in love: it is not a warning, it is the
+     one row on this sheet that is not going anywhere. */
+  .cleanup-song small.kept { color: var(--fg-2); }
   .cleanup-album { color: var(--fg-2); font-size: var(--t-12); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cleanup-time { color: var(--fg-2); font-family: var(--font-number); font-size: var(--t-12); text-align: right; }
   /* Love is the palette's "you cannot undo it", so the rows that go as a
      second copy of a selected song are washed in it rather than left to a
      small caption to explain. */
   tr.cleanup-extra { background: var(--danger-wash); }
+  /* A kept row is dimmed the way the app dims a row that is not going to play
+     (see .tl-row.unavailable), with its tick left at full strength: the tick
+     is the way back, and the one control on the row that still does anything. */
+  tr.cleanup-kept > td:not(.cleanup-keep) { opacity: 0.5; }
 
   /* Reserved height, message centred in it. The block is the whole preview
      until rows exist, so it holds the space the table will take — and that

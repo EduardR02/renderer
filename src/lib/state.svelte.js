@@ -179,7 +179,7 @@ export const ui = $state({
 });
 
 /** Live preference bits used by mounted surfaces without polling Settings. */
-export const appSettings = $state({ animated_canvas: false });
+export const appSettings = $state({ animated_canvas: true });
 
 const trackEditor = $state({ tracks: {} });
 const trackEditorKeys = [];

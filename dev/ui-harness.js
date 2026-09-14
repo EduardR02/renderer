@@ -1094,7 +1094,7 @@ window.__TAURI_INTERNALS__ = {
   },
 };
 
-const settings = { animated_canvas: false };
+const settings = { animated_canvas: true };
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
   unregisterListener: (event, eventId, handlerId) => unregisterListener(event, eventId, handlerId),
 };

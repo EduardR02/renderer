@@ -27,6 +27,17 @@
   let drag = $state(null);
   let hover = $state(null);
   let pointerId = null;
+  /**
+   * Whether the slider was last focused by a pointer rather than by the
+   * keyboard. `:focus-visible` is not enough on its own here: `onPointerDown`
+   * focuses the track so the arrow keys work straight after a drag, and on the
+   * very first interaction after the app opens Chromium counts that
+   * programmatic focus as keyboard-ish — so the first drag of a session used to
+   * leave a keyboard ring on the volume control until some later click took
+   * focus away (pressing Play, in practice). A drag is not keyboard
+   * navigation, so the ring is suppressed until a key actually arrives.
+   */
+  let pointerFocus = $state(false);
   const display = $derived(drag !== null ? drag : value);
   const p = $derived(max > min ? Math.min(1, Math.max(0, (display - min) / (max - min))) : 0);
   const hoverP = $derived(
@@ -83,6 +94,7 @@
     if (pointerId !== null || e.button !== 0 || !e.isPrimary) return;
     e.preventDefault();
     refreshGeometry();
+    pointerFocus = true;
     track.focus({ preventScroll: true });
     pointerId = e.pointerId;
     drag = fromClientX(e.clientX);
@@ -113,6 +125,8 @@
   }
 
   function onKeyDown(e) {
+    // A key means this is keyboard navigation, so the ring belongs.
+    pointerFocus = false;
     const span = max - min;
     const small = step ?? Math.max(1, span / 20);
     const big = span / 5;
@@ -132,6 +146,7 @@
 
 <span
   class={kind === "vol" ? "vol" : "rail-hit"}
+  class:pointer-focus={pointerFocus}
   style:--track-w="{trackWidth}px"
   role="slider"
   tabindex="0"
@@ -150,6 +165,7 @@
   onpointercancel={onPointerUp}
   onlostpointercapture={onPointerUp}
   onkeydown={onKeyDown}
+  onblur={() => (pointerFocus = false)}
 >
   {#if kind === "vol"}
     <span class="vol-rail"><span class="vol-fill" style:--p={p}></span></span>
@@ -179,5 +195,12 @@
   .vol:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 4px;
+  }
+  /* A pointer drag focuses the track (so the arrow keys work straight after
+     it), and on the first interaction of a session Chromium also treats that
+     focus as `:focus-visible`. The outline is for keyboard navigation, so it
+     waits for a key: this rule outranks the global `:focus-visible` ring. */
+  [role="slider"].pointer-focus:focus-visible {
+    outline: none;
   }
 </style>
