@@ -4,6 +4,7 @@
     playback,
     togglePlay,
     api,
+    insertPlaylist,
     navigate,
     promotePlaylist,
     retryDetail,
@@ -110,6 +111,12 @@
         playlistId = created?.id;
         if (!playlistId) throw new Error("Playlist creation returned no id.");
         saveState.playlistId = playlistId;
+        /* The row has to exist before anything can promote it: the
+           `promotePlaylist` below is a no-op for a playlist the library has
+           never heard of, so without this the freshly saved radio was absent
+           from the sidebar until the refetch, under the rootlist's not-yet-
+           readable name. */
+        insertPlaylist(created);
       }
       await api.addPlaylistTracks(playlistId, uris);
       promotePlaylist(playlistId);

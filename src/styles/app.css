@@ -1043,7 +1043,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    type on a plate that picks up whatever is behind it. The rule underneath is
    simple and holds everywhere — the tag carries the palette's hue on pages
    that have no colour of their own, and the CONTENT's hue on pages that do. */
-.wash .tag, .banner .tag, .np-head .tag {
+.wash .tag, .banner .tag, .np-head .tag, .np-stage .tag {
   background: rgba(255, 255, 255, 0.12);
   -webkit-backdrop-filter: blur(10px) saturate(1.6);
           backdrop-filter: blur(10px) saturate(1.6);
@@ -2821,9 +2821,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 @media (prefers-reduced-transparency: reduce) {
   .topbar, .tl-head { background: var(--bg-1); }
   .np-head { background: var(--bg-nav); }
-  .wash .tag, .banner .tag, .np-head .tag { background: rgba(255, 255, 255, 0.16); }
+  .wash .tag, .banner .tag, .np-head .tag, .np-stage .tag { background: rgba(255, 255, 255, 0.16); }
   .topbar, .tl-head, .np-head,
-  .wash .tag, .banner .tag, .np-head .tag {
+  .wash .tag, .banner .tag, .np-head .tag, .np-stage .tag {
     -webkit-backdrop-filter: none;
             backdrop-filter: none;
   }

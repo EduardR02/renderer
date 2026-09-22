@@ -155,6 +155,21 @@ export function artistNameHint(id) {
   return (key && artistNameHints.get(key)) || "";
 }
 
+/* Whether the inspector was open last time, in localStorage. Read here at
+   module init rather than from a mount effect so the very first paint already
+   has the restored layout — restoring later shows the panel visibly swinging
+   open after the window appears. Reading is wrapped because a webview with
+   storage disabled throws on access rather than returning null. */
+const INSPECTOR_KEY = "sr.now-playing-open";
+
+function readNowPlayingOpen() {
+  try {
+    return localStorage.getItem(INSPECTOR_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * `paneWidth` is the measured inner width of the content pane, published by
  * App.svelte from a ResizeObserver.
@@ -170,13 +185,33 @@ export function artistNameHint(id) {
  */
 export const ui = $state({
   searchFocusTick: 0,
-  nowPlayingOpen: false,
+  nowPlayingOpen: readNowPlayingOpen(),
   paneWidth: 0,
   /* Whether the app window has focus. Owned by App.svelte, published here
      because two unrelated surfaces gate decorative work on it: the VU meter's
      `anim-paused` class and the Canvas video's decoder. */
   windowFocused: true,
+  /* An action the FRONTEND started and that failed, for the one banner in
+     App.svelte. Separate from `playback.error` on purpose, in both
+     directions. `playback.error` is an engine field — it rides in on the
+     state payload and `applyPlayback` overwrites it from every event — so a
+     message written there is a message the next state tick may erase before
+     it has been read. And it is read as a meaning, not just a string:
+     TrackEditorView tests it bare to decide its preview failed, so parking an
+     unrelated failure in it makes some other surface report itself broken.
+     Two owners, two fields; the banner shows whichever is set. */
+  error: null,
 });
+
+/** The one write point for the inspector, so every toggle persists. */
+export function setNowPlayingOpen(open) {
+  ui.nowPlayingOpen = !!open;
+  try {
+    localStorage.setItem(INSPECTOR_KEY, ui.nowPlayingOpen ? "1" : "0");
+  } catch {
+    /* private mode / storage disabled: the panel stays session-local */
+  }
+}
 
 /** Live preference bits used by mounted surfaces without polling Settings. */
 export const appSettings = $state({ animated_canvas: true });
@@ -1666,6 +1701,36 @@ export function promotePlaylist(id, { played = false } = {}) {
   if (index === 0) return true;
   library.splice(index, 1);
   library.unshift(playlist);
+  return true;
+}
+
+/**
+ * Inserts a just-created playlist into the library, at the top.
+ *
+ * The create command answers with the whole row — the name is the one that
+ * was just typed — so the sidebar has no reason to wait for a rootlist
+ * refetch to learn it. It used to: `createPlaylist` was fire-and-forget and
+ * the row only appeared when the refresh landed, which is a round trip later
+ * and, worse, is a read of an eventually-consistent rootlist that lists the
+ * new playlist before its name attribute is readable. The row arrived blank.
+ *
+ * Ordering is not decided here. The backend stamps `last_activity` when it
+ * creates the row and the refetch carries that stamp forward, so unshifting
+ * is not an override of the sort in `setLibrary` — it is the position that
+ * sort already produces for the newest stamp. That is deliberately the only
+ * arrangement that keeps the optimistic row from visibly jumping when the
+ * authoritative answer arrives.
+ */
+export function insertPlaylist(playlist) {
+  const id = typeof playlist?.id === "string" ? playlist.id : "";
+  if (!id) return false;
+  // The refresh may have beaten us to it; one playlist is one row.
+  if (library.some((entry) => entry?.id === id)) return applyPlaylistSummary(playlist);
+  library.unshift({ ...playlist, last_activity: playlist.last_activity ?? activityNow() });
+  // `libraryState` is deliberately untouched. One created row is not the
+  // library having answered, and the rail's loading frame already stands
+  // down on `library.length` — claiming `loaded` here would tell Home and
+  // LibraryView that a one-row library is the whole of it.
   return true;
 }
 

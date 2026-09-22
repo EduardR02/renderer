@@ -7,8 +7,10 @@
     libraryState,
     followed,
     loadFollowedArtists,
+    insertPlaylist,
     api,
     playback,
+    ui,
   } from "../lib/state.svelte.js";
   import { trackDrag } from "../lib/dnd.svelte.js";
   import Icon from "./Icon.svelte";
@@ -171,14 +173,33 @@
     filterQuery = "";
   }
 
-  function commitCreate() {
+  async function commitCreate() {
     /* Pointer-down on Filter cancels before moving focus. Its ensuing blur
        must not resurrect the discarded partial name as a new playlist. */
     if (!creating) return;
     const name = newName.trim();
     creating = false;
     newName = "";
-    if (name) api.createPlaylist(name).catch(() => {});
+    if (!name) return;
+    try {
+      /* The command answers with the finished row, name included, and that
+         row is what goes into the list. Waiting for the rootlist refetch to
+         supply it instead is how the name went missing: the refetch reads an
+         eventually-consistent rootlist that lists the playlist before its
+         attributes are readable, so the row appeared untitled. */
+      insertPlaylist(await api.createPlaylist(name));
+    } catch (error) {
+      /* This used to be `.catch(() => {})`. A creation that fails is not a
+         no-op the user can be left to infer from an absent row — the field
+         has already closed by now, so there is nowhere local to say it, and
+         the app's one banner (App.svelte) is where an action failure with no
+         surviving form belongs. It goes to `ui.error`, not `playback.error`:
+         that one belongs to the engine, which overwrites it from every state
+         payload and whose meaning other surfaces read. */
+      ui.error = `Could not create "${name}". ${
+        error instanceof Error ? error.message : String(error ?? "")
+      }`.trim();
+    }
   }
 
   /** The badge is what will actually PLAY, not how many rows the queue holds:

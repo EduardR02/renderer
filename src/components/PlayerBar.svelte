@@ -8,6 +8,7 @@
     route,
     positionMs,
     ui,
+    setNowPlayingOpen,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
@@ -646,7 +647,7 @@
       class="btn-icon"
       class:on={ui.nowPlayingOpen}
       title="Now playing details"
-      onclick={() => (ui.nowPlayingOpen = !ui.nowPlayingOpen)}
+      onclick={() => setNowPlayingOpen(!ui.nowPlayingOpen)}
     >
       <Icon name="panel" size={18} />
     </button>

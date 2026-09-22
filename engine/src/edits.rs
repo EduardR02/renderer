@@ -14,6 +14,8 @@
 //!   rootlist via `/playlist/v2/user/{user}/rootlist/changes` (the same
 //!   rootlist-changes endpoint the official client uses to place playlists;
 //!   cross-verified against mirrorfm's working rootlist reorder client).
+//!   That ADD carries `add_first`, so a new playlist lands at the top of the
+//!   library server-side — see [`rootlist_add_op`].
 //! - Delete (unfollow) is a rootlist REM op keyed by the playlist URI.
 //!
 //! Wire format: protobuf binary (`application/x-protobuf`), using the
@@ -119,12 +121,26 @@ fn rename_op(name: &str) -> p4::Op {
     op
 }
 
-/// Rootlist ADD op: places an existing playlist at the end of the library.
+/// Rootlist ADD op: places an existing playlist at the TOP of the library.
+///
+/// The wire can say this directly. `Add` carries four mutually exclusive
+/// position fields — `from_index` (1), `add_last` (4), `add_first` (5),
+/// `add_before_item` (6), `add_after_item` (7) — so "at the top" is one
+/// boolean, exactly as "at the end" is. That matters because the rootlist
+/// order is the account's, not this client's: the official app also puts a
+/// newly created playlist first, and a client-side sort would leave the two
+/// disagreeing the moment you opened Spotify proper.
+///
+/// `add_first` is preferred over `from_index = 0`, which expresses the same
+/// intent as an absolute index and so races any concurrent rootlist edit
+/// between our revision read and the server's apply; the boolean has no
+/// index to go stale. Track ADDs keep `add_last` — appending is what adding
+/// a song to a playlist means (see [`add_tracks_op`]).
 fn rootlist_add_op(uri: &str) -> p4::Op {
     let mut op = p4::Op::new();
     op.set_kind(p4::op::Kind::ADD);
     let mut add = p4::Add::new();
-    add.add_last = Some(true);
+    add.add_first = Some(true);
     add.items = vec![item(uri)];
     op.add = protobuf::MessageField::some(add);
     op
@@ -328,7 +344,10 @@ pub async fn create_playlist(session: &Session, name: &str) -> Result<PlaylistRe
         return Err(format!("the server returned a non-playlist URI: {uri}"));
     };
     let id = id.to_base62().unwrap_or_default();
-    // Place the new playlist at the end of the library. If this fails the
+    // Place the new playlist at the TOP of the library, which is where the
+    // official client puts it and where the person who just named it expects
+    // to find it. This is a real rootlist ADD with `add_first`, not a local
+    // sort, so Spotify's own app shows the same first row. If it fails the
     // playlist exists server-side but is missing from the rootlist; the
     // error lets the UI refresh instead of silently showing nothing.
     post_rootlist_changes(session, vec![rootlist_add_op(&uri)]).await?;
@@ -511,7 +530,7 @@ mod tests {
             add_body.items[0].uri.as_deref(),
             Some("spotify:playlist:0123456789ABCDEFGHIJKL")
         );
-        assert_eq!(add_body.add_last, Some(true));
+        assert_eq!(add_body.add_first, Some(true));
 
         let rem = round_trip(&rootlist_remove_op(
             "spotify:playlist:0123456789ABCDEFGHIJKL",
@@ -523,6 +542,36 @@ mod tests {
             rem_body.items[0].uri.as_deref(),
             Some("spotify:playlist:0123456789ABCDEFGHIJKL")
         );
+    }
+
+    /// A new playlist belongs at the top of the library, and the two ADD
+    /// builders must not drift into each other: the rootlist one says
+    /// "first", the track one says "last", and neither may carry both
+    /// position flags — the server would have to pick one, and which one is
+    /// not ours to guess.
+    #[test]
+    fn rootlist_add_places_the_playlist_first_while_track_add_appends() {
+        let rootlist = round_trip(&rootlist_add_op("spotify:playlist:0123456789ABCDEFGHIJKL"))
+            .add
+            .unwrap();
+        assert_eq!(rootlist.add_first, Some(true));
+        assert!(
+            rootlist.add_last.is_none(),
+            "a rootlist ADD asking for both ends is ambiguous on the wire"
+        );
+        // Unset, not zero: an absolute index would be read against whatever
+        // revision the server applies, which is not the one we fetched.
+        assert!(rootlist.from_index.is_none());
+        assert!(rootlist.add_before_item.is_none());
+        assert!(rootlist.add_after_item.is_none());
+
+        let tracks = round_trip(&add_tracks_op(&[
+            "spotify:track:0123456789ABCDEFGHIJKL".to_owned()
+        ]))
+        .add
+        .unwrap();
+        assert_eq!(tracks.add_last, Some(true));
+        assert!(tracks.add_first.is_none());
     }
 
     #[test]

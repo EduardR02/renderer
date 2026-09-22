@@ -802,10 +802,10 @@ pub fn is_followed_playlist(playlists: &[Playlist], id: &str) -> bool {
     playlists.iter().any(|playlist| playlist.id == id)
 }
 
-/// Copies fields the rootlist cannot reliably produce — the description,
-/// previously browsed cover candidates, a missing cover URL, revision, and
-/// local activity timestamps — from the previous library snapshot onto a
-/// freshly fetched one.
+/// Copies fields the rootlist cannot reliably produce — the name, the
+/// description, previously browsed cover candidates, a missing cover URL,
+/// revision, and local activity timestamps — from the previous library
+/// snapshot onto a freshly fetched one.
 ///
 /// The rootlist is intentionally sparse, so a plain replacement would blank
 /// these fields on every library refresh. For the candidates that is not
@@ -814,10 +814,22 @@ pub fn is_followed_playlist(playlists: &[Playlist], id: &str) -> bool {
 /// each playlist happens to be browsed again. The timestamps likewise must
 /// survive refresh so the sidebar does not jump back to rootlist order and
 /// Home does not lose its listening history.
+///
+/// The name is here for the refresh that follows a creation. The rootlist is
+/// eventually consistent: it lists the brand-new playlist within the second,
+/// but its attributes can still arrive empty, and `PlaylistRef::name`
+/// defaults to `""` when they do. Letting that overwrite the name we just
+/// posted is the whole "the name I typed didn't apply" bug — the row went
+/// blank a moment after appearing. An empty name is never a real rename
+/// either (`rename_playlist` rejects one, and so does Spotify), so an empty
+/// fresh name always means "not supplied yet", never "cleared".
 pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
     for playlist in fresh.iter_mut() {
         playlist.description = normalize_canonical_playlist_description(&playlist.description);
         if let Some(old) = previous.iter().find(|entry| entry.id == playlist.id) {
+            if playlist.name.is_empty() {
+                playlist.name = old.name.clone();
+            }
             // Rootlist is sparse: preserve a browsed cover when its row has no
             // picture, but let a newly supplied rootlist cover win.
             if playlist.cover_url.is_empty() {
@@ -841,6 +853,43 @@ pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
 /// order consumed by both the sidebar and Home's remaining-library grid.
 pub fn order_by_last_activity(playlists: &mut [Playlist]) {
     playlists.sort_by_key(|playlist| std::cmp::Reverse(playlist.last_activity.unwrap_or(i64::MIN)));
+}
+
+/// Inserts a just-created playlist into the library and returns it stamped.
+///
+/// Creating a playlist IS library activity, so it gets the same `at` stamp an
+/// add-to-playlist would. That is what puts it first, and it is deliberately
+/// the only mechanism that does: [`order_by_last_activity`] is the single
+/// ordering authority here, the frontend sorts by the same field, and the
+/// rootlist ADD asks the server for the top as well — three places agreeing
+/// on one answer rather than an unsorted `insert(0, …)` that the next
+/// refresh would undo.
+///
+/// Re-creating an id already present (a refresh that raced us) updates that
+/// row rather than duplicating it, and does so through [`upsert_playlist`]
+/// rather than a merge of its own. Which fields survive a row being replaced
+/// in place is shared policy — it has already had to grow once — and a second
+/// hand-written copy here would be the one the next field is forgotten in. A
+/// freshly created row carries no description or cover, so delegating also
+/// means a raced refresh keeps the ones the library already knew instead of
+/// blanking them.
+pub fn insert_created_playlist(
+    playlists: &mut Vec<Playlist>,
+    mut playlist: Playlist,
+    at: i64,
+) -> Playlist {
+    // Stamped before the upsert, not after: `upsert_playlist` folds the
+    // incoming activity with `.or(existing)`, so ours is already the winner
+    // and the created row does not inherit a staler stamp.
+    playlist.last_activity = Some(at);
+    let id = playlist.id.clone();
+    upsert_playlist(playlists, playlist);
+    order_by_last_activity(playlists);
+    playlists
+        .iter()
+        .find(|entry| entry.id == id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Stamps `id` as used in the library at `at` and re-sorts the list.
@@ -1699,6 +1748,90 @@ mod tests {
         carry_local_fields(&previous, &mut fresh);
         assert_eq!(fresh[0].cover_url, "https://i.scdn.co/image/full");
         assert_eq!(fresh[1].cover_url, "https://i.scdn.co/image/new");
+    }
+
+    /// The rootlist lists a brand-new playlist before its attributes are
+    /// readable, so the refresh that follows a creation can carry `name: ""`.
+    /// Letting that land is what blanked the row the user had just named.
+    #[test]
+    fn a_rootlist_row_with_no_name_yet_keeps_the_name_we_already_know() {
+        let previous = vec![Playlist {
+            name: "Road Trip".into(),
+            ..playlist("p1")
+        }];
+        let mut fresh = vec![
+            playlist("p1"),
+            Playlist {
+                name: "Renamed".into(),
+                ..playlist("p1")
+            },
+        ];
+        carry_local_fields(&previous, &mut fresh);
+        assert_eq!(fresh[0].name, "Road Trip");
+        // A name the rootlist DOES supply still wins: this is a fallback for
+        // missing data, not a local override of the server's answer.
+        assert_eq!(fresh[1].name, "Renamed");
+    }
+
+    #[test]
+    fn a_created_playlist_takes_the_top_of_the_library() {
+        let mut playlists = vec![
+            Playlist {
+                last_activity: Some(500),
+                ..playlist("busy")
+            },
+            playlist("never-used"),
+        ];
+        let created = insert_created_playlist(
+            &mut playlists,
+            Playlist {
+                name: "Road Trip".into(),
+                ..playlist("new")
+            },
+            900,
+        );
+        // The returned row is what the frontend inserts optimistically, so it
+        // must carry the same stamp the library was sorted by.
+        assert_eq!(created.id, "new");
+        assert_eq!(created.name, "Road Trip");
+        assert_eq!(created.last_activity, Some(900));
+        // Creating is library activity, not listening history.
+        assert_eq!(created.last_played, None);
+        let ids: Vec<&str> = playlists.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, vec!["new", "busy", "never-used"]);
+        assert_eq!(playlists[0].last_activity, Some(900));
+    }
+
+    #[test]
+    fn re_inserting_a_known_id_updates_that_row_instead_of_duplicating_it() {
+        // A library refresh can land between the engine's answer and this
+        // insert, so the id may already be present.
+        let mut playlists = vec![
+            Playlist {
+                last_played: Some(50),
+                last_activity: Some(100),
+                ..playlist("new")
+            },
+            Playlist {
+                last_activity: Some(700),
+                ..playlist("busy")
+            },
+        ];
+        let created = insert_created_playlist(
+            &mut playlists,
+            Playlist {
+                name: "Road Trip".into(),
+                ..playlist("new")
+            },
+            900,
+        );
+        assert_eq!(playlists.len(), 2);
+        assert_eq!(playlists[0].id, "new");
+        assert_eq!(playlists[0].name, "Road Trip");
+        assert_eq!(playlists[0].last_activity, Some(900));
+        // An existing listening-history stamp is not erased by the re-insert.
+        assert_eq!(playlists[0].last_played, Some(50));
+        assert_eq!(created.last_played, Some(50));
     }
 
     #[test]

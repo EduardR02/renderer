@@ -219,6 +219,20 @@
     };
   });
 
+  /* The one banner, fed by two owners that must not share a field.
+     `playback.error` is the engine's: it arrives on the state payload and is
+     overwritten by every event, so it clears itself when the engine recovers.
+     `ui.error` is a frontend action that failed and has nowhere local to
+     report — nothing but a person dismissing it will clear that one. The
+     frontend message wins a tie because it is the one the user just caused.
+     Dismiss clears both, so the button always empties the banner it is in. */
+  const bannerError = $derived(ui.error ?? playback.error);
+
+  function dismissBanner() {
+    ui.error = null;
+    playback.error = null;
+  }
+
   /* Fetch detail data when a detail route becomes active. The fetch itself
      lives in the state module so that a failed page's "Try again" is literally
      the same call. `untrack` because loadDetail reads `detail` to decide
@@ -317,10 +331,10 @@
     <div class="scroll" bind:this={scrollEl}>
       <TopBar />
 
-      {#if playback.error}
+      {#if bannerError}
         <div class="error-banner" role="alert">
-          <span class="error-text">{playback.error}</span>
-          <button class="btn-icon" title="Dismiss" onclick={() => (playback.error = null)}>
+          <span class="error-text">{bannerError}</span>
+          <button class="btn-icon" title="Dismiss" onclick={dismissBanner}>
             <Icon name="x" size={14} />
           </button>
         </div>

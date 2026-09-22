@@ -25,6 +25,7 @@
 <symbol id="i-repeat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2.6 3.6 3.4L17 9.4"/><path d="M3.4 11v-1a4 4 0 0 1 4-4h13.2"/><path d="m7 21.4-3.6-3.4L7 14.6"/><path d="M20.6 13v1a4 4 0 0 1-4 4H3.4"/></symbol>
 <symbol id="i-heart-f" viewBox="0 0 24 24" fill="currentColor"><path d="M12 20.6l-1.3-1.2C6 15.1 3 12.3 3 8.9 3 6.2 5.1 4 7.8 4c1.5 0 3 .7 4.2 2 1.1-1.3 2.6-2 4.2-2C18.9 4 21 6.2 21 8.9c0 3.4-3 6.2-7.7 10.5L12 20.6Z"/></symbol>
 <symbol id="i-more" viewBox="0 0 24 24" fill="currentColor"><circle cx="5.4" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="18.6" cy="12" r="1.7"/></symbol>
+<symbol id="i-swap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h13m-3-3 3 3-3 3"/><path d="M20 15H7m3-3-3 3 3 3"/></symbol>
 <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m14.5 5-7 7 7 7"/></symbol>
 <symbol id="i-fwd" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 5 7 7-7 7"/></symbol>
 <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.4V12l3 2.5"/></symbol>

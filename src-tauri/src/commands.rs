@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use crate::app::{
     carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
-    is_followed_playlist, load_app_settings, load_playlist_list, now_secs, order_by_last_activity,
-    playlist_detail_from_cache, playlist_qualifies, remove_membership, save_app_settings,
-    save_membership, save_playlist_list, save_tracks_cache,
+    insert_created_playlist, is_followed_playlist, load_app_settings, load_playlist_list, now_secs,
+    order_by_last_activity, playlist_detail_from_cache, playlist_qualifies, remove_membership,
+    save_app_settings, save_membership, save_playlist_list, save_tracks_cache,
     touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, tracks_cache_bytes,
     upsert_membership, upsert_playlist, upsert_tracks_cache, write_tracks_cache_bytes, AppSettings,
     AppState, MembershipEntry, PlaylistListCache, PlaylistTracksEntry, RefreshCause,
@@ -504,6 +504,14 @@ pub async fn browse_followed_artists(
 // Playlist edit commands
 // ---------------------------------------------------------------------------
 
+/// Creates a playlist and installs it at the head of the library immediately.
+///
+/// The engine already answers with a fully populated reference — the name is
+/// the one we just posted — so nothing here waits on the rootlist to learn
+/// it. Installing the row before the refresh is what keeps the caller's
+/// optimistic insert and the refresh's answer in agreement: the stamp put on
+/// it here survives the refetch via `carry_local_fields`, so the row does not
+/// appear on top and then sink a second later when the rootlist event lands.
 #[tauri::command]
 pub async fn create_playlist(
     app: AppHandle,
@@ -511,7 +519,36 @@ pub async fn create_playlist(
     name: String,
 ) -> Result<Playlist, String> {
     let reference = client.create_playlist(&name).await?;
-    let playlist = Playlist::from(&reference);
+    let playlist = {
+        let state = app.state::<Mutex<AppState>>();
+        let persistence = state.lock().playlist_persistence.clone();
+        let _serialize = persistence.lock();
+        let (dir, cache, playlist) = {
+            let mut guard = state.lock();
+            // A rootlist request already in flight was answered before this
+            // playlist existed; installing that answer would drop the row we
+            // are about to add. Same fence a delete raises, for the same
+            // reason — `spawn_refresh_library` then re-runs the fetch.
+            guard.library_generation = guard.library_generation.wrapping_add(1);
+            let playlist = insert_created_playlist(
+                &mut guard.playlists,
+                Playlist::from(&reference),
+                now_secs(),
+            );
+            (
+                guard.data_dir.clone(),
+                PlaylistListCache {
+                    version: 1,
+                    fetched_at: guard.playlists_fetched_at,
+                    me_id: guard.me_id.clone(),
+                    playlists: guard.playlists.clone(),
+                },
+                playlist,
+            )
+        };
+        save_playlist_list(&dir, &cache);
+        playlist
+    };
     spawn_refresh_library(app);
     Ok(playlist)
 }
