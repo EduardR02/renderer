@@ -96,7 +96,7 @@
       disabled={!tracks.length}
       onclick={() => playFrom(0)}
     >
-      <Icon name="play" size={19} />
+      <Icon name="play" size={22} />
     </button>
   </div>
 

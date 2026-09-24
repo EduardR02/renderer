@@ -775,13 +775,13 @@ function trackCreditsPayload(id) {
 window.__fixtures = fixtures;
 /** How long `get_cover` pretends the network takes. See the command below. */
 let coverDelayMs = 0;
-window.__TAURI_INTERNALS__ = {
-  callbacks,
-  transformCallback,
-  runCallback,
-  unregisterCallback,
+/**
+ * The fixture backend: every command answered from the fixtures above. In real
+ * mode (`?real`, dev/ui-harness-real.js) the owner's app answers the reads and
+ * this keeps playback simulated.
+ */
+const mock = {
   invoke: async (cmd, args = {}) => {
-    calls.push({ cmd, args });
     switch (cmd) {
       case "plugin:event|listen": {
         const handlerId = args.handler ?? args.handlerId;
@@ -1120,6 +1120,19 @@ window.__TAURI_INTERNALS__ = {
   },
 };
 
+/** Set before mount when the page was opened with `?real`. */
+let realMode = null;
+window.__TAURI_INTERNALS__ = {
+  callbacks,
+  transformCallback,
+  runCallback,
+  unregisterCallback,
+  invoke: async (cmd, args = {}) => {
+    calls.push({ cmd, args });
+    return realMode ? realMode.invoke(cmd, args) : mock.invoke(cmd, args);
+  },
+};
+
 const settings = { animated_canvas: true };
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
   unregisterListener: (event, eventId, handlerId) => unregisterListener(event, eventId, handlerId),
@@ -1322,16 +1335,45 @@ Object.assign(window.__harness, {
 });
 
 
+if (new URLSearchParams(location.search).has("real")) {
+  const { createRealMode } = await import("./ui-harness-real.js");
+  // Null when neither the app nor anything stored answers get_state; the
+  // harness then boots on its fixtures, as it would without `?real`.
+  realMode = await createRealMode({
+    playback,
+    settings,
+    mock,
+    state,
+    emit,
+    emitState,
+    setCurrent,
+    clone,
+    redrawShuffleBag,
+    spliceIntoShuffleBag,
+    upcomingIndices,
+    shuffleBag: {
+      get: () => shuffleBag,
+      set: (indices) => {
+        touchQueue();
+        shuffleBag = indices;
+      },
+    },
+    snapshot: () => ({ ...clone(playback), queue_revision: queueRevision, upcoming: upcomingIndices() }),
+  });
+  if (realMode) window.__harness.real = realMode.helpers;
+}
+
 state.libraryState.loaded = true;
 state.session.auth_state = "ready";
-state.session.username = "eduard";
-state.setLibrary(fixtures.playlists);
+state.session.username = playback.username;
+state.setLibrary(realMode ? realMode.library : fixtures.playlists);
 // Default boot is final/fresh so ordinary UI tests exercise the settled Home,
 // shelves included. bootCachedLibrary() below rewinds to the staged boot.
 state.libraryState.fresh = true;
 
 mount(App, { target: document.getElementById("app") });
-state.navigate("playlist", "p1");
+if (realMode) realMode.openScene();
+else state.navigate("playlist", "p1");
 document.body.dataset.harnessReady = "true";
 
 console.info("[harness] ready — commands log at window.__calls");

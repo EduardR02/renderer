@@ -21,3 +21,6 @@ node_modules/
 
 # Agent verification screenshots, kept out of history
 .shots/
+
+# The UI harness bridge's copy of the owner's account data (dev/real-bridge.js)
+dev/.real-cache/

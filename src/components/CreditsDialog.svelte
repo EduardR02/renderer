@@ -4,6 +4,7 @@
   import { coverTone } from "../lib/covertone.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
+  import { scrollbar } from "../lib/scrollbar.js";
 
   let dialog = $state(null);
   let query = $state("");
@@ -140,7 +141,7 @@
 
 
 <dialog
-  class="credits-dialog"
+  class="credits-dialog glass-overlay"
   class:compact
   bind:this={dialog}
   tabindex="-1"
@@ -201,7 +202,7 @@
       </div>
     {/if}
 
-    <div class="credits-body" aria-live="polite">
+    <div class="credits-body" aria-live="polite" use:scrollbar>
       {#if credits.loading}
         <div class="credits-loading" aria-label="Loading credits">
           <span class="skeleton line sm"></span>

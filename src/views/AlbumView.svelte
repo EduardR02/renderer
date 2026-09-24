@@ -225,7 +225,7 @@
         </p>
         <div class="actions">
           <button class="play-lg" title="Play" onclick={() => playFrom(0)} disabled={!tracks.length}>
-            <Icon name="play" size={19} />
+            <Icon name="play" size={22} />
           </button>
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length || shuffleBusy}>
             <Icon name="shuffle" size={14} />{shuffleBusy ? "Starting…" : "Shuffle"}
@@ -246,7 +246,7 @@
             {#if menuOpen}
               <div
                 id="album-actions-menu"
-                class="menu head-menu"
+                class="menu head-menu glass-overlay"
                 role="menu"
                 tabindex="-1"
                 bind:this={menu}

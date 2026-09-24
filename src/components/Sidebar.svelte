@@ -16,6 +16,8 @@
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import LikedMark from "./LikedMark.svelte";
+  import { scrollbar } from "../lib/scrollbar.js";
+  import { frost } from "../lib/ambient.svelte.js";
 
   let creating = $state(false);
   let newName = $state("");
@@ -223,7 +225,7 @@
   });
 </script>
 
-<aside class="sidebar">
+<aside class="sidebar glass-chrome" use:frost>
   <nav class="nav">
     <button class="nav-item" class:active={route.name === "library"} onclick={() => navigate("library")}>
       <!-- The renderer's mark, where the outline house used to be. It came off
@@ -327,7 +329,7 @@
       </form>
     {/if}
 
-    <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} class:droppable={trackDrag.active} bind:this={libList}>
+    <div class="lib-list" class:fade-top={fadeTop} class:fade-bottom={fadeBottom} class:droppable={trackDrag.active} bind:this={libList} use:scrollbar>
       {#if showingArtists}
         <!-- Portraits, in circles, because a face is most of how an artist is
              recognised and the rail already draws every artist that way. This

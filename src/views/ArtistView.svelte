@@ -1049,7 +1049,7 @@
          count beside their own heading. -->
     <div class="actions" style="margin-top:var(--s6)">
       <button class="play-lg" title="Play popular songs" onclick={() => playTop(0)} disabled={!top.length}>
-        <Icon name="play" size={19} />
+        <Icon name="play" size={22} />
       </button>
       <button class="btn-ghost" onclick={shuffleTop} disabled={!top.length}>
         <Icon name="shuffle" size={14} />Shuffle
@@ -1073,7 +1073,7 @@
         {#if menuOpen}
           <div
             id="artist-actions-menu"
-            class="menu head-menu"
+            class="menu head-menu glass-overlay"
             role="menu"
             tabindex="-1"
             bind:this={menu}
@@ -1664,7 +1664,7 @@
   /* The sleeve throws its own colour under itself, as it does in the inspector
      and the credits sheet — what stops a tile reading as a stamp on a panel. */
   .pick-art :global(.art) {
-    box-shadow: var(--ring), 0 10px 24px -10px color-mix(in srgb, var(--tone-glow) 78%, transparent);
+    box-shadow: 0 10px 24px -10px color-mix(in srgb, var(--tone-glow) 78%, transparent);
   }
   /* `padding-right`, because the column that follows is the play button and an
      ellipsis that stops flush against it reads as text still running rather

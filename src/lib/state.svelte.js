@@ -186,6 +186,10 @@ function readNowPlayingOpen() {
 export const ui = $state({
   searchFocusTick: 0,
   nowPlayingOpen: readNowPlayingOpen(),
+  /* The panel's Canvas is the picture, covering the panel edge to edge, so
+     the haze under it is never seen. Owned by NowPlayingPanel; the haze
+     reads it. The layout does not: an open panel has one shape. */
+  immersive: false,
   paneWidth: 0,
   /* Whether the app window has focus. Owned by App.svelte, published here
      because two unrelated surfaces gate decorative work on it: the VU meter's
@@ -818,6 +822,32 @@ function resetFollowsForSession() {
 }
 
 export const search = $state({ query: "", results: null, submitted: false, busy: false, error: null, link: null });
+
+/**
+ * Which of the user's own containers hold the playing track — Liked Songs
+ * included, as the id "liked". One in-memory IPC per track change: the index
+ * lives in the Rust side and is kept fresh there by playlist fetches and a
+ * background reconciliation, so nothing here polls or waits on the network.
+ * The player bar drives the lookup (it is always mounted); the now-playing
+ * panel reads the same answer instead of asking again.
+ */
+export const nowSaved = $state({ refs: [] });
+let savedSeq = 0;
+
+export async function lookupSavedIn(uri) {
+  const seq = ++savedSeq;
+  if (!uri?.startsWith("spotify:track:")) {
+    nowSaved.refs = [];
+    return;
+  }
+  try {
+    const refs = await api.getTrackPlaylists(uri);
+    if (seq === savedSeq) nowSaved.refs = refs ?? [];
+  } catch {
+    // Backend not ready or gone: no mark is safer than a wrong mark.
+    if (seq === savedSeq) nowSaved.refs = [];
+  }
+}
 
 /**
  * On-demand track credits surface state. The payload is kept as the backend

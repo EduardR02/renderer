@@ -17,8 +17,14 @@
 <symbol id="i-queue" viewBox="0 0 24 24" fill="currentColor"><rect x="3.4" y="6.2" width="11" height="1.9" rx=".9"/><rect x="3.4" y="11.1" width="8" height="1.9" rx=".9"/><rect x="3.4" y="16" width="5" height="1.9" rx=".9"/><path d="M16.8 9.3v5.4c0 .6.6 1 1.2.7l4.7-2.7a.8.8 0 0 0 0-1.4L18 8.6c-.6-.3-1.2.1-1.2.7Z"/></symbol>
 <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4 17 7M7 17l-1.6 1.6"/></symbol>
 <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></symbol>
-<symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" d="M7.8 5.1v13.8c0 .9 1 1.4 1.7.9L20 12.9a1.1 1.1 0 0 0 0-1.8L9.5 4.2c-.7-.5-1.7 0-1.7.9Z"/></symbol>
-<symbol id="i-pause" viewBox="0 0 24 24" fill="currentColor"><rect x="6.4" y="4.9" width="3.6" height="14.2" rx="1.1"/><rect x="14" y="4.9" width="3.6" height="14.2" rx="1.1"/></symbol>
+<!-- Play and pause are one pair, drawn to the same box: 16 units tall, soft
+     all round. Pause is two slim bars with fully round ends, a bar's width
+     apart twice over. Play is a triangle with its corners rounded by a round
+     stroke join, set a unit right of centre: a triangle's weight sits at a
+     third of its width, so a mathematically centred one reads as left of
+     centre inside a circle. -->
+<symbol id="i-play" viewBox="0 0 24 24"><path d="M7.9 5.7v12.6L18.3 12Z" fill="currentColor" stroke="currentColor" stroke-width="3.2" stroke-linejoin="round"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24" fill="currentColor"><rect x="5.6" y="4" width="3.2" height="16" rx="1.6"/><rect x="15.2" y="4" width="3.2" height="16" rx="1.6"/></symbol>
 <symbol id="i-next" viewBox="0 0 24 24" fill="currentColor"><path d="M6.2 5.7v12.6c0 .8.9 1.3 1.6.9l9.2-6.3a1 1 0 0 0 0-1.8L7.8 4.8c-.7-.5-1.6 0-1.6.9Z"/><rect x="18.6" y="4.9" width="1.8" height="14.2" rx=".9"/></symbol>
 <symbol id="i-prev" viewBox="0 0 24 24" fill="currentColor"><path d="M17.8 5.7v12.6c0 .8-.9 1.3-1.6.9l-9.2-6.3a1 1 0 0 1 0-1.8l9.2-6.3c.7-.5 1.6 0 1.6.9Z"/><rect x="3.6" y="4.9" width="1.8" height="14.2" rx=".9"/></symbol>
 <symbol id="i-shuffle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 18h1.4c1.3 0 2.5-.6 3.2-1.7l6-8.6c.8-1.1 2-1.7 3.3-1.7h5"/><path d="m18 2.6 3.6 3.4-3.6 3.4"/><path d="M2.5 6h1.8c1.4 0 2.7.9 3.4 2.1"/><path d="M21.5 18h-5.3c-1.3 0-2.5-.7-3.2-1.8l-.5-.7"/><path d="m18 14.6 3.6 3.4-3.6 3.4"/></symbol>

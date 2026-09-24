@@ -9,12 +9,16 @@
     positionMs,
     ui,
     setNowPlayingOpen,
+    nowSaved,
+    lookupSavedIn,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
   import Slider from "./Slider.svelte";
   import { formatTime } from "../lib/time.js";
+  import { morphLayout } from "../lib/layout.js";
+  import { frost } from "../lib/ambient.svelte.js";
   import { listen } from "@tauri-apps/api/event";
 
   let dragPos = $state(null);
@@ -257,30 +261,6 @@
   });
 
   /**
-   * Which of the user's own containers hold the playing track. One in-memory
-   * IPC per track change — the index lives in the Rust side and is kept
-   * fresh there by playlist fetches and a background reconciliation, so the
-   * bar never polls and never blocks on the network.
-   */
-  let savedIn = $state([]);
-  let savedSeq = 0;
-
-  async function lookupSavedIn(uri) {
-    const seq = ++savedSeq;
-    if (!uri?.startsWith("spotify:track:")) {
-      savedIn = [];
-      return;
-    }
-    try {
-      const refs = await api.getTrackPlaylists(uri);
-      if (seq === savedSeq) savedIn = refs ?? [];
-    } catch {
-      // Backend not ready or gone: no mark is safer than a wrong mark.
-      if (seq === savedSeq) savedIn = [];
-    }
-  }
-
-  /**
    * The track the bar is looking at, as the one thing the saved-in lookup
    * depends on.
    *
@@ -303,7 +283,7 @@
   });
 
   /* Screen readers get the real container names, not a count. */
-  const savedLabel = $derived(`Saved in ${savedIn.map((ref) => ref.name).join(", ")}`);
+  const savedLabel = $derived(`Saved in ${nowSaved.refs.map((ref) => ref.name).join(", ")}`);
 
   function openSaved(id) {
     if (id === "liked") navigate("liked");
@@ -445,246 +425,252 @@
   });
 </script>
 
-<footer class="player">
-  <div class="p-now" class:idle={!current}>
-    {#if current}
-      <button
-        class="p-art-btn"
-        title="Go to album"
-        onclick={() => current.album_id && navigate("album", current.album_id)}
-      >
-        <Cover
-          src={current.cover_url}
-          id={current.album_id || current.uri}
-          name={current.album_name || current.name}
-          size={48}
-          class="p-art"
-        />
-      </button>
-      <span class="p-meta">
-        <span class="p-title-line">
-          {#if current.album_id}
-            <button
-              class="p-title"
-              title="Go to album"
-              onclick={() => navigate("album", current.album_id)}
-            >{current.name}</button>
-          {:else}
-            <span class="p-title">{current.name}</span>
-          {/if}
-        </span>
-        <ArtistLinks
-          class="p-artists"
-          names={current.artist_names}
-          ids={current.artist_ids ?? []}
-          id={current.artist_id}
-        />
-      </span>
-      {#if savedIn.length}
-        <!-- Marks live BESIDE the two-line text block, not inside its first
-             line: .p-now centres its children, so the check faces the whole
-             title+artists stack instead of hanging off the song name. -->
-        <span class="p-saved">
-          <span class="p-saved-mark"><Icon name="check" size={10} /></span>
-          <!-- Keyboard path: tabbing into a row button opens the panel
-               through :focus-within, so the wrapper stays non-focusable
-               and every interactive target remains a real button. -->
-          <span class="p-saved-panel" role="group" aria-label={savedLabel}>
-            <span class="p-saved-head">Saved in</span>
-            {#each savedIn as ref (ref.id)}
-              <button
-                class="p-saved-row"
-                title="Open {ref.name}"
-                onclick={() => openSaved(ref.id)}
-              >{ref.name}</button>
-            {/each}
-          </span>
-        </span>
-      {/if}
-      {#if editIndicator}
-        <span
-          class="p-edit-indicator"
-          title={editIndicator.title}
-          aria-label={editIndicator.title}
+<footer class="player glass-chrome" use:frost>
+  <div class="p-body">
+    <div class="p-now" class:idle={!current}>
+      {#if current}
+        <button
+          class="p-art-btn"
+          title="Go to album"
+          onclick={() => current.album_id && navigate("album", current.album_id)}
         >
-          <span class="p-edit-mark" aria-hidden="true"></span>
-          {editIndicator.label}
-        </span>
-      {/if}
-    {:else}
-      <!-- Idle holds the same 48px slot, so the bar does not jump the moment
-           the first track lands. -->
-      <span class="art p-art" aria-hidden="true"></span>
-      <span class="p-meta">
-        <span class="p-title">Nothing playing</span>
-        <span class="p-artists">Pick something from your library</span>
-      </span>
-    {/if}
-  </div>
-
-  <div class="p-center">
-    <div class="transport">
-      <button
-        class="ctl"
-        class:on={playback.shuffle}
-        title={playback.shuffle ? "Disable shuffle" : "Enable shuffle"}
-        onclick={() => api.setShuffle(!playback.shuffle).catch(() => {})}
-      >
-        <Icon name="shuffle" size={17} />
-      </button>
-      <button class="ctl" title="Previous" onclick={() => api.previous().catch(() => {})}>
-        <Icon name="previous" size={19} />
-      </button>
-      <button
-        class="play-btn"
-        title={playback.playing ? "Pause" : "Play"}
-        onclick={togglePlay}
-        disabled={!playback.queue.length}
-      >
-        <Icon name={playback.playing ? "pause" : "play"} size={16} />
-      </button>
-      <button class="ctl" title="Next" onclick={() => api.next().catch(() => {})}>
-        <Icon name="next" size={19} />
-      </button>
-      <button class="ctl" class:on={playback.repeat !== "off"} title={repeatTitle} onclick={cycleRepeat}>
-        <Icon name={playback.repeat === "track" ? "repeat-one" : "repeat"} size={17} />
-      </button>
-    </div>
-
-    <div class="p-seek">
-      <span class="p-time l">{formatTime(pos)}</span>
-      <div
-        class="p-seek-slider"
-        title={effectiveEdit ? editTimeline.markerTitle : undefined}
-      >
-        <Slider
-          min={0}
-          max={playback.duration_ms || 0}
-          value={positionMs()}
-          label="Seek"
-          step={5000}
-          formatValue={formatTime}
-          onCommit={(v) => {
-            dragPos = null;
-            api.seek(v).catch(() => {});
-          }}
-          onDragStart={(v) => (dragPos = v)}
-          onDragChange={(v) => (dragPos = v)}
-        />
-        {#if effectiveEdit}
-          <span class="p-seek-markers" aria-hidden="true">
-            {#if editTimeline.loop && editTimeline.loop.widthPercent > 0}
-              <span
-                class="p-loop-band"
-                style:left="{editTimeline.loop.startPercent}%"
-                style:width="{editTimeline.loop.widthPercent}%"
-                title={editTimeline.loop.title}
-              ></span>
+          <Cover
+            src={current.cover_url}
+            id={current.album_id || current.uri}
+            name={current.album_name || current.name}
+            size={48}
+            class="p-art"
+          />
+        </button>
+        <span class="p-meta">
+          <span class="p-title-line">
+            {#if current.album_id}
+              <button
+                class="p-title"
+                title="Go to album"
+                onclick={() => navigate("album", current.album_id)}
+              >{current.name}</button>
+            {:else}
+              <span class="p-title">{current.name}</span>
             {/if}
-            {#each editTimeline.seams as seam (seam.percent)}
-              <span
-                class="p-cut-seam"
-                style:left="{seam.percent}%"
-                title={seam.title}
-              ></span>
-            {/each}
+          </span>
+          <ArtistLinks
+            class="p-artists"
+            names={current.artist_names}
+            ids={current.artist_ids ?? []}
+            id={current.artist_id}
+          />
+        </span>
+        {#if nowSaved.refs.length}
+          <!-- Marks live BESIDE the two-line text block, not inside its first
+               line: .p-now centres its children, so the check faces the whole
+               title+artists stack instead of hanging off the song name. -->
+          <span class="p-saved">
+            <span class="p-saved-mark"><Icon name="check" size={10} /></span>
+            <!-- Keyboard path: tabbing into a row button opens the panel
+                 through :focus-within, so the wrapper stays non-focusable
+                 and every interactive target remains a real button. -->
+            <span class="p-saved-panel" role="group" aria-label={savedLabel}>
+              <span class="p-saved-head">Saved in</span>
+              {#each nowSaved.refs as ref (ref.id)}
+                <button
+                  class="p-saved-row"
+                  title="Open {ref.name}"
+                  onclick={() => openSaved(ref.id)}
+                >{ref.name}</button>
+              {/each}
+            </span>
           </span>
         {/if}
-      </div>
-      <span class="p-time r">{formatTime(playback.duration_ms)}</span>
-    </div>
-  </div>
-
-  <div class="p-right">
-    <button
-      class="p-speed"
-      class:on={speedPercent !== 100}
-      bind:this={speedButton}
-      title="Playback speed — scroll to adjust, double-click to reset"
-      aria-label="Playback speed"
-      aria-expanded={speedOpen}
-      onclick={toggleSpeedMenu}
-      ondblclick={() => commitSpeed(100)}
-    >
-      {speedLabel}×
-    </button>
-    <div
-      class="speed-menu"
-      popover="auto"
-      bind:this={speedMenu}
-      style:left="{speedAnchor.left}px"
-      style:bottom="{speedAnchor.bottom}px"
-    >
-      <div class="speed-head">
-        <span class="speed-value">{speedLabel}×</span>
-        <span class="speed-note">pitch preserved</span>
-      </div>
-      <Slider
-        min={SPEED_MIN}
-        max={SPEED_MAX}
-        value={speedPercent}
-        label="Playback speed"
-        step={SPEED_STEP}
-        kind="speed"
-        formatValue={(v) => formatSpeed(v) + "×"}
-        onDragStart={(v) => (speedDraft = v)}
-        onDragChange={(v) => (speedDraft = v)}
-        onCommit={(v) => commitSpeed(v)}
-      />
-      <div class="speed-presets">
-        {#each SPEED_PRESETS as preset}
-          <button
-            class="speed-preset"
-            class:on={speedPercent === preset}
-            onclick={() => commitSpeed(preset)}
+        {#if editIndicator}
+          <span
+            class="p-edit-indicator"
+            title={editIndicator.title}
+            aria-label={editIndicator.title}
           >
-            {formatSpeed(preset)}×
-          </button>
-        {/each}
+            <span class="p-edit-mark" aria-hidden="true"></span>
+            {editIndicator.label}
+          </span>
+        {/if}
+      {:else}
+        <!-- Idle holds the same 48px slot, so the bar does not jump the moment
+             the first track lands. -->
+        <span class="art p-art" aria-hidden="true"></span>
+        <span class="p-meta">
+          <span class="p-title">Nothing playing</span>
+          <span class="p-artists">Pick something from your library</span>
+        </span>
+      {/if}
+    </div>
+
+    <div class="p-center">
+      <div class="transport">
+        <button
+          class="ctl"
+          class:on={playback.shuffle}
+          title={playback.shuffle ? "Disable shuffle" : "Enable shuffle"}
+          onclick={() => api.setShuffle(!playback.shuffle).catch(() => {})}
+        >
+          <Icon name="shuffle" size={17} />
+        </button>
+        <button class="ctl" title="Previous" onclick={() => api.previous().catch(() => {})}>
+          <Icon name="previous" size={19} />
+        </button>
+        <button
+          class="play-btn"
+          title={playback.playing ? "Pause" : "Play"}
+          onclick={togglePlay}
+          disabled={!playback.queue.length}
+        >
+          <Icon name={playback.playing ? "pause" : "play"} size={20} />
+        </button>
+        <button class="ctl" title="Next" onclick={() => api.next().catch(() => {})}>
+          <Icon name="next" size={19} />
+        </button>
+        <button class="ctl" class:on={playback.repeat !== "off"} title={repeatTitle} onclick={cycleRepeat}>
+          <Icon name={playback.repeat === "track" ? "repeat-one" : "repeat"} size={17} />
+        </button>
+      </div>
+
+      <div class="p-seek">
+        <span class="p-time l">{formatTime(pos)}</span>
+        <div
+          class="p-seek-slider"
+          title={effectiveEdit ? editTimeline.markerTitle : undefined}
+        >
+          <Slider
+            min={0}
+            max={playback.duration_ms || 0}
+            value={positionMs()}
+            label="Seek"
+            step={5000}
+            formatValue={formatTime}
+            onCommit={(v) => {
+              dragPos = null;
+              api.seek(v).catch(() => {});
+            }}
+            onDragStart={(v) => (dragPos = v)}
+            onDragChange={(v) => (dragPos = v)}
+          />
+          {#if effectiveEdit}
+            <span class="p-seek-markers" aria-hidden="true">
+              {#if editTimeline.loop && editTimeline.loop.widthPercent > 0}
+                <span
+                  class="p-loop-band"
+                  style:left="{editTimeline.loop.startPercent}%"
+                  style:width="{editTimeline.loop.widthPercent}%"
+                  title={editTimeline.loop.title}
+                ></span>
+              {/if}
+              {#each editTimeline.seams as seam (seam.percent)}
+                <span
+                  class="p-cut-seam"
+                  style:left="{seam.percent}%"
+                  title={seam.title}
+                ></span>
+              {/each}
+            </span>
+          {/if}
+        </div>
+        <span class="p-time r">{formatTime(playback.duration_ms)}</span>
       </div>
     </div>
-    <button
-      class="btn-icon"
-      class:on={ui.nowPlayingOpen}
-      title="Now playing details"
-      onclick={() => setNowPlayingOpen(!ui.nowPlayingOpen)}
-    >
-      <Icon name="panel" size={18} />
-    </button>
-    <button
-      class="btn-icon"
-      class:on={route.name === "queue"}
-      title="Queue"
-      onclick={() => navigate(route.name === "queue" ? "library" : "queue")}
-    >
-      <Icon name="queue" size={18} />
-    </button>
-    <div class="p-volume" bind:this={volumeControl}>
+
+    <div class="p-right">
+      <button
+        class="p-speed"
+        class:on={speedPercent !== 100}
+        bind:this={speedButton}
+        title="Playback speed — scroll to adjust, double-click to reset"
+        aria-label="Playback speed"
+        aria-expanded={speedOpen}
+        onclick={toggleSpeedMenu}
+        ondblclick={() => commitSpeed(100)}
+      >
+        {speedLabel}×
+      </button>
+      <div
+        class="speed-menu glass-overlay"
+        popover="auto"
+        bind:this={speedMenu}
+        style:left="{speedAnchor.left}px"
+        style:bottom="{speedAnchor.bottom}px"
+      >
+        <div class="speed-head">
+          <span class="speed-value">{speedLabel}×</span>
+          <span class="speed-note">pitch preserved</span>
+        </div>
+        <Slider
+          min={SPEED_MIN}
+          max={SPEED_MAX}
+          value={speedPercent}
+          label="Playback speed"
+          step={SPEED_STEP}
+          kind="speed"
+          formatValue={(v) => formatSpeed(v) + "×"}
+          onDragStart={(v) => (speedDraft = v)}
+          onDragChange={(v) => (speedDraft = v)}
+          onCommit={(v) => commitSpeed(v)}
+        />
+        <div class="speed-presets">
+          {#each SPEED_PRESETS as preset}
+            <button
+              class="speed-preset"
+              class:on={speedPercent === preset}
+              onclick={() => commitSpeed(preset)}
+            >
+              {formatSpeed(preset)}×
+            </button>
+          {/each}
+        </div>
+      </div>
       <button
         class="btn-icon"
-        class:on={volumePercent === 0}
-        title={volumePercent === 0 ? `Unmute (${restoreVolume}%)` : `Mute (${volumePercent}%)`}
-        aria-label={volumePercent === 0 ? `Unmute to ${restoreVolume}%` : "Mute"}
-        aria-pressed={volumePercent === 0}
-        onclick={toggleMute}
+        class:on={ui.nowPlayingOpen}
+        title="Now playing details"
+        onclick={() => morphLayout(() => setNowPlayingOpen(!ui.nowPlayingOpen))}
       >
-        <Icon name="volume" size={18} />
+        <Icon name="panel" size={18} />
       </button>
-      <Slider
-        min={0}
-        max={100}
-        value={volumePercent}
-        label="Volume"
-        step={5}
-        kind="vol"
-        formatValue={(v) => `${Math.round(v)}%`}
-        onDragStart={(v) => changeVolume(v)}
-        onDragChange={(v) => changeVolume(v)}
-        onCommit={(v) => changeVolume(v, true)}
-      />
-      {#if volumeError}
-        <span class="p-volume-error" role="status">{volumeError}</span>
+      <!-- With the panel open the queue is in the panel's head, beside what it
+           follows; the bar keeps only what the bar alone can do. -->
+      {#if !ui.nowPlayingOpen}
+        <button
+          class="btn-icon"
+          class:on={route.name === "queue"}
+          title="Queue"
+          onclick={() => navigate(route.name === "queue" ? "library" : "queue")}
+        >
+          <Icon name="queue" size={18} />
+        </button>
       {/if}
+      <div class="p-volume" bind:this={volumeControl}>
+        <button
+          class="btn-icon"
+          class:on={volumePercent === 0}
+          title={volumePercent === 0 ? `Unmute (${restoreVolume}%)` : `Mute (${volumePercent}%)`}
+          aria-label={volumePercent === 0 ? `Unmute to ${restoreVolume}%` : "Mute"}
+          aria-pressed={volumePercent === 0}
+          onclick={toggleMute}
+        >
+          <Icon name="volume" size={18} />
+        </button>
+        <Slider
+          min={0}
+          max={100}
+          value={volumePercent}
+          label="Volume"
+          step={5}
+          kind="vol"
+          formatValue={(v) => `${Math.round(v)}%`}
+          onDragStart={(v) => changeVolume(v)}
+          onDragChange={(v) => changeVolume(v)}
+          onCommit={(v) => changeVolume(v, true)}
+        />
+        {#if volumeError}
+          <span class="p-volume-error" role="status">{volumeError}</span>
+        {/if}
+      </div>
     </div>
   </div>
 </footer>
@@ -711,29 +697,34 @@
     font-size: var(--t-12);
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
   }
+  /* The speed is a control like its neighbours, not a chip among them: the
+     same 32px round target, the same bare glyph-weight at rest and the same
+     plate under the pointer as the icon buttons — only its glyph is a
+     number. Off 1.0 it takes the foam and the dot every other "on" control
+     in the bar wears. */
   .p-speed {
-    min-width: 46px;
-    height: 28px;
+    position: relative;
+    min-width: 40px;
+    height: 32px;
     padding: 0 var(--s2);
-    border: 1px solid var(--line-2);
     border-radius: var(--rf);
-    background: var(--bg-2);
     color: var(--fg-2);
-    font: inherit;
+    font-family: var(--font-number);
     font-size: var(--t-12);
+    font-weight: var(--w-med);
     font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
     cursor: pointer;
     transition:
       color var(--d1) var(--ease),
-      border-color var(--d1) var(--ease);
+      background-color var(--d1) var(--ease);
   }
-  .p-speed:hover {
-    color: var(--fg-1);
-    border-color: var(--line-2);
-  }
-  .p-speed.on {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  .p-speed:hover { color: var(--fg); background: var(--hover-2); }
+  .p-speed[aria-expanded="true"] { color: var(--fg); background: var(--hover-2); }
+  .p-speed.on { color: var(--accent); }
+  .p-speed.on::after {
+    content: ""; position: absolute; bottom: 1px; left: 50%; margin-left: -1.5px;
+    width: 3px; height: 3px; border-radius: 50%; background: var(--accent);
   }
 
   /* Top layer, so the panel is never clipped by the player bar's own
@@ -745,10 +736,8 @@
     margin: 0;
     padding: var(--s4);
     width: 232px;
-    border: 1px solid var(--line-2);
-    border-radius: var(--r2);
-    background: var(--bg-2);
-    box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85), 0 2px 6px rgba(0, 0, 0, 0.5);
+    border: 0;
+    border-radius: var(--r3);
     color: var(--fg-1);
   }
   .p-title-line {

@@ -201,7 +201,7 @@
             onclick={playOrToggle}
             disabled={!tracks.length}
           >
-            <Icon name={playingThis && playback.playing ? "pause" : "play"} size={19} />
+            <Icon name={playingThis && playback.playing ? "pause" : "play"} size={22} />
           </button>
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
             <Icon name="shuffle" size={14} />Shuffle

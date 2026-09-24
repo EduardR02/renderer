@@ -22,6 +22,9 @@
   import TopBar from "./components/TopBar.svelte";
   import CreditsDialog from "./components/CreditsDialog.svelte";
   import NowPlayingPanel from "./components/NowPlayingPanel.svelte";
+  import Ambient from "./components/Ambient.svelte";
+  import { scrollbar } from "./lib/scrollbar.js";
+  import { frost } from "./lib/ambient.svelte.js";
   import LibraryView from "./views/LibraryView.svelte";
   import MadeForYouView from "./views/MadeForYouView.svelte";
   import LikedSongsView from "./views/LikedSongsView.svelte";
@@ -323,12 +326,18 @@
 </script>
 
 <IconSprite />
+<Ambient />
 
-<div class="app" class:anim-paused={!playback.playing || !ui.windowFocused} class:has-inspector={ui.nowPlayingOpen}>
+<div
+  class="app"
+  class:anim-paused={!playback.playing || !ui.windowFocused}
+  class:has-panel={ui.nowPlayingOpen}
+>
   <Sidebar />
 
-  <main class="pane" bind:this={paneEl}>
-    <div class="scroll" bind:this={scrollEl}>
+  <main class="pane glass-pane" bind:this={paneEl} use:frost>
+    <!-- The overlay bar starts under the sticky topbar (52px, --topbar-h). -->
+    <div class="scroll" bind:this={scrollEl} use:scrollbar={{ top: 52 }}>
       <TopBar />
 
       {#if bannerError}

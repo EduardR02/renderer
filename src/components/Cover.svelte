@@ -293,6 +293,7 @@
     class:mosaic={tier === "mosaic"}
     class:natural
     class:pending={!revealed}
+    class:ready={revealed}
     style:width={fill || natural ? "100%" : `${size}px`}
     style:height={natural ? null : fill ? "100%" : `${size}px`}
   >

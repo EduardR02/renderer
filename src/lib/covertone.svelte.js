@@ -29,6 +29,7 @@
 
 import { resolveCoverUrl } from "./state.svelte.js";
 import { boundedReads } from "./cover-work.js";
+import { warpHue, clayOf } from "./haze.js";
 
 /* --- Oklab. Small enough to inline; the alternative is a dependency for
        twelve lines of matrix arithmetic. -------------------------------- */
@@ -70,56 +71,9 @@ function hex(L, C, hueDeg) {
 
 /* --- The fold -------------------------------------------------------- */
 
-/**
- * The arc with no dark form, and the two edges where colour comes back.
- *
- * Every other hue at L 0.35 is a recognisable dark version of itself: 200° is
- * teal, 300° is aubergine, 14° is oxblood. This arc is the exception, and not
- * because of a bad choice of lightness — "amber" IS a light yellow, so there
- * is no dark amber, there is only brown. The failure runs the whole way from
- * burnt orange through olive; at the identity chroma, 68° is #5a2e00, 118° is
- * #374000 and 130° is still #294400. Warm survives up to about 38 and green
- * comes back at about 138, and between those two numbers there is nothing
- * worth showing.
- */
-const ARC_LO = 38;
-const ARC_HI = 156;
-const WARM_TIP = 54;
-const GREEN_TOE = 138;
-/** Pure yellow, and the middle of the arc: the one hue with no flank to prefer. */
-const FOLD = (ARC_LO + ARC_HI) / 2;
-
-/**
- * Vacate the arc by FOLDING it onto its own two edges.
- *
- * The thing to understand first is that no continuous monotonic remap can do
- * this. Push, squeeze, ease it however you like — if the map is continuous and
- * increasing, some input still lands in the middle, because that is what
- * continuity means. The narrow lightness bump this replaces did not even try:
- * it lifted a 64°-wide band around 68° and left the olive above it and the
- * burnt orange below it exactly as they were.
- *
- * So the map folds. Below 97° hues run down the warm flank towards burnt
- * sienna; above it they run up the green flank towards pine. It is continuous
- * at 38 and at 156, which is the part that matters, because those are the
- * seams with the untouched rest of the wheel and a jump there would be visible
- * as two neighbouring records looking unrelated. The one discontinuity sits at
- * the fold itself, on pure yellow, where a cover at 96 opens burnt orange and
- * one at 98 opens forest green. Nobody can tell: extraction is deterministic
- * per image, so no single record ever changes colour, and there is no second
- * rendering of the same cover to compare against.
- *
- * The cost is real and it is spread: 118° of input arrive on 34° of output, so
- * two gold sleeves that differ slightly now open the same page. That is the
- * trade being made on purpose — the arc had no variation worth keeping, only
- * different browns.
- */
-function warpHue(hue) {
-  const h = ((hue % 360) + 360) % 360;
-  if (h < ARC_LO || h > ARC_HI) return h;
-  if (h < FOLD) return ARC_LO + ((h - ARC_LO) / (FOLD - ARC_LO)) * (WARM_TIP - ARC_LO);
-  return GREEN_TOE + ((h - FOLD) / (ARC_HI - FOLD)) * (ARC_HI - GREEN_TOE);
-}
+/* The arc of hues with no dark form (burnt orange through olive), and the
+   fold that vacates it, live in haze.js: the ambient haze darkens colour
+   too and needs the same answer, from inside a worker. */
 
 /* --- The clamp ------------------------------------------------------- */
 
@@ -149,7 +103,7 @@ function palette(hue, chroma) {
    * both apply only to the wash pair — at L 0.6 the same hue is a caramel and
    * wants no help at all.
    */
-  const clay = h > WARM_TIP ? 0 : Math.max(0, (h - ARC_LO) / (WARM_TIP - ARC_LO));
+  const clay = clayOf(h);
   const lift = 0.06 * clay;
   const cw = c * (1 - 0.22 * clay);
   return {

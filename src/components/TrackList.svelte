@@ -19,6 +19,7 @@
   import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { observeStuck } from "../lib/sticky.js";
   import { rowWindow } from "../lib/virtual.js";
+  import { scrollbar } from "../lib/scrollbar.js";
   import { pressTrack, justDragged, registerReorderZone, trackDrag } from "../lib/dnd.svelte.js";
 
   let {
@@ -1073,16 +1074,18 @@
 </div>
 
 {#if menu.open}
+  <!-- The popover is the glass and its child is the scroller, so that the
+       scroller's overlay bar is laid inside the popover, in the top layer. -->
   <div
-    class="menu"
+    class="menu glass-overlay"
     popover="manual"
     use:topLayer
     bind:this={menuEl}
     style:left="{menu.x}px"
     style:top={menu.top === null ? null : menu.top + "px"}
     style:bottom={menu.bottom === null ? null : menu.bottom + "px"}
-    style:max-height="{menu.maxH}px"
   >
+    <div class="menu-scroll" use:scrollbar style:max-height="{menu.maxH}px">
     <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track, queueSource).catch(() => {}); }}>
       Add to queue
     </button>
@@ -1181,35 +1184,37 @@
         Remove from this playlist
       </button>
     {/if}
+    </div>
   </div>
 {/if}
 
 {#if picker.open}
   <div
-    class="menu"
+    class="menu glass-overlay"
     popover="manual"
     use:topLayer
     style:left="{picker.x}px"
     style:top={picker.top === null ? null : picker.top + "px"}
     style:bottom={picker.bottom === null ? null : picker.bottom + "px"}
-    style:max-height="{picker.maxH}px"
   >
-    {#each library as pl (pl.id)}
-      <button class="menu-item" onclick={() => addToPlaylist(pl)}>{pl.name}</button>
-    {/each}
+    <div class="menu-scroll" use:scrollbar style:max-height="{picker.maxH}px">
+      {#each library as pl (pl.id)}
+        <button class="menu-item" onclick={() => addToPlaylist(pl)}>{pl.name}</button>
+      {/each}
+    </div>
   </div>
 {/if}
 
 {#if artistPicker.open}
   <div
-    class="menu"
+    class="menu glass-overlay"
     popover="manual"
     use:topLayer
     style:left="{artistPicker.x}px"
     style:top={artistPicker.top === null ? null : artistPicker.top + "px"}
     style:bottom={artistPicker.bottom === null ? null : artistPicker.bottom + "px"}
-    style:max-height="{artistPicker.maxH}px"
   >
+    <div class="menu-scroll" use:scrollbar style:max-height="{artistPicker.maxH}px">
     {#each artistPicker.artists as artist (artist.id)}
       <button
         class="menu-item"
@@ -1220,6 +1225,7 @@
         }}
       >{artist.name}</button>
     {/each}
+    </div>
   </div>
 {/if}
 
@@ -1237,7 +1243,12 @@
     position: fixed;
     inset: auto;
     margin: 0;
+    padding: 0;
+  }
+  .menu-scroll {
+    padding: var(--s1);
     overflow-y: auto;
+    overscroll-behavior: contain;
   }
   .menu-error {
     max-width: 216px;

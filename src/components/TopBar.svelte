@@ -44,6 +44,22 @@
    */
   let sentinel = $state(null);
   let scrolled = $state(false);
+  /* The same device at the page's very top: once it has scrolled away,
+     content is passing under the bar and the bar takes its glass. */
+  let edge = $state(null);
+  let covering = $state(false);
+
+  $effect(() => {
+    const node = edge;
+    if (!node) return;
+    const root = node.closest(".scroll");
+    if (!root) return;
+    const observer = new IntersectionObserver(([entry]) => {
+      covering = !entry.isIntersecting;
+    }, { root });
+    observer.observe(node);
+    return () => observer.disconnect();
+  });
 
   $effect(() => {
     const node = sentinel;
@@ -125,8 +141,9 @@
 <!-- Lives in the scrolled content, not in the bar: the bar is sticky, so
      anything inside it stays put and would never cross anything. -->
 <div class="topbar-sentinel" aria-hidden="true" bind:this={sentinel}></div>
+<div class="topbar-sentinel topbar-edge" aria-hidden="true" bind:this={edge}></div>
 
-<div class="topbar" class:scrolled>
+<div class="topbar" class:scrolled class:glass-strip={covering}>
   <div class="hist">
     <button class="round" title="Back (Alt ←)" disabled={!canGoBack()} onclick={goBack}>
       <Icon name="back" size={16} />

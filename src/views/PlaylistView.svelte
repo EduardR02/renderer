@@ -804,7 +804,7 @@
             onclick={playOrToggle}
             disabled={!tracks.length}
           >
-            <Icon name={playingThis && playback.playing ? "pause" : "play"} size={19} />
+            <Icon name={playingThis && playback.playing ? "pause" : "play"} size={22} />
           </button>
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
             <Icon name="shuffle" size={14} />Shuffle
@@ -825,7 +825,7 @@
             {#if menuOpen}
               <div
                 id="playlist-actions-menu"
-                class="menu playlist-actions-menu"
+                class="menu playlist-actions-menu glass-overlay"
                 role="menu"
                 tabindex="-1"
                 bind:this={menu}

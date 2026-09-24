@@ -7,15 +7,14 @@
   color-scheme: dark;
 
   /* =====================================================================
-     SURFACES — two planes and a ground.
+     SURFACES — two planes and a ground, as OPAQUE values.
 
-     Earlier passes gave the sidebar, the player bar and the content pane
-     three separate values one or two steps apart, which is a difference too
-     small to read as a decision and just enough to stop the window looking
-     properly dark. There are only two kinds of surface here:
+     The planes are glass (GLASS, below); these are what each becomes where
+     glass is refused (REDUCED TRANSPARENCY, at the end of the file), and
+     the greys a few controls still stand on. There are two kinds of plane:
 
-       CHROME   — permanent furniture (sidebar, player bar, inspector). One
-                  value, shared, so the L-shape of chrome reads as one object.
+       CHROME   — permanent furniture (sidebar, player bar). One value,
+                  shared, so the L-shape of chrome reads as one object.
        CONTENT  — the pane you are actually reading. The lit plane.
 
      The ground behind both is darker than either and is only ever visible as
@@ -24,7 +23,6 @@
   --bg-0:   #080808;  /* window ground: gutters only                     */
   --bg-nav: #0e0e0e;  /* CHROME: sidebar, player bar, now-playing rail   */
   --bg-1:   #121212;  /* CONTENT: the pane, the brightest large plane    */
-  --bg-bar: var(--bg-nav);
   /* A modal is lifted by its border and its shadow, not by luminance: at a
      raised grey it became the brightest thing on screen and read as a card. */
   --bg-sheet: #131313;
@@ -45,11 +43,15 @@
          under a wash with real colour in it, --fg-2 at L* 67 sat too close to
          the tinted ground and picked the ground's hue up by simultaneous
          contrast — which is what "the grey subtext leans brown" was. Brighter
-         grey resists that, and reads as quiet rather than as dim. --- */
+         grey resists that, and reads as quiet rather than as dim.
+
+         The lower two rungs are set by the glass (see Glass, below): over
+         the brightest haze allowed, --fg-2 must still hold 4.5:1 and --fg-3
+         3:1, and these are the least light that does. --- */
   --fg:   #f2f2f2;   /* never pure #fff: it vibrates on near-black      */
   --fg-1: #c4c4c4;
-  --fg-2: #a0a0a0;
-  --fg-3: #757575;
+  --fg-2: #acacac;
+  --fg-3: #8b8b8b;
 
   /* =====================================================================
      ACCENTS — four hues, four layers of meaning, no overlap.
@@ -210,7 +212,6 @@
 
   /* --- Layout ------------------------------------------------------ */
   --sidebar-w: 240px;
-  --inspector-w: 336px;
   --player-h: 76px;
   --topbar-h: 52px;
   --row-h: 48px;    /* track row — fixed, virtualization-friendly       */
@@ -227,6 +228,88 @@
   --tone-wash:      #232f38;
   --tone-wash-deep: #18222a;
   --tone-glow:      #4e7182;
+
+  /* =====================================================================
+     GLASS — the one material every surface is built from.
+
+     Behind the panels is the haze (Ambient.svelte): the playing record,
+     reduced to a blurred 64px picture, lighting the window. Everything
+     that sits on it is glass, in five weights, each a class that any
+     surface can wear (THE MATERIAL, below the element rules):
+
+       .glass-chrome   rail and player bar. The thinnest: the haze is meant
+                       to be seen through it, as colour.
+       .glass-pane     the reading pane. A step denser, for dense text.
+       .glass-card     a plate raised ON glass: light added, and no frost of
+                       its own, because it is already over frosted glass.
+       .glass-overlay  menus, popovers, dialogs, tooltips, sheets. Over real
+                       content, so real blur, and dense enough to read over
+                       a white cover.
+       .glass-plate    a small control over the Canvas.
+
+     Each is FROST (what is done to what is behind), a thin TINT that evens
+     it out, a RIM — a hairline that catches the light at the top left and
+     fades away round the edge — with a faint SHEEN inside it, and a LIFT.
+
+     Every frost is a real one: blur, then saturate, then darken. The haze is
+     detailed and patchy on purpose, and glass that softens what is behind
+     it is what reads as frosted rather than as tinted plastic. Saturating
+     before darkening is what makes the glass read as stained rather than
+     smoked: a dark tint mixes the haze's colour toward grey, darkening keeps
+     its chroma, so the tints can stay thin.
+
+     The PLANES' frost is not a backdrop-filter. A backdrop filter is redone
+     whenever anything inside its element repaints — the playing row's VU
+     meter, a scrolled list — and on the pane that was forty percent of a
+     core. The haze layer draws a frosted twin of the haze instead, with
+     exactly --frost-plane's numbers, and shows it clipped to the planes
+     that wear `use:frost` (ambient.svelte.js, THE FROST); the plane itself
+     is only its tint, sheen, rim and lift. Strips, overlays and plates keep
+     a live backdrop-filter: what they frost is live content, and they are
+     small.
+
+     The numbers are held to the haze's CEILING (haze.js) through the frost,
+     not to a typical frame: glass.test.js searches every haze colour the
+     ceiling allows, and over the brightest of them --fg keeps 7:1, --fg-2
+     4.5:1 and --fg-3 3:1 on every surface; an overlay and a plate keep it
+     over pure white. Change a number here, run it.
+     ===================================================================== */
+  --frost-plane:   blur(36px) saturate(1.45) brightness(0.7);
+  --frost-strip:   blur(20px) saturate(1.7) brightness(0.9);
+  --frost-overlay: blur(28px) saturate(1.6) brightness(0.7);
+  /* Small: a plate sits over a playing video and is re-frosted every frame. */
+  --frost-plate:   blur(8px) saturate(1.5) brightness(0.72);
+  --tint-chrome:   rgb(10 11 14 / 0.33);
+  --tint-pane:     rgb(11 12 15 / 0.38);
+  --tint-strip:    rgb(13 14 17 / 0.62);
+  --tint-overlay:  rgb(19 20 24 / 0.78);
+  /* A modal sheet frosts its own dimmed page (--dim-modal), never bare
+     content, so it can be much thinner glass than a menu. */
+  --tint-sheet:    rgb(19 20 24 / 0.5);
+  --dim-modal:     rgb(4 5 7 / 0.5);
+  /* A plate over the Canvas thickens with the brightness under it
+     (NowPlayingPanel sets --plate-a); this is its floor. */
+  --tint-plate:    rgb(9 9 11 / var(--plate-a, 0.42));
+  /* Light added: a card is a brighter pane of the same glass, never a grey
+     laid over it — an opaque grey reads as a hole wherever the haze is
+     brighter than it. The raises are the same idea for hover and selection. */
+  --lift-card:     rgba(255, 255, 255, 0.03);
+  --raise-1: rgba(255, 255, 255, 0.03);
+  --raise-2: rgba(255, 255, 255, 0.075);
+  --raise-3: rgba(255, 255, 255, 0.11);
+  --glass-sheen:   linear-gradient(158deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 34%);
+  --glass-rim:     linear-gradient(145deg,
+                     rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.14) 14%,
+                     rgba(255, 255, 255, 0.06) 36%, rgba(255, 255, 255, 0.03) 68%,
+                     rgba(255, 255, 255, 0.08));
+  --lift-plane:    0 1px 1px rgba(0, 0, 0, 0.16), 0 16px 40px -22px rgba(0, 0, 0, 0.7);
+  --lift-raised:   0 1px 1px rgba(0, 0, 0, 0.14), 0 12px 28px -18px rgba(0, 0, 0, 0.7);
+  --lift-overlay:  0 2px 6px rgba(0, 0, 0, 0.28), 0 28px 64px -20px rgba(0, 0, 0, 0.78);
+
+  /* The now-playing panel is as wide as a 9:16 Canvas is at the window's
+     full height — it runs top to bottom — so the video is barely cropped,
+     and never more than 40% of the window. */
+  --panel-w: clamp(296px, 100vh * 9 / 16, 40vw);
 }
 
 
@@ -273,61 +356,215 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 ::selection { background: var(--accent-wash); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r1); }
 
-/* Scrollbars live inside the rounded pane, never against the window edge */
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--foam) 16%, rgba(255, 255, 255, 0.1));
-  border-radius: var(--rf);
-  border: 3px solid transparent;
-  background-clip: padding-box;
+/* =====================================================================
+   SCROLLBARS — drawn over the content, never beside it.
+
+   No native bar anywhere. A native bar is laid out inside its scroller:
+   every scroller reserved a 10px gutter for it, and the gutter is where
+   the glass stopped — the sticky topbar, the track head and every
+   full-bleed band ended 10px short of the pane's edge, which was the thin
+   line of different material down the right side. Each scroller draws an
+   overlay bar instead (lib/scrollbar.js): a sibling laid over its right
+   edge, in view only while scrolling or while the pointer is near it.
+   ===================================================================== */
+* { scrollbar-width: none; }
+.sb {
+  position: absolute; z-index: 35; width: 12px;
+  pointer-events: none;
+  opacity: 0; transition: opacity 320ms var(--ease);
 }
-::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--foam) 42%, transparent); background-clip: padding-box; }
+.sb.on { opacity: 1; transition-duration: 120ms; }
+.sb.none { display: none; }
+.sb-thumb {
+  position: absolute; top: 0; right: 3px; width: 4px;
+  border-radius: var(--rf);
+  background: rgba(255, 255, 255, 0.28);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.12);
+  will-change: transform;
+  transition: width var(--d2) var(--ease), background-color var(--d1) var(--ease);
+}
+/* A 12px target around a 4px mark, live only while the bar is in view. */
+.sb.on .sb-thumb { pointer-events: auto; }
+.sb-thumb::after { content: ""; position: absolute; inset: 0 -3px 0 -5px; }
+.sb-thumb:hover, .sb.drag .sb-thumb { width: 7px; background: rgba(255, 255, 255, 0.46); }
+.sb.drag .sb-thumb { background: rgba(255, 255, 255, 0.58); }
+
+/* =====================================================================
+   THE MATERIAL — glass, as classes any surface can wear.
+   (Tokens, weights and the reasoning: GLASS, in :root.)
+
+   The host must be positioned (the rim is absolutely placed); every
+   surface wearing these already is, or says so in its own rule — the
+   material cannot, because a modal <dialog> is positioned by the UA
+   sheet and any author `position` here would beat it.
+
+   `isolation` so the rim, which has to lie over whatever the surface holds
+   (a sticky bar, a scroller), can never climb out of it. The rim is a 1px
+   ring cut out of a gradient by a mask: a border cannot carry a gradient
+   round a radius, and an inset shadow cannot fade along an edge. It is
+   static, so it is rastered once.
+   ===================================================================== */
+.glass-chrome, .glass-pane, .glass-overlay, .glass-card, .glass-plate { isolation: isolate; }
+/* The planes carry no filter: their frost is drawn under them by the haze
+   layer, so a plane must also wear `use:frost` (see GLASS). */
+.glass-chrome {
+  background: var(--glass-sheen), var(--tint-chrome);
+  box-shadow: var(--lift-plane);
+}
+.glass-pane {
+  background: var(--glass-sheen), var(--tint-pane);
+  box-shadow: var(--lift-plane);
+}
+.glass-card {
+  background: var(--glass-sheen), var(--lift-card);
+  box-shadow: var(--lift-raised);
+}
+.glass-overlay {
+  background: var(--glass-sheen), var(--tint-overlay);
+  -webkit-backdrop-filter: var(--frost-overlay);
+          backdrop-filter: var(--frost-overlay);
+  box-shadow: var(--lift-overlay);
+  color: var(--fg);
+}
+/* A modal overlay is a SHEET: it lies over its own dimmed page, so the
+   worst it can frost is white at half strength, and it is thinner glass
+   than a menu, which can land on a white cover. The dim is only half: a
+   sheet of glass over a page gone black is a dark card. */
+.glass-overlay:modal { background: var(--glass-sheen), var(--tint-sheet); }
+.glass-overlay:modal::backdrop { background: var(--dim-modal); }
+.glass-plate {
+  background: var(--tint-plate);
+  -webkit-backdrop-filter: var(--frost-plate);
+          backdrop-filter: var(--frost-plate);
+  box-shadow: 0 2px 10px -2px rgba(0, 0, 0, 0.3);
+}
+:is(.glass-chrome, .glass-pane, .glass-overlay, .glass-card, .glass-plate)::before {
+  content: ""; position: absolute; inset: 0; z-index: 60;
+  border-radius: inherit; padding: 1px;
+  background: var(--glass-rim);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  pointer-events: none;
+}
+/* A STRIP is the frost without the object: the sticky bars that content
+   scrolls under — topbar, table heads — are part of the pane they sit in,
+   not surfaces of their own, so they get no rim, no sheen, no lift. */
+.glass-strip {
+  background: var(--tint-strip);
+  -webkit-backdrop-filter: var(--frost-strip);
+          backdrop-filter: var(--frost-strip);
+}
 
 /* =====================================================================
    SHELL
    ===================================================================== */
+/* Two layouts, one grid, and the surfaces name their areas instead of
+   counting tracks. The ground is transparent: the gutters are where the haze
+   shows through unfiltered, which is what draws the panels' edges.
+
+   With the now-playing panel open it takes the right side of the window in
+   both rows — the picture runs top to bottom — and the player bar gives up
+   the width under it. The panel steps out over the window's padding on
+   three sides (see .np-panel), so the grid itself stays one shape. */
 .app {
+  position: relative; z-index: 1;
   display: grid;
-  grid-template-columns: var(--sidebar-w) 1fr;
-  grid-template-rows: 1fr var(--player-h);
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) var(--player-h);
+  grid-template-areas: "side pane" "bar bar";
   gap: var(--gutter);
   padding: var(--gutter);
   height: 100vh;
-  background: var(--bg-0);
 }
-.app.has-inspector { grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--inspector-w); }
+.app.has-panel {
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--panel-w);
+  grid-template-areas: "side pane panel" "bar bar panel";
+}
+/* The glass meets the Canvas on one straight edge: rounded corners there
+   would each leave a notch of bare haze between the glass and the video.
+   The frost's clip follows the corners as computed. */
+.app.has-panel > .pane,
+.app.has-panel > .player { border-top-right-radius: 0; border-bottom-right-radius: 0; }
 
 /* =====================================================================
    NARROW WINDOW — the chrome gives ground before the content does.
 
-   The window's floor is 940px. With the inspector open that left the reading
-   pane 332px wide: 240 of rail, 336 of inspector and four gutters, all fixed,
-   against a pane that was the only thing asked to absorb the difference. A
-   playlist table cannot be built in 332px and neither can anything else.
+   The window's floor is 940px. With the panel open the reading pane is what
+   absorbs the difference, and a playlist table cannot be built in 332px.
 
-   So below 1180 the two pieces of permanent furniture step down — the rail to
-   a size that still holds "Driving North at…" and a count, the inspector to
-   the narrowest column its 1:1 artwork and two-line credits still work in —
-   and the pane gets the 68px back. It is the right trade: the rail and the
-   inspector are both about something you already know, and the pane is where
-   you are reading.
+   So below 1180 the rail steps down to a size that still holds "Driving
+   North at…" and a count, and the pane gets the 28px back. The panel
+   narrows on its own: it is as wide as the Canvas is at the window's
+   height (--panel-w), so a short window is also a narrower panel.
    ===================================================================== */
 @media (max-width: 1180px) {
-  :root { --sidebar-w: 212px; --inspector-w: 296px; --pane-pad: 18px; }
+  :root { --sidebar-w: 212px; --pane-pad: 18px; }
 }
 
+/* =====================================================================
+   THE LAYOUT MORPH
+
+   Opening or closing the now-playing panel is ONE layout change made
+   inside a view transition (morphLayout, in lib/layout.js). The browser
+   snapshots the surfaces named here, lays the app out once in its new
+   shape, and animates the snapshots on the compositor — nothing re-lays
+   out per frame, where animating the grid would re-lay out all of it.
+
+   Names exist only while `.morphing` is set, for the length of a morph.
+   The root takes none: the haze, the rail, the pane and the bar's glass
+   stay LIVE under the overlay. They are glass, and a snapshot of glass is
+   wrong: it is captured alone, so its frost has nothing behind it and the
+   image is a thin tint over nothing — painted over the live haze, it is
+   the raw haze, brighter and louder than the glass, until the morph ends
+   and the frost snaps back. (A frost on the transition's own boxes does
+   not help: the overlay is a backdrop root.) So the pane and the bar take
+   their new size at once, and what moves is what carries no glass: the
+   panel, sliding in from the window's edge and back out to it, and the
+   bar's clusters, the transport gliding to its new centre.
+   ===================================================================== */
+:root { view-transition-name: none; }
+.morphing .np-panel { view-transition-name: np-panel; }
+.morphing .p-now { view-transition-name: bar-now; }
+.morphing .p-center { view-transition-name: bar-center; }
+.morphing .p-right { view-transition-name: bar-right; }
+
+::view-transition-group(*) {
+  animation-duration: 480ms;
+  animation-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+}
+/* A cluster that changes width keeps its pixels 1:1 (`object-fit: none`)
+   and crossfades old into new rather than stretching type, and the two only
+   overlap for a moment: a crossfade drawn over the whole motion prints both
+   at half strength. */
+::view-transition-old(bar-center), ::view-transition-old(bar-right) { animation-duration: 170ms; }
+::view-transition-new(bar-center), ::view-transition-new(bar-right) { animation-duration: 240ms; animation-delay: 50ms; }
+::view-transition-old(bar-center), ::view-transition-new(bar-center) { height: 100%; object-fit: none; }
+::view-transition-old(bar-right), ::view-transition-new(bar-right) {
+  height: 100%; object-fit: none; object-position: right center;
+}
+/* The panel slides in from the window's edge and back out to it. */
+::view-transition-old(np-panel), ::view-transition-new(np-panel) {
+  height: 100%; object-fit: none; object-position: right top;
+}
+::view-transition-new(np-panel):only-child { animation: np-arrive 480ms cubic-bezier(0.32, 0.72, 0, 1) both; }
+::view-transition-old(np-panel):only-child { animation: np-leave 300ms cubic-bezier(0.4, 0, 1, 1) both; }
+@keyframes np-arrive { from { opacity: 0; transform: translateX(40px); } }
+@keyframes np-leave { to { opacity: 0; transform: translateX(40px); } }
+
 /* ---------------------------------------------------------------- sidebar */
+/* Chrome glass (.glass-chrome, in the markup). Even insets on both sides:
+   the list no longer keeps a scrollbar gutter on the right. */
 .sidebar {
-  grid-row: 1;
+  grid-area: side;
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: var(--s3) var(--s1) var(--s2) var(--s3);
-  background: var(--bg-nav);
+  padding: var(--s3) var(--s3) var(--s2);
   border-radius: var(--r-panel);
 }
-.nav { display: flex; flex-direction: column; gap: 1px; padding-right: var(--s1); }
+.nav { display: flex; flex-direction: column; gap: 1px; }
 /* The app's mark, carried by the Home row. It is a filled tile among outline
    glyphs, so it is drawn one pixel narrower than the 17px icons around it —
    area reads heavier than stroke, and at 20px it was the loudest thing in the
@@ -351,7 +588,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    luminance change is only the support. */
 .nav-item.active {
   color: var(--fg);
-  background: linear-gradient(90deg, var(--accent-wash), transparent 78%), var(--bg-3);
+  background: linear-gradient(90deg, var(--accent-wash), transparent 78%), var(--raise-2);
   box-shadow: inset 2px 0 var(--accent);
 }
 .nav-item.active svg { opacity: 1; color: var(--accent); }
@@ -369,7 +606,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   color: var(--count);
 }
 
-.lib { display: flex; flex-direction: column; flex: 1; min-height: 0; margin-top: var(--s3); }
+.lib { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; margin-top: var(--s3); }
 .lib-head {
   display: flex; align-items: center; justify-content: space-between;
   height: 28px; padding: 0 var(--s2); margin-bottom: var(--s1);
@@ -405,10 +642,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .lib-filter-empty .link-more {
   display: block; margin: var(--s2) auto 0; font-size: var(--t-11);
 }
-.lib-list {
-  flex: 1; min-height: 0; overflow-y: auto; padding-right: var(--s1);
-  scrollbar-gutter: stable;
-}
+.lib-list { flex: 1; min-height: 0; overflow-y: auto; }
 .lib-list.fade-top.fade-bottom {
   -webkit-mask-image: linear-gradient(180deg, transparent 0, var(--fg) var(--s3), var(--fg) calc(100% - var(--s5)), transparent 100%);
           mask-image: linear-gradient(180deg, transparent 0, var(--fg) var(--s3), var(--fg) calc(100% - var(--s5)), transparent 100%);
@@ -421,9 +655,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   -webkit-mask-image: linear-gradient(180deg, var(--fg) 0, var(--fg) calc(100% - var(--s5)), transparent 100%);
           mask-image: linear-gradient(180deg, var(--fg) 0, var(--fg) calc(100% - var(--s5)), transparent 100%);
 }
-/* the sidebar scrollbar only materialises while the sidebar is hovered */
-.lib-list::-webkit-scrollbar-thumb { background: transparent; }
-.sidebar:hover .lib-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.11); background-clip: padding-box; }
 
 .lib-row {
   display: grid; grid-template-columns: 32px minmax(0, 1fr) auto;
@@ -432,7 +663,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--r2); text-align: left;
   transition: background-color var(--d1) var(--ease);
 }
-.lib-row.active { background: linear-gradient(90deg, var(--accent-wash), transparent 80%), var(--bg-3);
+.lib-row.active { background: linear-gradient(90deg, var(--accent-wash), transparent 80%), var(--raise-2);
   box-shadow: inset 2px 0 var(--accent); }
 .lib-row.active .lib-name { color: var(--fg); }
 .lib-name {
@@ -449,7 +680,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The one row in the rail whose selected state is warm, because the thing it
    selects is the saved collection. Everything else selected is foam. */
 .lib-row.liked-row.active {
-  background: linear-gradient(90deg, var(--saved-wash), transparent 80%), var(--bg-3);
+  background: linear-gradient(90deg, var(--saved-wash), transparent 80%), var(--raise-2);
   /* The rail stays with the row: the nav and every library selection carry
      the same inset bar, so "selected" is one shape everywhere in the rail —
      and this one row's bar is warm because its wash is. */
@@ -498,244 +729,240 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    it did not match the one on the collection page. Both are now LikedMark. */
 
 /* ---------------------------------------------------------------- pane */
+/* Pane glass (.glass-pane, in the markup). Positioned: its scroller's
+   overlay bar is laid against it. */
 .pane {
-  grid-row: 1;
+  grid-area: pane;
+  position: relative;
   border-radius: var(--r-panel);
-  background: var(--bg-1);
   overflow: hidden;
   display: flex; flex-direction: column; min-width: 0;
 }
+
 /* ------------------------------------------------------- now playing panel
-   An inspector for one track: artwork at full column width, then identity,
-   album, credits, and what follows — in that order, each block separated by
-   space and a hairline rather than by a box. The previous version stacked
-   small facts in bordered rows, which made a 320px rail read like a settings
-   table; the panel is now mostly artwork and names. */
-/* The rail takes the playing record's colour, top to bottom. It was chrome
-   grey everywhere except the artwork, which is a strange thing for the one
-   surface in the app that always has a picture in it. */
+   One layout (NowPlayingPanel.svelte). Open, the panel is the right side of
+   the window, flush with its top, right and bottom — the window ends there,
+   so there is no gutter, no rounding and no frame on those sides — and it
+   spans the player bar's row. Its left edge is the pane's and the bar's
+   right edge: the picture runs at full strength up to one straight glass
+   edge (the pane and the bar square their right-hand corners while the
+   panel is open), and the frost under that glass carries the picture's own
+   colours on from exactly there (haze.anchor), so the Canvas reads as
+   flowing in under the glass rather than as a framed video beside it.
+
+   The picture is the Canvas when there is one, filling the panel, pinned
+   under the scrolling column. Without one — or with the cover asked for —
+   it is the cover, smaller and static in the hero, with the haze around
+   it. Between the two there is only a crossfade: nothing moves.
+
+   Nothing darkens the picture. The type floats on it, held by a shadow
+   that hugs the glyphs and is only as strong as the picture under it is
+   bright (--np-shade), and the controls sit on small glass plates. The
+   details scroll up over it on a veil: the haze's own colour at the
+   panel's edge, seen through chrome glass. */
 .np-panel {
-  grid-row: 1; grid-column: 3;
-  display: flex; flex-direction: column; min-height: 0;
-  overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable;
-  padding: 0 0 var(--s6);
-  border-radius: var(--r-panel);
-  /* A short band of the track's colour at the top, then chrome. Short on
-     purpose: this is a fixed 336px column of dense small type, and a tint
-     running the full height would make every line of it harder to read for no
-     gain. The colour's job is to say WHOSE panel this is, which takes 220px. */
-  background:
-    linear-gradient(180deg,
-      color-mix(in srgb, var(--tone-wash) 62%, var(--bg-nav)) 0,
-      var(--bg-nav) 220px),
-    var(--bg-nav);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --head-h: 56px;
+  --np-inset: calc(var(--gutter) + var(--s6));
+  --melt: 140px;
+  grid-area: panel;
+  position: relative; min-width: 0; min-height: 0;
+  /* Out over the window's padding on three sides, and over the gutter on
+     the fourth: the picture meets the window's edges and the pane's. It
+     must never run UNDER a plane — a plane is a thin tint now, and the
+     video would show through it unfrosted. */
+  margin: calc(var(--gutter) * -1);
+  overflow: hidden;
+  --veil: color-mix(in srgb, rgb(8 9 11) 56%, var(--haze-veil, var(--tone-wash-deep)));
 }
+
+/* The picture layer. Nothing rounded and nothing masked in it, so nothing
+   in it can fringe (see .art), and the video is drawn plainly. */
+.np-stage { position: absolute; inset: 0; z-index: 0; }
+.np-video {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover;
+  opacity: 0; visibility: hidden;
+  transition: opacity 600ms var(--ease), visibility 0s linear 600ms;
+}
+.np-video.shown { opacity: 1; visibility: visible; transition: opacity 600ms var(--ease), visibility 0s; }
+
+.np-scroll {
+  position: absolute; inset: 0; z-index: 1;
+  overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+}
+
+/* The head floats over the column: a label and a few plates, and no strip
+   of its own until the details have scrolled up under it. */
 .np-head {
-  position: sticky; top: 0; z-index: 2;
+  position: absolute; top: 0; left: 0; right: 0; z-index: 3;
   display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
-  height: 44px; flex: none; padding: 0 var(--s2) 0 var(--s4);
-  /* Sticky over a tinted panel, so it has to be glass rather than a fade to a
-     colour it does not know — the fade to --bg-nav used to leave a grey ghost
-     across the top of the tint as soon as anything scrolled under it. */
-  background: color-mix(in srgb, var(--bg-nav) 45%, transparent);
-  -webkit-backdrop-filter: blur(16px) saturate(1.6);
-          backdrop-filter: blur(16px) saturate(1.6);
+  height: var(--head-h); padding: 0 var(--s5) 0 var(--np-inset);
+  transition: background-color var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
 }
+.np-head.over { background: var(--veil); box-shadow: 0 12px 20px -8px var(--veil); }
+.np-head-actions { display: flex; align-items: center; gap: var(--s2); }
+.np-pill {
+  position: relative;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 26px; padding: 0 12px;
+  border-radius: var(--rf);
+  color: var(--fg);
+  font-family: var(--font-small); font-size: 10px; font-weight: var(--w-bold);
+  letter-spacing: 0.14em; text-transform: uppercase; white-space: nowrap;
+}
+button.np-pill { padding-left: 10px; transition: color var(--d1) var(--ease); }
+button.np-pill svg { opacity: 0.8; }
+.np-round {
+  position: relative;
+  display: grid; place-items: center; width: 30px; height: 30px; flex: none;
+  border-radius: var(--rf); color: var(--fg-1);
+  transition: color var(--d1) var(--ease);
+}
+.np-round.on { color: var(--accent); }
+/* Pressing a plate lights it from inside rather than greying it. */
+:is(button.np-pill, .np-round, .np-more)::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: rgba(255, 255, 255, 0); transition: background-color var(--d1) var(--ease);
+}
+:is(button.np-pill, .np-round, .np-more):hover { color: var(--fg); }
+:is(button.np-pill, .np-round, .np-more):hover::after { background: rgba(255, 255, 255, 0.1); }
 
-/* The stage holds the cover and, behind it, a blurred and slightly enlarged
-   copy of the same image. That is the app's one piece of colour taken from
-   content instead of from the palette. It is a static composited layer — no
-   animation, no per-frame cost — and it degrades correctly: with no artwork
-   the generated tile is a Rose Pine gradient, so the glow is still on-palette. */
-.np-stage {
-  /* At rest this is the inset square record sleeve. Canvas changes only its
-     height: --stage-open is the source's natural height/width percentage, so
-     the same framed artwork grows through normal flow without becoming part
-     of the rail chrome. */
-  --ease-open: cubic-bezier(0.32, 0.72, 0.08, 1);
-  position: relative; flex: none; padding: var(--s1) var(--s4) var(--s5);
+/* ---- Hero ------------------------------------------------------------- */
+.np-hero {
+  position: relative; height: 100%;
+  display: flex; flex-direction: column;
+  padding: var(--head-h) var(--s6) var(--s6) var(--np-inset);
 }
-.np-glow {
-  position: absolute; z-index: 0; inset: var(--s4) var(--s5) var(--s6);
-  display: block; filter: blur(38px) saturate(1.5); opacity: 0.5;
-  transform: translateY(8px) scale(1.02);
-  pointer-events: none;
-}
-.np-glow .art { box-shadow: none; border-radius: var(--r4); }
-.np-glow .art.gen::after { content: none; }
-@media (prefers-reduced-transparency: reduce) { .np-glow { display: none; } }
-
-/* The ratio box keeps the original sleeve width, rounding and coloured lift.
-   Its padding strut is square until a video proves another natural ratio. */
+/* The cover takes whatever the copy leaves, square, centred in it. */
 .np-art {
-  position: relative; z-index: 1; overflow: hidden; --tile: 288px;
-  border-radius: var(--r4);
+  flex: 1 1 auto; min-height: 0;
+  display: grid; place-items: center;
+  padding: var(--s3) 0 var(--s7);
+  container-type: size;
+  transition: opacity 600ms var(--ease), visibility 0s;
+}
+.np-art.away { opacity: 0; visibility: hidden; transition: opacity 600ms var(--ease), visibility 0s linear 600ms; }
+.np-art-tile {
+  position: relative; --tile: 320px;
+  width: min(88cqw, 100cqh, 380px); aspect-ratio: 1;
+  border-radius: var(--r3);
+}
+/* The tile's lift, on a layer UNDER it and a little inside its edge —
+   never on the element that clips the picture (see .art). */
+.np-art-tile::before {
+  content: ""; position: absolute; inset: 3px; border-radius: inherit; z-index: -1;
   box-shadow:
-    var(--ring),
-    0 16px 36px -12px rgba(0, 0, 0, 0.85),
-    0 22px 54px -18px color-mix(in srgb, var(--tone-glow) 72%, transparent);
+    0 24px 50px -20px rgba(0, 0, 0, 0.85),
+    0 36px 90px -36px color-mix(in srgb, var(--tone-glow) 85%, transparent);
 }
-.np-art::before { content: ""; display: block; padding-top: 100%; }
-.np-stage.play .np-art::before {
-  padding-top: var(--stage-open);
-  transition: padding-top 1.15s var(--ease-open);
-}
-/* The square cover remains the backing print while the sleeve grows. It
-   quietly recedes only after a Canvas is decodable. The outer sleeve owns
-   the radius and shadow, so the backing itself adds neither twice. */
-.np-art .art {
-  position: absolute; inset: 0;
-  border-radius: inherit; box-shadow: none;
-  filter: brightness(0.94) saturate(1.04);
-}
-.np-stage.play .np-art .art { animation: np-recede 1.2s var(--ease-open) both; }
-/* The Canvas takes the sleeve's WIDTH and its own height, once, and never
-   moves again — the growing sleeve only uncovers more of it.
+.np-art-tile .art { position: absolute; inset: 0; border-radius: inherit; }
 
-   It used to be `inset: 0` + `object-fit: contain`, which made the painted
-   picture a function of the box's animating height: contain letterboxes to
-   min(boxW, boxH x ratio), so while the sleeve grew from square to 16:9 the
-   picture swept 129px wider and its left edge travelled 69px inward. Worse,
-   that sweep was fighting `np-pour`'s own scale on a different curve, so the
-   width was not even monotonic — 59 direction reversals across one open.
-   That oscillation is what read as the sideways shimmy; it was never the
-   one-pixel rounding a previous pass went looking for.
-   Width-led with height auto, the element box equals the source's natural
-   frame exactly, so `object-fit` has nothing left to decide and the raster is
-   identical on every frame of the open. */
-.np-canvas {
-  position: absolute; top: 0; left: 0; z-index: 2;
-  display: block; width: 100%; height: auto;
-  border-radius: inherit;
-  opacity: 0; pointer-events: none;
+/* ---- Identity ----------------------------------------------------------- */
+.np-hero-copy { position: relative; flex: none; }
+.np-title-row { display: flex; align-items: flex-start; gap: var(--s3); min-width: 0; }
+.np-title-row h2 {
+  flex: 1; min-width: 0;
+  font-family: var(--font-display);
+  font-size: clamp(24px, 1.2vw + 14px, 34px); font-weight: var(--w-bold);
+  letter-spacing: -0.024em; line-height: 1.1; overflow-wrap: anywhere;
 }
-.np-stage.play .np-canvas { animation: np-pour 1.3s cubic-bezier(0.3, 0.6, 0.1, 1) 0.18s both; }
-/* Grounding: hairline frame, a breath of top light, and a seat at the bottom
-   edge before the identity block. Static — no per-frame work. */
-.np-art::after {
-  content: ""; position: absolute; z-index: 3; inset: 0; pointer-events: none;
-  border-radius: inherit;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 14%),
-    linear-gradient(180deg, transparent 64%, rgba(4, 8, 9, 0.4) 100%);
+/* The liked mark: the app's rose heart, as a fact about this track. There is
+   no write path for Liked Songs, so it is never offered as a toggle — and
+   when the track is not liked there is nothing here at all. */
+.np-liked {
+  display: grid; place-items: center; flex: none;
+  height: 1.1em; font-size: clamp(24px, 1.2vw + 14px, 34px);
+  color: var(--rose);
 }
-/* Reveal timeline once the video is decodable: the inset sleeve breathes open
-   while Canvas pours down and the cover recedes. Track changes keep `.play`
-   and the current geometry while their next Canvas request is pending. */
-/* Vertical only. The zoom-out that used to settle this had a different curve
-   from the sleeve's, so the two disagreed about the picture's width every
-   frame; a wipe has no horizontal component to disagree about. */
-@keyframes np-pour {
-  from { opacity: 0; clip-path: inset(0 0 100% 0); }
-  40%  { opacity: 1; }
-  to   { opacity: 1; clip-path: inset(0 0 0 0); }
-}
-@keyframes np-recede {
-  from { filter: brightness(0.94) saturate(1.04); transform: scale(1); }
-  to   { filter: brightness(0.4) saturate(1.02); transform: scale(1.06); }
-}
-/* Settle timeline — the authoritative goodbye. The sleeve travels home along
-   the same rail it opened on, a shade quicker because exits should not
-   dawdle, while the cover steps forward out of its recede and the Canvas
-   drains back up the way it poured down, handing the frame back to the cover
-   as a crossfade rather than a cut. The component holds the video mounted
-   and paused through this and releases it when the motion reports done. */
-.np-stage.settle .np-art::before {
-  padding-top: 100%;
-  transition-duration: 1.05s;
-}
-.np-stage.settle .np-art .art { animation: np-forward 1.05s var(--ease-open) both; }
-.np-stage.settle .np-canvas { animation: np-drain 1.05s var(--ease-open) both; }
-@keyframes np-forward {
-  from { filter: brightness(0.4) saturate(1.02); transform: scale(1.06); }
-  to   { filter: brightness(0.94) saturate(1.04); transform: scale(1); }
-}
-@keyframes np-drain {
-  from { opacity: 1; clip-path: inset(0 0 0 0); }
-  45%  { opacity: 0.3; }
-  to   { opacity: 0; clip-path: inset(0 0 100% 0); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .np-stage.play .np-art::before { transition: none; }
-  .np-stage.play .np-art .art { animation: none; }
-  .np-stage.play .np-canvas { animation: none; opacity: 1; }
-  .np-stage.settle .np-art .art { animation: none; }
-  .np-stage.settle .np-canvas { animation: none; opacity: 0; }
-}
-
-.np-block { flex: none; padding: 0 var(--s4); min-width: 0; }
-/* A track change swaps the whole identity stack — the sleeve above already
-   hands the frame over through np-recede/np-forward, so the text arriving
-   dead-still under a dissolving cover read as two clocks. One quiet fade-up
-   a step (no slide distance to read as motion, no stagger to time) puts the
-   copy on the same beat as the artwork. `both` so first paint of a track
-   starts from the from-frame, and the album button is on the list because it
-   sits between two animated blocks and would otherwise pop. */
-.np-block, .np-album { animation: np-swap-in 360ms var(--ease) both; }
-@keyframes np-swap-in {
-  from { opacity: 0; transform: translateY(4px); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .np-block, .np-album { animation: none; }
-}
-.np-identity h2 {
-  font-family: var(--font-display); font-size: var(--t-23); font-weight: var(--w-bold);
-  letter-spacing: -0.02em; line-height: 1.16; overflow-wrap: anywhere;
-}
+.np-liked svg { filter: drop-shadow(0 1px 5px rgb(0 0 0 / calc(0.25 + var(--np-shade, 0.5) * 0.4))); }
 /* Artists wrap to two lines rather than ellipsing at one: on a track with
    four credited artists the names are the point, not an overflow problem. */
 .np-artists {
   display: block; min-width: 0; margin-top: var(--s2);
-  color: var(--fg-1); font-size: var(--t-13);
+  color: color-mix(in srgb, var(--fg) 90%, transparent); font-size: var(--t-15);
   overflow: hidden; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
 }
+.np-meta-row { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); margin-top: var(--s3); }
 .np-meta {
-  display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap;
-  margin-top: var(--s4); color: var(--fg-2);
+  display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; min-width: 0;
+  color: var(--fg-1);
   font-family: var(--font-small); font-size: var(--t-12);
 }
-.np-dot { width: 3px; height: 3px; border-radius: 50%; background: var(--fg-3); flex: none; }
-
-.np-album {
-  display: grid; grid-template-columns: 34px minmax(0, 1fr) auto;
-  align-items: center; gap: var(--s3);
-  /* Same plate geometry as `.np-next`: 8px past the text grid on both
-     sides, so the two hover plates in this column share one x-range and
-     the album row's copy lines up with every other block's copy. */
-  width: calc(100% - var(--s4)); margin: var(--s5) var(--s2) 0;
-  padding: var(--s2); border-radius: var(--r2);
-  color: var(--fg-1); text-align: left;
-  transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
+.np-dot { width: 3px; height: 3px; border-radius: 50%; background: currentColor; opacity: 0.7; flex: none; }
+/* Type on a picture, with no band behind it: each glyph carries its own
+   shadow — a tight one that draws the edge and a wide one that settles the
+   word — and both scale with the light measured under the copy, so a dark
+   Canvas keeps almost nothing and a white one gets what it needs. */
+.np-title-row h2 {
+  text-shadow:
+    0 1px 2px rgb(0 0 0 / calc(0.18 + var(--np-shade, 1) * 0.5)),
+    0 0 4px rgb(0 0 0 / calc(var(--np-shade, 1) * 0.42)),
+    0 0 14px rgb(0 0 0 / calc(0.08 + var(--np-shade, 1) * 0.5)),
+    0 2px 34px rgb(0 0 0 / calc(var(--np-shade, 1) * 0.45));
 }
-.np-album:hover:not(:disabled) { background: var(--hover); color: var(--fg); }
+.np-artists, .np-meta {
+  text-shadow:
+    0 1px 1px rgb(0 0 0 / calc(0.22 + var(--np-shade, 1) * 0.55)),
+    0 0 3px rgb(0 0 0 / calc(var(--np-shade, 1) * 0.55)),
+    0 0 10px rgb(0 0 0 / calc(0.1 + var(--np-shade, 1) * 0.55));
+}
+.np-more {
+  position: relative;
+  display: grid; place-items: center; width: 30px; height: 30px; flex: none;
+  margin-right: calc(var(--s1) * -1);
+  border-radius: var(--rf); color: var(--fg-1);
+  transition: color var(--d1) var(--ease);
+}
+
+/* A track change swaps the copy; one quiet fade-up puts it on the same beat
+   as the picture changing above it. */
+.np-hero-copy, .np-details > * { animation: np-swap-in 360ms var(--ease) both; }
+@keyframes np-swap-in {
+  from { opacity: 0; transform: translateY(4px); }
+}
+
+/* ---- Details ---------------------------------------------------------- */
+/* The veil rises with the details: a static gradient riding the scrolled
+   content, so the melt IS the scroll and costs nothing extra. It starts
+   clear — no dark band where the picture ends. */
+.np-details {
+  position: relative;
+  padding: var(--melt) var(--s5) var(--s5) var(--np-inset);
+  background: linear-gradient(180deg, transparent 0, var(--veil) var(--melt));
+}
+/* Tall enough that the veil can cover the whole panel: that is the state in
+   which the Canvas pauses, and it must be reachable. */
+.np-panel.video .np-details { min-height: calc(100% + var(--melt) + var(--s2)); }
+/* The panel's two IntersectionObserver strips (see watchPassed). Each ends
+   at its line and reaches up past the top of the content. The cover strip
+   runs from the top of the column to where the veil turns opaque; the head
+   strip hangs above the hero's title. Unpainted and unhittable. */
+.np-sentinel { position: absolute; left: 0; width: 1px; pointer-events: none; visibility: hidden; }
+.np-cover-line { top: 0; height: calc(100% + var(--melt)); }
+.np-head-line { bottom: 100%; height: 200vh; }
+
+.np-card {
+  position: relative;
+  display: block; width: 100%; margin-bottom: var(--s2);
+  padding: var(--s4);
+  border-radius: var(--r3);
+  text-align: left;
+}
+.np-album {
+  display: grid; grid-template-columns: 40px minmax(0, 1fr) auto;
+  align-items: center; gap: var(--s3);
+  padding: var(--s3);
+  color: var(--fg-1);
+  transition: color var(--d1) var(--ease);
+}
+.np-album:hover:not(:disabled) { background: var(--glass-sheen), var(--raise-2); color: var(--fg); }
 .np-album:disabled { opacity: 1; }
 .np-album-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.np-album-name {
-  font-size: var(--t-12); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
+.np-album-name { font-size: var(--t-12); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .np-label {
   color: var(--label); font-family: var(--font-small); font-size: var(--t-caps);
   font-weight: var(--w-semi); text-transform: uppercase; letter-spacing: var(--track-caps);
-}
-
-/* A rule plus generous space is the only grouping device in the panel — but
-   the rules are no longer identical greys. Each section's rule leads with that
-   section's hue and fades into the ordinary hairline, so scrolling the rail
-   passes gold (who made it) and then foam (what is next) rather than two
-   indistinguishable lines. Same object as `--rule-accent`, different lead. */
-.np-credits, .np-upnext { margin-top: var(--s6); padding-top: var(--s5); }
-.np-credits {
-  border-top: 1px solid transparent;
-  border-image: linear-gradient(90deg,
-    color-mix(in srgb, var(--gold) 62%, transparent), var(--line) 34%, var(--line)) 1;
-}
-.np-upnext {
-  border-top: 1px solid transparent;
-  border-image: linear-gradient(90deg,
-    color-mix(in srgb, var(--foam) 55%, transparent), var(--line) 34%, var(--line)) 1;
 }
 .np-section-head {
   display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
@@ -747,9 +974,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .np-credit-line { min-width: 0; }
 .np-credit-line + .np-credit-line { margin-top: var(--s4); }
-/* The demonstration, in one rule. A role set as 11px tracked caps in ROSE was
-   indistinguishable from dirty white; in gold — same warmth, twice the chroma
-   — it is unmistakably a colour at the same size, weight and tracking. */
+/* A role set as 11px caps in rose reads as dirty white; in gold — same
+   warmth, twice the chroma — it is unmistakably a colour. */
 .np-role {
   display: block;
   font-family: var(--font-small); font-size: var(--t-caps); font-weight: var(--w-semi);
@@ -763,8 +989,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .np-more-inline { color: color-mix(in srgb, var(--gold) 70%, var(--fg-2)); font-weight: var(--w-med); }
 .np-muted { color: var(--fg-2); font-size: var(--t-12); }
 
-/* Text link, not a button: the credits are already on the page, so the way to
-   the rest of them should not compete with them for weight. */
+/* Text link, not a button: the credits are already on the card, so the way
+   to the rest of them should not compete with them for weight. */
 .np-link {
   display: inline-flex; align-items: center; gap: var(--s1);
   margin-top: var(--s4); color: var(--fg-2);
@@ -777,34 +1003,37 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 .np-next {
   display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: center;
-  gap: var(--s3); width: calc(100% + var(--s4)); margin-left: calc(var(--s2) * -1);
+  gap: var(--s3); width: calc(100% + var(--s4)); margin: calc(var(--s2) * -1);
   padding: var(--s2); border-radius: var(--r2); text-align: left;
   transition: background-color var(--d1) var(--ease);
 }
-.np-next:hover { background: var(--hover); }
+.np-next:hover { background: var(--raise-1); }
 .np-next-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .np-next-copy strong, .np-next-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .np-next-copy strong { font-size: var(--t-12); font-weight: var(--w-med); }
 .np-next-copy span { color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-11); }
-.np-empty { margin: auto 0; padding: 0 var(--s5); color: var(--fg-2); text-align: center; }
+.np-empty {
+  position: absolute; inset: var(--head-h) 0 0;
+  display: flex; flex-direction: column; justify-content: center;
+  padding: 0 var(--s6) 0 var(--np-inset); color: var(--fg-2); text-align: center;
+}
 .np-empty p { color: var(--fg); font-family: var(--font-display); font-size: var(--t-15); }
 .np-empty span { display: block; margin-top: var(--s2); font-size: var(--t-12); }
+
+@media (prefers-reduced-motion: reduce) {
+  .np-hero-copy, .np-details > * { animation: none; }
+  .np-video, .np-art { transition: none; }
+}
+
 /* `position: relative` is the containing block for the topbar's scroll
    sentinel and nothing else — every other absolutely positioned box inside the
    pane already has a positioned parent of its own.
 
-   `scrollbar-gutter: stable` because the TOPBAR LIVES IN HERE. Every other
-   scroller in the app holds content that can afford to reflow by a scrollbar
-   width; this one holds the search field, and it is sticky, so the moment a
-   page grew past the viewport the 10px scrollbar took its width out of the
-   content box and shifted the field the user was typing into 10px to the
-   left, under their cursor. Typing one character did it, and clicking the
-   clear button did it back. The gutter is reserved at all times instead, so
-   the pane is inset by the same 10px whether or not the page scrolls — which
-   is what the sidebar list and the now-playing rail already do. */
+   No scrollbar gutter: the bar is an overlay (SCROLLBARS), so the sticky
+   topbar and its search field keep the pane's full width whether or not the
+   page scrolls, and nothing ends short of the pane's edge. */
 .scroll {
   flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; position: relative;
-  scrollbar-gutter: stable;
 }
 
 /* ---------------------------------------------------------------- topbar */
@@ -824,37 +1053,19 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   grid-template-columns: auto minmax(0, 1fr) minmax(152px, min(340px, 40%));
   align-items: center; gap: var(--s4);
   height: var(--topbar-h); padding: 0 var(--pane-pad);
-  /* Passthrough glass, and it is back on purpose.
-     A previous pass removed the blur while chasing the "scroll moves but
-     nothing repaints until I jiggle the mouse" stall, and left a comment here
-     blaming `backdrop-filter` for it. That comment was wrong. The cause was the
-     pair of scroll-driven animations that used to live below this rule —
-     `animation-timeline: scroll()` binds an animation to the scroller, and when
-     it cannot be composited every change of scroll offset needs a main-thread
-     animation update before a frame can be produced. Removing those two fixed
-     it; the blur never had anything to do with it. Do not re-remove the blur,
-     and do not reintroduce `animation-timeline` anywhere in this app.
+  /* At rest the bar is nothing but its controls, on the pane's own glass:
+     a strip of material across the top of a page with nothing under it is
+     a band that belongs to no layer. The moment the page scrolls under it
+     (.glass-strip, set by TopBar from a sentinel at the page's top) it takes
+     the strip's frost and blurs what passes beneath.
 
-     The bar is translucent and blurs whatever is scrolling under it, which is
-     the point: a detail page's header wash is a real colour now, and the bar
-     picks it up and carries it across the top of the pane instead of cutting a
-     flat grey band through it.
-
-     `saturate` is doing as much work as `blur`. Averaging a colour field over a
-     20px radius desaturates it — the mean of a gradient is always duller than
-     its parts — so without the boost the glass reads grey over a red header,
-     which defeats the exercise.
-
-     The fill under the blur is 62% rather than opaque: below about 70% the bar
-     stops reading as glass and starts reading as a hole. */
-  background: color-mix(in srgb, var(--bg-1) 62%, transparent);
-  -webkit-backdrop-filter: blur(22px) saturate(1.9);
-          backdrop-filter: blur(22px) saturate(1.9);
-}
-/* Where the effect is unavailable the bar must still hide the rows sliding
-   under it, so it goes back to being opaque rather than staying see-through. */
-@supports not (backdrop-filter: blur(1px)) {
-  .topbar { background: var(--bg-1); }
+     Do not replace the frost with a flat fill, and do not reach for
+     `animation-timeline` to fade it: a scroll-driven animation that cannot be
+     composited costs a main-thread update per scroll offset, which is the
+     "nothing repaints until I move the mouse" stall this app was debugged
+     out of. The blur itself never had anything to do with that. */
+  background: transparent;
+  transition: background-color var(--d2) var(--ease);
 }
 /* The hairline and the sticky title appear once the page has been scrolled
    past its header.
@@ -880,6 +1091,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   position: absolute; top: 150px; left: 0;
   width: 1px; height: 1px; pointer-events: none; visibility: hidden;
 }
+.topbar-sentinel.topbar-edge { top: 2px; }
 
 .hist { display: flex; gap: var(--s1); flex: none; }
 .round {
@@ -921,7 +1133,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .searchbox {
   display: flex; align-items: center; gap: var(--s2); min-width: 0;
   width: 100%; height: 32px; padding: 0 var(--s3) 0 var(--s4);
-  border-radius: var(--rf); background: var(--bg-2);
+  border-radius: var(--rf); background: var(--raise-1);
   border: 1px solid var(--line);
   /* Owns the magnifier, which inherits it. A glyph carries more ink than text
      of the same value, so at rest it sits one rung below the placeholder it
@@ -940,7 +1152,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    comes up a rung with it. Three small agreeing signals instead of one loud
    one. */
 .searchbox:focus-within {
-  background: var(--bg-3);
+  background: var(--raise-2);
   border-color: color-mix(in srgb, var(--foam) 46%, transparent);
   color: var(--fg-1);
 }
@@ -1043,7 +1255,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    type on a plate that picks up whatever is behind it. The rule underneath is
    simple and holds everywhere — the tag carries the palette's hue on pages
    that have no colour of their own, and the CONTENT's hue on pages that do. */
-.wash .tag, .banner .tag, .np-head .tag, .np-stage .tag {
+.wash .tag, .banner .tag {
   background: rgba(255, 255, 255, 0.12);
   -webkit-backdrop-filter: blur(10px) saturate(1.6);
           backdrop-filter: blur(10px) saturate(1.6);
@@ -1105,8 +1317,24 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   position: relative; flex: none; overflow: hidden;
   border-radius: var(--r1);
   background: var(--bg-2);          /* a failed load still paints this box   */
-  box-shadow: var(--ring);          /* keeps light art off the dark ground   */
 }
+/* THE CORNERS. The tile clips its picture to a rounded rect, and anything
+   the tile paints itself — its placeholder fill, an inset ring — lies UNDER
+   the picture inside the same curve. A rounded edge is anti-aliased: a
+   corner pixel is part picture and part whatever was painted before it, and
+   with the ground drawn first as well, that ground leaks into the corner at
+   up to a quarter strength. Along a straight edge coverage is whole and it
+   never shows; at the corners it is the pale fringe (sharpest where a
+   Canvas sat over a light cover, clipped the same way). So a revealed
+   picture is the only thing inside its curve — the fill goes — and the ring
+   that keeps light art off a dark ground is drawn OVER it, as its own
+   anti-aliased line, identical at every corner. */
+.art.ready { background: none; }
+.art:not(.gen)::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit;
+  box-shadow: var(--ring); pointer-events: none;
+}
+.art.gen { box-shadow: var(--ring); }
 .art > img {
   width: 100%; height: 100%; object-fit: cover;
   /* A broken image must reserve exactly the same box as a loaded one, so its
@@ -1116,7 +1344,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .art.lg { border-radius: var(--r3); }
 .art.circle { border-radius: var(--rf); }
-.art.raised { box-shadow: var(--ring), 0 14px 34px -10px rgba(0, 0, 0, 0.85); }
+.art.raised { box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.85); }
 /* While known artwork is still resolving, the tile holds a calm neutral
    ground — the identity tile's composition with the colour and the letter
    taken out — so a cold start paints surface, never a monogram, for a cover
@@ -1178,60 +1406,40 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   padding: var(--s6) 0 var(--s5);
 }
 /* =====================================================================
-   THE HEADER WASH
+   THE HEADER LIGHT
 
-   This is where the record's own colour enters the interface, and it is the
-   single biggest reason the app is not monotone: every playlist, album and
-   collection opens a different colour, and none of them came from the palette.
+   This is where a record's own colour enters the page: every playlist,
+   album and artist opens in a different light, and none of it came from the
+   palette.
 
-   The stops are OPAQUE and the colour arrives pre-mixed. `--tone-wash` is a
-   real dark colour at a fixed lightness (see covertone.svelte.js), so the top
-   of the page is as strong as Spotify's — and the bottom DISSOLVES into the
-   pane rather than landing on it: a ramp that ends exactly at --bg-1 leaves
-   a hard horizontal seam, so the last stop fades to transparent instead and
-   the colour goes out the way light does, with no edge to catch on.
-   ===================================================================== */
+   It is LIGHT, not paint. The pane is glass over the haze, and an opaque
+   band of the record's colour laid across the top of it read as a flat
+   brown slab — a surface that belonged to no layer, sitting on the glass
+   rather than in it. So the colour arrives the way light arrives through
+   glass: two soft pools of the record's own glow (--tone-glow, the light
+   tone covertone.svelte.js keeps out of the muddy arc), one falling behind
+   the artwork and one wider and fainter across the title, both going to
+   nothing well before the list. Mixed in Oklab, so a pool fades in
+   lightness without greying on the way out. Static, painted once. */
 .wash {
   position: relative;
 }
 .wash::before {
-  content: ""; position: absolute; z-index: 0;
+  content: ""; position: absolute; z-index: 0; pointer-events: none;
   /* Horizontal insets are 0, not -(--pane-pad): an absolutely positioned box
      resolves them against the PADDING box, which already spans the full pane
      width. Pulling them out by another 24px each side overflowed the scroll
      container — invisible behind overflow-x:hidden, but real. */
   inset: calc(var(--topbar-h) * -1) 0 auto;
-  height: 460px;
-  /* Fast fall through a deeper shade, a long tail, then a dissolve. A straight
-     two-stop ramp reads as a gradient *effect*; this reads as light on a
-     surface — and the transparent close means no seam where the wash stops. */
-  background: linear-gradient(
-    180deg,
-    var(--tone-wash) 0%,
-    var(--tone-wash-deep) 30%,
-    color-mix(in srgb, var(--tone-wash-deep) 42%, var(--bg-1)) 58%,
-    color-mix(in srgb, var(--bg-1) 88%, transparent) 82%,
-    transparent 100%
-  );
-  pointer-events: none;
+  height: 520px;
+  background:
+    radial-gradient(44% 70% at 12% 20%, color-mix(in oklab, var(--tone-glow) 44%, transparent), transparent 100%),
+    radial-gradient(80% 60% at 60% 0%, color-mix(in oklab, var(--tone-glow) 22%, transparent), transparent 100%);
 }
-/* The one shape that sits inside the wash and is not type. A soft light in the
-   top-left corner keeps the flat colour field from reading as a printed block,
-   and it costs one extra gradient on a layer that is already painted. */
-.wash::after {
-  content: ""; position: absolute; z-index: 0; pointer-events: none;
-  inset: calc(var(--topbar-h) * -1) 0 auto;
-  height: 460px;
-  background: radial-gradient(
-    88% 62% at 8% 0%,
-    color-mix(in srgb, var(--tone-glow) 30%, transparent),
-    transparent 68%
-  );
-}
-/* A third of the strength, for pages whose subject is not one record: the
-   home screen, where the colour is a mood rather than an identification. */
-.wash.soft::before { height: 320px; opacity: 0.42; }
-.wash.soft::after { height: 320px; opacity: 0.5; }
+/* A fraction of the strength, for pages whose subject is not one record:
+   the home screen, where the colour is a mood rather than an identification. */
+.wash.soft::before { height: 360px; opacity: 0.5; }
+
 .wash > * { position: relative; z-index: 1; }
 /* Keep header popovers in a higher local layer than sticky/windowed rows.
    The topbar remains above the whole page in its own z-index: 30 layer. */
@@ -1412,18 +1620,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   box-shadow: inset 0 -1px 0 var(--line);
   transition: background-color var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
 }
-/* STUCK: now it is covering rows, so it becomes the same glass as the topbar
-   directly above it — half the blur, because it only has to separate itself
-   from 48px rows rather than from a whole page. `.stuck` is set by an
+/* STUCK: now it is covering rows, so it becomes the same strip glass as the
+   topbar directly above it, and the two read as one band. `.stuck` is set by an
    IntersectionObserver in TrackList, never by a scroll timeline. */
 .tl-head.stuck {
-  background: color-mix(in srgb, var(--bg-1) 68%, transparent);
-  -webkit-backdrop-filter: blur(14px) saturate(1.7);
-          backdrop-filter: blur(14px) saturate(1.7);
+  background: var(--tint-strip);
+  -webkit-backdrop-filter: var(--frost-strip);
+          backdrop-filter: var(--frost-strip);
   box-shadow: inset 0 -1px 0 var(--line-2);
-}
-@supports not (backdrop-filter: blur(1px)) {
-  .tl-head.stuck { background: var(--bg-1); }
 }
 /* Zero-size, unpainted, unhittable. It only needs a position in the scrolled
    content for the observer to watch — same device as `.topbar-sentinel`. */
@@ -1666,7 +1870,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    the same `--cols`, so the list it stands in for lands without moving. */
 .sk-row { display: grid; grid-template-columns: var(--cols); align-items: center; gap: var(--tl-gap, var(--s4));
   height: var(--row-h); padding: 0 var(--s3); }
-.sk { background: var(--bg-2); border-radius: var(--r1); height: 10px; }
+.sk { background: var(--raise-1); border-radius: var(--r1); height: 10px; }
 .sk.art { height: 36px; width: 36px; border-radius: var(--r1); box-shadow: none; }
 .sk.a { width: 62%; } .sk.b { width: 38%; height: 8px; }
 /* The title cell is two lines in every real row — the name and the artists —
@@ -1723,7 +1927,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    between this looking like a music app and looking like a file browser. */
 .card:hover .card-art .art {
   box-shadow:
-    var(--ring),
     0 16px 26px -14px rgba(0, 0, 0, 0.9),
     0 16px 40px -8px color-mix(in srgb, var(--tone-glow) 72%, transparent);
 }
@@ -1805,16 +2008,34 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* =====================================================================
    PLAYER BAR
    ===================================================================== */
-/* Its own floating panel, one luminance step ABOVE the sidebar and the
-   content pane. Gutter + luminance = the sidebar/bar boundary. */
+/* Chrome glass (.glass-chrome, in the markup), like the rail. It is also a
+   size container: with the panel open, the bar gives the right column to
+   it and has to fit in what is left, and only the bar knows how wide that
+   is. */
 .player {
-  grid-column: 1 / -1; position: relative;
-  display: grid; grid-template-columns: minmax(220px, 1fr) minmax(0, 2fr) minmax(220px, 1fr);
-  align-items: center; gap: var(--s5);
-  height: var(--player-h); padding: 0 var(--s5);
-  background: var(--bg-bar);
+  grid-area: bar; position: relative;
+  container: player / inline-size;
+  height: var(--player-h);
   border-radius: var(--r-panel);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+}
+/* The centre takes the larger share and the sides split the rest, the right
+   one never less than its controls: a cluster squeezed under its own width
+   is what ran the speed, the toggles and the volume into each other. */
+.p-body {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 1.4fr) minmax(max-content, 1fr);
+  align-items: center; gap: var(--s5);
+  height: 100%; padding: 0 var(--s5);
+}
+/* Too narrow for three columns — which only happens beside the open
+   panel — the bar sheds the track's identity: the panel next to it is
+   showing the title, the artists and the picture, at five times the size. */
+@container player (max-width: 860px) {
+  .p-body { grid-template-columns: minmax(0, 1fr) max-content; gap: var(--s5); }
+  .p-body .p-now { display: none; }
+}
+@container player (max-width: 680px) {
+  .p-body .vol { width: 64px; }
+  .p-body .transport { gap: var(--s3); }
 }
 
 .p-now { display: flex; align-items: center; gap: var(--s3); min-width: 0; }
@@ -1836,8 +2057,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .p-artists:hover { color: var(--fg); }
 .p-now.idle .p-title { color: var(--fg-2); }
 .p-now.idle .p-artists { color: var(--fg-3); }
-/* Standard arrangement kept: transport centred, seek rail beneath it. */
-.p-center { display: flex; flex-direction: column; align-items: center; gap: var(--s2); min-width: 0; }
+/* Standard arrangement kept: transport centred, seek rail beneath it. A
+   seek rail longer than this stops reading as one gesture. */
+.p-center {
+  display: flex; flex-direction: column; align-items: center; gap: var(--s2);
+  justify-self: center; width: 100%; max-width: 640px; min-width: 0;
+}
 .transport { display: flex; align-items: center; gap: var(--s6); flex: none; }
 .ctl {
   position: relative; display: grid; place-items: center; flex: none;
@@ -1859,7 +2084,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    contest against a coloured rail without competing with it, and foam arrives
    on hover, where it is a state and not a decoration. */
 .play-btn {
-  display: grid; place-items: center; width: 36px; height: 36px; flex: none;
+  display: grid; place-items: center; width: 38px; height: 38px; flex: none;
   border-radius: var(--rf); background: var(--fg); color: var(--bg-0);
   box-shadow: 0 4px 14px -4px rgba(0, 0, 0, 0.65);
   transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease), transform var(--d1) var(--ease);
@@ -1924,7 +2149,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .seek-tip.visible { opacity: 1; visibility: visible; }
 /* Right cluster: given real room (panel padding 20px + 8px gutter = 28px
    clear of the window edge) and an icon sized like the rest of the bar. */
-.p-right { display: flex; align-items: center; justify-content: flex-end; gap: var(--s3); min-width: 0; }
+.p-right { display: flex; align-items: center; justify-content: flex-end; gap: var(--s2); min-width: 0; }
+.p-right > .p-volume { margin-left: var(--s1); }
 .vol { display: flex; align-items: center; width: 96px; height: 12px; flex: none; cursor: pointer; }
 .vol-rail { position: relative; width: 100%; height: 3px; border-radius: var(--rf);
   background: rgba(255, 255, 255, 0.13); overflow: hidden; }
@@ -1955,30 +2181,36 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 
 /* =====================================================================
-   MENU
+   MENU — overlay glass (.glass-overlay, in the markup).
+
+   The surface is the material; this is only the shape and the items. An
+   item under the pointer is lit from inside the glass rather than laid
+   with a grey, and its label goes to full ink: over the densest thing a
+   menu can sit on, a white cover, --fg holds 7.5:1 on a lit item and the
+   resting --fg-1 6:1 (glass.test.js). Radius one step up from a row's, so
+   the item plates sit concentric inside it.
    ===================================================================== */
 .menu {
   min-width: 216px; max-width: 320px;   /* a long playlist name cannot widen it */
   padding: var(--s1);
-  border-radius: var(--r2); background: var(--bg-2);
-  border: 1px solid var(--line-2);
-  box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85), 0 2px 6px rgba(0, 0, 0, 0.5);
+  border: 0;                            /* the UA gives a popover a border */
+  border-radius: var(--r3);
 }
 .menu-item {
   display: flex; align-items: center; gap: var(--s3);
-  width: 100%; height: 30px; padding: 0 var(--s3);
-  border-radius: var(--r1); font-size: var(--t-13); color: var(--fg-1);
+  width: 100%; height: 32px; padding: 0 var(--s3);
+  border-radius: var(--r2); font-size: var(--t-13); color: var(--fg-1);
   text-align: left; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
   transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
 .menu-item:hover:not(:disabled),
-.menu-item:focus-visible { background: var(--bg-4); color: var(--fg); outline: none; }
+.menu-item:focus-visible { background: rgba(255, 255, 255, 0.08); color: var(--fg); outline: none; }
 .menu-item .hint { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--fg-2); }
 .menu-item.danger { color: var(--danger); }
 .menu-item.danger:hover:not(:disabled),
-.menu-item.danger:focus-visible { background: color-mix(in srgb, var(--love) 12%, var(--bg-4)); color: var(--love); }
-.menu-sep { height: 1px; margin: var(--s1) var(--s2); background: var(--line); }
+.menu-item.danger:focus-visible { background: var(--danger-wash); color: var(--love); }
+.menu-sep { height: 1px; margin: var(--s1) var(--s3); background: rgba(255, 255, 255, 0.08); }
 
 .playlist-menu-wrap { position: relative; }
 .playlist-actions-menu {
@@ -2058,15 +2290,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    then slid to 600px when a short list landed, so every credits dialog for a
    two-writer single visibly corrected itself after first paint. There is no
    `transition: width` here on purpose. See CreditsDialog.svelte. */
+/* Overlay glass (.glass-overlay, in the markup): the page shows through it,
+   frosted, and the rim and the lift are what raise it — never a lighter
+   grey, which read as a card. */
 .credits-dialog {
   width: min(920px, calc(100vw - var(--s7)));
   max-width: none; max-height: min(84vh, 880px);
   margin: auto; padding: 0; overflow: hidden;
-  border: 1px solid var(--line-2); border-radius: var(--r3);
-  /* A modal is lifted by its border and its shadow, not by luminance. At the
-     raised grey it was the brightest plane on screen and read as a card. */
-  background: var(--bg-sheet); color: var(--fg);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.72);
+  border: 0; border-radius: var(--r4);
 }
 /* A 2px edge, and it is GOLD rather than the app's foam→rose signature. The
    signature gradient means "this is the app" and turns up on the seek rail,
@@ -2078,9 +2309,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   background: linear-gradient(90deg,
     var(--gold), color-mix(in srgb, var(--gold) 55%, var(--rose)) 62%,
     color-mix(in srgb, var(--gold) 20%, transparent));
-}
-.credits-dialog::backdrop {
-  background: color-mix(in srgb, var(--bg-0) 80%, transparent);
 }
 /* A two-writer single is not a 920px problem. */
 .credits-dialog.compact { width: min(560px, calc(100vw - var(--s7))); }
@@ -2098,26 +2326,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s4);
   padding: var(--s6) var(--s5) var(--s5) var(--s6); flex: none;
   background:
-    radial-gradient(130% 165% at 0% 0%, color-mix(in srgb, var(--tone-wash) 88%, transparent), transparent 62%),
+    radial-gradient(130% 165% at 0% 0%, color-mix(in srgb, var(--tone-wash) 46%, transparent), transparent 62%),
     radial-gradient(90% 150% at 100% 0%, color-mix(in srgb, var(--gold) 9%, transparent), transparent 58%);
 }
 /* The sleeve throws its colour under itself here too, which is what stops the
    64px tile reading as a stamp glued onto a grey header. */
 .credits-identity .art {
-  box-shadow: var(--ring), 0 10px 26px -10px color-mix(in srgb, var(--tone-glow) 78%, transparent);
-}
-/* Grain, on the header only.
-   These are liner notes, and liner notes were printed on something. A few
-   percent of fractal noise over the colour field is the difference between a
-   surface and a fill — flat colour at this size reads as a UI panel, grained
-   colour reads as a card stock the type was put onto.
-   Header only, and deliberately: a blended layer over the SCROLLING list would
-   have to recomposite on every frame for an effect nobody can see while they
-   are moving. The header never moves, so it costs one paint, ever. */
-.credits-head::after {
-  content: ""; position: absolute; inset: 0; pointer-events: none;
-  opacity: 0.05; mix-blend-mode: overlay;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+  box-shadow: 0 10px 26px -10px color-mix(in srgb, var(--tone-glow) 78%, transparent);
 }
 .credits-head { position: relative; }
 .credits-identity { display: flex; align-items: center; gap: var(--s4); min-width: 0; }
@@ -2150,8 +2365,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .credits-filter {
   display: flex; align-items: center; gap: var(--s2); flex: none;
   width: 236px; height: 30px; padding: 0 var(--s2) 0 var(--s3);
-  border-radius: var(--r2); background: var(--bg-0);
-  border: 1px solid var(--line); color: var(--fg-2);
+  /* A field is pressed INTO the glass: a shade under it and a hairline. */
+  border-radius: var(--rf); background: rgb(0 0 0 / 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.08); color: var(--fg-2);
   transition: border-color var(--d1) var(--ease);
 }
 .credits-filter:focus-within { border-color: color-mix(in srgb, var(--foam) 58%, transparent); }
@@ -2399,12 +2615,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: grid; place-items: center;
   width: 18px; height: 18px; margin: 0;
   border: 1px solid var(--line-2); border-radius: var(--r1);
-  background: var(--bg-2);
+  background: var(--raise-1);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
   cursor: pointer;
   transition: background-color var(--d1) var(--ease), border-color var(--d1) var(--ease);
 }
-.set-check:hover:enabled { border-color: var(--fg-3); background: var(--bg-3); }
+.set-check:hover:enabled { border-color: var(--fg-3); background: var(--raise-2); }
 .set-check:checked {
   background: var(--accent);
   border-color: var(--accent);
@@ -2425,16 +2641,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
   min-width: 140px; height: 34px; padding: 0 var(--s3);
   border: 1px solid var(--line-2); border-radius: var(--r2);
-  background: var(--bg-2); color: var(--fg);
+  background: var(--raise-1); color: var(--fg);
   font-size: var(--t-12); font-weight: var(--w-med);
   transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
 .sel-btn .icon { color: var(--fg-2); transition: color var(--d1) var(--ease); }
-.sel-btn:hover:not(:disabled) { background: var(--bg-3); border-color: rgba(255, 255, 255, 0.18); }
+.sel-btn:hover:not(:disabled) { background: var(--raise-2); border-color: rgba(255, 255, 255, 0.18); }
 .sel-btn:hover:not(:disabled) .icon { color: var(--fg-1); }
 .sel-btn.open {
   border-color: color-mix(in srgb, var(--foam) 62%, transparent);
-  background: var(--bg-3);
+  background: var(--raise-2);
 }
 .sel-btn.open .icon { color: var(--accent); }
 .sel-btn:disabled { opacity: 0.45; }
@@ -2490,11 +2706,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .chip {
   display: inline-flex; align-items: center; gap: var(--s2);
   height: 28px; padding: 0 var(--s2) 0 var(--s3); max-width: 100%;
-  border-radius: var(--rf); background: var(--bg-2);
+  border-radius: var(--rf); background: var(--raise-1);
   border: 1px solid var(--line); font-size: var(--t-12); color: var(--fg-1);
   transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
-.chip:hover { background: var(--bg-3); color: var(--fg); }
+.chip:hover { background: var(--raise-2); color: var(--fg); }
 /* Selected filter. Tinted rather than solid-accent: these sit in a row of
    three and a filled pill would out-shout the content they filter. */
 .chip.on {
@@ -2534,7 +2750,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      control into a 74px-tall lozenge with semicircular ends, and 18px leaves
      a rounded rectangle that still looks like the same object. */
   border-radius: 18px;
-  background: var(--bg-2); border: 1px solid var(--line);
+  background: var(--raise-1); border: 1px solid var(--line);
 }
 .seg-btn {
   display: inline-flex; align-items: center; gap: var(--s2);
@@ -2622,8 +2838,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The panel's own loading frame: same box, no tone, and inert. Its
    placeholders step UP a shade rather than down — at the raised grey they
    would be the same colour as the panel and the box would read as empty. */
-.sk-top { background: var(--bg-2); cursor: default; }
-.sk-top .skeleton { background: var(--bg-3); }
+.sk-top { background: var(--raise-1); cursor: default; }
+.sk-top .skeleton { background: var(--raise-2); }
 .top-result:focus-visible { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 45%, transparent); }
 /* Two lines, then ellipsis — not one line, then ellipsis.
    The name is the entire answer this panel gives, and now that the answer can
@@ -2688,7 +2904,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   padding: 0 var(--pane-pad) var(--s6); display: flex; flex-direction: column; justify-content: flex-end;
   overflow: hidden;
 }
-.banner .bg { position: absolute; inset: 0; z-index: 0; }
+/* The portrait and its scrim dissolve together into the pane's glass — the
+   old last stop was an opaque --bg-1, which on glass is a grey seam. */
+.banner .bg {
+  position: absolute; inset: 0; z-index: 0;
+  -webkit-mask-image: linear-gradient(180deg, #000 72%, transparent);
+          mask-image: linear-gradient(180deg, #000 72%, transparent);
+}
 /* Favour the upper third — artist portraits put the face there — but not as
    hard as before. The band's top `--topbar-h` sits behind the glass, so a crop
    pinned high pushed the subject INTO the blurred strip. Shifting the window
@@ -2713,7 +2935,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
     rgba(10, 10, 12, 0.10) 24%,
     rgba(10, 10, 12, 0.12) 54%,
     rgba(10, 10, 12, 0.52) 84%,
-    var(--bg-1) 100%);
+    rgba(10, 10, 12, 0.7) 100%);
 }
 .banner > *:not(.bg) { position: relative; z-index: 1; }
 /* The banner is a flex COLUMN, so without this the tag stretches to the full
@@ -2775,7 +2997,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    Static placeholders on purpose: a shimmer gradient animates forever and
    is exactly the idle cost this app exists to avoid.
    ===================================================================== */
-.skeleton { background: var(--bg-2); border-radius: var(--r1); }
+.skeleton { background: var(--raise-1); border-radius: var(--r1); }
 .skeleton.line { display: block; height: 12px; border-radius: var(--r1); margin-bottom: var(--s3); }
 .skeleton.line.sm { width: 84px; }
 .skeleton.line.lg { width: 320px; height: 40px; }
@@ -2800,7 +3022,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .lib-create input {
   width: 100%; height: 32px; padding: 0 var(--s3);
   font-size: var(--t-13); color: var(--fg);
-  background: var(--bg-2); border: 1px solid var(--line-2);
+  background: var(--raise-1); border: 1px solid var(--line-2);
   border-radius: var(--r1); outline: none;
 }
 .lib-create input:focus { border-color: var(--accent); }
@@ -2813,17 +3035,23 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    Last in the file on purpose: each of these has to beat the background it
    overrides, and every one of those rules is declared above.
 
-   The glass surfaces — topbar, track-list head, now-playing head, and the tag
-   when it sits on a coloured header — go back to being solid. Each of them is
-   a sticky bar whose real job is to hide what is sliding underneath it; the
-   blur is how it does that beautifully, not how it does it at all.
+   The haze is not drawn at all (Ambient.svelte), and every glass surface
+   goes back to its opaque plane with no frost: the tints become the planes
+   (SURFACES), the frosts become nothing. The sticky strips — topbar,
+   track-list head, now-playing head — and the tag on a coloured header go
+   solid too. Each of them has a real job, hiding what slides underneath;
+   the blur is how it does that beautifully, not how it does it at all.
    ===================================================================== */
 @media (prefers-reduced-transparency: reduce) {
+  :root {
+    --tint-chrome: var(--bg-nav); --tint-pane: var(--bg-1); --tint-strip: var(--bg-1);
+    --tint-overlay: var(--bg-sheet); --tint-sheet: var(--bg-sheet); --tint-plate: rgb(9 9 11 / 0.8);
+    --frost-plane: none; --frost-strip: none; --frost-overlay: none; --frost-plate: none;
+  }
   .topbar, .tl-head { background: var(--bg-1); }
-  .np-head { background: var(--bg-nav); }
-  .wash .tag, .banner .tag, .np-head .tag, .np-stage .tag { background: rgba(255, 255, 255, 0.16); }
-  .topbar, .tl-head, .np-head,
-  .wash .tag, .banner .tag, .np-head .tag, .np-stage .tag {
+  .np-head.over { background: var(--bg-nav); box-shadow: none; }
+  .wash .tag, .banner .tag { background: rgba(255, 255, 255, 0.16); }
+  .topbar, .tl-head, .np-head, .wash .tag, .banner .tag {
     -webkit-backdrop-filter: none;
             backdrop-filter: none;
   }
@@ -2951,7 +3179,7 @@ html.dragging-track .tl-row:hover .c-more button { opacity: 0; }
    refuses the cursor — dropping a song back where it came from is not an
    action, and the UI should say so before the release. --- */
 .lib-list.droppable .lib-row[data-pid]:hover {
-  background: var(--bg-3);
+  background: var(--raise-2);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--rose-ink) 45%, transparent);
 }
 .lib-list.droppable .lib-row[data-pid]:hover .lib-name { color: var(--rose-ink); }
