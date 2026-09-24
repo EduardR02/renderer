@@ -84,7 +84,7 @@
    luminance at most 0.10 (#595959 as a grey) — 0.05 with the panel closed —
    within the grade's chroma and perceived-lightness caps; and its mean
    luminance is at most 0.045. The one exception is the seam band (THE
-   FROST, 3), which no glass ever lies over. glass.test.js frosts the
+   FROST, 3), which no type ever lies over. glass.test.js frosts the
    brightest colour the haze can make exactly as CSS frosts it, and holds
    the type's greys over it on every surface.
 
@@ -98,7 +98,8 @@
       haze picture, made in the same pass at half its resolution with the
       numbers of --frost-plane (a 12px blur, then saturate and brightness;
       read from :root on every render — change the token and the frost
-      follows), from the haze WITHOUT the seam band. Strips, overlays and
+      follows), from the haze without the seam band, except for the first
+      SPILL px under the glass (haze.js). Strips, overlays and
       plates keep a real backdrop-filter: they frost live content, not the
       haze, and they are small.
    3. The seam with the Canvas. The video is never under a plane, and never
@@ -110,7 +111,8 @@
       px left of the video's edge and SEAM_IN px inside it (haze.js) — it
       is the video's own light, at SEAM_DIM, fading into the graded haze:
       the gap reads as the video's light rather than as a dark notch, and
-      the light dims only where the glass begins.
+      the light carries on into the glass's edge (SPILL) and is gone before
+      any type.
    4. The morph needs nothing: the planes stay live through it (THE LAYOUT
       MORPH, app.css) and the frost is traced in the ResizeObserver pass,
       after layout and before paint, so it takes a plane's new edge in the

@@ -445,13 +445,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    the page's own colour pooled in two corners, a sheen and a catch of
    light along the top edge. The pools are held to the calibration where
    they are strongest, at the corners, over a white cover and the most
-   luminous tone a record can give (glass.test.js): the glow is the bright
-   one, so it is the thin one. */
+   luminous tone a record can give (glass.test.js). So the glow is laid at
+   a fixed, low lightness with all of the tone's chroma: colour without
+   light. Thin, at the tone's own lightness, the menus read as the flat
+   grey they had been before the glass. */
 .glass-overlay {
   background:
     var(--glass-sheen),
-    radial-gradient(140% 110% at 0% 0%, color-mix(in srgb, var(--tone-glow) 10%, transparent), transparent 72%),
-    radial-gradient(120% 120% at 100% 100%, color-mix(in srgb, var(--tone-wash) 36%, transparent), transparent 70%),
+    radial-gradient(140% 110% at 0% 0%, oklch(from var(--tone-glow) 0.38 c h / 0.34), transparent 72%),
+    radial-gradient(120% 120% at 100% 100%, color-mix(in srgb, var(--tone-wash) 46%, transparent), transparent 72%),
     var(--tint-overlay);
   -webkit-backdrop-filter: var(--frost-overlay);
           backdrop-filter: var(--frost-overlay);
@@ -462,7 +464,21 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    worst it can frost is white at half strength, and it is thinner glass
    than a menu, which can land on a white cover. The dim is only half: a
    sheet of glass over a page gone black is a dark card. */
-.glass-overlay:modal { background: var(--glass-sheen), var(--tint-sheet); }
+/* The sheet's frost is a layer UNDER its content, not a filter on the
+   sheet: a sheet that carried the backdrop-filter itself was a backdrop
+   root for everything in it, and an overlay inside it (a select's list,
+   the cleanup's suggestions) could no longer blur — the sheet's own text
+   read crisply through it. So the sheet is bare, and its ::after is the
+   frost, tint and sheen, exactly as they were. (A modal's ::after is the
+   material's; a sheet's own accents live on its content.) */
+.glass-overlay:modal { background: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
+.glass-overlay:modal::after {
+  content: ""; position: absolute; inset: 0; z-index: -1;
+  border-radius: inherit; pointer-events: none;
+  background: var(--glass-sheen), var(--tint-sheet);
+  -webkit-backdrop-filter: var(--frost-overlay);
+          backdrop-filter: var(--frost-overlay);
+}
 .glass-overlay:modal::backdrop { background: var(--dim-modal); }
 .glass-plate {
   background: var(--tint-plate);
@@ -1155,14 +1171,17 @@ button.np-pill svg { opacity: 0.8; }
      a strip of material across the top of a page with nothing under it is
      a band that belongs to no layer. The moment the page scrolls under it
      (.glass-strip, set by TopBar from a sentinel at the page's top) it takes
-     the strip's frost and blurs what passes beneath.
+     the strip's frost and tint and blurs what passes beneath. The bar sets
+     no background of its own: declared here, it would beat the strip's tint
+     (same weight, later rule), and bright art scrolled under the bar came
+     through at nine tenths of its light, a band of a different material
+     from the track list's head below it.
 
      Do not replace the frost with a flat fill, and do not reach for
      `animation-timeline` to fade it: a scroll-driven animation that cannot be
      composited costs a main-thread update per scroll offset, which is the
      "nothing repaints until I move the mouse" stall this app was debugged
      out of. The blur itself never had anything to do with that. */
-  background: transparent;
   transition: background-color var(--d2) var(--ease);
 }
 /* The hairline and the sticky title appear once the page has been scrolled
@@ -2312,6 +2331,13 @@ button.np-pill svg { opacity: 0.8; }
 .menu-item.danger:hover:not(:disabled),
 .menu-item.danger:focus-visible { background: var(--danger-wash); color: var(--love); }
 .menu-sep { height: 1px; margin: var(--s1) var(--s3); background: rgba(255, 255, 255, 0.08); }
+/* A submenu (TrackList's playlist and artist pickers) hangs 228px left of
+   its menu, so it is exactly 220px: at the menu's 320px ceiling a long
+   playlist name laid it a hundred pixels over the menu it came from. */
+.menu.submenu { width: 220px; min-width: 0; max-width: none; }
+/* A flex item cannot ellipsise its row's bare text, so a name that can run
+   long sits in a label that can. */
+.menu-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 .playlist-menu-wrap { position: relative; }
 .playlist-actions-menu {
@@ -2332,14 +2358,15 @@ button.np-pill svg { opacity: 0.8; }
 /* Every modal's top edge names the layer it belongs to — the credits sheet's
    is gold because those are liner notes; this one's is love, because love in
    this palette means one thing only: you cannot undo it. It is the first thing
-   you see and it says so before the heading does. (After: the glass rim is
-   the before.) */
-.confirm-dialog::after {
+   you see and it says so before the heading does. It lives on the sheet's
+   content, like the credits sheet's: the dialog's own pseudo-elements are
+   the material's (the rim, and the sheet's frost). */
+.confirm-dialog > :is(.dialog-sheet, .cleanup-sheet)::before {
   content: ""; position: absolute; inset: 0 0 auto; height: 2px; z-index: 2;
   background: linear-gradient(90deg,
     var(--love), color-mix(in srgb, var(--love) 45%, transparent) 72%, transparent);
 }
-.dialog-sheet { padding: var(--s6); }
+.dialog-sheet { position: relative; padding: var(--s6); }
 .dialog-copy h2 {
   font-family: var(--font-display); font-size: var(--t-20); font-weight: var(--w-bold);
   letter-spacing: -0.015em;
@@ -2394,6 +2421,10 @@ button.np-pill svg { opacity: 0.8; }
   margin: auto; padding: 0; overflow: hidden;
   border: 0; border-radius: var(--r4);
 }
+/* The sheet holds focus so the first Tab lands inside it (CreditsDialog);
+   opened from the keyboard, the focus ring drew a foam frame round the
+   whole sheet, which is not a control. The lightbox does the same. */
+.credits-dialog:focus-visible { outline: none; }
 /* A 2px edge, and it is GOLD rather than the app's foam→rose signature. The
    signature gradient means "this is the app" and turns up on the seek rail,
    the brand mark and the cache meter. This sheet is not the app announcing

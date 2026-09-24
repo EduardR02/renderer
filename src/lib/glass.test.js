@@ -180,7 +180,10 @@ test("overlays keep their contrast over a white cover, in their tone pools too",
     if (!m) throw new Error(`no ${name} pool`);
     return Number(m[1]) / 100;
   };
-  const glow = over(over(base, brightestTone(0.6, 0.14), pool("--tone-glow")), [1, 1, 1], sheenOf());
+  // The glow is the tone's hue and chroma at a fixed lightness.
+  const g = body.match(/oklch\(from var\(--tone-glow\) ([\d.]+) c h \/ ([\d.]+)\)/);
+  if (!g) throw new Error("no --tone-glow pool");
+  const glow = over(over(base, brightestTone(Number(g[1]), 0.14), Number(g[2])), [1, 1, 1], sheenOf());
   const washed = over(base, brightestTone(0.41, 0.115), pool("--tone-wash"));
   // A lit item (menus, the listbox, the saved-in rows) is white 0.08, and its
   // label goes to --fg.

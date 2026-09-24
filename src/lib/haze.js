@@ -544,11 +544,22 @@ const FALLOFF = 0.2;
 /** The seam. For SEAM CSS pixels left of the video's edge — the gap, the
     planes' rounded corners — and SEAM_IN inside it — the video's own
     rounded corners — the haze is the video's own light, at SEAM_DIM,
-    fading into the graded haze. Only the gap and the cut-outs show it: the
-    frost is made without it, so the glass stays calibrated. */
+    fading into the graded haze. It is the video's BROAD light, softened
+    by SEAM_SOFT (CSS px): the haze is one frame of a moving loop, and a
+    sharp slice of it beside the video is a shape the video no longer has
+    a moment later. */
 const SEAM = 44;
 const SEAM_IN = 22;
 const SEAM_DIM = 0.9;
+const SEAM_SOFT = 10;
+/** The glass carries the seam's light in from its edge: the frost is made
+    from the haze as it is for the first SPILL CSS px under the glass, and
+    from the calibrated haze (no seam) from there on — so the light flows
+    from the gap into the frost and is gone before any type can lie there
+    (the pane's padding is at least 18px). GAP is the gutter (--gutter):
+    where the glass begins, left of the video's edge. */
+const GAP = 8;
+const SPILL = 16;
 
 const smooth = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
 /** Mirror tiling: 0→1 over one copy, back 1→0 over the next (and the same
@@ -599,9 +610,9 @@ function sample1(img, iw, ih, u, v) {
 const lumOf = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
 /** The columns from x0 on of a `ch`-channel image, as their own image. */
-function cropCols(img, w, h, x0, ch) {
-  const cw = w - x0, out = new Float32Array(cw * h * ch);
-  for (let y = 0; y < h; y++) out.set(img.subarray((y * w + x0) * ch, (y * w + w) * ch), y * cw * ch);
+function cropCols(img, w, h, x0, ch, x1 = w) {
+  const cw = x1 - x0, out = new Float32Array(cw * h * ch);
+  for (let y = 0; y < h; y++) out.set(img.subarray((y * w + x0) * ch, (y * w + x1) * ch), y * cw * ch);
   return out;
 }
 
@@ -797,12 +808,16 @@ export function renderHaze(src, geo, tint, { scale = 1, seed = 1, frost = null }
   const meanY = sumY / Math.max(1, nY), meanP = sumP / Math.max(1, nY);
   const gain = Math.min(1, (CEILING.mean * scale) / Math.max(1e-6, meanY), ((P_MEAN * s3) / Math.max(1e-6, meanP)) ** 3);
 
-  /* The seam: the video's own light, carried out of its edge. */
+  /* The seam: the video's own light, carried out of its edge. Only the
+     source's columns the mirror reads are softened. */
   let seam = null;
   if (video) {
     const x0 = Math.max(0, Math.floor(frame.x - SEAM / px));
     const x1 = Math.min(w, Math.ceil(frame.x + (1.5 * SEAM_IN) / px));
     const sw = Math.max(0, x1 - x0);
+    const soft = SEAM_SOFT / ((frame.w * px) / rw);
+    const ew = Math.min(rw, Math.ceil(((SEAM + 1.5 * SEAM_IN) / px / frame.w) * rw + 3 * soft) + 2);
+    const edge = blur(cropCols(raw, rw, rh, 0, 3, ew), ew, rh, soft);
     const light = new Float32Array(sw * h * 3), alpha = new Float32Array(sw * h);
     for (let y = 0; y < h; y++) {
       const v = fold((y + 0.5 - frame.y) / frame.h);
@@ -811,7 +826,7 @@ export function renderHaze(src, geo, tint, { scale = 1, seed = 1, frost = null }
         const a = d > 0 ? 1 - smooth(d / SEAM) : 1 - smooth((-d - 0.5 * SEAM_IN) / SEAM_IN);
         if (a <= 0) continue;
         const q = y * sw + (x - x0);
-        sample3(raw, rw, rh, Math.abs(d) / px / frame.w, v, light, q * 3);
+        sample3(edge, ew, rh, ((Math.abs(d) / px / frame.w) * rw) / ew, v, light, q * 3);
         light[q * 3] *= SEAM_DIM; light[q * 3 + 1] *= SEAM_DIM; light[q * 3 + 2] *= SEAM_DIM;
         alpha[q] = a;
       }
@@ -831,15 +846,24 @@ function frameOf(geo) {
 }
 
 /** Quantise a finished haze (linear, under the peak) with its gain and its
-    seam, and everything measured on it: the frost (of the haze WITHOUT the
-    seam), the veil, the type's light. */
+    seam, and everything measured on it: the frost (of the haze without the
+    seam, except at the glass's edge: see SPILL), the veil, the type's light. */
 function emit(out, gain, { src, shown, geo, frame, seed, frost, grey, seam }) {
   const { w, h } = geo;
+  const px = geo.px ?? 5;
   /* Quantise, dithered: each channel rounds up with the probability of its
      fraction, so a gradient's average is exact and its steps dissolve. */
   const rand = noise(seed);
   const rgba = new Uint8ClampedArray(w * h * 4);
   const encoded = frost ? new Float32Array(w * h * 3) : null;
+  /* The columns whose frost the seam reaches, from SPILL under the glass
+     (and the frost's blur beyond it) to the seam's end: the haze as it is
+     there, seam included. Even-aligned, for the frost's half resolution. */
+  const reach = frost ? Math.ceil(3 * frost.sigma) + 2 : 0;
+  const lx0 = frost && seam ? Math.max(0, Math.floor(frame.x - (GAP + SPILL) / px - reach) & ~1) : 0;
+  const lx1 = frost && seam ? Math.min(w, seam.x0 + seam.w + reach) : 0;
+  const lw = lx1 - lx0;
+  const lit = lw > 0 ? new Float32Array(lw * h * 3) : null;
   const vx1 = frame ? Math.min(w, Math.max(1, Math.floor(frame.x))) : w;
   const vx0 = Math.max(0, vx1 - 2);
   const veil = [0, 0, 0];
@@ -855,16 +879,24 @@ function emit(out, gain, { src, shown, geo, frame, seed, frost, grey, seam }) {
       veil[0] += er; veil[1] += eg; veil[2] += eb;
       nv++;
     }
+    const l = lit && x >= lx0 && x < lx1 ? ((p / w | 0) * lw + x - lx0) * 3 : -1;
     const s = seam && x >= seam.x0 && x < seam.x0 + seam.w ? (p / w | 0) * seam.w + (x - seam.x0) : -1;
     const a = s >= 0 ? seam.alpha[s] : 0;
     if (a > 0) {
       r += (seam.light[s * 3] - r) * a;
       g += (seam.light[s * 3 + 1] - g) * a;
       b += (seam.light[s * 3 + 2] - b) * a;
-      rgba[q] = Math.floor(encFast(r) * 255 + rand());
-      rgba[q + 1] = Math.floor(encFast(g) * 255 + rand());
-      rgba[q + 2] = Math.floor(encFast(b) * 255 + rand());
+      const sr = encFast(r), sg = encFast(g), sb = encFast(b);
+      if (l >= 0) {
+        lit[l] = sr; lit[l + 1] = sg; lit[l + 2] = sb;
+      }
+      rgba[q] = Math.floor(sr * 255 + rand());
+      rgba[q + 1] = Math.floor(sg * 255 + rand());
+      rgba[q + 2] = Math.floor(sb * 255 + rand());
     } else {
+      if (l >= 0) {
+        lit[l] = er; lit[l + 1] = eg; lit[l + 2] = eb;
+      }
       rgba[q] = Math.floor(er * 255 + rand());
       rgba[q + 1] = Math.floor(eg * 255 + rand());
       rgba[q + 2] = Math.floor(eb * 255 + rand());
@@ -880,9 +912,26 @@ function emit(out, gain, { src, shown, geo, frame, seed, frost, grey, seam }) {
      coarser than two haze pixels, so nothing is lost, and it is a quarter
      of the work and of the texture. */
   const fw = Math.ceil(w / 2), fh = Math.ceil(h / 2);
+  const half = frost ? { ...frost, sigma: frost.sigma / 2 } : null;
+  const frosted = frost ? frostOf(halve(encoded, w, h), fw, fh, half, rand) : null;
+  if (lit) {
+    /* The glass's edge: the frost of the haze as it is, handing over to
+       the calibrated frost across SPILL. */
+    const hw = Math.ceil(lw / 2), fx0 = lx0 / 2;
+    const edge = frostOf(halve(lit, lw, h), hw, fh, half, rand);
+    for (let x = 0; x < hw && fx0 + x < fw; x++) {
+      const d = (frame.x - 2 * (fx0 + x + 0.5)) * px - GAP;
+      const k = 1 - smooth(d / SPILL);
+      if (k <= 0) continue;
+      for (let y = 0; y < fh; y++) {
+        const q = (y * fw + fx0 + x) * 4, e = (y * hw + x) * 4;
+        for (let c = 0; c < 3; c++) frosted[q + c] = Math.round(frosted[q + c] + (edge[e + c] - frosted[q + c]) * k);
+      }
+    }
+  }
   return {
     rgba,
-    frost: frost ? frostOf(halve(encoded, w, h), fw, fh, { ...frost, sigma: frost.sigma / 2 }, rand) : null,
+    frost: frosted,
     frostW: fw,
     frostH: fh,
     gain,

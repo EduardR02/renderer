@@ -203,7 +203,7 @@ test("the haze lies under the video exactly as it is shown, and carries on from 
   expect(hueNear(hueOf(at(out, geo, 100, 45)), -95, 30)).toBe(true);
 });
 
-test("the seam is the video's own light, and the glass is frosted without it", () => {
+test("the seam is the video's own light, and the glass carries it in only at its edge", () => {
   // A light blue Canvas, far brighter than the haze may be.
   const sky = [120, 170, 240];
   const out = renderHaze(source(() => sky), VIDEO, ROSE, { frost: parseFrost("blur(12px) saturate(1.45) brightness(0.7)", 5) });
@@ -213,9 +213,20 @@ test("the seam is the video's own light, and the glass is frosted without it", (
   expect(lumAt(out, VIDEO, edge - 1, 45)).toBeGreaterThan(skyY * 0.6);
   // Past the seam: the graded haze, under the peak.
   expect(lumAt(out, VIDEO, edge - 12, 45)).toBeLessThanOrEqual(CEILING.peak);
-  // The frost never saw it: glass calibrated against the peak holds.
+  // The frost, by how far its pixel lies left of the video's edge (CSS px;
+  // the glass begins 8px out, and type 18px further in at the least).
+  const frostAt = (x, y) => [0, 1, 2].map((c) => out.frost[(y * out.frostW + x) * 4 + c] / 255);
+  const cssOut = (x) => (VIDEO.video.x - (2 * x + 1)) * 5;
+  const under = (css) => Math.floor((VIDEO.video.x - css / 5) / 2);
+  // Just under the glass's edge it is lit by the video, in its colour...
+  const lit = frostAt(under(12), 22);
+  expect(luminance(...lit)).toBeGreaterThan(luminance(...frostAt(under(80), 22)) * 1.5);
+  expect(hueNear(hueOf(lit), hueOf(sky.map((v) => v / 255)), 25)).toBe(true);
+  // ...and wherever type can lie, the glass is calibrated against the peak.
   let worst = 0;
-  for (let p = 0; p < out.frostW * out.frostH; p++) worst = Math.max(worst, luminance(out.frost[p * 4] / 255, out.frost[p * 4 + 1] / 255, out.frost[p * 4 + 2] / 255));
+  for (let y = 0; y < out.frostH; y++) {
+    for (let x = 0; x < out.frostW && cssOut(x) >= 8 + 16; x++) worst = Math.max(worst, luminance(...frostAt(x, y)));
+  }
   expect(worst).toBeLessThanOrEqual(CEILING.peak);
 });
 

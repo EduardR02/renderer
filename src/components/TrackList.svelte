@@ -1190,7 +1190,7 @@
 
 {#if picker.open}
   <div
-    class="menu glass-overlay"
+    class="menu submenu glass-overlay"
     popover="manual"
     use:topLayer
     style:left="{picker.x}px"
@@ -1199,7 +1199,7 @@
   >
     <div class="menu-scroll" use:scrollbar style:max-height="{picker.maxH}px">
       {#each library as pl (pl.id)}
-        <button class="menu-item" onclick={() => addToPlaylist(pl)}>{pl.name}</button>
+        <button class="menu-item" title={pl.name} onclick={() => addToPlaylist(pl)}><span class="menu-label">{pl.name}</span></button>
       {/each}
     </div>
   </div>
@@ -1207,7 +1207,7 @@
 
 {#if artistPicker.open}
   <div
-    class="menu glass-overlay"
+    class="menu submenu glass-overlay"
     popover="manual"
     use:topLayer
     style:left="{artistPicker.x}px"
@@ -1223,7 +1223,8 @@
           artistPicker.open = false;
           navigateArtist(artist.id, artist.name);
         }}
-      >{artist.name}</button>
+        title={artist.name}
+      ><span class="menu-label">{artist.name}</span></button>
     {/each}
     </div>
   </div>
