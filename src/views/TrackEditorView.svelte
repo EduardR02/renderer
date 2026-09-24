@@ -686,7 +686,7 @@
         <p>{(track.artist_names ?? []).join(", ")} · <span class="tnum">{formatTime(track.duration_ms)}</span> original</p>
       </div>
     </header>
-    <section class="repair-sheet" aria-busy={loading}>
+    <section class="repair-sheet glass-card" aria-busy={loading}>
       <div class="sheet-head">
         <div class="sheet-intro"><p class="caps">Original timeline</p><h2>Remove sections or repeat a passage.</h2></div>
         <p class="sheet-note">Cuts and loops change playback only — the audio file is never modified.</p>
@@ -803,11 +803,8 @@
   letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap;
 }
 .edit-head p, .sheet-note, .range-heading p, .empty-range { color: var(--fg-2); }
-.repair-sheet {
-  overflow: clip; border: 1px solid var(--line-2); border-radius: var(--r3);
-  background: color-mix(in srgb, var(--bg-2) 74%, var(--bg-1));
-  box-shadow: 0 18px 42px rgba(0, 0, 0, .18);
-}
+/* A card on the pane (.glass-card, in the markup). */
+.repair-sheet { position: relative; overflow: clip; border-radius: var(--r3); }
 .sheet-head {
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 430px);
   align-items: end; gap: var(--s6); padding: var(--s5) var(--s6) var(--s4);
@@ -822,7 +819,7 @@
   gap: var(--s3); margin: var(--s3) var(--s6) var(--s2); padding: 9px 12px;
   border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
   border-left: 2px solid color-mix(in srgb, var(--accent) 72%, transparent);
-  border-radius: var(--r2); background: color-mix(in srgb, var(--accent) 7%, var(--bg-1));
+  border-radius: var(--r2); background: color-mix(in srgb, var(--accent) 7%, transparent);
 }
 .preview-actions { display: flex; align-items: center; gap: 6px; flex: none; }
 .preview-button, .preview-pause {
@@ -837,10 +834,10 @@
 }
 .preview-pause {
   gap: 6px; padding: 0 10px; border: 1px solid var(--line-2);
-  background: var(--bg-2); color: var(--fg-1); font-size: var(--t-11);
+  background: var(--raise-1); color: var(--fg-1); font-size: var(--t-11);
   transition: color var(--d1) var(--ease), border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.preview-pause:hover { border-color: color-mix(in srgb, var(--fg) 22%, transparent); background: var(--bg-3); }
+.preview-pause:hover { border-color: color-mix(in srgb, var(--fg) 22%, transparent); background: var(--raise-2); }
 .preview-button:hover:not(:disabled) { filter: brightness(1.08); }
 .preview-button:active:not(:disabled) { transform: scale(0.98); }
 .preview-copy { display: grid; min-width: 0; gap: 2px; color: var(--fg-2); font-size: var(--t-11); }
@@ -883,7 +880,7 @@
 .exact-row {
   display: grid; align-items: end; column-gap: var(--s2); row-gap: 5px;
   min-height: 62px; padding: 7px 8px 7px 0; border: 1px solid transparent;
-  border-radius: var(--r2); background: color-mix(in srgb, var(--bg-1) 62%, transparent);
+  border-radius: var(--r2); background: var(--raise-1);
   transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
 .exact-row.cut-row {
@@ -897,11 +894,11 @@
    tint the region paints on the waveform above — one fact, two surfaces. */
 .exact-row.cut-row.selected {
   border-color: color-mix(in srgb, var(--rose-ink) 38%, var(--line));
-  background: color-mix(in srgb, var(--rose-ink) 7%, color-mix(in srgb, var(--bg-1) 62%, transparent));
+  background: color-mix(in srgb, var(--rose-ink) 7%, var(--raise-1));
 }
 .loop-row.selected {
   border-color: color-mix(in srgb, var(--gold) 38%, var(--line));
-  background: color-mix(in srgb, var(--gold) 7%, color-mix(in srgb, var(--bg-1) 62%, transparent));
+  background: color-mix(in srgb, var(--gold) 7%, var(--raise-1));
 }
 .region-index {
   align-self: stretch; display: flex; align-items: center; gap: 7px; padding-left: 10px;
@@ -914,8 +911,8 @@
 .loop-row .region-index span { background: var(--gold); }
 .exact-row label { display: grid; gap: 4px; color: var(--fg-2); font: var(--t-11) var(--font-small); }
 .time-input {
-  width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--line-2);
-  border-radius: var(--r1); outline: 0; background: var(--bg-2); color: var(--fg); font: var(--t-12) var(--font-mono);
+  width: 100%; height: 34px; padding: 0 9px; border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--r1); outline: 0; background: rgb(0 0 0 / 0.22); color: var(--fg); font: var(--t-12) var(--font-mono);
   transition: border-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease), opacity var(--d1) var(--ease);
 }
 .time-input:hover:not(:disabled):not(:focus) { border-color: color-mix(in srgb, var(--fg) 18%, var(--line-2)); }
@@ -936,7 +933,7 @@
 .range-error { grid-column: 2/-1; color: var(--rose-ink); font-size: var(--t-11); }
 .enable-row {
   display: flex; align-items: flex-start; gap: var(--s3); margin: 0 var(--s6) var(--s5); padding: var(--s4);
-  border: 1px solid var(--line-2); border-radius: var(--r2); background: color-mix(in srgb, var(--bg-1) 36%, transparent);
+  border: 1px solid var(--line-2); border-radius: var(--r2); background: var(--raise-1);
   transition: border-color var(--d1) var(--ease), opacity var(--d1) var(--ease);
 }
 .enable-row:hover:not(:has(.enable-check:disabled)) { border-color: color-mix(in srgb, var(--fg) 18%, var(--line-2)); }
@@ -956,8 +953,10 @@
 .edit-footer {
   position: sticky; z-index: 8; bottom: 0; display: flex; align-items: center;
   justify-content: space-between; min-height: 64px; padding: var(--s3) var(--s6);
-  border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--bg-sheet) 92%, transparent);
-  backdrop-filter: blur(18px);
+  /* Strip glass: always covering, since the sheet runs on under it. */
+  border-top: 1px solid var(--line-2); background: var(--tint-strip);
+  -webkit-backdrop-filter: var(--frost-strip);
+          backdrop-filter: var(--frost-strip);
 }
 .edit-footer>div, .footer-left, .history-actions { display: flex; align-items: center; gap: var(--s2); }
 .btn-ghost.compact { min-height: 30px; padding-inline: 10px; font-size: var(--t-11); }

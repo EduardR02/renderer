@@ -891,7 +891,7 @@
 {#snippet pickCard(item)}
   {@const tone = coverTone(item.cover || item.covers, item.id)}
   <div
-    class="pick"
+    class="pick glass-card"
     class:playable={item.kind === "track"}
     style:--tone-wash={tone.wash}
     style:--tone-glow={tone.glow}
@@ -1647,19 +1647,20 @@
      artwork's colour so it reads as a thing that was chosen rather than as the
      first cell of a shelf that is not there. The shelf card it used to borrow
      was a 240px square that looked like a stray album with a caption. */
+  /* A card on the pane (.glass-card, in the markup), its colour pooled in
+     the glass as the Top Result's is. Hover adds light rather than a filter:
+     a filter on a glass host re-rasters its rim, and bleaches the sleeve. */
   .pick {
-    position: relative; isolation: isolate;
+    --pick-tone: linear-gradient(150deg, color-mix(in srgb, var(--tone-wash) 72%, transparent), transparent 82%);
+    position: relative;
     display: grid; grid-template-columns: 88px minmax(0, 1fr) auto;
     align-items: center; gap: var(--s4);
     width: min(560px, 100%); padding: var(--s4);
     border-radius: var(--r3);
-    background:
-      linear-gradient(150deg,
-        color-mix(in srgb, var(--tone-wash, var(--bg-2)) 78%, var(--bg-2)),
-        var(--bg-2) 82%);
-    transition: filter var(--d1) var(--ease);
+    background: var(--glass-sheen), var(--pick-tone), var(--lift-card);
+    transition: background-color var(--d1) var(--ease);
   }
-  .pick:hover { filter: brightness(1.22); }
+  .pick:hover { background: var(--glass-sheen), var(--pick-tone), var(--raise-2); }
   .pick-art { position: relative; width: 88px; height: 88px; --tile: 88px; }
   /* The sleeve throws its own colour under itself, as it does in the inspector
      and the credits sheet — what stops a tile reading as a stamp on a panel. */

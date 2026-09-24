@@ -2,26 +2,42 @@
    THE HAZE — what the panels and the layer share
 
    The layer (Ambient.svelte) renders the haze in a worker, rarely, and
-   shows it with a compositor crossfade. The arithmetic lives in haze.js.
+   shows it with a compositor crossfade: still at rest, about a second's
+   crossfade on a change of record, and no work at all in between. The
+   arithmetic lives in haze.js.
+
+   The haze is the record's own picture seen through a light lens (haze.js,
+   the "A light" pipeline): the source read at PROBE pixels, graded against
+   its own median with its chroma kept and its detail laid back over the
+   compressed range, then laid out — under the video exactly as the video
+   shows it, and to its left as its own mirror image, continuous at the
+   video's edge and magnified with distance (ZOOM), so the window is one
+   large view of the picture rather than repeated copies — blurred once
+   (LENS, 6px) and held under the ceilings.
 
    THE CONTRACT — every field of `haze`, who writes it, and what it means.
    The layer also reads `ui.immersive` (state.svelte.js), as "a Canvas
-   video covers the panel": the haze under the panel is then only seen at
-   the panel's dissolving left edge.
+   video covers the panel": the type's light is then measured on the video.
 
    haze.video        written by the panel.
                      The Canvas <video> while it is the picture in the
                      panel, else null. The haze is drawn from it.
 
-   haze.anchor       written by the panel.
-                     { left } — the panel's left edge as a fraction of the
-                     window's width, or null while the panel is closed. The
-                     open panel is a full-height column flush with the
-                     window's right edge; the haze lays the panel's picture
-                     out under it (object-fit: cover — a Canvas exactly as
-                     shown, a cover as the light its smaller tile sits in)
-                     and carries it on leftward from this edge. With no
-                     anchor it is the restrained glow from the player bar.
+   haze.anchor       written by the panel (placeCanvas, NowPlayingPanel).
+                     { left, video }, or null while the panel is closed.
+                     - left: the panel's left edge as a fraction of the
+                       window's width. The open panel is a full-height
+                       column at the window's right edge; the haze lays the
+                       panel's picture out under it (a cover as the light
+                       its smaller tile sits in) and carries it on leftward.
+                     - video: { x, y, w, h }, the Canvas's VISIBLE rect in
+                       window CSS px, or null while no video is shown. The
+                       haze frames the picture to exactly that rect
+                       (haze.js, frameOf), so it meets the video where the
+                       video is, whether it fills the panel or is capped
+                       and dissolving (placeCanvas).
+                     With no anchor the haze is the restrained glow from
+                     the player bar (RESTRAINED).
 
    haze.awaiting     written by the panel.
                      true from a record change until the panel knows
@@ -52,51 +68,56 @@
                      0.30. Published only on a change of more than 0.01.
 
    haze.veil         written here.
-                     "r g b" (0..255) of the haze just left of the panel's
-                     edge: what a surface in the panel can melt into.
+                     "r g b" (0..255) of the haze just left of the video's
+                     edge (the window's right edge while the panel is
+                     closed): what a surface in the panel melts into. Its
+                     tone (covertone, toneOfColor) is also the root's
+                     --tone-*, written only when it changes: what a surface
+                     with no page tone of its own — a menu on the queue, the
+                     drag pill — pools in its glass, so it glows with the
+                     record too. Pages, the panel and the bar set their own.
 
    use:frost         the action, worn by the glass planes (see THE FROST).
 
    What the glass is calibrated against (haze.js, CEILING): every pixel of
    the haze, after dithering, is an in-gamut sRGB colour of relative
    luminance at most 0.10 (#595959 as a grey) — 0.05 with the panel closed —
-   of any hue; and the haze's mean luminance is at most 0.045. The frost is
-   exactly CSS's blur() saturate() brightness() of that haze, so glass
-   calibrated against a live backdrop-filter holds over it unchanged.
+   within the grade's chroma and perceived-lightness caps; and its mean
+   luminance is at most 0.045. The one exception is the seam band (THE
+   FROST, 3), which no glass ever lies over. glass.test.js frosts the
+   brightest colour the haze can make exactly as CSS frosts it, and holds
+   the type's greys over it on every surface.
 
    THE FROST — what the glass (app.css and the components) does with it:
 
    1. The three planes wear `use:frost`: the rail (.sidebar, Sidebar.svelte),
       the pane (.pane, App.svelte) and the bar (.player, PlayerBar.svelte).
-   2. .glass-chrome and .glass-pane drop backdrop-filter. They keep their
-      tint, sheen, rim and lift exactly as they are: the layer draws the
-      frost under them, clipped to their boxes and corner radii, with the
-      numbers of --frost-plane (read from :root on every render — change the
-      token and the frost follows). Nothing else changes material: strips,
-      overlays and plates keep their real backdrop-filter; they frost live
-      content, not the haze, and they are small.
-   3. The seam with the Canvas: the video is at full strength right up to
-      the pane's and the bar's edges, and the glass reads as lying over it.
-      - .np-stage loses its left mask (no --np-bleed dissolve at all).
-      - .np-panel keeps margin: calc(var(--gutter) * -1), so its left edge
-        is exactly the pane's (and the bar's) right edge; the video ends
-        there. No z-index change: nothing overlaps. The video must NOT run
-        under a plane — a plane is a thin tint now, and the video would show
-        through it unfrosted.
-      - While the panel is open, .pane and .player take square right-hand
-        corners (border-top-right-radius and border-bottom-right-radius: 0),
-        so the glass meets the video on one straight edge rather than
-        leaving the haze in a notch at each rounded corner. The frost clip
-        follows the corners as computed.
-      - haze.anchor.left stays the panel's left edge = the video's left
-        edge: the haze mirrors the video outward from exactly there, so the
-        frost under the pane carries the video's own colours on beneath the
-        glass, continuous at the edge, and lets them dissolve leftward.
+   2. .glass-chrome and .glass-pane carry no backdrop-filter, only their
+      tint, sheen, rim and lift: the layer draws the frost under them,
+      clipped to their boxes and corner radii. The frost is a twin of each
+      haze picture, made in the same pass at half its resolution with the
+      numbers of --frost-plane (a 12px blur, then saturate and brightness;
+      read from :root on every render — change the token and the frost
+      follows), from the haze WITHOUT the seam band. Strips, overlays and
+      plates keep a real backdrop-filter: they frost live content, not the
+      haze, and they are small.
+   3. The seam with the Canvas. The video is never under a plane, and never
+      widened or covered: the panel keeps the gutter on its left, the pane
+      and the bar end a gutter short of it as whole planes (four rounded
+      corners and the rim), and the panel's own two left corners are
+      rounded (--np-radius, cut by the layers that paint in it). The haze
+      shows bare in that gap and in the corner cut-outs, and there — SEAM
+      px left of the video's edge and SEAM_IN px inside it (haze.js) — it
+      is the video's own light, at SEAM_DIM, fading into the graded haze:
+      the gap reads as the video's light rather than as a dark notch, and
+      the light dims only where the glass begins.
    4. The morph needs nothing: the planes stay live through it (THE LAYOUT
       MORPH, app.css) and the frost is traced in the ResizeObserver pass,
       after layout and before paint, so it takes a plane's new edge in the
       same frame the plane does.
    ===================================================================== */
+
+import { toneOfColor } from "./covertone.svelte.js";
 
 /** What the panels and the layer share. Written only on a real change. */
 export const haze = $state({
@@ -119,6 +140,23 @@ export function publishLight(light) {
 export function publishVeil(veil) {
   if (!veil || !veilMoved(haze.veil, veil)) return;
   haze.veil = veil;
+  publishTone(veil);
+}
+
+/* The veil's tone on the root, for the surfaces that inherit it. Three
+   properties, set only when the tone itself changes — a small move of the
+   veil often lands on the same palette. */
+let rootTone = "";
+function publishTone(veil) {
+  const [r, g, b] = veil.split(" ").map(Number);
+  const tone = toneOfColor(r, g, b);
+  const key = `${tone.wash} ${tone.washDeep} ${tone.glow}`;
+  if (key === rootTone) return;
+  rootTone = key;
+  const style = document.documentElement.style;
+  style.setProperty("--tone-wash", tone.wash);
+  style.setProperty("--tone-wash-deep", tone.washDeep);
+  style.setProperty("--tone-glow", tone.glow);
 }
 
 function veilMoved(a, b) {

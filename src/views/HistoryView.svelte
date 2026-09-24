@@ -706,12 +706,9 @@
     transition: background-color var(--d2) var(--ease);
   }
   .history-block.stuck {
-    background: color-mix(in srgb, var(--bg-1) 72%, transparent);
-    -webkit-backdrop-filter: blur(14px) saturate(1.7);
-            backdrop-filter: blur(14px) saturate(1.7);
-  }
-  @supports not (backdrop-filter: blur(1px)) {
-    .history-block.stuck { background: var(--bg-1); }
+    background: var(--tint-strip);
+    -webkit-backdrop-filter: var(--frost-strip);
+            backdrop-filter: var(--frost-strip);
   }
   .history-tools {
     display: flex; align-items: center; gap: var(--s4);
@@ -937,7 +934,7 @@
   }
   .hi-rail {
     display: block; width: 52px; height: 3px; border-radius: var(--rf);
-    background: var(--bg-4); overflow: hidden;
+    background: rgba(255, 255, 255, 0.13); overflow: hidden;
   }
   .hi-rail i {
     display: block; min-width: 3px; height: 100%; border-radius: inherit;

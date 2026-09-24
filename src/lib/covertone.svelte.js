@@ -172,6 +172,22 @@ export function identityTone(seed, chroma = 0.095) {
   return palette(IDENTITY_HUES[fnv(String(seed ?? "")) % IDENTITY_HUES.length], chroma);
 }
 
+/**
+ * The tone of one colour already on screen — the haze's, which is the
+ * record's light as the window shows it. The hue is the colour's own. The
+ * haze is dark, and a dark colour's chroma is small however colourful it
+ * looks, so the chroma is read relative to its lightness: a colour at full
+ * saturation for its lightness earns the full chroma a sleeve can, a grey
+ * earns the near-neutral a monochrome sleeve gets.
+ */
+export function toneOfColor(r8, g8, b8) {
+  const [L, a, b] = oklab(r8, g8, b8);
+  let hue = (Math.atan2(b, a) * 180) / Math.PI;
+  if (hue < 0) hue += 360;
+  const saturation = Math.hypot(a, b) / Math.max(L, 0.08);
+  return palette(hue, 0.028 + 0.087 * Math.min(1, saturation / 0.3));
+}
+
 /* --- Extraction ------------------------------------------------------ */
 
 /**

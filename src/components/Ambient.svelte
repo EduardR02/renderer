@@ -557,8 +557,9 @@
 
 <style>
   /* Behind everything, stretched over the window by the compositor: each
-     picture is a fifth of the window's size and already blurred, so the
-     bilinear upscale is all the smoothing it needs. The layers only ever
+     picture is half the window's size (DENSITY), its frost a quarter, and
+     both are already blurred, so the bilinear upscale is all the smoothing
+     they need. The layers only ever
      change opacity, on the compositor, and are hidden once covered. Each
      layer's frosted twin lies over its haze, cut to the planes. */
   .ambient {

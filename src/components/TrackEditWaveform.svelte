@@ -841,11 +841,11 @@
   .tool-button, .fit-button, .zoom-button {
     display: inline-flex; align-items: center; justify-content: center;
     height: 34px; border: 1px solid var(--line-2); color: var(--fg-1);
-    background: color-mix(in srgb, var(--bg-2) 76%, transparent); font-family: var(--font-small);
+    background: var(--raise-1); font-family: var(--font-small);
   }
   .tool-button { min-width: 92px; padding: 0 var(--s3); border-radius: var(--r2); font-size: var(--t-12); }
   .tool-button:hover:not(:disabled), .fit-button:hover, .zoom-button:hover {
-    color: var(--fg); border-color: color-mix(in srgb, var(--fg) 22%, transparent); background: var(--bg-3);
+    color: var(--fg); border-color: color-mix(in srgb, var(--fg) 22%, transparent); background: var(--raise-2);
   }
   .cut-tool { border-color: color-mix(in srgb, var(--rose-ink) 30%, var(--line-2)); }
   .loop-tool { border-color: color-mix(in srgb, var(--gold) 30%, var(--line-2)); }
@@ -857,7 +857,7 @@
   .selection-readout {
     display: inline-flex; align-items: center; justify-content: center; min-width: 0;
     height: 30px; padding: 0 var(--s3); overflow: hidden; border: 1px solid var(--line);
-    border-radius: var(--rf); background: color-mix(in srgb, var(--bg-1) 52%, transparent);
+    border-radius: var(--rf); background: rgb(0 0 0 / 0.22);
     color: var(--fg-2); font-family: var(--font-small); font-size: var(--t-12);
     text-align: center; text-overflow: ellipsis; white-space: nowrap;
   }
@@ -867,8 +867,9 @@
   .fit-button { min-width: 50px; padding: 0 10px; border-radius: var(--r2); font-size: var(--t-12); }
   .zoom-level { width: 38px; color: var(--fg-2); font: var(--t-11) var(--font-mono); text-align: center; }
   .main-stage, .overview-stage {
-    position: relative; overflow: hidden; border: 1px solid var(--line-2);
-    background: var(--bg-1); user-select: none; touch-action: pan-y;
+    /* A well pressed into the glass, like every field on it. */
+    position: relative; overflow: hidden; border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgb(0 0 0 / 0.22); user-select: none; touch-action: pan-y;
   }
   .main-stage { height: 238px; border-radius: var(--r2) var(--r2) 0 0; cursor: crosshair; }
   .main-stage::after {

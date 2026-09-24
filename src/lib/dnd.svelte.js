@@ -227,7 +227,7 @@ function buildGhost(rowEl) {
   const wrap = document.createElement("div");
   wrap.className = "tl-drag-ghost";
   const pill = document.createElement("div");
-  pill.className = "tl-drag-pill";
+  pill.className = "tl-drag-pill glass-overlay";
   const art = rowEl.querySelector(".c-art");
   if (art) pill.appendChild(art.cloneNode(true));
   const title = rowEl.querySelector(".c-title");

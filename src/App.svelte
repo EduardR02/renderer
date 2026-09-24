@@ -341,7 +341,7 @@
       <TopBar />
 
       {#if bannerError}
-        <div class="error-banner" role="alert">
+        <div class="error-banner glass-card" role="alert">
           <span class="error-text">{bannerError}</span>
           <button class="btn-icon" title="Dismiss" onclick={dismissBanner}>
             <Icon name="x" size={14} />
@@ -401,7 +401,10 @@
 {/if}
 
 <style>
+  /* A card on the pane (.glass-card, in the markup), lit with the danger
+     wash rather than the card's plain light. */
   .error-banner {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -409,7 +412,7 @@
     margin: 0 var(--s6);
     padding: var(--s2) var(--s3);
     border-radius: var(--r2);
-    background: color-mix(in srgb, var(--love) 12%, transparent);
+    background: var(--glass-sheen), var(--danger-wash);
     color: var(--danger);
     font-size: var(--t-12);
   }

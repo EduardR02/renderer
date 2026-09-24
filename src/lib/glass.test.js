@@ -96,3 +96,117 @@ test("type on the glass planes keeps its contrast over the brightest haze", () =
     }
   }
 });
+
+/** The body of the rule whose selector list is exactly `selector`. */
+const rule = (selector) => {
+  const text = css.replace(/\r\n/g, "\n");
+  const at = text.indexOf(`\n${selector} {`);
+  if (at < 0) throw new Error(`no rule ${selector}`);
+  return text.slice(text.indexOf("{", at) + 1, text.indexOf("}", at));
+};
+/** `color-mix(in srgb, var(--hue) N%, transparent)` → the hue at alpha N. */
+const wash = (value) => {
+  const m = value.match(/var\((--[\w-]+)\)\s+([\d.]+)%/);
+  return { rgb: hex(token(m[1])), a: Number(m[2]) / 100 };
+};
+const sheenOf = () => Number(token("--glass-sheen").match(/rgba\(255, 255, 255, ([\d.]+)\)/)[1]);
+
+test("a selected row in the rail keeps its contrast over the brightest haze", () => {
+  const floor = brightestFrost(parseFrost(token("--frost-plane"), 1));
+  const tint = rgba(token("--tint-chrome"));
+  const chrome = over(over(floor, tint.rgb, tint.a), [1, 1, 1], sheenOf());
+  const dense = rgba(token("--tint-active"));
+  const raise = rgba(token("--raise-2"));
+  const type = { "--fg": 7, "--fg-2": 4.5, "--fg-3": 3 };
+  for (const [selector, hue] of [
+    [".nav-item.active", "--accent-wash"],
+    [".lib-row.active", "--accent-wash"],
+    [".lib-row.liked-row.active", "--saved-wash"],
+  ]) {
+    // The rule is what the numbers below model: the wash, over the raise,
+    // over the denser glass.
+    const body = rule(selector).replace(/\s+/g, " ");
+    expect(body).toContain(`var(${hue})`);
+    expect(body).toContain("linear-gradient(var(--raise-2) 0 0), var(--tint-active)");
+    // At the wash's full strength, where it starts at the row's left edge.
+    const w = wash(token(hue));
+    const bg = over(over(over(chrome, dense.rgb, dense.a), raise.rgb, raise.a), w.rgb, w.a);
+    for (const [name, target] of Object.entries(type)) {
+      const c = contrast(hex(token(name)), bg);
+      if (c < target) throw new Error(`${name} on ${selector}: ${c.toFixed(2)} under ${target}`);
+      expect(c).toBeGreaterThanOrEqual(target);
+    }
+  }
+});
+
+/* The most luminous tone a record can give an overlay's pools: covertone's
+   palette sets the glow at Oklab L 0.6 with chroma up to 0.14, and the wash
+   at L 0.35 (0.41 on the lifted warm flank) with chroma up to 0.115. Every
+   hue is tried at those bounds, clipped by channel as covertone clips. */
+const toEnc = (y) => Math.min(1, Math.max(0, y <= 0.0031308 ? y * 12.92 : 1.055 * y ** (1 / 2.4) - 0.055));
+function brightestTone(L, C) {
+  let worst = null, wy = -1;
+  for (let deg = 0; deg < 360; deg++) {
+    const h = (deg * Math.PI) / 180, a = C * Math.cos(h), b = C * Math.sin(h);
+    const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+    const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+    const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
+    const rgb = [
+      4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+      -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+      -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
+    ].map((v) => Math.round(toEnc(v) * 255) / 255);
+    if (Y(rgb) > wy) {
+      wy = Y(rgb);
+      worst = rgb;
+    }
+  }
+  return worst;
+}
+
+test("overlays keep their contrast over a white cover, in their tone pools too", () => {
+  // The worst an overlay can frost is white; frosted, it is its brightness.
+  const frost = parseFrost(token("--frost-overlay"), 1);
+  const white = [1, 1, 1].map((v) => v * frost.brightness);
+  const tint = rgba(token("--tint-overlay"));
+  const base = over(white, tint.rgb, tint.a);
+  // The material as .glass-overlay paints it: the sheen, the glow pooled at
+  // the top left, the wash at the bottom right, over the tint.
+  const body = rule(".glass-overlay").replace(/\s+/g, " ");
+  expect(body).toContain("var(--glass-sheen)");
+  expect(body).toContain("var(--tint-overlay)");
+  const pool = (name) => {
+    const m = body.match(new RegExp(`color-mix\\(in srgb, var\\(${name}\\) ([\\d.]+)%`));
+    if (!m) throw new Error(`no ${name} pool`);
+    return Number(m[1]) / 100;
+  };
+  const glow = over(over(base, brightestTone(0.6, 0.14), pool("--tone-glow")), [1, 1, 1], sheenOf());
+  const washed = over(base, brightestTone(0.41, 0.115), pool("--tone-wash"));
+  // A lit item (menus, the listbox, the saved-in rows) is white 0.08, and its
+  // label goes to --fg.
+  const lit = 0.08;
+  const type = { "--fg": 7, "--fg-2": 4.5, "--fg-3": 3 };
+  for (const [where, bg] of [["centre", base], ["glow pool", glow], ["wash pool", washed]]) {
+    for (const [name, target] of Object.entries(type)) {
+      const c = contrast(hex(token(name)), bg);
+      if (c < target) throw new Error(`${name} on an overlay, ${where}: ${c.toFixed(2)} under ${target}`);
+      expect(c).toBeGreaterThanOrEqual(target);
+    }
+    const c = contrast(hex(token("--fg")), over(bg, [1, 1, 1], lit));
+    if (c < 7) throw new Error(`--fg on a lit item, ${where}: ${c.toFixed(2)} under 7`);
+    expect(c).toBeGreaterThanOrEqual(7);
+  }
+});
+
+test("a modal sheet keeps its contrast over its own dimmed page", () => {
+  const frost = parseFrost(token("--frost-overlay"), 1);
+  const dim = rgba(token("--dim-modal"));
+  const page = over([1, 1, 1], dim.rgb, dim.a).map((v) => v * frost.brightness);
+  const tint = rgba(token("--tint-sheet"));
+  const bg = over(over(page, tint.rgb, tint.a), [1, 1, 1], sheenOf());
+  for (const [name, target] of Object.entries({ "--fg": 7, "--fg-2": 4.5, "--fg-3": 3 })) {
+    const c = contrast(hex(token(name)), bg);
+    if (c < target) throw new Error(`${name} on a sheet: ${c.toFixed(2)} under ${target}`);
+    expect(c).toBeGreaterThanOrEqual(target);
+  }
+});

@@ -232,8 +232,8 @@
   /* =====================================================================
      GLASS — the one material every surface is built from.
 
-     Behind the panels is the haze (Ambient.svelte): the playing record,
-     reduced to a blurred 64px picture, lighting the window. Everything
+     Behind the panels is the haze (Ambient.svelte): the playing record's
+     own picture, seen through a light lens, lighting the window. Everything
      that sits on it is glass, in five weights, each a class that any
      surface can wear (THE MATERIAL, below the element rules):
 
@@ -287,7 +287,7 @@
   --tint-chrome:   rgb(10 11 14 / 0.36);
   --tint-pane:     rgb(11 12 15 / 0.38);
   --tint-strip:    rgb(13 14 17 / 0.62);
-  --tint-overlay:  rgb(8 9 13 / 0.74);
+  --tint-overlay:  rgb(8 9 13 / 0.76);
   /* A modal sheet frosts its own dimmed page (--dim-modal), never bare
      content, so it can be much thinner glass than a menu. */
   --tint-sheet:    rgb(19 20 24 / 0.5);
@@ -302,6 +302,12 @@
   --raise-1: rgba(255, 255, 255, 0.03);
   --raise-2: rgba(255, 255, 255, 0.075);
   --raise-3: rgba(255, 255, 255, 0.11);
+  /* A selected row in the rail is lit — the raise and an accent wash — and
+     light on the thinnest glass over the brightest haze is more than its
+     type can stand (--fg-2 fell to 3.5:1). So it is also a step DENSER
+     glass: this lies under the light, and over a dark haze it changes
+     almost nothing (glass.test.js). */
+  --tint-active: rgb(8 9 12 / 0.55);
   --glass-sheen:   linear-gradient(158deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 34%);
   --glass-rim:     linear-gradient(145deg,
                      rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.14) 14%,
@@ -437,12 +443,14 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    flat menus the app had before the glass. So its tint carries no grey
    (--tint-overlay), and it is lit the way the planes are lit by the haze —
    the page's own colour pooled in two corners, a sheen and a catch of
-   light along the top edge — at the same luminance the calibration allows
-   (glass.test.js), so the colour costs no contrast. */
+   light along the top edge. The pools are held to the calibration where
+   they are strongest, at the corners, over a white cover and the most
+   luminous tone a record can give (glass.test.js): the glow is the bright
+   one, so it is the thin one. */
 .glass-overlay {
   background:
-    linear-gradient(158deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0) 38%),
-    radial-gradient(140% 110% at 0% 0%, color-mix(in srgb, var(--tone-glow) 20%, transparent), transparent 72%),
+    var(--glass-sheen),
+    radial-gradient(140% 110% at 0% 0%, color-mix(in srgb, var(--tone-glow) 10%, transparent), transparent 72%),
     radial-gradient(120% 120% at 100% 100%, color-mix(in srgb, var(--tone-wash) 36%, transparent), transparent 70%),
     var(--tint-overlay);
   -webkit-backdrop-filter: var(--frost-overlay);
@@ -627,7 +635,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    luminance change is only the support. */
 .nav-item.active {
   color: var(--fg);
-  background: linear-gradient(90deg, var(--accent-wash), transparent 78%), var(--raise-2);
+  background:
+    linear-gradient(90deg, var(--accent-wash), transparent 78%),
+    linear-gradient(var(--raise-2) 0 0), var(--tint-active);
   box-shadow: inset 2px 0 var(--accent);
 }
 .nav-item.active svg { opacity: 1; color: var(--accent); }
@@ -702,8 +712,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   border-radius: var(--r2); text-align: left;
   transition: background-color var(--d1) var(--ease);
 }
-.lib-row.active { background: linear-gradient(90deg, var(--accent-wash), transparent 80%), var(--raise-2);
-  box-shadow: inset 2px 0 var(--accent); }
+.lib-row.active {
+  background:
+    linear-gradient(90deg, var(--accent-wash), transparent 80%),
+    linear-gradient(var(--raise-2) 0 0), var(--tint-active);
+  box-shadow: inset 2px 0 var(--accent);
+}
 .lib-row.active .lib-name { color: var(--fg); }
 .lib-name {
   font-size: var(--t-13); color: var(--fg-1);
@@ -719,7 +733,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* The one row in the rail whose selected state is warm, because the thing it
    selects is the saved collection. Everything else selected is foam. */
 .lib-row.liked-row.active {
-  background: linear-gradient(90deg, var(--saved-wash), transparent 80%), var(--raise-2);
+  background:
+    linear-gradient(90deg, var(--saved-wash), transparent 80%),
+    linear-gradient(var(--raise-2) 0 0), var(--tint-active);
   /* The rail stays with the row: the nav and every library selection carry
      the same inset bar, so "selected" is one shape everywhere in the rail —
      and this one row's bar is warm because its wash is. */
@@ -816,12 +832,15 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   /* Out over the window's padding on the three sides where the window
      ends; the gutter stays on the fourth. */
   margin: calc(var(--gutter) * -1) calc(var(--gutter) * -1) calc(var(--gutter) * -1) 0;
-  border-radius: var(--np-radius) 0 0 var(--np-radius);
-  overflow: hidden;
+  /* The corners are cut by the layers that paint (.np-stage, .np-scroll,
+     .np-head), not by the panel: a clip on the panel put every layer of it,
+     the playing video included, under one rounded clip, which cost more
+     than cutting the two that reach the corners. */
+  --np-corners: var(--np-radius) 0 0 var(--np-radius);
   --veil: color-mix(in srgb, rgb(8 9 11) 56%, var(--haze-veil, var(--tone-wash-deep)));
 }
 
-/* The picture layer, cut to the panel's corners by the panel. Nothing is
+/* The picture layer, cut to the panel's corners. Nothing is
    painted under the video in it — no fill, no shadow — so the rounded cut
    has only the video and the haze on its two sides and cannot fringe (see
    .art). The video is placed by placeCanvas, inline. When it stops short
@@ -830,7 +849,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    the ramp is eased — a linear one shows where it starts. The mask is
    static, rastered when the layout changes and never per frame, and a
    Canvas that fills the panel carries none at all. */
-.np-stage { position: absolute; inset: 0; z-index: 0; }
+.np-stage { position: absolute; inset: 0; z-index: 0; border-radius: var(--np-corners); overflow: hidden; }
 .np-stage.float {
   mask-image:
     linear-gradient(90deg,
@@ -864,6 +883,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 .np-scroll {
   position: absolute; inset: 0; z-index: 1;
+  border-radius: var(--np-corners);
   overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
 }
 
@@ -873,6 +893,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   position: absolute; top: 0; left: 0; right: 0; z-index: 3;
   display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
   height: var(--head-h); padding: 0 var(--s5) 0 var(--np-inset);
+  /* Its veil reaches the panel's top-left corner. */
+  border-top-left-radius: var(--np-radius);
   transition: background-color var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
 }
 .np-head.over { background: var(--veil); box-shadow: 0 12px 20px -8px var(--veil); }
@@ -1223,7 +1245,7 @@ button.np-pill svg { opacity: 0.8; }
    field the loudest object in the window: 340px of saturated ring around the
    one control that is already announcing itself with a caret. The state to
    communicate is "typing lands here", and the app has a quieter vocabulary for
-   it — the surface lifts to the same --bg-3 every other control uses when it is
+   it — the surface lifts to the same raise every other control uses when it is
    active, the hairline takes foam at hairline strength, and the magnifier
    comes up a rung with it. Three small agreeing signals instead of one loud
    one. */
@@ -1619,7 +1641,7 @@ button.np-pill svg { opacity: 0.8; }
 }
 .btn-accent:hover:not(:disabled) { background: var(--accent-hi); }
 .btn-accent:active:not(:disabled) { transform: scale(0.98); }
-.btn-accent:disabled { background: var(--bg-4); color: var(--fg-2); }
+.btn-accent:disabled { background: var(--raise-2); color: var(--fg-2); }
 
 .btn-icon {
   display: grid; place-items: center; width: 32px; height: 32px; flex: none;
@@ -2178,8 +2200,7 @@ button.np-pill svg { opacity: 0.8; }
   background: var(--accent-lo); transform: scale(0.94);
   box-shadow: 0 4px 12px -4px color-mix(in srgb, var(--foam) 55%, transparent);
 }
-.play-btn:disabled { box-shadow: none; }
-.play-btn:disabled { background: var(--bg-4); color: var(--fg-2); }
+.play-btn:disabled { background: var(--raise-2); color: var(--fg-2); box-shadow: none; }
 
 .p-seek { display: flex; align-items: center; gap: var(--s3); width: 100%; min-width: 0; }
 .p-time {
@@ -2266,9 +2287,9 @@ button.np-pill svg { opacity: 0.8; }
    The surface is the material; this is only the shape and the items. An
    item under the pointer is lit from inside the glass rather than laid
    with a grey, and its label goes to full ink: over the densest thing a
-   menu can sit on, a white cover, --fg holds 7.5:1 on a lit item and the
-   resting --fg-1 6:1 (glass.test.js). Radius one step up from a row's, so
-   the item plates sit concentric inside it.
+   menu can sit on, a white cover, --fg holds 7:1 on a lit item and --fg-2
+   4.5:1 at rest, in the tone pools too (glass.test.js). Radius one step up
+   from a row's, so the item plates sit concentric inside it.
    ===================================================================== */
 .menu {
   min-width: 216px; max-width: 320px;   /* a long playlist name cannot widen it */
@@ -2681,8 +2702,8 @@ button.np-pill svg { opacity: 0.8; }
 .set-ctl:has(> .set-check) { align-self: start; min-height: calc(var(--t-13) * 1.45); }
 
 /* The drawn checkbox, shared by Settings and any other boolean row: a raised
-   field at rest, the foam fill with the ink glyph when checked. 16px box,
-   18px hit target via padding on the row's own label — the control is small
+   field at rest, the foam fill with the ink glyph when checked. 18px box,
+   hit target widened by the row's own label — the control is small
    on purpose, but never smaller than a pointer can land on. */
 .set-check {
   appearance: none;
@@ -2840,7 +2861,7 @@ button.np-pill svg { opacity: 0.8; }
   color: var(--fg);
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--foam) 24%, transparent), transparent),
-    var(--bg-4);
+    var(--raise-2);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 32%, transparent);
 }
 .seg-n {
@@ -2876,16 +2897,19 @@ button.np-pill svg { opacity: 0.8; }
 .split-top { flex: 0 1 320px; min-width: 0; }
 .split-songs { flex: 1 1 440px; min-width: 0; }
 
+/* A card on the pane (.glass-card, in the markup). */
 .top-result {
+  position: relative;
   display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s4);
   align-items: end; padding: var(--s4); border-radius: var(--r3);
-  /* The record's own colour, mixed back toward the raised grey so the panel is
-     tinted rather than painted — it still has to read as a surface with a
-     cover sitting on it, not as a second cover. */
+  /* The record's own colour pooled in the glass from the top left, fading
+     into the card's own light, so the panel is tinted rather than painted —
+     it still has to read as a surface with a cover sitting on it, not as a
+     second cover. */
   background:
-    linear-gradient(155deg,
-      color-mix(in srgb, var(--tone-wash, var(--bg-2)) 76%, var(--bg-2)),
-      var(--bg-2) 78%);
+    var(--glass-sheen),
+    linear-gradient(155deg, color-mix(in srgb, var(--tone-wash) 72%, transparent), transparent 78%),
+    var(--lift-card);
   transition: transform var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
   text-align: left; width: 100%;
 }
@@ -2897,9 +2921,7 @@ button.np-pill svg { opacity: 0.8; }
    that must not change when you point at it. */
 .top-result:hover {
   transform: translateY(-2px);
-  box-shadow:
-    0 18px 30px -18px rgba(0, 0, 0, 0.9),
-    0 16px 40px -10px color-mix(in srgb, var(--tone-glow) 58%, transparent);
+  box-shadow: var(--lift-raised), 0 16px 40px -10px color-mix(in srgb, var(--tone-glow) 58%, transparent);
 }
 /* The light arriving underneath is the affordance; the 2px lift is only what
    makes it look lit from the front. Reduced motion keeps the first and drops
@@ -2908,10 +2930,9 @@ button.np-pill svg { opacity: 0.8; }
 @media (prefers-reduced-motion: reduce) {
   .top-result:hover, .card:hover { transform: none; }
 }
-/* The panel's own loading frame: same box, no tone, and inert. Its
-   placeholders step UP a shade rather than down — at the raised grey they
-   would be the same colour as the panel and the box would read as empty. */
-.sk-top { background: var(--raise-1); cursor: default; }
+/* The panel's own loading frame: same card, no tone, and inert. Its
+   placeholders step UP a shade rather than down, or the box reads as empty. */
+.sk-top { background: var(--glass-sheen), var(--lift-card); cursor: default; }
 .sk-top .skeleton { background: var(--raise-2); }
 .top-result:focus-visible { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 45%, transparent); }
 /* Two lines, then ellipsis — not one line, then ellipsis.
@@ -3119,6 +3140,7 @@ button.np-pill svg { opacity: 0.8; }
   :root {
     --tint-chrome: var(--bg-nav); --tint-pane: var(--bg-1); --tint-strip: var(--bg-1);
     --tint-overlay: var(--bg-sheet); --tint-sheet: var(--bg-sheet); --tint-plate: rgb(9 9 11 / 0.8);
+    --tint-active: transparent;
     --frost-plane: none; --frost-strip: none; --frost-overlay: none; --frost-plate: none;
   }
   .topbar, .tl-head { background: var(--bg-1); }
@@ -3141,7 +3163,7 @@ button.np-pill svg { opacity: 0.8; }
     1. #drag-layer + .tl-drag-ghost — the grabbed row folded into a compact
         pill of cloned nodes (art tile + two-line title block). It opens at
         the row's full geometry and compresses onto the pointer over
-        var(--d2): raised surface, hairline edge, deep shadow, a 1.028
+        var(--d2): overlay glass, as a menu is, and a 1.028
         scale. Lifted enough to read as "in hand", never tilted — tilt reads
         as playful, and this app is not.
 
@@ -3186,12 +3208,10 @@ button.np-pill svg { opacity: 0.8; }
   gap: 10px;
   height: var(--row-h);
   padding: 8px 14px 8px 8px; /* art sits flush in the rounded corner */
+  /* Overlay glass (.glass-overlay, set by dnd.svelte.js): it is carried over
+     live content, like a menu. */
+  position: relative;
   border-radius: var(--r2);
-  background: var(--bg-2);
-  box-shadow:
-    inset 0 0 0 1px var(--line-2),
-    0 14px 32px -10px rgba(0, 0, 0, 0.8),
-    0 3px 10px rgba(0, 0, 0, 0.5);
   overflow: hidden;
   /* The pill slides inside the wrap while the width folds, so the grab
      point travels from wherever the pointer closed on the row to the pill's

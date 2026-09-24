@@ -225,7 +225,7 @@
     <div class="search-split" aria-busy="true" aria-label="Searching">
       <div class="split-top">
         <div class="section-head"><h2 class="section-title">Top result</h2></div>
-        <div class="top-result sk-top">
+        <div class="top-result glass-card sk-top">
           <span class="skeleton" style="width:92px;height:92px;border-radius:var(--r3)"></span>
           <span style="min-width:0;display:block">
             <span class="skeleton line" style="width:74%;height:24px;margin:0"></span>
@@ -300,7 +300,7 @@
                result IS a subject, so the panel around it takes that record's
                colour rather than being the fourth grey rectangle on screen. -->
           <button
-            class="top-result"
+            class="top-result glass-card"
             style:--tone-wash={topTone.wash}
             style:--tone-glow={topTone.glow}
             onclick={openTop}

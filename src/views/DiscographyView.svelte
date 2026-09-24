@@ -348,19 +348,16 @@
     gap: var(--s4) var(--s5); flex-wrap: wrap;
     padding: var(--s3) 0;
     /* Same rule as the track-list head: no plate until it is covering
-       something. Glass rather than the flat --bg-1 it used to carry, so it
-       matches the topbar it sticks under. */
+       something, and then the same strip glass as the topbar it sticks
+       under. */
     background: transparent;
     transition: background-color var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
   }
   .dx-controls.stuck {
-    background: color-mix(in srgb, var(--bg-1) 72%, transparent);
-    -webkit-backdrop-filter: blur(14px) saturate(1.7);
-            backdrop-filter: blur(14px) saturate(1.7);
-    box-shadow: inset 0 -1px 0 var(--line);
-  }
-  @supports not (backdrop-filter: blur(1px)) {
-    .dx-controls.stuck { background: var(--bg-1); }
+    background: var(--tint-strip);
+    -webkit-backdrop-filter: var(--frost-strip);
+            backdrop-filter: var(--frost-strip);
+    box-shadow: inset 0 -1px 0 var(--line-2);
   }
   /* `space-between` puts a lone item at flex-START on a wrapped line, so on a
      narrow pane the order control dropped to the left under the toggle rather
