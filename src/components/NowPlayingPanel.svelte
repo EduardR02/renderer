@@ -230,22 +230,121 @@
     haze.video = videoShown && videoEl ? videoEl : null;
   });
 
-  /* Where the panel's left edge is, for the haze to carry the picture on
-     from. Its size changes with the window; so does its position. */
+  /* ---- Where the Canvas sits -------------------------------------------
+     The video covers the panel, centred, cropped evenly — but a Canvas is a
+     few hundred pixels of compressed video, and drawn much larger than
+     that it goes blocky. So it never grows past CANVAS_LIMIT device pixels
+     to each of its own. On a window taller (or, for a small Canvas, wider)
+     than that, it stops growing, centred in the panel, and each edge that
+     no longer reaches the panel's dissolves into the haze — the Canvas's
+     own light — over a distance that grows with the gap it borders, so the
+     change comes on from nothing as the window is dragged, never as a jump.
+
+     Published as haze.anchor.video: the part of the video on screen, in
+     window pixels, for the haze to carry its colour on from; and with it
+     the panel's left edge. */
+  const CANVAS_LIMIT = 1.2;
+  /** The longest an edge dissolve runs. */
+  const EDGE_FADE = 96;
+
+  let stageEl = $state(null);
+  let pixelRatio = $state(window.devicePixelRatio || 1);
+
+  /* The panel's width is bounded in device pixels too (--panel-w), so the
+     stylesheet needs the ratio as well as placeCanvas. Dragging the window
+     to another screen changes it. */
   $effect(() => {
-    const el = panelEl;
-    if (!el) return;
-    const publish = () => {
-      const left = el.getBoundingClientRect().left / window.innerWidth;
-      if (!haze.anchor || Math.abs(haze.anchor.left - left) > 0.004) haze.anchor = { left };
+    const root = document.documentElement;
+    let query = null;
+    const update = () => {
+      pixelRatio = window.devicePixelRatio || 1;
+      root.style.setProperty("--dpr", String(pixelRatio));
+      query?.removeEventListener("change", update);
+      query = window.matchMedia(`(resolution: ${pixelRatio}dppx)`);
+      query.addEventListener("change", update);
     };
-    const observer = new ResizeObserver(publish);
-    observer.observe(el);
-    window.addEventListener("resize", publish);
+    update();
+    return () => query?.removeEventListener("change", update);
+  });
+
+  const round = (v) => Math.round(v * 100) / 100;
+
+  function placeCanvas() {
+    const panel = panelEl;
+    const stage = stageEl;
+    if (!panel || !stage) return;
+    const box = panel.getBoundingClientRect();
+    const left = box.left / window.innerWidth;
+    const nw = videoEl?.videoWidth;
+    const nh = videoEl?.videoHeight;
+    let visible = null;
+    if (nw && nh) {
+      const scale = Math.min(CANVAS_LIMIT / pixelRatio, Math.max(box.width / nw, box.height / nh));
+      const w = nw * scale;
+      const h = nh * scale;
+      const sx = (box.width - w) / 2;
+      const sy = (box.height - h) / 2;
+      Object.assign(videoEl.style, {
+        left: `${round(sx)}px`,
+        top: `${round(sy)}px`,
+        width: `${round(w)}px`,
+        height: `${round(h)}px`,
+      });
+      const floatX = sx > 0.5;
+      const floatY = sy > 0.5;
+      stage.classList.toggle("float", floatX || floatY);
+      if (floatX || floatY) {
+        const dx = floatX ? Math.min(EDGE_FADE, sx * 3, w * 0.2) : 0;
+        const dy = floatY ? Math.min(EDGE_FADE, sy * 3, h * 0.2) : 0;
+        const vars = {
+          "--x0": `${floatX ? round(sx) : -1}px`,
+          "--x1": `${round(floatX ? sx + w : box.width + 1)}px`,
+          "--y0": `${floatY ? round(sy) : -1}px`,
+          "--y1": `${round(floatY ? sy + h : box.height + 1)}px`,
+          "--dx": `${round(dx)}px`,
+          "--dy": `${round(dy)}px`,
+        };
+        for (const [name, value] of Object.entries(vars)) stage.style.setProperty(name, value);
+      }
+      visible = {
+        x: round(box.left + Math.max(0, sx)),
+        y: round(box.top + Math.max(0, sy)),
+        w: round(Math.min(w, box.width)),
+        h: round(Math.min(h, box.height)),
+      };
+    }
+    /* Only a video on screen has colour to carry on. */
+    if (!videoShown) visible = null;
+    const last = haze.anchor;
+    const moved =
+      !last ||
+      Math.abs(last.left - left) > 0.0005 ||
+      Boolean(last.video) !== Boolean(visible) ||
+      (visible && ["x", "y", "w", "h"].some((k) => Math.abs(last.video[k] - visible[k]) > 0.25));
+    if (moved) haze.anchor = { left, video: visible };
+  }
+
+  /* Placed again whenever one of its inputs moves: the panel's box (the
+     window, the grid) through the observer and the resize event; and here
+     the ratio, the element, and whether it is shown. The video's own size
+     arrives with its metadata (onloadedmetadata). */
+  $effect(() => {
+    const panel = panelEl;
+    if (!panel || !stageEl) return;
+    const place = () => untrack(placeCanvas);
+    const observer = new ResizeObserver(place);
+    observer.observe(panel);
+    window.addEventListener("resize", place);
     return () => {
       observer.disconnect();
-      window.removeEventListener("resize", publish);
+      window.removeEventListener("resize", place);
     };
+  });
+  $effect(() => {
+    pixelRatio;
+    videoEl;
+    videoShown;
+    untrack(placeCanvas);
   });
 
   /* Two sentinels in the scrolled content, the app's usual device: each
@@ -326,9 +425,8 @@
   style:--plate-a={plateAlpha}
 >
   {#if current}
-    <!-- The picture layer, pinned under the scrolling column and dissolved
-         at its left edge into the haze. -->
-    <div class="np-stage" aria-hidden="true">
+    <!-- The picture layer, pinned under the scrolling column. -->
+    <div class="np-stage" bind:this={stageEl} aria-hidden="true">
       {#if canvasUrl}
         <video
           class="np-video"
@@ -340,6 +438,8 @@
           loop
           playsinline
           preload="auto"
+          onloadedmetadata={placeCanvas}
+          onresize={placeCanvas}
           oncanplay={handleCanvasReady}
           onerror={handleCanvasError}
         ></video>

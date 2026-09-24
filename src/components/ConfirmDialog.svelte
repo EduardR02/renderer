@@ -41,7 +41,7 @@
 </script>
 
 <dialog
-  class="confirm-dialog"
+  class="confirm-dialog glass-overlay"
   bind:this={dialog}
   aria-labelledby={titleId}
   aria-describedby={messageId}

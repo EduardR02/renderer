@@ -45,10 +45,12 @@
   const CANVAS_WAIT_MS = 2500;
   /** A black first frame (a Canvas fading up) is skipped this many times. */
   const BLANK_TRIES = 6;
-  /** Window pixels per haze pixel. The picture is a blur, so the
-      compositor's bilinear upscale of it is invisible; this is only fine
-      enough that the upscale does not show its own steps. */
-  const DENSITY = 5;
+  /** Window pixels per haze pixel, and the most haze pixels across. The
+      picture is seen through a light lens (haze.js, LENS), so it needs a
+      real resolution: at two window pixels per haze pixel the compositor's
+      bilinear upscale is finer than the lens and never shows its steps. */
+  const DENSITY = 2;
+  const MAX_W = 1000;
   /** The first loop is sampled at most this many times over at most this long. */
   const PASS_SAMPLES = 10;
   const PASS_MAX_MS = 12000;
@@ -111,7 +113,7 @@
   /** The planes' frost as the worker needs it, read from the glass token. */
   function frostFor(geo) {
     const token = getComputedStyle(document.documentElement).getPropertyValue("--frost-plane");
-    return parseFrost(token, (window.innerWidth || geo.w) / geo.w);
+    return parseFrost(token, geo.px);
   }
 
   /* ---- The layers ---------------------------------------------------------
@@ -317,15 +319,27 @@
   function geometry() {
     const vw = window.innerWidth || 1;
     const vh = window.innerHeight || 1;
-    const w = Math.round(Math.min(400, Math.max(200, vw / DENSITY)));
+    const w = Math.round(Math.min(MAX_W, Math.max(200, vw / DENSITY)));
     const h = Math.max(1, Math.round((w * vh) / vw));
+    const px = vw / w;
     const left = haze.anchor ? haze.anchor.left : null;
-    return { w, h, left, immersive: left != null && ui.immersive };
+    /* The video's rect on screen, in haze pixels: the haze carries the
+       picture on from exactly where the video shows it. */
+    const v = left != null ? haze.anchor.video : null;
+    const video = v ? { x: v.x / px, y: v.y / px, w: v.w / px, h: v.h / px } : null;
+    return { w, h, px, left, video, immersive: left != null && ui.immersive };
   }
 
   function sameGeo(a, b) {
     return Boolean(a && b) && a.w === b.w && a.h === b.h && a.immersive === b.immersive &&
-      (a.left == null) === (b.left == null) && Math.abs((a.left ?? 0) - (b.left ?? 0)) < 0.004;
+      (a.left == null) === (b.left == null) && Math.abs((a.left ?? 0) - (b.left ?? 0)) < 0.004 &&
+      sameRect(a.video, b.video);
+  }
+
+  /** The same video rect, to within half a haze pixel. */
+  function sameRect(a, b) {
+    if (!a || !b) return a === b;
+    return ["x", "y", "w", "h"].every((k) => Math.abs(a[k] - b[k]) < 0.5);
   }
 
   /** What the haze should be made of now, or that it should wait. */
@@ -353,6 +367,7 @@
       video?.currentSrc ?? "",
       still?.key ?? "",
       haze.anchor?.left ?? null,
+      haze.anchor?.video ?? null,
       ui.immersive,
       haze.awaiting,
       resized,
@@ -374,7 +389,7 @@
         return;
       }
       armPass();
-      const discrete = [deps[1], deps[2], deps[3], deps[4] == null, deps[5], deps[6], deps[8]].join("|");
+      const discrete = [deps[1], deps[2], deps[3], deps[4] == null, deps[5] == null, deps[6], deps[7], deps[9]].join("|");
       schedule(discrete !== lastDiscrete ? 60 : 250);
       lastDiscrete = discrete;
     });

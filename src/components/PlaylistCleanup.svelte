@@ -2,6 +2,7 @@
   import Cover from "./Cover.svelte";
   import Icon from "./Icon.svelte";
   import Select from "./Select.svelte";
+  import { scrollbar } from "../lib/scrollbar.js";
   import { api } from "../lib/state.svelte.js";
   import { formatTime } from "../lib/time.js";
   import {
@@ -379,7 +380,7 @@
 </script>
 
 <dialog
-  class="confirm-dialog cleanup-dialog"
+  class="confirm-dialog cleanup-dialog glass-overlay"
   bind:this={dialog}
   aria-labelledby="cleanup-title"
   aria-describedby="cleanup-description"
@@ -410,14 +411,14 @@
     </header>
 
     {#if removed === null}
-      <div class="cleanup-body">
+      <div class="cleanup-body" use:scrollbar>
         {#if stale && !busy}
-          <div class="cleanup-notice alert" role="alert">
+          <div class="cleanup-notice glass-card alert" role="alert">
             <p>This playlist changed. Your preview is out of date; nothing more can be removed from it.</p>
             <button type="button" class="btn-ghost" onclick={useLatest}>Review latest playlist</button>
           </div>
         {:else if !source?.snapshot_id}
-          <div class="cleanup-notice" role="status">
+          <div class="cleanup-notice glass-card" role="status">
             <p>Waiting for a verified playlist revision. Reload before reviewing removals.</p>
             <button type="button" class="btn-ghost" disabled={reloading} onclick={reload}>{reloading ? "Reloading…" : "Reload playlist"}</button>
           </div>
@@ -536,7 +537,8 @@
                   onkeydown={suggestionKey}
                 />
                 {#if suggestionsOpen && !frozen && (field === "artist" || field === "album")}
-                  <div class="cleanup-suggestions" class:up={suggestionsUp} style:max-height="{suggestionsRoom}px" id="cleanup-suggestions" role="listbox" aria-label={`${field === "artist" ? "Artists" : "Albums"} in this playlist${suggestionMatches.length > suggestions.length ? `, showing the first ${suggestions.length} of ${suggestionMatches.length} matches` : ""}`}>
+                  <div class="cleanup-suggestions glass-overlay" class:up={suggestionsUp} id="cleanup-suggestions" role="listbox" aria-label={`${field === "artist" ? "Artists" : "Albums"} in this playlist${suggestionMatches.length > suggestions.length ? `, showing the first ${suggestions.length} of ${suggestionMatches.length} matches` : ""}`}>
+                    <div class="cleanup-suggestions-scroll" use:scrollbar style:max-height="{suggestionsRoom}px">
                     {#each suggestions as choice, index (choice.key)}
                       {@const highlightStart = choice.name.toLowerCase().indexOf(query.trim().toLowerCase())}
                       {@const highlightEnd = highlightStart + query.trim().length}
@@ -563,6 +565,7 @@
                     {#if suggestionMatches.length > suggestions.length}
                       <p>Showing the first {suggestions.length} of {suggestionMatches.length} matches — keep typing to narrow them.</p>
                     {/if}
+                    </div>
                   </div>
                 {/if}
               </div>
@@ -620,7 +623,7 @@
                rest of a page is unreachable from the keyboard, since the
                pagination only ever moves in hundred-row steps. Same deliberate
                exception Select.svelte makes for its own list. -->
-          <div class="cleanup-results" role="region" tabindex="0" aria-label="Playlist entries that will be removed">
+          <div class="cleanup-results" use:scrollbar role="region" tabindex="0" aria-label="Playlist entries that will be removed">
             {#if preview.rows.length}
               <table>
                 <colgroup>
@@ -751,23 +754,21 @@
      the preview table. A band that never moves cannot cover anything, and both
      popups now live inside the band that scrolls — `overflow-y: auto` clips
      them at the actions rather than under them. */
+  /* Overlay glass (.glass-overlay, in the markup), which makes a modal a
+     sheet. */
   .cleanup-dialog {
-    /* The scrollbar this sheet reserves room for. Mirrors the global
-       `::-webkit-scrollbar` width: the head, the body and the action band all
-       end at the same right edge, so the reserve has to be a number they can
-       share rather than one band's private padding. */
-    --sheet-gutter: 10px;
     display: flex; flex-direction: column;
     width: min(860px, calc(100vw - var(--s8)));
     max-height: calc(100dvh - var(--s8));
     overflow: hidden;
   }
-  .cleanup-sheet { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 0; }
+  /* Positioned: the body's overlay scrollbar is laid against it. */
+  .cleanup-sheet { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 0; }
 
   /* --- head. Fixed, so the thing you are about to do never scrolls away. */
   .cleanup-head {
     position: relative; flex: none;
-    padding: var(--s5) calc(var(--s8) + var(--sheet-gutter)) var(--s4) var(--s6);
+    padding: var(--s5) var(--s8) var(--s4) var(--s6);
     border-bottom: 1px solid var(--line);
   }
   .cleanup-head h2 {
@@ -776,31 +777,30 @@
     font-weight: var(--w-bold); letter-spacing: -0.02em; line-height: 1.15;
   }
   .cleanup-head > p { margin-top: var(--s2); max-width: 66ch; color: var(--fg-1); font-size: var(--t-13); }
-  .cleanup-close { position: absolute; top: var(--s4); right: calc(var(--s5) + var(--sheet-gutter)); color: var(--fg-2); }
+  .cleanup-close { position: absolute; top: var(--s4); right: var(--s5); color: var(--fg-2); }
 
   /* --- body. The only scroller. The rule builder is fixed and the preview
      takes the slack, so a crowded rule list scrolls the body while a short one
      leaves the dialog exactly as tall as its content. */
   .cleanup-body {
     flex: 1 1 auto; min-height: 0; overflow-y: auto;
-    /* Reserved, not borrowed: with the preview floor below, this band always
-       scrolls on a short window, and a scrollbar that appears only once the
-       preview has rows would shift the table sideways under its own reader.
-       The same reserve the app's other scrollers keep (see app.css). */
-    scrollbar-gutter: stable;
+    /* Its scrollbar is an overlay (lib/scrollbar.js): nothing is reserved
+       for it, and nothing shifts when it appears. */
     display: flex; flex-direction: column; gap: var(--s4);
     padding: var(--s4) var(--s6) var(--s5);
   }
 
   /* A blocking notice is a plate with its action on the same line as its
      sentence: stacked, the two made a tall box with a stranded button. */
+  /* A card on the sheet (.glass-card, in the markup). */
   .cleanup-notice {
+    position: relative;
     flex: none; display: flex; align-items: center; justify-content: space-between;
     gap: var(--s4); padding: var(--s3) var(--s4);
-    border-radius: var(--r2); background: var(--bg-2);
+    border-radius: var(--r2);
     color: var(--fg-1); font-size: var(--t-12);
   }
-  .cleanup-notice.alert { background: var(--danger-wash); }
+  .cleanup-notice.alert { background: var(--glass-sheen), var(--danger-wash); }
   .cleanup-notice p { min-width: 0; }
   .cleanup-notice button { flex: none; }
 
@@ -856,8 +856,9 @@
   .cleanup-input-wrap .cleanup-input { width: 100%; }
   .cleanup-input {
     height: 34px; padding: 0 var(--s3);
-    border: 1px solid var(--line-2); border-radius: var(--r2);
-    background: var(--bg-2); color: var(--fg);
+    /* Pressed into the glass, like every field on it (.credits-filter). */
+    border: 1px solid rgba(255, 255, 255, 0.08); border-radius: var(--r2);
+    background: rgb(0 0 0 / 0.22); color: var(--fg);
     font: inherit; font-size: var(--t-13);
   }
   .cleanup-input::placeholder { color: var(--fg-3); }
@@ -868,25 +869,24 @@
   .cleanup-date { width: 152px; }
   .cleanup-add { height: 34px; }
 
-  /* The app's one menu material — the same fill, radius, hairline and shadow
-     as .sel-list and .menu, so the two dropdowns on this sheet are one object. */
+  /* Overlay glass (.glass-overlay, in the markup): the same object as
+     .sel-list and .menu, so the two dropdowns on this sheet are one thing.
+     The list scrolls inside the glass, so its overlay bar is laid inside it. */
   .cleanup-suggestions {
     position: absolute; z-index: 3; top: calc(100% + var(--s1)); left: 0; right: 0;
-    max-height: 200px; overflow-y: auto; padding: var(--s1);
-    border: 1px solid var(--line-2); border-radius: var(--r2);
-    background: var(--bg-2);
-    box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85), 0 2px 6px rgba(0, 0, 0, 0.5);
+    border-radius: var(--r3);
   }
+  .cleanup-suggestions-scroll { max-height: 200px; overflow-y: auto; overscroll-behavior: contain; padding: var(--s1); }
   .cleanup-suggestions.up { top: auto; bottom: calc(100% + var(--s1)); }
   .cleanup-suggestions button {
     display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
     width: 100%; min-height: 32px; padding: var(--s1) var(--s2) var(--s1) var(--s3);
-    border-radius: var(--r1); color: var(--fg-1); font-size: var(--t-13); text-align: left;
+    border-radius: var(--r2); color: var(--fg-1); font-size: var(--t-13); text-align: left;
   }
   /* Same active plate as the listbox: hover and the arrow-key position are the
      same fact, so they are the same colour. */
   .cleanup-suggestions button:hover,
-  .cleanup-suggestions button[aria-selected="true"] { background: var(--bg-4); color: var(--fg); }
+  .cleanup-suggestions button[aria-selected="true"] { background: rgba(255, 255, 255, 0.08); color: var(--fg); }
   .cleanup-suggestions button > span:first-child { min-width: 0; }
   .cleanup-suggestions small {
     display: block; margin-top: 1px;
@@ -894,7 +894,7 @@
   }
   .cleanup-suggestions .tnum { white-space: nowrap; color: var(--count); font-size: var(--t-12); font-weight: var(--w-med); }
   .cleanup-suggestions mark { background: transparent; color: var(--accent); font-weight: var(--w-bold); }
-  .cleanup-suggestions > p { padding: var(--s3); color: var(--fg-2); font-size: var(--t-12); }
+  .cleanup-suggestions p { padding: var(--s3); color: var(--fg-2); font-size: var(--t-12); }
 
   /* --- preview. The rule that opens it leads with the accent and fades into
      the ordinary hairline, the way every structural rule in this app does.
@@ -902,6 +902,7 @@
      it is the scroller. */
   .cleanup-preview {
     --preview-floor: 252px;
+    position: relative; /* the results' overlay scrollbar is laid against it */
     display: flex; flex-direction: column;
     flex: none;
     padding-top: var(--s4);
@@ -935,9 +936,12 @@
     box-shadow: inset 0 -1px 0 var(--line);
   }
   .cleanup-results table { width: 100%; border-collapse: collapse; table-layout: fixed; text-align: left; }
+  /* Always stuck, so always a strip: the rows scroll under its frost. */
   .cleanup-results th {
     height: 28px; padding: 0 var(--s3);
-    background: var(--bg-sheet);
+    background: var(--tint-strip);
+    -webkit-backdrop-filter: var(--frost-strip);
+            backdrop-filter: var(--frost-strip);
     position: sticky; top: 0; z-index: 1;
     box-shadow: inset 0 -1px 0 var(--line-2);
     text-align: left;
@@ -968,7 +972,7 @@
     display: grid; place-items: center;
     width: 16px; height: 16px; margin: 0;
     border: 1px solid var(--line-2); border-radius: var(--r1);
-    background: var(--bg-2); cursor: pointer;
+    background: var(--raise-1); cursor: pointer;
     transition: background-color var(--d1) var(--ease), border-color var(--d1) var(--ease);
   }
   .cleanup-keep input:hover:enabled { border-color: var(--fg-3); }
@@ -1024,18 +1028,16 @@
      the whole sheet, not to the section the rules happen to be in. */
   .cleanup-error {
     flex: none; display: flex; align-items: center; justify-content: space-between;
-    gap: var(--s4); padding: var(--s3) calc(var(--s6) + var(--sheet-gutter)) var(--s3) var(--s6);
+    gap: var(--s4); padding: var(--s3) var(--s6);
     background: var(--danger-wash); color: var(--love); font-size: var(--t-13);
   }
   .cleanup-error button { flex: none; }
 
-  .cleanup-foot { flex: none; margin-top: 0; padding: var(--s4) calc(var(--s6) + var(--sheet-gutter)) var(--s4) var(--s6); border-top: 1px solid var(--line); flex-wrap: wrap; }
+  .cleanup-foot { flex: none; margin-top: 0; padding: var(--s4) var(--s6); border-top: 1px solid var(--line); flex-wrap: wrap; }
 
   @media (max-width: 600px) {
     .cleanup-dialog { width: calc(100vw - var(--s4)); max-height: calc(100dvh - var(--s4)); }
-    /* Left inset shrinks with the sheet; the reserved gutter does not, and the
-       three bands keep ending on the same edge. */
-    .cleanup-head, .cleanup-error, .cleanup-foot { padding-inline: var(--s4) calc(var(--s4) + var(--sheet-gutter)); }
+    .cleanup-head, .cleanup-error, .cleanup-foot { padding-inline: var(--s4); }
     .cleanup-body { padding-inline: var(--s4); }
     .cleanup-field { flex: 1 1 100%; }
   }

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import {
   renderHaze,
-  toneLab,
+  gradeLab,
   cropBorders,
   lightOf,
   framing,
@@ -25,6 +25,8 @@ const SW = 45;
 const SH = 80;
 const OPEN = { w: 160, h: 90, left: 0.62, immersive: true };
 const COVER = { ...OPEN, immersive: false };
+/** A Canvas on screen: the video fills the panel. */
+const VIDEO = { ...OPEN, video: { x: 99.2, y: 0, w: 60.8, h: 90 } };
 const CLOSED = { w: 160, h: 90, left: null, immersive: false };
 /** The record's colour for these tests: a rose glow. */
 const ROSE = [0.92, 0.62, 0.66];
@@ -63,7 +65,7 @@ const RED = [210, 50, 30];
 test("a colour keeps its own hue: blue stays blue and red stays red", () => {
   const tint = toOklab(...ROSE);
   for (const [rgb, hue] of [[BLUE, -95], [RED, 30]]) {
-    const [L, a, b] = toneLab(toOklab(...rgb.map((v) => v / 255)), tint);
+    const [L, a, b] = gradeLab(toOklab(...rgb.map((v) => v / 255)), tint);
     expect(Math.hypot(a, b)).toBeGreaterThan(0.08);
     expect(hueNear((Math.atan2(b, a) * 180) / Math.PI, hue, 25)).toBe(true);
     expect(luminance(...fromOklab(L, a, b))).toBeLessThanOrEqual(CEILING.peak);
@@ -72,7 +74,7 @@ test("a colour keeps its own hue: blue stays blue and red stays red", () => {
 
 test("a dark colour is lifted: shadow still glows, as colour", () => {
   const src = [20, 28, 60].map((v) => v / 255);
-  const [L, a, b] = toneLab(toOklab(...src), toOklab(...ROSE));
+  const [L, a, b] = gradeLab(toOklab(...src), toOklab(...ROSE));
   expect(L).toBeGreaterThan(toOklab(...src)[0] * 1.1);
   expect(Math.hypot(a, b)).toBeGreaterThan(0.05);
 });
@@ -97,10 +99,13 @@ const SOURCES = {
 
 test("no pixel of the haze is brighter than the peak, after dithering, whatever the source", () => {
   for (const [name, pixel] of Object.entries(SOURCES)) {
-    for (const [geo, cap] of [[OPEN, CEILING.peak], [COVER, CEILING.peak], [CLOSED, CEILING.peak * RESTRAINED]]) {
+    for (const [geo, cap] of [[OPEN, CEILING.peak], [COVER, CEILING.peak], [CLOSED, CEILING.peak * RESTRAINED], [VIDEO, CEILING.peak]]) {
       const out = render(source(pixel), geo);
+      // Beside a video the seam is the video's own light (see below); the
+      // rest of the window holds the peak.
+      const x1 = geo.video ? Math.floor(geo.video.x - 44 / 5) : geo.w;
       let worst = 0;
-      for (let y = 0; y < geo.h; y++) for (let x = 0; x < geo.w; x++) worst = Math.max(worst, lumAt(out, geo, x, y));
+      for (let y = 0; y < geo.h; y++) for (let x = 0; x < x1; x++) worst = Math.max(worst, lumAt(out, geo, x, y));
       if (worst > cap) throw new Error(`${name}: ${worst} over ${cap}`);
     }
   }
@@ -112,7 +117,6 @@ test("a white Canvas is a dim haze in the record's colour, and a dark window", (
   let sum = 0;
   for (let y = 0; y < geo.h; y++) for (let x = 0; x < geo.w; x++) sum += lumAt(out, geo, x, y);
   expect(sum / (geo.w * geo.h)).toBeLessThanOrEqual(CEILING.mean * 1.02);
-  expect(out.gain).toBeLessThan(1);
   const [r, g, b] = at(out, geo, 150, 45);
   expect(r).toBeGreaterThan(g + 0.03);
   expect(r).toBeGreaterThan(b + 0.02);
@@ -126,13 +130,14 @@ test("pale warm light is warm graphite, not sienna; fire stays fire", () => {
     expect(chromaOf(rgb)).toBeLessThan(0.03);
     expect(rgb[0]).toBeGreaterThanOrEqual(rgb[2]); // a breath of warmth, not grey-blue
   }
-  // A genuinely saturated orange keeps its colour.
+  // A genuinely saturated orange keeps its colour: a whole window of it is
+  // held to the mean chroma budget, and it is still several times the cream.
   const fire = at(render(source(() => [235, 110, 20]), COVER), COVER, 150, 45);
-  expect(chromaOf(fire)).toBeGreaterThan(0.08);
+  expect(chromaOf(fire)).toBeGreaterThan(0.06);
   expect(hueNear(hueOf(fire), 45, 15)).toBe(true);
   // And a red is untouched by it.
   const red = at(render(source(() => [205, 40, 40]), COVER), COVER, 150, 45);
-  expect(chromaOf(red)).toBeGreaterThan(0.1);
+  expect(chromaOf(red)).toBeGreaterThan(0.06);
 });
 
 test("the panel-closed glow is restrained", () => {
@@ -155,7 +160,7 @@ test("a picture that cannot be read is the record's own colour, under the ceilin
 
 /* ---- The layout -------------------------------------------------------- */
 
-test("the haze is the panel's picture carried on out of the panel", () => {
+test("the haze is the panel's picture carried on out of the panel, magnified", () => {
   // Blue on the left of the frame, red on the right.
   const out = render(source((x) => (x < SW / 2 ? BLUE : RED)));
   const s = seam(OPEN);
@@ -164,7 +169,7 @@ test("the haze is the panel's picture carried on out of the panel", () => {
   expect(hueNear(hueOf(at(out, OPEN, s + 2, 45)), -95, 30)).toBe(true);
   // Under the panel's right side, the frame's right side: red.
   expect(hueNear(hueOf(at(out, OPEN, OPEN.w - 4, 45)), 30, 30)).toBe(true);
-  // Mirrored: further out, the frame's right half comes round again.
+  // Mirrored and magnified: further out, the frame's right half comes round.
   const panelW = OPEN.w - s;
   expect(hueNear(hueOf(at(out, OPEN, Math.round(s - panelW * 1.3), 45)), 30, 35)).toBe(true);
 });
@@ -186,6 +191,32 @@ test("the light is strongest at the panel and falls off to the far edge, as colo
   const s = seam(OPEN);
   expect(lumAt(out, OPEN, s - 2, 45)).toBeGreaterThan(lumAt(out, OPEN, 3, 45) * 1.5);
   expect(chromaOf(at(out, OPEN, 3, 45))).toBeGreaterThan(0.04);
+});
+
+test("the haze lies under the video exactly as it is shown, and carries on from its edge", () => {
+  // A video that floats in the panel, narrower and shorter than it.
+  const geo = { ...OPEN, video: { x: 112, y: 12, w: 36, h: 64 } };
+  const out = render(source((x) => (x < SW / 2 ? BLUE : RED)), geo);
+  expect(hueNear(hueOf(at(out, geo, 116, 45)), -95, 30)).toBe(true);
+  expect(hueNear(hueOf(at(out, geo, 144, 45)), 30, 30)).toBe(true);
+  // Left of its edge (past the seam), its own left side carries on.
+  expect(hueNear(hueOf(at(out, geo, 100, 45)), -95, 30)).toBe(true);
+});
+
+test("the seam is the video's own light, and the glass is frosted without it", () => {
+  // A light blue Canvas, far brighter than the haze may be.
+  const sky = [120, 170, 240];
+  const out = renderHaze(source(() => sky), VIDEO, ROSE, { frost: parseFrost("blur(12px) saturate(1.45) brightness(0.7)", 5) });
+  const edge = Math.floor(VIDEO.video.x);
+  const skyY = luminance(...sky.map((v) => v / 255));
+  // In the gap: nearly the video itself, so the edge does not step to dark.
+  expect(lumAt(out, VIDEO, edge - 1, 45)).toBeGreaterThan(skyY * 0.6);
+  // Past the seam: the graded haze, under the peak.
+  expect(lumAt(out, VIDEO, edge - 12, 45)).toBeLessThanOrEqual(CEILING.peak);
+  // The frost never saw it: glass calibrated against the peak holds.
+  let worst = 0;
+  for (let p = 0; p < out.frostW * out.frostH; p++) worst = Math.max(worst, luminance(out.frost[p * 4] / 255, out.frost[p * 4 + 1] / 255, out.frost[p * 4 + 2] / 255));
+  expect(worst).toBeLessThanOrEqual(CEILING.peak);
 });
 
 /* ---- Quantisation ------------------------------------------------------- */

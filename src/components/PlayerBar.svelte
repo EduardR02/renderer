@@ -19,6 +19,8 @@
   import { formatTime } from "../lib/time.js";
   import { morphLayout } from "../lib/layout.js";
   import { frost } from "../lib/ambient.svelte.js";
+  import { scrollbar } from "../lib/scrollbar.js";
+  import { coverTone } from "../lib/covertone.svelte.js";
   import { listen } from "@tauri-apps/api/event";
 
   let dragPos = $state(null);
@@ -246,6 +248,10 @@
     playback.current_index >= 0 ? (playback.queue[playback.current_index] ?? null) : null
   );
 
+  /** The record's colour, for the glass the bar opens (the speed menu, the
+      saved-in list) to be lit by, as a page's menus are by the page's. */
+  const tone = $derived(coverTone(current?.cover_url ?? "", current?.album_id || current?.uri || ""));
+
   const effectiveEdit = $derived(current?.effective_edit ?? null);
   const editTimeline = $derived.by(() => makeEditTimeline(
     effectiveEdit,
@@ -425,7 +431,7 @@
   });
 </script>
 
-<footer class="player glass-chrome" use:frost>
+<footer class="player glass-chrome" use:frost style:--tone-wash={tone.wash} style:--tone-glow={tone.glow}>
   <div class="p-body">
     <div class="p-now" class:idle={!current}>
       {#if current}
@@ -470,15 +476,17 @@
             <!-- Keyboard path: tabbing into a row button opens the panel
                  through :focus-within, so the wrapper stays non-focusable
                  and every interactive target remains a real button. -->
-            <span class="p-saved-panel" role="group" aria-label={savedLabel}>
-              <span class="p-saved-head">Saved in</span>
-              {#each nowSaved.refs as ref (ref.id)}
-                <button
-                  class="p-saved-row"
-                  title="Open {ref.name}"
-                  onclick={() => openSaved(ref.id)}
-                >{ref.name}</button>
-              {/each}
+            <span class="p-saved-panel glass-overlay" role="group" aria-label={savedLabel}>
+              <span class="p-saved-scroll" use:scrollbar>
+                <span class="p-saved-head">Saved in</span>
+                {#each nowSaved.refs as ref (ref.id)}
+                  <button
+                    class="p-saved-row"
+                    title="Open {ref.name}"
+                    onclick={() => openSaved(ref.id)}
+                  >{ref.name}</button>
+                {/each}
+              </span>
             </span>
           </span>
         {/if}
@@ -668,7 +676,7 @@
           onCommit={(v) => changeVolume(v, true)}
         />
         {#if volumeError}
-          <span class="p-volume-error" role="status">{volumeError}</span>
+          <span class="p-volume-error glass-overlay" role="status">{volumeError}</span>
         {/if}
       </div>
     </div>
@@ -690,12 +698,9 @@
     width: max-content;
     max-width: 280px;
     padding: var(--s2) var(--s3);
-    border: 1px solid var(--line-2);
-    border-radius: var(--r1);
-    background: var(--bg-2);
-    color: var(--fg-2);
+    border-radius: var(--r2);
+    color: var(--fg-1);
     font-size: var(--t-12);
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
   }
   /* The speed is a control like its neighbours, not a chip among them: the
      same 32px round target, the same bare glyph-weight at rest and the same
@@ -811,23 +816,16 @@
     background: color-mix(in srgb, var(--rose-ink) 82%, #ffffff);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--rose-ink) 22%, transparent);
   }
+  /* Overlay glass (.glass-overlay); the list scrolls inside it, so its
+     overlay bar is laid inside the glass. */
   .p-saved-panel {
     position: absolute;
     bottom: calc(100% + 8px);
     left: -8px;
     z-index: 20;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
     min-width: 200px;
     max-width: 280px;
-    max-height: 232px;
-    overflow-y: auto;
-    padding: var(--s3);
-    border: 1px solid var(--line-2);
-    border-radius: var(--r2);
-    background: var(--bg-2);
-    box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.85), 0 2px 6px rgba(0, 0, 0, 0.5);
+    border-radius: var(--r3);
     opacity: 0;
     visibility: hidden;
     transform: translateY(4px);
@@ -837,9 +835,19 @@
       transform var(--d1) var(--ease),
       visibility var(--d1) var(--ease);
   }
+  .p-saved-scroll {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    max-height: 232px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: var(--s3);
+  }
   /* Invisible bridge across the gap, so the pointer can travel from the
-     mark into the panel without the hover chain breaking mid-way. */
-  .p-saved-panel::before {
+     mark into the panel without the hover chain breaking mid-way. (After,
+     not before: the glass rim is the before.) */
+  .p-saved-panel::after {
     content: "";
     position: absolute;
     top: -8px;
@@ -869,7 +877,7 @@
     padding: 3px 6px;
     margin: 0 -6px;
     border: 0;
-    border-radius: var(--r1);
+    border-radius: var(--r2);
     background: none;
     color: var(--fg-1);
     font: inherit;
@@ -884,7 +892,8 @@
       background var(--d1) var(--ease);
   }
   .p-saved-row:hover {
-    background: var(--bg-3);
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--fg);
   }
   .p-seek-slider {
     position: relative;

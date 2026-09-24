@@ -89,16 +89,16 @@ function paint(m, src, seen = null, distance = undefined) {
     seed: seed++,
     frost: m.frost ?? null,
   });
-  if (stage.width !== m.geo.w || stage.height !== m.geo.h) {
-    stage.width = m.geo.w;
-    stage.height = m.geo.h;
-  }
-  const bitmapOf = (rgba) => {
-    stageCtx.putImageData(new ImageData(rgba, m.geo.w, m.geo.h), 0, 0);
+  const bitmapOf = (rgba, w, h) => {
+    if (stage.width !== w || stage.height !== h) {
+      stage.width = w;
+      stage.height = h;
+    }
+    stageCtx.putImageData(new ImageData(rgba, w, h), 0, 0);
     return stage.transferToImageBitmap();
   };
-  const bitmap = bitmapOf(out.rgba);
-  const frost = out.frost ? bitmapOf(out.frost) : null;
+  const bitmap = bitmapOf(out.rgba, m.geo.w, m.geo.h);
+  const frost = out.frost ? bitmapOf(out.frost, out.frostW, out.frostH) : null;
   const light = !src ? UNKNOWN : seen ? max(seen, out.light) : out.light;
   postMessage(
     {

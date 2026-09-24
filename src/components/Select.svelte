@@ -115,7 +115,7 @@
   </button>
 
   {#if open}
-    <ul class="sel-list" id="{id}-list" role="listbox" aria-label={label || undefined}>
+    <ul class="sel-list glass-overlay" id="{id}-list" role="listbox" aria-label={label || undefined}>
       {#each options as option, i (option.value)}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <li

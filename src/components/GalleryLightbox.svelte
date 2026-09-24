@@ -127,14 +127,14 @@
   </figure>
 
   {#if total > 1}
-    <button class="shot-step prev" title="Previous picture" aria-label="Previous picture" onclick={() => step(-1)}>
+    <button class="shot-step prev glass-plate" title="Previous picture" aria-label="Previous picture" onclick={() => step(-1)}>
       <Icon name="back" size={18} />
     </button>
-    <button class="shot-step next" title="Next picture" aria-label="Next picture" onclick={() => step(1)}>
+    <button class="shot-step next glass-plate" title="Next picture" aria-label="Next picture" onclick={() => step(1)}>
       <Icon name="fwd" size={18} />
     </button>
   {/if}
-  <button class="shot-close" title="Close" aria-label="Close picture" onclick={() => onClose?.()}>
+  <button class="shot-close glass-plate" title="Close" aria-label="Close picture" onclick={() => onClose?.()}>
     <Icon name="x" size={16} />
   </button>
 </dialog>
@@ -205,16 +205,21 @@
 
   /* The steppers sit against the window edges rather than under the picture,
      because the picture's own edges move with every step and a control that
-     moves between clicks walks out from under the cursor. */
+     moves between clicks walks out from under the cursor. They are glass
+     plates (.glass-plate, in the markup), like the controls over the Canvas,
+     and light from inside under the pointer. */
   .shot-step, .shot-close {
     position: absolute;
     display: grid; place-items: center;
     border-radius: var(--rf); color: var(--fg-1);
-    background: color-mix(in srgb, var(--bg-2) 82%, transparent);
-    box-shadow: var(--ring);
-    transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+    transition: color var(--d1) var(--ease);
   }
-  .shot-step:hover, .shot-close:hover { color: var(--fg); background: var(--bg-3); }
+  .shot-step::after, .shot-close::after {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background: rgba(255, 255, 255, 0); transition: background-color var(--d1) var(--ease);
+  }
+  .shot-step:hover, .shot-close:hover { color: var(--fg); }
+  .shot-step:hover::after, .shot-close:hover::after { background: rgba(255, 255, 255, 0.1); }
   .shot-step { top: 50%; width: 44px; height: 44px; transform: translateY(-50%); }
   .shot-step.prev { left: var(--s5); }
   .shot-step.next { right: var(--s5); }

@@ -174,7 +174,7 @@
     <span class="rail-knob" style:--p={p}></span>
     <span
       id={tooltipId}
-      class="seek-tip"
+      class="seek-tip glass-overlay"
       class:visible={hover !== null}
       style:--tip-x="{hoverP * 100}%"
       role="tooltip"
