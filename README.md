@@ -11,9 +11,9 @@ because you need your PC to be as silent as possible — every time I started a
 song in the normal Spotify app it would spin my fans and distract me.
 
 <p align="center">
-  <img src="docs/library.png" alt="A playlist open in Renderer" width="900">
+  <img src="docs/library.png" alt="Playlist with album artwork in the Now Playing sidebar" width="900">
   <br><br>
-  <img src="docs/now-playing.png" alt="The now playing panel" width="900">
+  <img src="docs/now-playing.png" alt="Playlist with video Canvas in the Now Playing sidebar" width="900">
 </p>
 
 ## Install
