@@ -25,6 +25,7 @@
   import Ambient from "./components/Ambient.svelte";
   import { scrollbar } from "./lib/scrollbar.js";
   import { frost } from "./lib/ambient.svelte.js";
+  import { vuMeterStyle } from "./lib/vu-meter.js";
   import LibraryView from "./views/LibraryView.svelte";
   import MadeForYouView from "./views/MadeForYouView.svelte";
   import LikedSongsView from "./views/LikedSongsView.svelte";
@@ -324,6 +325,11 @@
     };
   });
 </script>
+
+<svelte:head>
+  <!-- The VU meter's keyframes, baked at 60 a second (lib/vu-meter.js). -->
+  {@html `<style>${vuMeterStyle()}</style>`}
+</svelte:head>
 
 <IconSprite />
 <Ambient />

@@ -9,7 +9,6 @@
     loadTrackCredits,
     api,
     appSettings,
-    nowSaved,
   } from "../lib/state.svelte.js";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
@@ -24,9 +23,6 @@
   );
   const next = $derived(playback.queue[playback.upcoming?.[0]] ?? null);
   const playCountFormatter = new Intl.NumberFormat();
-  /* State, not an action: the engine has no write path for Liked Songs, so
-     this is the app's rose mark and never a toggle. */
-  const liked = $derived(nowSaved.refs.some((ref) => ref.id === "liked"));
 
   /* ---- The picture -----------------------------------------------------
      One layout. The picture is the Canvas when this record has one and it
@@ -522,22 +518,15 @@
 </aside>
 
 {#snippet identity()}
-  <div class="np-title-row">
-    <h2>
-      {#if current.album_id}
-        <span class="np-title-link" role="link" tabindex="0" title="Go to album" onclick={openAlbum} onkeydown={openAlbum}
-          >{current.name}</span
-        >
-      {:else}
-        {current.name}
-      {/if}
-    </h2>
-    {#if liked}
-      <span class="np-liked" role="img" aria-label="In Liked Songs" title="In Liked Songs">
-        <Icon name="heart-filled" size={21} />
-      </span>
+  <h2 class="np-title">
+    {#if current.album_id}
+      <span class="np-title-link" role="link" tabindex="0" title="Go to album" onclick={openAlbum} onkeydown={openAlbum}
+        >{current.name}</span
+      >
+    {:else}
+      {current.name}
     {/if}
-  </div>
+  </h2>
   <ArtistLinks
     class="np-artists"
     names={current.artist_names}

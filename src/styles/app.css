@@ -975,9 +975,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 /* ---- Identity ----------------------------------------------------------- */
 .np-hero-copy { position: relative; flex: none; }
-.np-title-row { display: flex; align-items: flex-start; gap: var(--s3); min-width: 0; }
-.np-title-row h2 {
-  flex: 1; min-width: 0;
+.np-title {
   font-family: var(--font-display);
   font-size: clamp(24px, 1.2vw + 14px, 34px); font-weight: var(--w-bold);
   letter-spacing: -0.024em; line-height: 1.1; overflow-wrap: anywhere;
@@ -987,15 +985,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    with their step up to full white. */
 .np-title-link { cursor: pointer; }
 .np-panel .np-artists .artist-link:hover { text-decoration: none; }
-/* The liked mark: the app's rose heart, as a fact about this track. There is
-   no write path for Liked Songs, so it is never offered as a toggle — and
-   when the track is not liked there is nothing here at all. */
-.np-liked {
-  display: grid; place-items: center; flex: none;
-  height: 1.1em; font-size: clamp(24px, 1.2vw + 14px, 34px);
-  color: var(--rose);
-}
-.np-liked svg { filter: drop-shadow(0 1px 5px rgb(0 0 0 / calc(0.25 + var(--np-shade, 0.5) * 0.4))); }
 /* Artists wrap to two lines rather than ellipsing at one: on a track with
    four credited artists the names are the point, not an overflow problem. */
 .np-artists {
@@ -1015,7 +1004,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    shadow — a tight one that draws the edge and a wide one that settles the
    word — and both scale with the light measured under the copy, so a dark
    Canvas keeps almost nothing and a white one gets what it needs. */
-.np-title-row h2 {
+.np-title {
   text-shadow:
     0 1px 2px rgb(0 0 0 / calc(0.18 + var(--np-shade, 1) * 0.5)),
     0 0 4px rgb(0 0 0 / calc(var(--np-shade, 1) * 0.42)),
@@ -1858,38 +1847,25 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .tl-row.current:hover .eq { display: none; }
 
 /* VU meter: 4 bars animating scaleY only, so each one is a compositor
-   animation and the main thread does nothing at all while they run. That is
-   what makes a *smooth* curve affordable here — the earlier steps(1, end) was
-   throttling commits that never had to reach the main thread in the first
-   place. Idle cost is protected by not running at all (see below) rather than
-   by running badly. */
+   animation and the main thread does nothing at all while they run. Their
+   keyframes are baked at 60 a second (lib/vu-meter.js, with each bar's
+   name, duration and delay), held by step-end, so the compositor draws the
+   window 60 times a second for them rather than at the display's rate.
+   Idle cost is protected by not running at all (see below) rather than by
+   running badly. */
 .eq { align-items: flex-end; gap: 2px; height: 13px; flex: none; }
 .eq i {
   width: 2px; height: 100%; flex: none; background: var(--accent); border-radius: 1px;
   transform-origin: bottom; transform: scaleY(0.3);
-  animation: eq 1.59s ease-in-out infinite;
+  animation-timing-function: step-end;
+  animation-iteration-count: infinite;
   /* Paused unless the app says otherwise: a paused track or an unfocused
      window must cost zero commits. `.anim-paused` is set in App.svelte. */
   animation-play-state: paused;
 }
-/* About two-thirds of the former cadence, with phase offsets scaled in step so
-   the four bars still avoid visibly re-syncing into a single pulse. */
-.eq i:nth-child(1) { animation-duration: 1.59s; animation-delay: -0.30s; }
-.eq i:nth-child(2) { animation-duration: 1.30s; animation-delay: -0.53s; }
-.eq i:nth-child(3) { animation-duration: 1.86s; animation-delay: -1.09s; }
-.eq i:nth-child(4) { animation-duration: 1.44s; animation-delay: -0.27s; }
 .app:not(.anim-paused) .eq i { animation-play-state: running; }
-@keyframes eq {
-  0%   { transform: scaleY(0.28); }
-  20%  { transform: scaleY(0.90); }
-  35%  { transform: scaleY(0.45); }
-  50%  { transform: scaleY(1.00); }
-  65%  { transform: scaleY(0.38); }
-  80%  { transform: scaleY(0.72); }
-  100% { transform: scaleY(0.28); }
-}
 @media (prefers-reduced-motion: reduce) {
-  .eq i, .app:not(.anim-paused) .eq i { animation: none; transform: scaleY(0.7); }
+  .eq i { transform: scaleY(0.7); }
 }
 
 .c-art { width: 36px; height: 36px; --tile: 36px; }

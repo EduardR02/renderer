@@ -10,7 +10,6 @@
   const ALIASES = {
     previous: "prev",
     forward: "fwd",
-    "heart-filled": "heart-f",
     volume: "vol",
   };
 

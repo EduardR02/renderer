@@ -2,9 +2,10 @@
    THE HAZE — what the panels and the layer share
 
    The layer (Ambient.svelte) renders the haze in a worker, rarely, and
-   shows it with a compositor crossfade: still at rest, about a second's
-   crossfade on a change of record, and no work at all in between. The
-   arithmetic lives in haze.js.
+   shows it with a compositor crossfade: still at rest, a crossfade with
+   the art's own on a change of record, and no work at all in between. The
+   arithmetic lives in haze.js, drawn by the GPU (haze-gl.js) or, where
+   there is no WebGL2, by the CPU.
 
    The haze is the record's own picture seen through a light lens (haze.js,
    the "A light" pipeline): the source read at PROBE pixels, graded against

@@ -19,6 +19,11 @@
      rate with no script and no canvas work per frame. At rest nothing runs
      at all: no sampling, no worker, no uploads, a static backdrop.
 
+     A change of record is one change with the art: the worker draws on the
+     GPU in a few milliseconds, the picture is asked for as soon as the new
+     cover (or Canvas) is there — which is when the art changes too — and it
+     crossfades as the panel's picture does.
+
      A playing Canvas's first loop is looked at a few more times, about a
      second apart, and then never again: the type's light is the brightest
      the loop gets, and if the frame the haze was made of turns out to be
@@ -32,11 +37,13 @@
      moves; the twin fades with its haze as one layer.
      ===================================================================== */
 
-  /** Crossfades: a new record arrives quickly, a layout change a touch
-      slower, and the loop's settling is not meant to be watched. */
+  /** Crossfades: a new record with the art, on the panel's own crossfade
+      of its picture (app.css, .np-video and .np-art: 600ms var(--ease));
+      a layout change a touch slower; and the loop's settling is not meant
+      to be watched. */
   const FADES = {
     first: { ms: 1600, easing: "cubic-bezier(0.4, 0, 0.2, 1)" },
-    track: { ms: 1000, easing: "cubic-bezier(0.4, 0, 0.2, 1)" },
+    track: { ms: 600, easing: "cubic-bezier(0.2, 0, 0, 1)" },
     layout: { ms: 900, easing: "cubic-bezier(0.4, 0, 0.2, 1)" },
     settle: { ms: 10000, easing: "cubic-bezier(0.45, 0, 0.55, 1)" },
   };
@@ -54,6 +61,9 @@
   /** The first loop is sampled at most this many times over at most this long. */
   const PASS_SAMPLES = 10;
   const PASS_MAX_MS = 12000;
+  /** The harness can have the haze drawn on the CPU, the fallback, to check
+      it: dev/ui-harness.html?real&haze=cpu. */
+  const CPU_ONLY = Boolean(import.meta.env?.DEV) && new URLSearchParams(location.search).get("haze") === "cpu";
 
   const current = $derived(
     playback.current_index >= 0 ? (playback.queue[playback.current_index] ?? null) : null,
@@ -90,7 +100,7 @@
   });
 
   /** Counters, for the harness to read. Not state: nothing renders them. */
-  const stats = { posts: 0, received: 0, renders: 0, uploads: 0, samples: 0, workerMs: 0, fades: [], settles: [] };
+  const stats = { posts: 0, received: 0, renders: 0, uploads: 0, samples: 0, workerMs: 0, gpu: null, fades: [], settles: [] };
   if (import.meta.env?.DEV) {
     window.__haze = stats;
     /* The harness can frost planes that do not wear the action yet. */
@@ -203,6 +213,7 @@
     if (!enabled || !layerEls[0]) return;
     const w = new Worker(new URL("../lib/haze.worker.js", import.meta.url), { type: "module" });
     w.onmessage = ({ data: m }) => receive(m);
+    w.postMessage({ type: "init", cpu: CPU_ONLY });
     worker = w;
     return () => {
       w.terminate();
@@ -226,6 +237,7 @@
       case "haze": {
         stats.renders++;
         stats.workerMs += m.ms;
+        stats.gpu = m.gpu;
         if (m.distance !== undefined) stats.settles.push(+m.distance.toFixed(3));
         if (m.seq !== seq) {
           m.bitmap.close();
@@ -356,9 +368,10 @@
   }
 
   /* Everything the picture depends on. A discrete change — the record, the
-     source, the layout's shape, the colour — is answered at once; the
-     continuous ones (a window being resized, the panel's edge moving with
-     it) wait until they stop. */
+     source, the layout's shape, the colour — is answered at once, in the
+     next task, once whatever changed with it has landed; the continuous
+     ones (a window being resized, the panel's edge moving with it) wait
+     until they stop. */
   $effect(() => {
     const deps = [
       worker,
@@ -389,7 +402,7 @@
       }
       armPass();
       const discrete = [deps[1], deps[2], deps[3], deps[4] == null, deps[5] == null, deps[6], deps[7], deps[9]].join("|");
-      schedule(discrete !== lastDiscrete ? 60 : 250);
+      schedule(discrete !== lastDiscrete ? 0 : 250);
       lastDiscrete = discrete;
     });
   });

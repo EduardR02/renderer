@@ -9,7 +9,13 @@
    no loop: every message in is one piece of work, and there are only a
    handful per track.
 
+   The picture is drawn by the GPU (haze-gl.js), in a few milliseconds, so
+   the crossfade can start with the art that changed. The CPU's renderer
+   (haze.js) draws it instead where WebGL2 cannot be had, while a lost
+   context has not come back, or when the page asks for it (`init`).
+
    Messages in:
+     init   { cpu }  whether to draw on the CPU only; before any render
      render { seq, key, fade, source?, video?, allowBlank?, geo, tint, scale, frost }
             render the haze for `key`, and its frosted twin when `frost`
             (parseFrost) is given. `source` (a VideoFrame or an
@@ -22,7 +28,7 @@
             the loop has been seen: if its representative frame is a
             different picture from the one the haze was made of, render it.
    Messages out (seq, key and fade are echoed):
-     haze   { seq, key, fade, bitmap, frost, grey, light, distance?, ms }
+     haze   { seq, key, fade, bitmap, frost, grey, light, distance?, gpu, ms }
                                                      a picture to show
      blank  { seq }                                  that frame was black
      light  { key, light }                           the type's light
@@ -41,6 +47,7 @@ import {
   PROBE,
   SETTLE_DISTANCE,
 } from "./haze.js";
+import { createGlHaze } from "./haze-gl.js";
 
 /* Downscale on the GPU, read through a CPU canvas: drawing a video frame
    straight into a CPU canvas would pull all 720x1280 pixels across. */
@@ -51,6 +58,8 @@ const read = new OffscreenCanvas(PROBE, PROBE).getContext("2d", { willReadFreque
 const stage = new OffscreenCanvas(1, 1);
 const stageCtx = stage.getContext("2d");
 
+/** The GPU's renderer; null until `init`, false where there is none. */
+let gpu = null;
 /** The kept source: { key, src } — src null when it could not be read. */
 let kept = null;
 /** A playing Canvas's first loop: { key, frames: [src], light }. */
@@ -80,15 +89,9 @@ const max = (a, b) => ({ top: Math.max(a.top, b.top), bottom: Math.max(a.bottom,
 /** An unreadable picture: the type must assume the worst. */
 const UNKNOWN = { top: 1, bottom: 1 };
 
-/** Render and hand over a picture. `seen` is the light already measured on
-    other frames of the same loop, which the type must also clear. */
-function paint(m, src, seen = null, distance = undefined) {
-  const t0 = performance.now();
-  const out = renderHaze(src ?? solidSource(m.tint), m.geo, m.tint, {
-    scale: m.scale,
-    seed: seed++,
-    frost: m.frost ?? null,
-  });
+/** The haze on the CPU, as bitmaps. */
+function renderOnCpu(src, m, options) {
+  const out = renderHaze(src, m.geo, m.tint, options);
   const bitmapOf = (rgba, w, h) => {
     if (stage.width !== w || stage.height !== h) {
       stage.width = w;
@@ -97,8 +100,35 @@ function paint(m, src, seen = null, distance = undefined) {
     stageCtx.putImageData(new ImageData(rgba, w, h), 0, 0);
     return stage.transferToImageBitmap();
   };
-  const bitmap = bitmapOf(out.rgba, m.geo.w, m.geo.h);
-  const frost = out.frost ? bitmapOf(out.frost, out.frostW, out.frostH) : null;
+  return {
+    bitmap: bitmapOf(out.rgba, m.geo.w, m.geo.h),
+    frost: out.frost ? bitmapOf(out.frost, out.frostW, out.frostH) : null,
+    grey: out.grey,
+    light: out.light,
+  };
+}
+
+/** The haze on the GPU, or null when it cannot draw it now. A renderer
+    that fails is not asked again. */
+function renderOnGpu(src, m, options) {
+  if (!gpu) return null;
+  try {
+    return gpu.render(src, m.geo, m.tint, options);
+  } catch (error) {
+    console.warn("haze: the GPU renderer failed; drawing on the CPU from now on.", error);
+    gpu = false;
+    return null;
+  }
+}
+
+/** Render and hand over a picture. `seen` is the light already measured on
+    other frames of the same loop, which the type must also clear. */
+function paint(m, src, seen = null, distance = undefined) {
+  const t0 = performance.now();
+  const source = src ?? solidSource(m.tint);
+  const options = { scale: m.scale, seed: seed++, frost: m.frost ?? null };
+  const drawn = renderOnGpu(source, m, options);
+  const out = drawn ?? renderOnCpu(source, m, options);
   const light = !src ? UNKNOWN : seen ? max(seen, out.light) : out.light;
   postMessage(
     {
@@ -106,19 +136,33 @@ function paint(m, src, seen = null, distance = undefined) {
       seq: m.seq,
       key: m.key,
       fade: m.fade,
-      bitmap,
-      frost,
+      bitmap: out.bitmap,
+      frost: out.frost,
       grey: out.grey,
       light,
       distance,
+      gpu: Boolean(drawn),
       ms: performance.now() - t0,
     },
-    frost ? [bitmap, frost] : [bitmap],
+    out.frost ? [out.bitmap, out.frost] : [out.bitmap],
   );
 }
 
 onmessage = ({ data: m }) => {
   switch (m.type) {
+    case "init": {
+      if (m.cpu) {
+        gpu = false;
+        break;
+      }
+      try {
+        gpu = createGlHaze() ?? false;
+      } catch (error) {
+        console.warn("haze: no GPU renderer; drawing on the CPU.", error);
+        gpu = false;
+      }
+      break;
+    }
     case "render": {
       if (m.source !== undefined) {
         const src = m.source ? readSource(m.source) : null;
