@@ -1,0 +1,12 @@
+{
+  "identifier": "com.renderer.client",
+  "bundle": {
+    "targets": ["app"],
+    "resources": {
+      "../target/release/PlaybackEngine": "PlaybackEngine"
+    },
+    "macOS": {
+      "minimumSystemVersion": "14.0"
+    }
+  }
+}

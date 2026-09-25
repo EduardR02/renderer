@@ -1,0 +1,72 @@
+name: macOS build
+
+on:
+  push:
+    branches: [main, macos-port]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Test frontend
+        run: bun test
+      - name: Test engine and shell
+        run: |
+          cargo build -p renderer-engine
+          cargo test -p renderer-engine
+          cargo test -p renderer
+      - name: Build macOS app
+        run: bun tauri build
+      - name: Verify and sign app
+        run: |
+          app=target/release/bundle/macos/renderer.app
+          test -d "$app"
+          test -x "$app/Contents/Resources/PlaybackEngine"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.renderer.client
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 14.0
+          codesign --force --sign - "$app/Contents/Resources/PlaybackEngine"
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+      - name: Smoke-launch the app and bundled engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=target/release/bundle/macos/renderer.app
+          log="$HOME/Library/Application Support/SpotifyRenderer/logs/renderer.log"
+          "$app/Contents/MacOS/renderer" > runner-app.log 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..20}; do
+            if test -f "$log" && grep -q 'engine spawned (pid' "$log"; then
+              exit 0
+            fi
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              cat runner-app.log
+              test ! -f "$log" || cat "$log"
+              exit 1
+            fi
+            sleep 1
+          done
+          cat runner-app.log
+          test ! -f "$log" || cat "$log"
+          exit 1
+      - name: Archive app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent target/release/bundle/macos/renderer.app renderer-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renderer-macos-adhoc-${{ runner.arch }}
+          path: renderer-macos.zip
+          if-no-files-found: error
+          retention-days: 14

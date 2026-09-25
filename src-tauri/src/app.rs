@@ -324,19 +324,28 @@ pub struct PlaylistTracksEntry {
 // Data directory
 // ---------------------------------------------------------------------------
 
-/// `%LOCALAPPDATA%\SpotifyRenderer` (with a sane fallback when the variable
-/// is unset). All caches and the engine state dir live under here.
+/// Keeps the existing Windows data directory; macOS uses the user's
+/// Application Support directory so the library and playback state survive
+/// restarts instead of landing in the temporary-directory fallback.
 pub fn data_dir() -> PathBuf {
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local).join("SpotifyRenderer");
+    #[cfg(target_os = "macos")]
+    {
+        return PathBuf::from(std::env::var_os("HOME").expect("macOS home directory unavailable"))
+            .join("Library/Application Support/SpotifyRenderer");
     }
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(profile)
-            .join("AppData")
-            .join("Local")
-            .join("SpotifyRenderer");
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local).join("SpotifyRenderer");
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(profile)
+                .join("AppData")
+                .join("Local")
+                .join("SpotifyRenderer");
+        }
+        std::env::temp_dir().join("SpotifyRenderer")
     }
-    std::env::temp_dir().join("SpotifyRenderer")
 }
 
 fn settings_path() -> PathBuf {

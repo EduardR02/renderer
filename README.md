@@ -1,8 +1,9 @@
 # Renderer
 
-A desktop Spotify client for Windows. I built it because the official app used
-more CPU than I want a music player to use. My computer has a liquid-cooled
-Ryzen 9 5950X, and the native desktop app would constantly boost it to 80 °C.
+A desktop Spotify client for Windows and macOS 14 or later. I built it because
+the official app used more CPU than I want a music player to use. My computer
+has a liquid-cooled Ryzen 9 5950X, and the native desktop app would constantly
+boost it to 80 °C.
 WTF? Literal benchmarks that use all cores at max don't go that high. A music
 player is constantly open, and randomly spinning my CPU to absurd temps is
 insane, so I had to make this. It's worse if you have open-back headphones,
@@ -17,11 +18,16 @@ song in the normal Spotify app it would spin my fans and distract me.
 
 ## Install
 
-Grab the setup from [Releases](../../releases) and run it. It's an ordinary
-Windows install wizard, nothing unusual. You need a Spotify Premium account;
-the app opens a Spotify login in your browser on first launch.
+Windows: grab the NSIS setup from [Releases](../../releases) and run it. You need
+a Spotify Premium account; the app opens a Spotify login in your browser on
+first launch.
 
-If you'd rather build it yourself, see [Building](#building).
+macOS 14+: build the `.app` yourself using [Building](#building), or download the
+ad-hoc-signed build from a successful run of the
+[macOS build workflow](../../actions/workflows/macos-build.yml). This is a
+test artifact, not a notarized release installer. Extract `renderer-macos.zip`
+from the workflow artifact before opening `renderer.app`. Only bypass macOS
+Gatekeeper for builds you trust.
 
 ## Not affiliated with Spotify
 
@@ -72,7 +78,9 @@ This isn't meant to replace the Spotify app. It's a daily player, with enough
 discovery in it that you don't have to leave for that, but there will be things
 you occasionally need the real app for.
 
-Windows only, and you need Spotify Premium.
+Windows and macOS 14 or later only, and you need Spotify Premium. The macOS
+build has to be verified on a Mac; CI can compile and test it, but cannot verify
+audio devices, window appearance or GPU rendering on your machine.
 
 No lossless. Spotify has it and the official app plays it, but this client isn't
 offered it — the track metadata we get back lists AAC 24 and Ogg Vorbis
@@ -93,22 +101,43 @@ to them. I don't use it.
 
 ## Building
 
-You need [Rust](https://rustup.rs) and [Bun](https://bun.sh). Cargo compiles
-every dependency from source, so the build directory ends up several GB; it's
-all generated, and `cargo clean` takes it back.
+You need [Rust](https://rustup.rs) and [Bun](https://bun.sh). Build on the OS
+you intend to run (Windows for NSIS, macOS for `.app`); Cargo compiles every
+dependency from source, so the build directory ends up several GB. On macOS,
+install Xcode Command Line Tools (`xcode-select --install`) and use macOS 14
+or later: the ambient haze uses WebKit worker OffscreenCanvas WebGL, which
+needs macOS 14+. Both Intel and Apple Silicon builds use the host architecture.
 
 ```bash
 bun install
-bun run build:engine
 bun tauri build
 ```
 
-`bun tauri dev` for development. Checks are `cargo test -p renderer-engine`,
-`cargo test -p renderer`, and `bun run build`.
+Tauri's `beforeBuildCommand` runs `bun run build` and
+`bun run build:engine` (which runs `cargo build --release -p renderer-engine`).
+The workspace engine ends up at `target/release/PlaybackEngine.exe` on Windows
+or `target/release/PlaybackEngine` on macOS. Tauri packages that executable as
+`PlaybackEngine.exe` in the NSIS installer or as
+`renderer.app/Contents/Resources/PlaybackEngine` in the Mac app. Outputs are
+`target/release/bundle/nsis/` and `target/release/bundle/macos/renderer.app`.
+`bun tauri dev` starts the frontend development server; build the engine first
+with `bun run build:engine` if you have not already built it. Checks are
+`cargo test -p renderer-engine`, `cargo test -p renderer`, `bun test`, and
+`bun run build`.
 
-Credentials go to Spotify, never through this app. What's stored locally is the
-token they hand back, under `%LOCALAPPDATA%\SpotifyRenderer` along with the audio
-cache, covers and history.
+The [manual macOS build workflow](../../actions/workflows/macos-build.yml)
+(`Actions` → `macOS build` → `Run workflow`, or
+`gh workflow run macos-build.yml`) runs the tests and the same Tauri build
+on Apple Silicon and Intel macOS 15 runners. Choose the artifact matching your
+Mac's architecture. Each `renderer-macos-adhoc-*` artifact contains a
+`renderer-macos.zip` archive of the ad-hoc-signed `.app` for launch testing,
+not a DMG or a release. Ad-hoc signing is not Apple Developer ID signing;
+distribution to other users requires a proper Developer ID signature and
+Apple notarization. Without those, Gatekeeper may block the app.
+
+Credentials go to Spotify, never through this app. The token, audio cache,
+covers and history stay under `%LOCALAPPDATA%\SpotifyRenderer` on Windows or
+`~/Library/Application Support/SpotifyRenderer` on macOS.
 
 ## How it works
 

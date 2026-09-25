@@ -404,6 +404,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    edge, in view only while scrolling or while the pointer is near it.
    ===================================================================== */
 * { scrollbar-width: none; }
+/* Safari before 18.2 ignores scrollbar-width; hide its native bar as well. */
+*::-webkit-scrollbar { display: none; }
 .sb {
   position: absolute; z-index: 35; width: 12px;
   pointer-events: none;

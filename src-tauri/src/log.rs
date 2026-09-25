@@ -3,10 +3,10 @@
 //! The app previously logged nowhere: engine lifecycle events (spawn, exit,
 //! ready, error, retry) and library failures went to stderr, which is
 //! invisible in a GUI launch. This module appends timestamped lines to
-//! `%LOCALAPPDATA%\SpotifyRenderer\logs\renderer.log` with plain
-//! `std::fs` — no dependencies, no async, safe to call from the engine
-//! reader thread. Timestamps are UTC, matching the engine's own log
-//! (`playback_engine.log`), so the two files line up for diagnosis.
+//! `app::logs_dir()/renderer.log` with plain `std::fs` — no dependencies, no
+//! async, safe to call from the engine reader thread. Timestamps are UTC,
+//! matching the engine's own log (`playback_engine.log`), so the two files
+//! line up for diagnosis.
 
 use std::fs::OpenOptions;
 use std::io::Write;

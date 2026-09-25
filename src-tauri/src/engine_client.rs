@@ -76,6 +76,12 @@ const ENGINE_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
+const ENGINE_BINARY: &str = if cfg!(windows) {
+    "PlaybackEngine.exe"
+} else {
+    "PlaybackEngine"
+};
+
 /// One engine reply (any non-`state`/`position` line). `data` carries the
 /// payload of `browse_*`/`edit_*` responses; plain `response` lines leave
 /// it `None`.
@@ -834,9 +840,8 @@ impl EngineClient {
     /// Spawns the engine process and its reader thread. Only called when no
     /// process is currently running.
     fn spawn_engine(self: &Arc<Self>) -> Result<(), String> {
-        let exe = locate_engine().ok_or_else(|| {
-            "PlaybackEngine.exe not found (set SPOTIFY_ENGINE_PATH)".to_owned()
-        })?;
+        let exe = locate_engine()
+            .ok_or_else(|| format!("{ENGINE_BINARY} not found (set SPOTIFY_ENGINE_PATH)"))?;
         std::fs::create_dir_all(&self.state_dir)
             .map_err(|error| format!("could not create engine state dir: {error}"))?;
         // The engine's diagnostics live in the same file the panic hook
@@ -2206,8 +2211,8 @@ fn parse_data<T: serde::de::DeserializeOwned>(reply: EngineReply, kind: &str) ->
     serde_json::from_value(data).map_err(|error| format!("unexpected {kind} payload: {error}"))
 }
 
-/// Locates the engine executable: `SPOTIFY_ENGINE_PATH`, a sibling of the
-/// app executable, or the repository's release build.
+/// Locates the engine executable: `SPOTIFY_ENGINE_PATH`, the app's bundled
+/// resource (or Windows sibling), or the workspace's release build.
 fn locate_engine() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("SPOTIFY_ENGINE_PATH") {
         let path = PathBuf::from(path);
@@ -2216,18 +2221,22 @@ fn locate_engine() -> Option<PathBuf> {
         }
     }
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    // Bundled next to the app executable.
-    let sibling = exe_dir.join("PlaybackEngine.exe");
+    // macOS resources live in <app>.app/Contents/Resources, while the app
+    // executable lives in Contents/MacOS. Keep the engine in the signed bundle.
+    #[cfg(target_os = "macos")]
+    {
+        let bundled = exe_dir.parent()?.join("Resources").join(ENGINE_BINARY);
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    let sibling = exe_dir.join(ENGINE_BINARY);
     if sibling.is_file() {
         return Some(sibling);
     }
-    // Workspace builds use the same target directory as the bundler resource:
-    // <repo>/target/release/PlaybackEngine.exe. Do not fall back to an
-    // engine-local target tree; that would create a second artifact contract.
-    let workspace_release = exe_dir
-        .parent()?
-        .join("release")
-        .join("PlaybackEngine.exe");
+    // In development the shell runs from target/debug, but the bundler builds
+    // its engine resource into the shared workspace target/release directory.
+    let workspace_release = exe_dir.parent()?.join("release").join(ENGINE_BINARY);
     workspace_release.is_file().then_some(workspace_release)
 }
 
@@ -3521,20 +3530,16 @@ mod tests {
         }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         for candidate in [
-            root.join("target")
-                .join("debug")
-                .join("PlaybackEngine.exe"),
-            root.join("target")
-                .join("release")
-                .join("PlaybackEngine.exe"),
+            root.join("target").join("debug").join(ENGINE_BINARY),
+            root.join("target").join("release").join(ENGINE_BINARY),
             root.join("engine")
                 .join("target")
                 .join("debug")
-                .join("PlaybackEngine.exe"),
+                .join(ENGINE_BINARY),
             root.join("engine")
                 .join("target")
                 .join("release")
-                .join("PlaybackEngine.exe"),
+                .join(ENGINE_BINARY),
         ] {
             if candidate.is_file() {
                 return Some(candidate);
@@ -3550,7 +3555,7 @@ mod tests {
     async fn engine_client_round_trips_over_the_line_protocol() {
         let Some(exe) = find_engine() else {
             eprintln!(
-                "skipping: PlaybackEngine.exe is not built \
+                "skipping: {ENGINE_BINARY} is not built \
                  (run `cargo build -p renderer-engine`)"
             );
             return;

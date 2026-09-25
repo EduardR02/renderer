@@ -1,16 +1,9 @@
-//! Windows media-key integration: System Media Transport Controls (SMTC).
+//! System media controls for Windows and macOS.
 //!
-//! Registers the main window as a media source so hardware play/pause/next/
-//! previous keys control playback while the app is unfocused — the same
-//! contract Chrome and Spotify fulfill. Registration also surfaces the
-//! session in Quick Settings and on the lock screen; whether Windows draws
-//! any overlay is its own decision and none of ours.
-//!
-//! Shape: one dedicated thread owns the `MediaControls` (the COM object
-//! behind SMTC is happiest single-threaded), fed by a channel from the state
-//! consumer. Button presses arrive on a system thread inside the attached
-//! callback and are forwarded to the engine client as spawned async tasks.
-
+//! A dedicated thread owns the `MediaControls`, fed by a channel from the state
+//! consumer. Windows attaches SMTC to the main HWND; macOS attaches to the
+//! application event loop without a window handle. Button presses are
+//! forwarded to the engine client as spawned async tasks.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,17 +49,13 @@ enum Update {
     Stopped,
 }
 
-/// Attaches SMTC to the main window and starts the update thread. Failures
-/// are warnings, never fatal: a player without media keys still plays.
-pub fn init(client: Arc<EngineClient>, hwnd: *mut std::ffi::c_void) {
-    // A window handle is pointer-sized by definition; `usize` is its Send-able
-    // suitcase for the thread hop. Converted before the closure so the raw
-    // pointer itself is never captured.
-    let hwnd = hwnd as usize;
+/// Attaches system media controls. Failures are warnings, never fatal: a
+/// player without media keys still plays.
+pub fn init(client: Arc<EngineClient>, hwnd: Option<usize>) {
     let (sender, receiver) = channel::<Update>();
 
     let result = std::thread::Builder::new()
-        .name("smtc".to_owned())
+        .name("media-controls".to_owned())
         .spawn(move || run_controls(client, hwnd, sender, receiver));
     if let Err(error) = result {
         log::warn(&format!("could not start the media-key thread: {error}"));
@@ -75,14 +64,14 @@ pub fn init(client: Arc<EngineClient>, hwnd: *mut std::ffi::c_void) {
 
 fn run_controls(
     client: Arc<EngineClient>,
-    hwnd: usize,
+    hwnd: Option<usize>,
     sender: Sender<Update>,
     receiver: std::sync::mpsc::Receiver<Update>,
 ) {
     let config = PlatformConfig {
         dbus_name: "renderer",
         display_name: "Renderer",
-        hwnd: Some(hwnd as *mut std::ffi::c_void),
+        hwnd: hwnd.map(|value| value as *mut std::ffi::c_void),
     };
     let mut controls = match MediaControls::new(config) {
         Ok(controls) => controls,
@@ -98,10 +87,12 @@ fn run_controls(
         return;
     }
     #[cfg(windows)]
-    if let Err(error) = disable_unsupported_seek_buttons(hwnd) {
-        log::warn(&format!(
-            "could not disable unsupported fast-forward/rewind controls: {error}"
-        ));
+    if let Some(hwnd) = hwnd {
+        if let Err(error) = disable_unsupported_seek_buttons(hwnd) {
+            log::warn(&format!(
+                "could not disable unsupported fast-forward/rewind controls: {error}"
+            ));
+        }
     }
 
     // Publish the sender before asking for status. Otherwise a fast response
@@ -155,8 +146,10 @@ fn run_controls(
                 PLAYING.store(false, Ordering::Relaxed);
                 last_uri.clear();
                 #[cfg(windows)]
-                if let Err(error) = clear_windows_metadata(hwnd) {
-                    log::warn(&format!("could not clear media metadata: {error}"));
+                if let Some(hwnd) = hwnd {
+                    if let Err(error) = clear_windows_metadata(hwnd) {
+                        log::warn(&format!("could not clear media metadata: {error}"));
+                    }
                 }
                 #[cfg(not(windows))]
                 if let Err(error) = controls.set_metadata(MediaMetadata::default()) {

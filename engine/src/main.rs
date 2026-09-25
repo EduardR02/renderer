@@ -956,9 +956,8 @@ fn parse_arguments(
         }
         index += 2;
     }
-    let state_directory = state_directory.ok_or_else(|| {
-        "usage: PlaybackEngine.exe --state-dir <absolute-app-owned-path>".to_owned()
-    })?;
+    let state_directory = state_directory
+        .ok_or_else(|| "usage: PlaybackEngine --state-dir <absolute-app-owned-path>".to_owned())?;
     Ok((
         state_directory,
         log_file,

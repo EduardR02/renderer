@@ -168,14 +168,20 @@ pub fn run() {
             let supervisor = client.clone();
             tauri::async_runtime::spawn(async move { supervisor.supervise().await });
 
-            // Register the window with Windows' media transport controls so
-            // hardware play/pause/next/previous keys work while unfocused.
+            // Souvlaki needs the native window handle on Windows. On macOS it
+            // attaches to the app's event loop without one.
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(windows)]
                 match window.hwnd() {
-                    Ok(hwnd) => media_keys::init(client.clone(), hwnd.0),
+                    Ok(hwnd) => media_keys::init(client.clone(), Some(hwnd.0 as usize)),
                     Err(error) => log::warn(&format!(
                         "could not get the main window handle for media keys: {error}"
                     )),
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = window;
+                    media_keys::init(client.clone(), None);
                 }
             } else {
                 log::warn("could not find the main window for media keys");

@@ -1,0 +1,23 @@
+{
+  "identifier": "com.renderer.app",
+  "app": {
+    "windows": [
+      {
+        "title": "Renderer",
+        "visible": false,
+        "width": 1200,
+        "height": 800,
+        "minWidth": 940,
+        "minHeight": 560,
+        "backgroundColor": "#121212",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "../target/release/PlaybackEngine.exe": "PlaybackEngine.exe"
+    }
+  }
+}
