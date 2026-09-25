@@ -22,12 +22,11 @@ Windows: grab the NSIS setup from [Releases](../../releases) and run it. You nee
 a Spotify Premium account; the app opens a Spotify login in your browser on
 first launch.
 
-macOS 14+: build the `.app` yourself using [Building](#building), or download the
-ad-hoc-signed build from a successful run of the
-[macOS build workflow](../../actions/workflows/macos-build.yml). This is a
-test artifact, not a notarized release installer. Extract `renderer-macos.zip`
-from the workflow artifact before opening `renderer.app`. Only bypass macOS
-Gatekeeper for builds you trust.
+macOS 14+ on Apple Silicon: download `renderer-macos.zip` from
+[Releases](../../releases), extract `renderer.app`, and open it. You can also
+[build it yourself](#building). The Mac ZIP is ad-hoc signed, not notarized;
+Gatekeeper may require manual approval. Only bypass Gatekeeper for builds you
+trust.
 
 ## Not affiliated with Spotify
 
@@ -125,15 +124,14 @@ with `bun run build:engine` if you have not already built it. Checks are
 `cargo test -p renderer-engine`, `cargo test -p renderer`, `bun test`, and
 `bun run build`.
 
-The [macOS build workflow](../../actions/workflows/macos-build.yml)
-(`Actions` → `macOS build` → `Run workflow`, or
-`gh workflow run macos-build.yml`) runs the tests and Tauri build on an
-Apple Silicon macOS 15 runner. The `renderer-macos-adhoc-ARM64` artifact
-contains a `renderer-macos.zip` archive of the ad-hoc-signed `.app` for
-launch testing on Apple Silicon Macs, not a DMG or a release.
-Ad-hoc signing is not Apple Developer ID signing;
-distribution to other users requires a proper Developer ID signature and
-Apple notarization. Without those, Gatekeeper may block the app.
+The [macOS build workflow](../../actions/workflows/macos-build.yml) runs
+the tests and Tauri build on an Apple Silicon macOS 15 runner when a GitHub
+release is published, then attaches `renderer-macos.zip` to that release.
+A manually dispatched workflow run uploads the
+`renderer-macos-adhoc-ARM64` artifact instead. Apple Developer Program
+membership is not needed to build or upload either ZIP; a Developer ID
+signature and Apple notarization are needed for friction-free Gatekeeper
+installation.
 
 Credentials go to Spotify, never through this app. The token, audio cache,
 covers and history stay under `%LOCALAPPDATA%\SpotifyRenderer` on Windows or
