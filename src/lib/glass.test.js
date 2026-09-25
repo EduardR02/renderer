@@ -79,6 +79,7 @@ test("type on the glass planes keeps its contrast over the brightest haze", () =
   const floor = brightestFrost(frost);
   const sheen = Number(token("--glass-sheen").match(/rgba\(255, 255, 255, ([\d.]+)\)/)[1]);
   const hover = rgba(token("--hover"));
+  const lift = rgba(token("--lift-card"));
   const type = { "--fg": 7, "--fg-2": 4.5, "--fg-3": 3 };
   for (const plane of ["--tint-chrome", "--tint-pane"]) {
     const tint = rgba(token(plane));
@@ -87,6 +88,11 @@ test("type on the glass planes keeps its contrast over the brightest haze", () =
       ["plain", glass],
       ["sheen", over(glass, [1, 1, 1], sheen)],
       ["hovered row", over(over(glass, [1, 1, 1], sheen), hover.rgb, hover.a)],
+      // A card is the plane's glass with light added; the now-playing
+      // album card lights to the hover under the pointer (instead of its
+      // lift).
+      ["card", over(over(glass, lift.rgb, lift.a), [1, 1, 1], sheen)],
+      ["hovered card", over(over(glass, hover.rgb, hover.a), [1, 1, 1], sheen)],
     ]) {
       for (const [name, target] of Object.entries(type)) {
         const c = contrast(hex(token(name)), bg);
@@ -139,70 +145,69 @@ test("a selected row in the rail keeps its contrast over the brightest haze", ()
   }
 });
 
-/* The most luminous tone a record can give an overlay's pools: covertone's
-   palette sets the glow at Oklab L 0.6 with chroma up to 0.14, and the wash
-   at L 0.35 (0.41 on the lifted warm flank) with chroma up to 0.115. Every
-   hue is tried at those bounds, clipped by channel as covertone clips. */
-const toEnc = (y) => Math.min(1, Math.max(0, y <= 0.0031308 ? y * 12.92 : 1.055 * y ** (1 / 2.4) - 0.055));
-function brightestTone(L, C) {
-  let worst = null, wy = -1;
-  for (let deg = 0; deg < 360; deg++) {
-    const h = (deg * Math.PI) / 180, a = C * Math.cos(h), b = C * Math.sin(h);
-    const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
-    const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
-    const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
-    const rgb = [
-      4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
-      -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
-      -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
-    ].map((v) => Math.round(toEnc(v) * 255) / 255);
-    if (Y(rgb) > wy) {
-      wy = Y(rgb);
-      worst = rgb;
-    }
-  }
-  return worst;
-}
-
-test("overlays keep their contrast over a white cover, in their tone pools too", () => {
-  // The worst an overlay can frost is white; frosted, it is its brightness.
-  const frost = parseFrost(token("--frost-overlay"), 1);
-  const white = [1, 1, 1].map((v) => v * frost.brightness);
-  const tint = rgba(token("--tint-overlay"));
-  const base = over(white, tint.rgb, tint.a);
-  // The material as .glass-overlay paints it: the sheen, the glow pooled at
-  // the top left, the wash at the bottom right, over the tint.
-  const body = rule(".glass-overlay").replace(/\s+/g, " ");
-  expect(body).toContain("var(--glass-sheen)");
-  expect(body).toContain("var(--tint-overlay)");
-  const pool = (name) => {
-    const m = body.match(new RegExp(`color-mix\\(in srgb, var\\(${name}\\) ([\\d.]+)%`));
-    if (!m) throw new Error(`no ${name} pool`);
-    return Number(m[1]) / 100;
-  };
-  // The glow is the tone's hue and chroma at a fixed lightness.
-  const g = body.match(/oklch\(from var\(--tone-glow\) ([\d.]+) c h \/ ([\d.]+)\)/);
-  if (!g) throw new Error("no --tone-glow pool");
-  const glow = over(over(base, brightestTone(Number(g[1]), 0.14), Number(g[2])), [1, 1, 1], sheenOf());
-  const washed = over(base, brightestTone(0.41, 0.115), pool("--tone-wash"));
-  // A lit item (menus, the listbox, the saved-in rows) is white 0.08, and its
-  // label goes to --fg.
-  const lit = 0.08;
-  const type = { "--fg": 7, "--fg-2": 4.5, "--fg-3": 3 };
-  for (const [where, bg] of [["centre", base], ["glow pool", glow], ["wash pool", washed]]) {
-    for (const [name, target] of Object.entries(type)) {
+const TYPE = { "--fg": 7, "--fg-2": 4.5, "--fg-3": 3 };
+/** Every grey of the type over each ground, at its target. */
+function holds(surface, grounds) {
+  for (const [where, bg] of grounds) {
+    for (const [name, target] of Object.entries(TYPE)) {
       const c = contrast(hex(token(name)), bg);
-      if (c < target) throw new Error(`${name} on an overlay, ${where}: ${c.toFixed(2)} under ${target}`);
+      if (c < target) throw new Error(`${name} on ${surface}, ${where}: ${c.toFixed(2)} under ${target}`);
       expect(c).toBeGreaterThanOrEqual(target);
     }
+  }
+}
+
+/* Glass over arbitrary content has no ceiling under it: the worst it can
+   frost is white, and white frosted is its brightness() (saturate leaves
+   it white). */
+const frostedWhite = (name) => [1, 1, 1].map((v) => v * parseFrost(token(name), 1).brightness);
+
+test("overlays keep their contrast over a white cover", () => {
+  const tint = rgba(token("--tint-overlay"));
+  const base = over(frostedWhite("--frost-overlay"), tint.rgb, tint.a);
+  // The material as .glass-overlay paints it: the sheen over the tint over
+  // the frost, and nothing else.
+  const body = rule(".glass-overlay").replace(/\s+/g, " ");
+  expect(body).toContain("background: var(--glass-sheen), var(--tint-overlay);");
+  expect(body).toContain("backdrop-filter: var(--frost-overlay);");
+  const sheened = over(base, [1, 1, 1], sheenOf());
+  holds("an overlay", [["centre", base], ["sheen", sheened]]);
+  // A lit item (menus, the speed presets, the listbox, the saved-in rows) is
+  // white 0.08, and its label goes to --fg.
+  const lit = 0.08;
+  for (const [where, bg] of [["centre", base], ["sheen", sheened]]) {
     const c = contrast(hex(token("--fg")), over(bg, [1, 1, 1], lit));
     if (c < 7) throw new Error(`--fg on a lit item, ${where}: ${c.toFixed(2)} under 7`);
     expect(c).toBeGreaterThanOrEqual(7);
   }
 });
 
+test("the now-playing details keep their contrast over a white frame of the Canvas", () => {
+  // Over a cover the details are the pane's glass over the haze, which the
+  // planes' test holds; over a Canvas, the tint over a live frost of the
+  // video.
+  const pane = rule(".np-details::before").replace(/\s+/g, " ");
+  expect(pane).toContain("background: var(--tint-pane);");
+  expect(pane).toContain("backdrop-filter: var(--frost-plane);");
+  const body = rule(".np-panel.video .np-details::before").replace(/\s+/g, " ");
+  expect(body).toContain("background: var(--tint-video);");
+  expect(body).toContain("backdrop-filter: var(--frost-video);");
+  const tint = rgba(token("--tint-video"));
+  const glass = over(frostedWhite("--frost-video"), tint.rgb, tint.a);
+  // The type is on glass cards: their light and the sheen, and the album
+  // card lit to the hover under the pointer.
+  const lift = rgba(token("--lift-card"));
+  const hoverRule = rule(".np-album:hover:not(:disabled)").replace(/\s+/g, " ");
+  expect(hoverRule).toContain("background: var(--glass-sheen), var(--hover);");
+  const hover = rgba(token("--hover"));
+  holds("the details", [
+    ["card", over(over(glass, lift.rgb, lift.a), [1, 1, 1], sheenOf())],
+    ["hovered card", over(over(glass, hover.rgb, hover.a), [1, 1, 1], sheenOf())],
+  ]);
+});
+
 test("a modal sheet keeps its contrast over its own dimmed page", () => {
-  const frost = parseFrost(token("--frost-overlay"), 1);
+  const frost = parseFrost(token("--frost-sheet"), 1);
   const dim = rgba(token("--dim-modal"));
   const page = over([1, 1, 1], dim.rgb, dim.a).map((v) => v * frost.brightness);
   const tint = rgba(token("--tint-sheet"));

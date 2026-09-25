@@ -243,9 +243,13 @@
        .glass-card     a plate raised ON glass: light added, and no frost of
                        its own, because it is already over frosted glass.
        .glass-overlay  menus, popovers, dialogs, tooltips, sheets. Over real
-                       content, so real blur, and dense enough to read over
+                       content, so real blur, and dark enough to read over
                        a white cover.
        .glass-plate    a small control over the Canvas.
+
+     And one surface that is not a class: the now-playing details, which
+     scroll up over the playing Canvas as frosted glass (--frost-video,
+     --tint-video; .np-details::before).
 
      Each is FROST (what is done to what is behind), a thin TINT that evens
      it out, a RIM — a hairline that catches the light at the top left and
@@ -264,9 +268,9 @@
      core. The haze layer draws a frosted twin of the haze instead, with
      exactly --frost-plane's numbers, and shows it clipped to the planes
      that wear `use:frost` (ambient.svelte.js, THE FROST); the plane itself
-     is only its tint, sheen, rim and lift. Strips, overlays and plates keep
-     a live backdrop-filter: what they frost is live content, and they are
-     small.
+     is only its tint, sheen, rim and lift. Strips, overlays, plates and
+     the now-playing details keep a live backdrop-filter: what they frost
+     is live content, the video included.
 
      The planes' frost is light (12px): the haze is the picture itself, seen
      softly, and the glass should show its shapes rather than dissolve them
@@ -278,19 +282,32 @@
      planes — plain, under the sheen, and on a hovered row. Change a number
      here, run it. (The tightest today: --fg-3 at 3.04:1 on a hovered row of
      the chrome.)
+
+     Glass over arbitrary content — a menu, the details over the Canvas —
+     has no ceiling under it: the worst it can frost is white. There the
+     frost's brightness() does the darkening and the tint stays thin, so
+     the glass takes its colour from what is really behind it rather than
+     from paint; glass.test.js holds the type over white frosted by it.
      ===================================================================== */
   --frost-plane:   blur(12px) saturate(1.45) brightness(0.7);
   --frost-strip:   blur(20px) saturate(1.7) brightness(0.9);
-  --frost-overlay: blur(28px) saturate(1.6) brightness(0.7);
+  --frost-overlay: blur(32px) saturate(1.8) brightness(0.24);
+  /* A modal sheet frosts its own dimmed page (--dim-modal), never bare
+     content, so it can be much thinner glass than a menu. */
+  --frost-sheet:   blur(28px) saturate(1.6) brightness(0.7);
+  /* The details over the Canvas: re-frosted every frame of the video. */
+  --frost-video:   blur(32px) saturate(1.6) brightness(0.21);
   /* Small: a plate sits over a playing video and is re-frosted every frame. */
   --frost-plate:   blur(8px) saturate(1.5) brightness(0.72);
   --tint-chrome:   rgb(10 11 14 / 0.36);
   --tint-pane:     rgb(11 12 15 / 0.38);
   --tint-strip:    rgb(13 14 17 / 0.62);
-  --tint-overlay:  rgb(8 9 13 / 0.76);
-  /* A modal sheet frosts its own dimmed page (--dim-modal), never bare
-     content, so it can be much thinner glass than a menu. */
+  /* Light, not shade: the frost has already darkened what is behind, and a
+     thin grey over it is what lifts a menu off the dark pane as a pane of
+     its own rather than a hole in it. */
+  --tint-overlay:  rgb(36 38 44 / 0.22);
   --tint-sheet:    rgb(19 20 24 / 0.5);
+  --tint-video:    rgb(10 11 14 / 0.18);
   --dim-modal:     rgb(4 5 7 / 0.5);
   /* A plate over the Canvas thickens with the brightness under it
      (NowPlayingPanel sets --plate-a); this is its floor. */
@@ -315,7 +332,7 @@
                      rgba(255, 255, 255, 0.08));
   --lift-plane:    0 1px 1px rgba(0, 0, 0, 0.16), 0 16px 40px -22px rgba(0, 0, 0, 0.7);
   --lift-raised:   0 1px 1px rgba(0, 0, 0, 0.14), 0 12px 28px -18px rgba(0, 0, 0, 0.7);
-  --lift-overlay:  0 2px 6px rgba(0, 0, 0, 0.28), 0 28px 64px -20px rgba(0, 0, 0, 0.78);
+  --lift-overlay:  0 2px 6px rgba(0, 0, 0, 0.22), 0 20px 44px -18px rgba(0, 0, 0, 0.66);
 
   /* The now-playing panel is as wide as a 9:16 Canvas is at the window's
      full height — it runs top to bottom — so the video is barely cropped;
@@ -438,26 +455,16 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   background: var(--glass-sheen), var(--lift-card);
   box-shadow: var(--lift-raised);
 }
-/* An overlay floats over the pane, and the pane is dark: the frost of dark
-   content is dark, and a dark sheet with a grey in its tint read as the
-   flat menus the app had before the glass. So its tint carries no grey
-   (--tint-overlay), and it is lit the way the planes are lit by the haze —
-   the page's own colour pooled in two corners, a sheen and a catch of
-   light along the top edge. The pools are held to the calibration where
-   they are strongest, at the corners, over a white cover and the most
-   luminous tone a record can give (glass.test.js). So the glow is laid at
-   a fixed, low lightness with all of the tone's chroma: colour without
-   light. Thin, at the tone's own lightness, the menus read as the flat
-   grey they had been before the glass. */
+/* An overlay is the planes' glass lifted off them: the same sheen and rim,
+   over a frost of whatever it floats on. That can be a white cover, so the
+   frost is a heavy one that darkens as it blurs (--frost-overlay), and its
+   colour is the colour of what is really behind it — the pane, the rows,
+   the haze through them — not a tone painted into it. */
 .glass-overlay {
-  background:
-    var(--glass-sheen),
-    radial-gradient(140% 110% at 0% 0%, oklch(from var(--tone-glow) 0.38 c h / 0.34), transparent 72%),
-    radial-gradient(120% 120% at 100% 100%, color-mix(in srgb, var(--tone-wash) 46%, transparent), transparent 72%),
-    var(--tint-overlay);
+  background: var(--glass-sheen), var(--tint-overlay);
   -webkit-backdrop-filter: var(--frost-overlay);
           backdrop-filter: var(--frost-overlay);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), var(--lift-overlay);
+  box-shadow: var(--lift-overlay);
   color: var(--fg);
 }
 /* A modal overlay is a SHEET: it lies over its own dimmed page, so the
@@ -476,8 +483,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   content: ""; position: absolute; inset: 0; z-index: -1;
   border-radius: inherit; pointer-events: none;
   background: var(--glass-sheen), var(--tint-sheet);
-  -webkit-backdrop-filter: var(--frost-overlay);
-          backdrop-filter: var(--frost-overlay);
+  -webkit-backdrop-filter: var(--frost-sheet);
+          backdrop-filter: var(--frost-sheet);
 }
 .glass-overlay:modal::backdrop { background: var(--dim-modal); }
 .glass-plate {
@@ -600,8 +607,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    and crossfades old into new rather than stretching type, and the two only
    overlap for a moment: a crossfade drawn over the whole motion prints both
    at half strength. */
-::view-transition-old(bar-center), ::view-transition-old(bar-right) { animation-duration: 170ms; }
-::view-transition-new(bar-center), ::view-transition-new(bar-right) { animation-duration: 240ms; animation-delay: 50ms; }
+::view-transition-old(bar-now), ::view-transition-old(bar-center), ::view-transition-old(bar-right) { animation-duration: 170ms; }
+::view-transition-new(bar-now), ::view-transition-new(bar-center), ::view-transition-new(bar-right) { animation-duration: 240ms; animation-delay: 50ms; }
+::view-transition-old(bar-now), ::view-transition-new(bar-now) { height: 100%; object-fit: none; object-position: left center; }
 ::view-transition-old(bar-center), ::view-transition-new(bar-center) { height: 100%; object-fit: none; }
 ::view-transition-old(bar-right), ::view-transition-new(bar-right) {
   height: 100%; object-fit: none; object-position: right center;
@@ -707,7 +715,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .lib-filter-empty .link-more {
   display: block; margin: var(--s2) auto 0; font-size: var(--t-11);
 }
-.lib-list { flex: 1; min-height: 0; overflow-y: auto; }
+/* The scroller reaches the rail's right edge, its rows keeping their inset
+   as padding, so the overlay bar hugs the glass's edge as the pane's does. */
+.lib-list {
+  flex: 1; min-height: 0; overflow-y: auto;
+  margin-right: calc(var(--s3) * -1); padding-right: var(--s3);
+}
 .lib-list.fade-top.fade-bottom {
   -webkit-mask-image: linear-gradient(180deg, transparent 0, var(--fg) var(--s3), var(--fg) calc(100% - var(--s5)), transparent 100%);
           mask-image: linear-gradient(180deg, transparent 0, var(--fg) var(--s3), var(--fg) calc(100% - var(--s5)), transparent 100%);
@@ -836,8 +849,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    Nothing darkens the picture. The type floats on it, held by a shadow
    that hugs the glyphs and is only as strong as the picture under it is
    bright (--np-shade), and the controls sit on small glass plates. The
-   details scroll up over it on a veil: the haze's own colour at the
-   panel's edge, seen through chrome glass. */
+   details scroll up over it as glass, the video frosted behind them. */
 .np-panel {
   --head-h: 56px;
   --np-inset: var(--s6);
@@ -853,7 +865,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
      the playing video included, under one rounded clip, which cost more
      than cutting the two that reach the corners. */
   --np-corners: var(--np-radius) 0 0 var(--np-radius);
-  --veil: color-mix(in srgb, rgb(8 9 11) 56%, var(--haze-veil, var(--tone-wash-deep)));
 }
 
 /* The picture layer, cut to the panel's corners. Nothing is
@@ -903,43 +914,34 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
 }
 
-/* The head floats over the column: a label and a few plates, and no strip
-   of its own until the details have scrolled up under it. */
+/* The head holds the one control over the picture — cover or Canvas — in
+   the corner, and is there only while there is a choice. Once the details
+   scroll up under it, it is the pane's top-bar strip (.glass-strip, set by
+   the panel), frosting the video live. Its corner is the panel's. */
 .np-head {
   position: absolute; top: 0; left: 0; right: 0; z-index: 3;
-  display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
-  height: var(--head-h); padding: 0 var(--s5) 0 var(--np-inset);
-  /* Its veil reaches the panel's top-left corner. */
+  display: flex; align-items: center; justify-content: flex-end;
+  height: var(--head-h); padding: 0 var(--s5);
   border-top-left-radius: var(--np-radius);
-  transition: background-color var(--d2) var(--ease), box-shadow var(--d2) var(--ease);
+  transition: background-color var(--d2) var(--ease);
 }
-.np-head.over { background: var(--veil); box-shadow: 0 12px 20px -8px var(--veil); }
-.np-head-actions { display: flex; align-items: center; gap: var(--s2); }
-.np-pill {
+.np-swap {
   position: relative;
   display: inline-flex; align-items: center; gap: 6px;
-  height: 26px; padding: 0 12px;
+  height: 26px; padding: 0 12px 0 10px;
   border-radius: var(--rf);
   color: var(--fg);
   font-family: var(--font-small); font-size: 10px; font-weight: var(--w-bold);
   letter-spacing: 0.14em; text-transform: uppercase; white-space: nowrap;
 }
-button.np-pill { padding-left: 10px; transition: color var(--d1) var(--ease); }
-button.np-pill svg { opacity: 0.8; }
-.np-round {
-  position: relative;
-  display: grid; place-items: center; width: 30px; height: 30px; flex: none;
-  border-radius: var(--rf); color: var(--fg-1);
-  transition: color var(--d1) var(--ease);
-}
-.np-round.on { color: var(--accent); }
+.np-swap svg { opacity: 0.8; }
 /* Pressing a plate lights it from inside rather than greying it. */
-:is(button.np-pill, .np-round, .np-more)::after {
+:is(.np-swap, .np-more)::after {
   content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
   background: rgba(255, 255, 255, 0); transition: background-color var(--d1) var(--ease);
 }
-:is(button.np-pill, .np-round, .np-more):hover { color: var(--fg); }
-:is(button.np-pill, .np-round, .np-more):hover::after { background: rgba(255, 255, 255, 0.1); }
+:is(.np-swap, .np-more):hover { color: var(--fg); }
+:is(.np-swap, .np-more):hover::after { background: rgba(255, 255, 255, 0.1); }
 
 /* ---- Hero ------------------------------------------------------------- */
 .np-hero {
@@ -980,6 +982,11 @@ button.np-pill svg { opacity: 0.8; }
   font-size: clamp(24px, 1.2vw + 14px, 34px); font-weight: var(--w-bold);
   letter-spacing: -0.024em; line-height: 1.1; overflow-wrap: anywhere;
 }
+/* The title and the artists go where the player bar's do. Over the picture
+   they say so with the pointer alone — no underline — and the artists
+   with their step up to full white. */
+.np-title-link { cursor: pointer; }
+.np-panel .np-artists .artist-link:hover { text-decoration: none; }
 /* The liked mark: the app's rose heart, as a fact about this track. There is
    no write path for Liked Songs, so it is never offered as a toggle — and
    when the track is not liked there is nothing here at all. */
@@ -1037,23 +1044,39 @@ button.np-pill svg { opacity: 0.8; }
 }
 
 /* ---- Details ---------------------------------------------------------- */
-/* The veil rises with the details: a static gradient riding the scrolled
-   content, so the melt IS the scroll and costs nothing extra. It starts
-   clear — no dark band where the picture ends. */
+/* The details rise over the picture as glass cards on a pane of glass. The
+   pane is a live frost of what is under it, as a layer under the cards
+   rather than a filter on the details, and it melts in from clear over
+   --melt: a static mask riding the scrolled content, so the melt IS the
+   scroll and costs nothing extra, with no dark band where the picture ends.
+   Over a cover what is under it is the haze, held under its ceiling, so it
+   is the reading pane's own glass. Over a playing Canvas nothing holds the
+   picture down, and it is the glass over arbitrary content (--frost-video):
+   the video still moves behind it, darker. */
 .np-details {
-  position: relative;
+  position: relative; isolation: isolate;
   padding: var(--melt) var(--s5) var(--s5) var(--np-inset);
-  background: linear-gradient(180deg, transparent 0, var(--veil) var(--melt));
 }
-/* Tall enough that the veil can cover the whole panel: that is the state in
-   which the Canvas pauses, and it must be reachable. */
-.np-panel.video .np-details { min-height: calc(100% + var(--melt) + var(--s2)); }
-/* The panel's two IntersectionObserver strips (see watchPassed). Each ends
-   at its line and reaches up past the top of the content. The cover strip
-   runs from the top of the column to where the veil turns opaque; the head
-   strip hangs above the hero's title. Unpainted and unhittable. */
+.np-details::before {
+  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: var(--tint-pane);
+  -webkit-backdrop-filter: var(--frost-plane);
+          backdrop-filter: var(--frost-plane);
+  --melted: linear-gradient(180deg,
+    transparent, rgb(0 0 0 / 0.2) calc(var(--melt) * 0.3),
+    rgb(0 0 0 / 0.64) calc(var(--melt) * 0.62), #000 var(--melt));
+  -webkit-mask-image: var(--melted);
+          mask-image: var(--melted);
+}
+.np-panel.video .np-details::before {
+  background: var(--tint-video);
+  -webkit-backdrop-filter: var(--frost-video);
+          backdrop-filter: var(--frost-video);
+}
+/* The strip the head watches (see watchPassed): it ends above the hero's
+   title and reaches up past the top of the content. Unpainted and
+   unhittable. */
 .np-sentinel { position: absolute; left: 0; width: 1px; pointer-events: none; visibility: hidden; }
-.np-cover-line { top: 0; height: calc(100% + var(--melt)); }
 .np-head-line { bottom: 100%; height: 200vh; }
 
 .np-card {
@@ -1070,7 +1093,7 @@ button.np-pill svg { opacity: 0.8; }
   color: var(--fg-1);
   transition: color var(--d1) var(--ease);
 }
-.np-album:hover:not(:disabled) { background: var(--glass-sheen), var(--raise-2); color: var(--fg); }
+.np-album:hover:not(:disabled) { background: var(--glass-sheen), var(--hover); color: var(--fg); }
 .np-album:disabled { opacity: 1; }
 .np-album-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .np-album-name { font-size: var(--t-12); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2135,27 +2158,32 @@ button.np-pill svg { opacity: 0.8; }
   height: var(--player-h);
   border-radius: var(--r-panel);
 }
-/* The centre takes half the bar and the sides a quarter each, the right one
-   never less than its controls: a cluster squeezed under its own width is
-   what ran the speed, the toggles and the volume into each other. Half is
-   what the seek rail had before the glass, and it is what it needs: the
-   rail is the one control in the bar that is a distance, and a short one
-   turns a click into a guess. */
+/* Three columns, open panel or not. The track's identity is always there:
+   its column is a share of the bar, at most 300px, so the transport never
+   moves when a title changes length, and a narrower bar narrows it — the
+   title and the artists truncate first. The controls on the right are as
+   wide as they are and never take a share of their own; a cluster squeezed
+   under its width is what ran the speed, the toggles and the volume into
+   each other. The seek rail takes everything else, down to a floor where
+   it is still a distance rather than a guess: it is the one control in the
+   bar that is one. */
 .p-body {
-  display: grid; grid-template-columns: minmax(200px, 1fr) minmax(0, 2fr) minmax(max-content, 1fr);
+  display: grid;
+  grid-template-columns: minmax(0, min(300px, 26%)) minmax(240px, 1fr) max-content;
   align-items: center; gap: var(--s5);
   height: 100%; padding: 0 var(--s5);
 }
-/* Beside the open panel, a bar too narrow to give the rail its half sheds
-   the track's identity instead — the panel next to it shows the title, the
-   artists and the picture at five times the size — and the transport and
-   the rail take all the width the controls leave. */
-@container player (max-width: 1180px) {
-  .has-panel .p-body { grid-template-columns: minmax(0, 1fr) max-content; column-gap: var(--s7); }
-  .has-panel .p-now { display: none; }
+/* A narrower bar lets go of the queue first (the rail has Queue) and
+   shortens the volume rail; a genuinely narrow one folds the identity to
+   its cover and the volume to its mute button, and draws the transport in. */
+@container player (max-width: 900px) {
+  .p-queue { display: none; }
+  .p-body .vol { width: 64px; }
 }
 @container player (max-width: 680px) {
-  .p-body .vol { width: 64px; }
+  .p-body { grid-template-columns: max-content minmax(0, 1fr) max-content; }
+  .p-now :is(.p-meta, .p-saved, .p-edit-indicator) { display: none; }
+  .p-body .vol { display: none; }
   .p-body .transport { gap: var(--s3); }
 }
 
@@ -2291,14 +2319,6 @@ button.np-pill svg { opacity: 0.8; }
      rules on purpose: equal specificity, so source order decides. */
   .transport { gap: var(--s4); }
 }
-@media (max-width: 760px) {
-  /* The bar's floor. The seek rail cannot give more room — it is already the
-     flexible track between two fixed columns — so the volume rail is what
-     leaves: it is the one control here with an equivalent (the OS volume,
-     and the mute click beside it). Keeping the icon and dropping only the
-     rail keeps the habit and the mute affordance intact. */
-  .vol { display: none; }
-}
 
 /* =====================================================================
    MENU — overlay glass (.glass-overlay, in the markup).
@@ -2307,8 +2327,8 @@ button.np-pill svg { opacity: 0.8; }
    item under the pointer is lit from inside the glass rather than laid
    with a grey, and its label goes to full ink: over the densest thing a
    menu can sit on, a white cover, --fg holds 7:1 on a lit item and --fg-2
-   4.5:1 at rest, in the tone pools too (glass.test.js). Radius one step up
-   from a row's, so the item plates sit concentric inside it.
+   4.5:1 at rest (glass.test.js). Radius one step up from a row's, so the
+   item plates sit concentric inside it.
    ===================================================================== */
 .menu {
   min-width: 216px; max-width: 320px;   /* a long playlist name cannot widen it */
@@ -3030,11 +3050,18 @@ button.np-pill svg { opacity: 0.8; }
   overflow: hidden;
 }
 /* The portrait and its scrim dissolve together into the pane's glass — the
-   old last stop was an opaque --bg-1, which on glass is a grey seam. */
+   old last stop was an opaque --bg-1, which on glass is a grey seam. The
+   photograph holds whole to within 72px of the band's foot and dissolves
+   there, on an eased ramp: a linear one shows the line where it starts,
+   and a dissolve over the band's last quarter took a quarter of the
+   picture with it. */
 .banner .bg {
   position: absolute; inset: 0; z-index: 0;
-  -webkit-mask-image: linear-gradient(180deg, #000 72%, transparent);
-          mask-image: linear-gradient(180deg, #000 72%, transparent);
+  --dissolve: linear-gradient(180deg,
+    #000 calc(100% - 72px), rgb(0 0 0 / 0.86) calc(100% - 56px), rgb(0 0 0 / 0.56) calc(100% - 36px),
+    rgb(0 0 0 / 0.22) calc(100% - 16px), transparent);
+  -webkit-mask-image: var(--dissolve);
+          mask-image: var(--dissolve);
 }
 /* Favour the upper third — artist portraits put the face there — but not as
    hard as before. The band's top `--topbar-h` sits behind the glass, so a crop
@@ -3058,9 +3085,9 @@ button.np-pill svg { opacity: 0.8; }
   background: linear-gradient(180deg,
     rgba(10, 10, 12, 0.30) 0%,
     rgba(10, 10, 12, 0.10) 24%,
-    rgba(10, 10, 12, 0.12) 54%,
-    rgba(10, 10, 12, 0.52) 84%,
-    rgba(10, 10, 12, 0.7) 100%);
+    rgba(10, 10, 12, 0.10) 58%,
+    rgba(10, 10, 12, 0.46) 86%,
+    rgba(10, 10, 12, 0.62) 100%);
 }
 .banner > *:not(.bg) { position: relative; z-index: 1; }
 /* The banner is a flex COLUMN, so without this the tag stretches to the full
@@ -3171,11 +3198,11 @@ button.np-pill svg { opacity: 0.8; }
   :root {
     --tint-chrome: var(--bg-nav); --tint-pane: var(--bg-1); --tint-strip: var(--bg-1);
     --tint-overlay: var(--bg-sheet); --tint-sheet: var(--bg-sheet); --tint-plate: rgb(9 9 11 / 0.8);
-    --tint-active: transparent;
-    --frost-plane: none; --frost-strip: none; --frost-overlay: none; --frost-plate: none;
+    --tint-active: transparent; --tint-video: var(--bg-nav);
+    --frost-plane: none; --frost-strip: none; --frost-overlay: none; --frost-sheet: none;
+    --frost-video: none; --frost-plate: none;
   }
   .topbar, .tl-head { background: var(--bg-1); }
-  .np-head.over { background: var(--bg-nav); box-shadow: none; }
   .wash .tag, .banner .tag { background: rgba(255, 255, 255, 0.16); }
   .topbar, .tl-head, .np-head, .wash .tag, .banner .tag {
     -webkit-backdrop-filter: none;

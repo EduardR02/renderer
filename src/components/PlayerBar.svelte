@@ -20,7 +20,6 @@
   import { morphLayout } from "../lib/layout.js";
   import { frost } from "../lib/ambient.svelte.js";
   import { scrollbar } from "../lib/scrollbar.js";
-  import { coverTone } from "../lib/covertone.svelte.js";
   import { listen } from "@tauri-apps/api/event";
 
   let dragPos = $state(null);
@@ -248,10 +247,6 @@
     playback.current_index >= 0 ? (playback.queue[playback.current_index] ?? null) : null
   );
 
-  /** The record's colour, for the glass the bar opens (the speed menu, the
-      saved-in list) to be lit by, as a page's menus are by the page's. */
-  const tone = $derived(coverTone(current?.cover_url ?? "", current?.album_id || current?.uri || ""));
-
   const effectiveEdit = $derived(current?.effective_edit ?? null);
   const editTimeline = $derived.by(() => makeEditTimeline(
     effectiveEdit,
@@ -431,7 +426,7 @@
   });
 </script>
 
-<footer class="player glass-chrome" use:frost style:--tone-wash={tone.wash} style:--tone-glow={tone.glow}>
+<footer class="player glass-chrome" use:frost>
   <div class="p-body">
     <div class="p-now" class:idle={!current}>
       {#if current}
@@ -640,18 +635,15 @@
       >
         <Icon name="panel" size={18} />
       </button>
-      <!-- With the panel open the queue is in the panel's head, beside what it
-           follows; the bar keeps only what the bar alone can do. -->
-      {#if !ui.nowPlayingOpen}
-        <button
-          class="btn-icon"
-          class:on={route.name === "queue"}
-          title="Queue"
-          onclick={() => navigate(route.name === "queue" ? "library" : "queue")}
-        >
-          <Icon name="queue" size={18} />
-        </button>
-      {/if}
+      <!-- The first thing a narrow bar lets go of: the rail has Queue too. -->
+      <button
+        class="btn-icon p-queue"
+        class:on={route.name === "queue"}
+        title="Queue"
+        onclick={() => navigate(route.name === "queue" ? "library" : "queue")}
+      >
+        <Icon name="queue" size={18} />
+      </button>
       <div class="p-volume" bind:this={volumeControl}>
         <button
           class="btn-icon"
@@ -739,7 +731,7 @@
     inset: auto auto auto 0;
     transform: translateX(-50%);
     margin: 0;
-    padding: var(--s4);
+    padding: var(--s3) var(--s3) var(--s1);
     width: 232px;
     border: 0;
     border-radius: var(--r3);
@@ -935,7 +927,7 @@
     align-items: baseline;
     justify-content: space-between;
     gap: var(--s3);
-    margin-bottom: var(--s3);
+    margin-bottom: var(--s2);
   }
   .speed-value {
     font-size: var(--t-15);
@@ -945,29 +937,29 @@
     font-size: var(--t-11);
     color: var(--fg-3);
   }
+  /* The presets are menu items laid in a row: the same plate lit under the
+     pointer, the same step from --fg-1 to --fg. The current one wears foam. */
   .speed-presets {
     display: flex;
-    gap: var(--s2);
-    margin-top: var(--s3);
+    gap: 2px;
+    margin: var(--s2) calc(var(--s2) * -1) 0;
   }
   .speed-preset {
     flex: 1;
-    height: 24px;
-    border: 1px solid var(--line-2);
-    border-radius: var(--rf);
-    background: none;
-    color: var(--fg-2);
-    font: inherit;
-    font-size: var(--t-11);
-    font-variant-numeric: tabular-nums;
-    cursor: pointer;
-  }
-  .speed-preset:hover {
+    height: 32px;
+    border-radius: var(--r2);
     color: var(--fg-1);
-    border-color: var(--line-2);
+    font-size: var(--t-12);
+    font-variant-numeric: tabular-nums;
+    transition: background-color var(--d1) var(--ease), color var(--d1) var(--ease);
+  }
+  .speed-preset:hover,
+  .speed-preset:focus-visible {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--fg);
+    outline: none;
   }
   .speed-preset.on {
     color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   }
 </style>

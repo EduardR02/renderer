@@ -3,14 +3,12 @@
   import {
     playback,
     ui,
-    route,
     navigate,
     openCredits,
     trackCredits,
     loadTrackCredits,
     api,
     appSettings,
-    setNowPlayingOpen,
     nowSaved,
   } from "../lib/state.svelte.js";
   import Cover from "./Cover.svelte";
@@ -18,7 +16,6 @@
   import Icon from "./Icon.svelte";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { haze } from "../lib/ambient.svelte.js";
-  import { morphLayout } from "../lib/layout.js";
   import { formatTime } from "../lib/time.js";
   import { scrollbar } from "../lib/scrollbar.js";
 
@@ -44,12 +41,8 @@
   let canvasReady = $state(false);
   /** A look at this record's cover; the next record arrives on its Canvas. */
   let preferCover = $state(false);
-  /** Scrolled so far into the details that the veil hides the video. */
-  let covered = $state(false);
   /** The hero's copy has scrolled up under the head. */
   let headOver = $state(false);
-  /** A modal dialog is up: the page under its backdrop is not being watched. */
-  let modalOpen = $state(false);
   let pageVisible = $state(!document.hidden);
   let reducedMotion = $state(false);
 
@@ -57,10 +50,12 @@
   let panelEl = $state(null);
   let scrollEl = $state(null);
   let detailsEl = $state(null);
-  let coverSentinel = $state(null);
   let headSentinel = $state(null);
 
   const videoShown = $derived(Boolean(canvasUrl) && canvasReady && !preferCover);
+  /** The head is the cover-or-Canvas choice, so it is there only while
+      there is one. */
+  const hasHead = $derived(Boolean(current) && canvasReady);
 
   /* The haze lays out differently when the video covers the panel: what is
      under it is never seen. Written from an effect so every path in and out
@@ -86,32 +81,6 @@
     return () => {
       media.removeEventListener?.("change", updateMotion);
       document.removeEventListener("visibilitychange", updateVisibility);
-    };
-  });
-
-  /* Dialogs open and close through the top layer, which reports both as a
-     `toggle` (and `close`) on the dialog; neither bubbles, so they are
-     caught on the way down. Popovers toggle too, and the check is one
-     selector. A dialog that is unmounted while open reports nothing on its
-     way out, so while one is up it is looked for again every 400ms — and
-     nothing runs at all while none is. */
-  $effect(() => {
-    let timer = 0;
-    const check = () => {
-      modalOpen = Boolean(document.querySelector(":modal"));
-      if (modalOpen && !timer) timer = setInterval(check, 400);
-      else if (!modalOpen && timer) {
-        clearInterval(timer);
-        timer = 0;
-      }
-    };
-    check();
-    document.addEventListener("toggle", check, true);
-    document.addEventListener("close", check, true);
-    return () => {
-      clearInterval(timer);
-      document.removeEventListener("toggle", check, true);
-      document.removeEventListener("close", check, true);
     };
   });
 
@@ -196,23 +165,23 @@
     if (canvasReady) preferCover = !preferCover;
   }
 
-  function closePanel() {
-    morphLayout(() => setNowPlayingOpen(false));
+  function openAlbum(event) {
+    if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    if (current?.album_id) navigate("album", current.album_id);
   }
 
   /**
    * Whether the Canvas decoder may run.
    *
-   * A 720x1280 loop decoding forever is exactly the cost this app exists to
-   * avoid, so it stops on everything that means nobody is watching: the
-   * window blurred or hidden, the details scrolled over it, a modal dialog
-   * dimming the page, the cover shown instead, and the music paused — a
-   * Canvas is the record's motion, and it standing still with the record is
-   * also what Spotify does. The panel closing unmounts it.
+   * A Canvas is the record's motion, so it moves with the record: it plays
+   * while the music plays and stands still while it is paused, which is
+   * also what Spotify does. Whatever lies over it — the details' glass, a
+   * dialog — frosts it without stopping it. Beyond that it stops only where
+   * nobody can see it at all: the window blurred or hidden, or the cover
+   * shown instead. The panel closing unmounts it.
    */
-  const canvasPlaying = $derived(
-    videoShown && !covered && !modalOpen && pageVisible && ui.windowFocused && playback.playing,
-  );
+  const canvasPlaying = $derived(videoShown && pageVisible && ui.windowFocused && playback.playing);
 
   $effect(() => {
     /* Keyed on the source too: a replaced src parks the element, so the
@@ -347,12 +316,12 @@
     untrack(placeCanvas);
   });
 
-  /* Two sentinels in the scrolled content, the app's usual device: each
-     fires once crossing and never in between. No scroll listener, and no
-     scroll timeline — the latter is banned in this app (see app.css).
+  /* A sentinel in the scrolled content, the app's usual device: it fires
+     once crossing and never in between. No scroll listener, and no scroll
+     timeline — the latter is banned in this app (see app.css).
 
-     Each one is a tall strip that ENDS at its line and reaches up past the
-     top of the content, so it can only ever be intersecting or above — never
+     It is a tall strip that ENDS at its line and reaches up past the top of
+     the content, so it can only ever be intersecting or above — never
      below. That matters: an observer reports changes of intersection only,
      and a one-pixel marker that a jump (a scrollbar drag, End, a fling)
      carries straight from below the viewport to above it never intersects
@@ -367,13 +336,6 @@
     observer.observe(target);
     return () => observer.disconnect();
   }
-  $effect(() => {
-    if (!videoShown) {
-      covered = false;
-      return;
-    }
-    return watchPassed(coverSentinel, "0px", (v) => (covered = v));
-  });
   $effect(() => watchPassed(headSentinel, "-56px 0px 0px 0px", (v) => (headOver = v)));
 
   function revealDetails() {
@@ -398,8 +360,7 @@
   /** How many names each group shows before it starts counting the remainder. */
   const PANEL_NAMES = 4;
 
-  /** The record's colour: the cover's cast light, and the details' veil
-      until the haze has been measured. */
+  /** The record's colour: the light the cover casts. */
   const tone = $derived(coverTone(current?.cover_url ?? "", current?.album_id || current?.uri || ""));
 
   /* How much help the type needs, from the light the haze measured under
@@ -417,10 +378,7 @@
   class:video={videoShown}
   bind:this={panelEl}
   aria-label="Now playing details"
-  style:--tone-wash={tone.wash}
-  style:--tone-wash-deep={tone.washDeep}
   style:--tone-glow={tone.glow}
-  style:--haze-veil={haze.veil ? `rgb(${haze.veil})` : null}
   style:--np-shade={shade}
   style:--plate-a={plateAlpha}
 >
@@ -446,10 +404,7 @@
       {/if}
     </div>
 
-    <div class="np-scroll" bind:this={scrollEl} use:scrollbar={{ top: 56 }}>
-      <!-- Everything above the line where the veil turns opaque: once it has
-           all scrolled away, nothing of the video shows. -->
-      <span class="np-sentinel np-cover-line" bind:this={coverSentinel} aria-hidden="true"></span>
+    <div class="np-scroll" bind:this={scrollEl} use:scrollbar={{ top: hasHead ? 56 : 0 }}>
       <section class="np-hero">
         <div class="np-art" class:away={videoShown}>
           <div class="np-art-tile">
@@ -552,41 +507,31 @@
     </div>
   {/if}
 
-  <header class="np-head" class:over={headOver}>
-    <span class="np-pill glass-plate">Now playing</span>
-    <span class="np-head-actions">
-      {#if current && canvasReady}
-        <button
-          class="np-pill glass-plate"
-          type="button"
-          title={videoShown ? "Show the cover art" : "Show the Canvas animation"}
-          onclick={swapSurface}
-        >
-          <Icon name="swap" size={11} />{videoShown ? "Cover" : "Canvas"}
-        </button>
-      {/if}
-      <!-- The queue lives here while the panel is open: the player bar gives
-           this side of the window to the panel, and the queue is what comes
-           after the record the panel is about. -->
+  {#if hasHead}
+    <header class="np-head" class:glass-strip={headOver}>
       <button
-        class="np-round glass-plate"
-        class:on={route.name === "queue"}
-        title="Queue"
-        aria-label="Queue"
-        onclick={() => navigate(route.name === "queue" ? "library" : "queue")}
+        class="np-swap glass-plate"
+        type="button"
+        title={videoShown ? "Show the cover art" : "Show the Canvas animation"}
+        onclick={swapSurface}
       >
-        <Icon name="queue" size={15} />
+        <Icon name="swap" size={11} />{videoShown ? "Cover" : "Canvas"}
       </button>
-      <button class="np-round glass-plate" title="Close now playing details" aria-label="Close now playing details" onclick={closePanel}>
-        <Icon name="x" size={13} />
-      </button>
-    </span>
-  </header>
+    </header>
+  {/if}
 </aside>
 
 {#snippet identity()}
   <div class="np-title-row">
-    <h2>{current.name}</h2>
+    <h2>
+      {#if current.album_id}
+        <span class="np-title-link" role="link" tabindex="0" title="Go to album" onclick={openAlbum} onkeydown={openAlbum}
+          >{current.name}</span
+        >
+      {:else}
+        {current.name}
+      {/if}
+    </h2>
     {#if liked}
       <span class="np-liked" role="img" aria-label="In Liked Songs" title="In Liked Songs">
         <Icon name="heart-filled" size={21} />

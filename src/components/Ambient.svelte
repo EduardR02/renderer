@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import { playback, ui, resolveCoverUrl } from "../lib/state.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
-  import { haze, publishLight, publishVeil, frost, watchFrost } from "../lib/ambient.svelte.js";
+  import { haze, publishLight, frost, watchFrost } from "../lib/ambient.svelte.js";
   import { rgbOf, parseFrost, RESTRAINED } from "../lib/haze.js";
 
   /* =====================================================================
@@ -236,7 +236,6 @@
         lit = true;
         grey = m.grey;
         blankTries = 0;
-        publishVeil(m.veil);
         lightKey = m.key;
         if (!unreadableShown()) publishLight(m.light);
         if (m.fade !== "settle" && m.fade !== "layout" && asked?.kind === "video" && asked.key === m.key) {

@@ -535,6 +535,9 @@ const LENS = 6;
 /** Under a cover (not a Canvas) the haze round the tile is this much
     softer, so it reads as the light the tile sits in, not a second copy. */
 const UNDER_COVER = 3;
+/** The panel's two left corners (--np-radius, app.css), in CSS px: the
+    softer haze under a cover is the panel's surface, and is cut to them. */
+const CORNER = 18;
 /** Left of the picture: the magnification reached far from it, and over
     what share of the space to its left. */
 const ZOOM = 2.4;
@@ -634,12 +637,11 @@ function cropCols(img, w, h, x0, ch, x1 = w) {
  *              no video); and whether a Canvas covers the panel
  * @param tint  encoded [r, g, b] of the record's colour, for what has none
  * @param frost the glass planes' frost (parseFrost), or null for none
- * @returns { rgba, frost, frostW, frostH, gain, veil, grey, light } — the
- *          haze as 8-bit RGBA; the same haze frosted (or null), at half its
- *          size (frostW x frostH); the gain the mean
- *          ceilings took; "r g b" of the haze just left of the picture; the
- *          share of pixels that took the record's tint; and how bright the
- *          panel's picture is under its type (see lightOf)
+ * @returns { rgba, frost, frostW, frostH, gain, grey, light } — the haze as
+ *          8-bit RGBA; the same haze frosted (or null), at half its size
+ *          (frostW x frostH); the gain the mean ceilings took; the share of
+ *          pixels that took the record's tint; and how bright the panel's
+ *          picture is under its type (see lightOf)
  */
 export function renderHaze(src, geo, tint, { scale = 1, seed = 1, frost = null } = {}) {
   const { w, h } = geo;
@@ -760,16 +762,32 @@ export function renderHaze(src, geo, tint, { scale = 1, seed = 1, frost = null }
   const cw = w - sx0;
   const softer = cover ? blur(cropCols(laid, w, h, sx0, 3), cw, h, sigma * UNDER_COVER) : null;
   const softerC = cover ? blur(cropCols(laidC, w, h, sx0, 1), cw, h, sigma * UNDER_COVER, 1) : null;
+  /* How much of the softer lens a pixel takes: all of it on the picture,
+     none off it, and in the panel's corners none outside the arc, which is
+     anti-aliased — the cut-outs keep the gutter's sharper lens. */
+  const R = CORNER / px;
+  const softness = (x, y) => {
+    if (!onPicture[x]) return 0;
+    const dx = frame.x + R - (x + 0.5);
+    const dy = Math.max(R - (y + 0.5), y + 0.5 - (h - R));
+    return dx <= 0 || dy <= 0 ? 1 : clamp01(R - Math.hypot(dx, dy) + 0.5);
+  };
   const measureTo = frame && geo.immersive ? Math.max(1, Math.floor(frame.x)) : w;
   let sumC = 0, nC = 0;
   for (let p = 0; p < w * h; p++) {
     const x = p % w, o = p * 3;
-    const soft = softer && onPicture[x];
-    const q = soft ? (p / w | 0) * cw + x - sx0 : p;
-    const img = soft ? softer : lensed;
-    labOfLinear(img[q * 3], img[q * 3 + 1], img[q * 3 + 2], one);
+    let r = lensed[o], g = lensed[o + 1], b = lensed[o + 2], mixC = lensedC[p];
+    const t = softer ? softness(x, (p / w) | 0) : 0;
+    if (t > 0) {
+      const q = ((p / w) | 0) * cw + x - sx0;
+      r += (softer[q * 3] - r) * t;
+      g += (softer[q * 3 + 1] - g) * t;
+      b += (softer[q * 3 + 2] - b) * t;
+      mixC += (softerC[q] - mixC) * t;
+    }
+    labOfLinear(r, g, b, one);
     const c = Math.sqrt(one[1] * one[1] + one[2] * one[2]);
-    const kr = c > 1e-5 ? Math.min(2.2, Math.max(1, ((soft ? softerC : lensedC)[q] * 0.85) / c)) : 1;
+    const kr = c > 1e-5 ? Math.min(2.2, Math.max(1, (mixC * 0.85) / c)) : 1;
     const f = F[p], fc = kr * Fc[p];
     lensed[o] = one[0] * f;
     lensed[o + 1] = one[1] * fc;
@@ -847,7 +865,7 @@ function frameOf(geo) {
 
 /** Quantise a finished haze (linear, under the peak) with its gain and its
     seam, and everything measured on it: the frost (of the haze without the
-    seam, except at the glass's edge: see SPILL), the veil, the type's light. */
+    seam, except at the glass's edge: see SPILL), the type's light. */
 function emit(out, gain, { src, shown, geo, frame, seed, frost, grey, seam }) {
   const { w, h } = geo;
   const px = geo.px ?? 5;
@@ -864,20 +882,12 @@ function emit(out, gain, { src, shown, geo, frame, seed, frost, grey, seam }) {
   const lx1 = frost && seam ? Math.min(w, seam.x0 + seam.w + reach) : 0;
   const lw = lx1 - lx0;
   const lit = lw > 0 ? new Float32Array(lw * h * 3) : null;
-  const vx1 = frame ? Math.min(w, Math.max(1, Math.floor(frame.x))) : w;
-  const vx0 = Math.max(0, vx1 - 2);
-  const veil = [0, 0, 0];
-  let nv = 0;
   for (let p = 0; p < w * h; p++) {
     const o = p * 3, q = p * 4, x = p % w;
     let r = out[o] * gain, g = out[o + 1] * gain, b = out[o + 2] * gain;
     const er = encFast(r), eg = encFast(g), eb = encFast(b);
     if (encoded) {
       encoded[o] = er; encoded[o + 1] = eg; encoded[o + 2] = eb;
-    }
-    if (x >= vx0 && x < vx1) {
-      veil[0] += er; veil[1] += eg; veil[2] += eb;
-      nv++;
     }
     const l = lit && x >= lx0 && x < lx1 ? ((p / w | 0) * lw + x - lx0) * 3 : -1;
     const s = seam && x >= seam.x0 && x < seam.x0 + seam.w ? (p / w | 0) * seam.w + (x - seam.x0) : -1;
@@ -935,7 +945,6 @@ function emit(out, gain, { src, shown, geo, frame, seed, frost, grey, seam }) {
     frostW: fw,
     frostH: fh,
     gain,
-    veil: veil.map((v) => Math.round((v / Math.max(1, nv)) * 255)).join(" "),
     grey,
     light,
   };

@@ -29,7 +29,8 @@
                        window's width. The open panel is a full-height
                        column at the window's right edge; the haze lays the
                        panel's picture out under it (a cover as the light
-                       its smaller tile sits in) and carries it on leftward.
+                       its smaller tile sits in, cut to the panel's rounded
+                       corners) and carries it on leftward.
                      - video: { x, y, w, h }, the Canvas's VISIBLE rect in
                        window CSS px, or null while no video is shown. The
                        haze frames the picture to exactly that rect
@@ -66,16 +67,6 @@
                      white. White type's contrast over the band is at worst
                      1.05 / (light + 0.05): 4.5:1 up to 0.183, 3:1 up to
                      0.30. Published only on a change of more than 0.01.
-
-   haze.veil         written here.
-                     "r g b" (0..255) of the haze just left of the video's
-                     edge (the window's right edge while the panel is
-                     closed): what a surface in the panel melts into. Its
-                     tone (covertone, toneOfColor) is also the root's
-                     --tone-*, written only when it changes: what a surface
-                     with no page tone of its own — a menu on the queue, the
-                     drag pill — pools in its glass, so it glows with the
-                     record too. Pages, the panel and the bar set their own.
 
    use:frost         the action, worn by the glass planes (see THE FROST).
 
@@ -119,8 +110,6 @@
       same frame the plane does.
    ===================================================================== */
 
-import { toneOfColor } from "./covertone.svelte.js";
-
 /** What the panels and the layer share. Written only on a real change. */
 export const haze = $state({
   video: null,
@@ -128,7 +117,6 @@ export const haze = $state({
   awaiting: false,
   lightTop: 1,
   lightBottom: 1,
-  veil: "",
 });
 
 /** Publish the type's light; a change of 0.01 or less is not published. */
@@ -136,36 +124,6 @@ export function publishLight(light) {
   if (!light) return;
   if (Math.abs(haze.lightTop - light.top) > 0.01) haze.lightTop = light.top;
   if (Math.abs(haze.lightBottom - light.bottom) > 0.01) haze.lightBottom = light.bottom;
-}
-
-/** Publish the veil; a move of three levels or less is not published. */
-export function publishVeil(veil) {
-  if (!veil || !veilMoved(haze.veil, veil)) return;
-  haze.veil = veil;
-  publishTone(veil);
-}
-
-/* The veil's tone on the root, for the surfaces that inherit it. Three
-   properties, set only when the tone itself changes — a small move of the
-   veil often lands on the same palette. */
-let rootTone = "";
-function publishTone(veil) {
-  const [r, g, b] = veil.split(" ").map(Number);
-  const tone = toneOfColor(r, g, b);
-  const key = `${tone.wash} ${tone.washDeep} ${tone.glow}`;
-  if (key === rootTone) return;
-  rootTone = key;
-  const style = document.documentElement.style;
-  style.setProperty("--tone-wash", tone.wash);
-  style.setProperty("--tone-wash-deep", tone.washDeep);
-  style.setProperty("--tone-glow", tone.glow);
-}
-
-function veilMoved(a, b) {
-  if (!a) return true;
-  const pa = a.split(" ").map(Number);
-  const pb = b.split(" ").map(Number);
-  return pa.some((v, i) => Math.abs(v - pb[i]) > 3);
 }
 
 /* ---- The frost -----------------------------------------------------------

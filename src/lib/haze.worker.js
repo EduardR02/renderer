@@ -22,7 +22,7 @@
             the loop has been seen: if its representative frame is a
             different picture from the one the haze was made of, render it.
    Messages out (seq, key and fade are echoed):
-     haze   { seq, key, fade, bitmap, frost, veil, grey, light, distance?, ms }
+     haze   { seq, key, fade, bitmap, frost, grey, light, distance?, ms }
                                                      a picture to show
      blank  { seq }                                  that frame was black
      light  { key, light }                           the type's light
@@ -108,7 +108,6 @@ function paint(m, src, seen = null, distance = undefined) {
       fade: m.fade,
       bitmap,
       frost,
-      veil: out.veil,
       grey: out.grey,
       light,
       distance,
