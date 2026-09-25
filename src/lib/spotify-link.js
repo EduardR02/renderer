@@ -59,11 +59,9 @@ export function spotifyLink(kind, id) {
  * Put text on the system clipboard; true when it landed, which is what the
  * menus turn into "Link copied".
  *
- * `navigator.clipboard` is available because WebView2 serves the app from a
- * localhost origin, which is a secure context. No clipboard PLUGIN is installed
- * and this deliberately does not add one. The execCommand path is the fallback
- * for the case where the async API is refused (it can reject on a document that
- * is not focused), and it is the only thing left that works there.
+ * Uses the Clipboard API when permitted by the webview. No clipboard plugin is
+ * installed; `execCommand` handles a refused write (for example, when the
+ * document is not focused) without claiming the link was copied.
  */
 export async function writeClipboard(text) {
   try {

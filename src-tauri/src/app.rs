@@ -1,9 +1,7 @@
 //! Application state and on-disk caches.
 //!
-//! The disk formats are frozen: `playlist_list.json` and
-//! `playlist_tracks_cache.json` under `%LOCALAPPDATA%\SpotifyRenderer` reuse
-//! the old app's layout so existing user data migrates unchanged. Covers are
-//! raw image bytes keyed by `sha1(url)`.
+//! Playlist and cache files live under the platform's app-owned data directory.
+//! Covers are raw image bytes keyed by `sha1(url)`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -502,13 +500,13 @@ pub fn clear_playback_snapshot() -> Result<(), String> {
     Ok(())
 }
 
-/// Diagnostic logs: `%LOCALAPPDATA%\SpotifyRenderer\logs` — the app's own
-/// `renderer.log` and the engine's `playback_engine.log`.
+/// Diagnostic logs under the app data directory: `renderer.log` and the
+/// engine's `playback_engine.log`.
 pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
 }
 
-/// Engine `--state-dir`: `%LOCALAPPDATA%\SpotifyRenderer\engine`, overridable
+/// Engine `--state-dir`: the app data directory's `engine` child, overridable
 /// via `SPOTIFY_STATE_DIR`.
 pub fn engine_state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SPOTIFY_STATE_DIR") {

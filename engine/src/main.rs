@@ -1243,29 +1243,37 @@ mod tests {
         args.iter().map(|arg| OsString::from(*arg)).collect()
     }
 
+    fn test_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join("sr")
+            .join(name)
+            .to_str()
+            .expect("test temp directory is UTF-8")
+            .to_owned()
+    }
+
     #[test]
     fn parse_arguments_requires_state_dir_and_accepts_an_optional_log_file() {
+        let state_dir = test_path("engine");
+        let log_file = test_path("logs/playback_engine.log");
         let (state, log, cache_limit, normalisation) =
-            parse_arguments(os(&["--state-dir", "C:\\sr\\engine"])).expect("state dir alone");
-        assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
+            parse_arguments(os(&["--state-dir", &state_dir])).expect("state dir alone");
+        assert_eq!(state, PathBuf::from(&state_dir));
         assert!(log.is_none(), "log file is optional");
         assert_eq!(cache_limit, Some(AUDIO_CACHE_LIMIT_BYTES));
         assert!(!normalisation, "normalisation defaults to off");
 
         let (state, log, cache_limit, _) = parse_arguments(os(&[
             "--state-dir",
-            "C:\\sr\\engine",
+            &state_dir,
             "--log-file",
-            "C:\\sr\\logs\\playback_engine.log",
+            &log_file,
             "--audio-cache-limit-mb",
             "4096",
         ]))
         .expect("both flags");
-        assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
-        assert_eq!(
-            log,
-            Some(PathBuf::from("C:\\sr\\logs\\playback_engine.log"))
-        );
+        assert_eq!(state, PathBuf::from(&state_dir));
+        assert_eq!(log, Some(PathBuf::from(&log_file)));
         assert_eq!(cache_limit, Some(4096 * 1024 * 1024));
 
         // Flag order must not matter.
@@ -1273,21 +1281,22 @@ mod tests {
             "--audio-cache-limit-mb",
             "0",
             "--log-file",
-            "C:\\sr\\logs\\playback_engine.log",
+            &log_file,
             "--state-dir",
-            "C:\\sr\\engine",
+            &state_dir,
         ]))
         .expect("log file first");
-        assert_eq!(state, PathBuf::from("C:\\sr\\engine"));
+        assert_eq!(state, PathBuf::from(&state_dir));
         assert!(log.is_some());
         assert_eq!(cache_limit, None, "zero selects an unlimited cache");
     }
 
     #[test]
     fn parse_arguments_reads_the_normalisation_flag() {
+        let state_dir = test_path("engine");
         let (_, _, _, normalisation) = parse_arguments(os(&[
             "--state-dir",
-            "C:\\sr\\engine",
+            &state_dir,
             "--normalisation",
             "true",
         ]))
@@ -1296,7 +1305,7 @@ mod tests {
 
         let (_, _, _, normalisation) = parse_arguments(os(&[
             "--state-dir",
-            "C:\\sr\\engine",
+            &state_dir,
             "--normalisation",
             "false",
         ]))
@@ -1306,7 +1315,7 @@ mod tests {
         assert!(
             parse_arguments(os(&[
                 "--state-dir",
-                "C:\\sr\\engine",
+                &state_dir,
                 "--normalisation",
                 "maybe",
             ]))
@@ -1317,27 +1326,35 @@ mod tests {
 
     #[test]
     fn parse_arguments_rejects_relative_state_dir_unknown_flags_and_duplicates() {
+        let state_dir = test_path("a");
+        let duplicate_dir = test_path("b");
         assert!(parse_arguments(os(&[])).is_err(), "state dir required");
         assert!(
             parse_arguments(os(&["--state-dir"])).is_err(),
             "missing value rejected"
         );
         assert!(
-            parse_arguments(os(&["--state-dir", "relative\\engine"])).is_err(),
+            parse_arguments(os(&["--state-dir", "relative/engine"])).is_err(),
             "relative state dir rejected"
         );
         assert!(
-            parse_arguments(os(&["--state-dir", "C:\\a", "--bogus", "x"])).is_err(),
+            parse_arguments(os(&["--state-dir", &state_dir, "--bogus", "x"])).is_err(),
             "unknown flag rejected"
         );
         assert!(
-            parse_arguments(os(&["--state-dir", "C:\\a", "--state-dir", "C:\\b",])).is_err(),
+            parse_arguments(os(&[
+                "--state-dir",
+                &state_dir,
+                "--state-dir",
+                &duplicate_dir,
+            ]))
+            .is_err(),
             "duplicate state dir rejected"
         );
         assert!(
             parse_arguments(os(&[
                 "--state-dir",
-                "C:\\a",
+                &state_dir,
                 "--audio-cache-limit-mb",
                 "wat",
             ]))
@@ -1347,7 +1364,7 @@ mod tests {
         assert!(
             parse_arguments(os(&[
                 "--state-dir",
-                "C:\\a",
+                &state_dir,
                 "--audio-cache-limit-mb",
                 "1024",
                 "--audio-cache-limit-mb",
