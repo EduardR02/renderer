@@ -266,7 +266,7 @@
       <div class="set-row">
         <div>
           <div class="k">Start minimized</div>
-          <div class="d">Opens the normal window minimized to the taskbar; closing it still exits the app.</div>
+          <div class="d">Opens the window minimized; closing it still exits the app.</div>
           {#if settingErrors.startMinimized}<div class="inline-error" role="alert">{settingErrors.startMinimized}</div>{/if}
         </div>
         <div class="set-ctl">
