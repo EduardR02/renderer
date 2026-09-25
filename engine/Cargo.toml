@@ -1,6 +1,6 @@
 [package]
 name = "renderer-engine"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -36,3 +36,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis", "flac"] }
 url = "2.5"
 bytes = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.44", features = ["implement", "Win32_Media_Audio", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["AudioHardware", "block2", "dispatch2", "objc2"] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"

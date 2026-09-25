@@ -77,9 +77,16 @@ This isn't meant to replace the Spotify app. It's a daily player, with enough
 discovery in it that you don't have to leave for that, but there will be things
 you occasionally need the real app for.
 
-Windows and macOS 14 or later only, and you need Spotify Premium. The macOS
-build has to be verified on a Mac; CI can compile and test it, but cannot verify
-audio devices, window appearance or GPU rendering on your machine.
+Windows and macOS 14 or later only, and you need Spotify Premium. The frontend
+is shared, but macOS WebKit and Windows WebView2 can render the same CSS
+differently; check changed layouts on both. The macOS build has to be verified
+on a Mac; CI can compile and test it, but cannot verify audio devices, window
+appearance or GPU rendering on your machine.
+
+The app watches the system default audio output. Switching outputs rebuilds
+the player against the new device and resumes the current track at its previous
+position; unplugged or stalled outputs use the same recovery path. Output
+handover still needs a real-device check on each OS.
 
 No lossless. Spotify has it and the official app plays it, but this client isn't
 offered it — the track metadata we get back lists AAC 24 and Ogg Vorbis
@@ -155,6 +162,11 @@ and handles everything to do with sound. The Tauri shell in `src-tauri/`
 supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
 Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
+
+At startup the sidebar can use the on-disk playlist snapshot, while Home waits
+for the authenticated rootlist so stale shelves do not flash. That rootlist
+fetch runs alongside playback-state restoration rather than waiting for the
+queue and settings to finish restoring.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.

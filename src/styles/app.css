@@ -2096,9 +2096,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    -8px margin cancelling that gap after the fact, which meant the two lines
    were never actually set as a pair. */
 .card-copy {
-  display: flex; flex-direction: column; gap: 2px; min-width: 0;
-  text-align: left;
+  display: flex; flex-direction: column; gap: 2px;
+  width: 100%; min-width: 0; text-align: left;
 }
+/* Buttons can retain their contents' intrinsic width in WebKit; give each
+   ellipsizing flex child a definite ceiling inside the tile. */
+.card-name, .card-sub { min-width: 0; max-width: 100%; }
 .card-name {
   font-size: var(--t-13); color: var(--fg);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

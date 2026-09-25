@@ -1036,6 +1036,7 @@ impl Default for PlaybackState {
 pub struct AppState {
     pub playback: PlaybackState,
     pub playlists: Vec<Playlist>,
+    pub library_fresh: bool,
     pub me_id: String,
 }
 

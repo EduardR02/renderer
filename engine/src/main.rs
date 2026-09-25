@@ -7,6 +7,8 @@ mod engine;
 mod follow;
 mod history;
 mod io;
+#[cfg(any(windows, target_os = "macos"))]
+mod output_device;
 mod resample;
 mod time_stretch;
 mod waveform;
@@ -226,6 +228,7 @@ async fn run(
     let (player_sender, mut player_receiver) = mpsc::unbounded_channel::<PlayerSignal>();
     let (browse_sender, mut browse_receiver) = mpsc::unbounded_channel::<BrowseOutcome>();
     let (audio_sender, mut audio_receiver) = mpsc::unbounded_channel();
+    let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
     io::spawn_input_reader(input_sender);
 
     configure_audio_fetch();
@@ -243,6 +246,16 @@ async fn run(
         audio::default_sink_opener(),
         audio::default_device_presence(),
     );
+    #[cfg(any(windows, target_os = "macos"))]
+    let _output_watcher = match output_device::watch(output_sender) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            eprintln!("could not watch default audio output changes: {error}");
+            None
+        }
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    drop(output_sender);
     engine.start_authentication(auth_sender.clone());
     engine.emit_state()?;
 
@@ -847,6 +860,12 @@ async fn run(
                             )?;
                         }
                     }
+                }
+            }
+            Some(()) = output_receiver.recv() => {
+                if engine.on_default_output_changed() {
+                    engine.emit_state()?;
+                    engine.tick_audio_device(&auth_sender);
                 }
             }
             _ = position_heartbeat.tick() => {

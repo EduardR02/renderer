@@ -2496,6 +2496,14 @@ export async function initEvents() {
     // in another client. The first page of Saved Tracks is the one piece of
     // that collection this hub keeps, and it must not outlive the news.
     ["memberships_changed", () => invalidateLikedFirstPage()],
+    // Disk hydration is useful for the sidebar and detail routes, but must
+    // never promote Home past its fresh-rootlist loading frame. If a cache
+    // event is delivered late, keep the authoritative answer already shown.
+    ["library_cached", (e) => {
+      if (libraryState.fresh) return;
+      libraryEvents += 1;
+      setLibrary(e.payload);
+    }],
     // The one authoritative rootlist answer; the only writer that promotes
     // `libraryState.fresh` (a completed play may also, via promotePlaylist).
     ["library", (e) => {
@@ -2550,8 +2558,14 @@ export async function initEvents() {
         }
         applyPlayback(snapshot);
       }
-      if (libraryEvents === libraryAtPull && Array.isArray(payload?.playlists)) {
-        setLibrary(payload.playlists);
+      if (Array.isArray(payload?.playlists) && (
+        libraryEvents === libraryAtPull ||
+        (payload.library_fresh === true && !libraryState.fresh)
+      )) {
+        // A cached event may arrive during the pull even though the rootlist
+        // already completed before subscriptions. Do not let that event keep
+        // Home in the loading frame; a newer fresh event wins on its own.
+        setLibrary(payload.playlists, { fresh: payload.library_fresh === true });
       }
     })
     .catch(() => {});

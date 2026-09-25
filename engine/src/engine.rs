@@ -929,6 +929,29 @@ impl Engine {
         true
     }
 
+    /// The system changed its default render endpoint while a player was
+    /// installed. Stop the old stream and make its in-flight events/rebuilds
+    /// stale, then let the existing device probe open the new default.
+    ///
+    /// Preserve the projected playhead, queue and play/pause intent. The caller
+    /// probes immediately; the heartbeat retains the usual backoff if opening
+    /// the replacement fails. A second change while that open is in flight
+    /// invalidates its generation and starts a probe for the newer default.
+    pub fn on_default_output_changed(&mut self) -> bool {
+        if !self.state.ready || self.session.is_none() {
+            return false;
+        }
+        self.tick_position();
+        self.enter_audio_unavailable(
+            "the default audio output changed; switching playback".to_owned(),
+            PlayerFailure::Ordinary,
+        );
+        if let Some(unavailable) = self.audio_unavailable.as_mut() {
+            unavailable.retry_at = Instant::now();
+        }
+        true
+    }
+
     /// Probes for an output device while the machine has none, on the same
     /// heartbeat that advances the playhead.
     ///
@@ -8771,6 +8794,81 @@ mod tests {
         );
         assert!(!session.is_invalid(), "on the session that never went away");
         receive_load(&mut player_receiver).await;
+    }
+
+    /// Switching the system default is different from unplugging a device:
+    /// the old endpoint can keep draining forever. A notification must stop
+    /// that player, reopen the new default and resume the same track, while a
+    /// second switch makes an earlier device open's answer obsolete.
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_output_switch_reopens_and_resumes_the_current_track() {
+        let device = TestAudioDevice::present();
+        let (mut engine, _) =
+            test_engine_with_audio(PathBuf::new(), device.opener(), device.presence());
+        let probe = SinkProbe::new();
+        let (player, session) = probe_player(&probe);
+        let old_player = Arc::downgrade(&player);
+        engine.state = playback_state(240_000);
+        engine.state.playing = true;
+        engine.player = Some(player);
+        engine.session = Some(session.clone());
+        engine.play_request_id = Some(7);
+        engine.update_position(42_000);
+        note_audio(&mut engine);
+        let old_generation = engine.generation;
+
+        let (auth_sender, mut auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (player_sender, mut player_receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(engine.on_default_output_changed());
+        assert!(old_player.upgrade().is_none() && !probe.is_alive());
+        assert!(engine.state.playing, "the user's play intent survives the switch");
+        assert!(engine.state.position_ms >= 42_000);
+        assert!(!session.is_invalid(), "a device change does not reconnect Spotify");
+        assert_ne!(engine.generation, old_generation);
+        assert!(!engine.tick_audio_device(&auth_sender));
+        let old_answer = receive_auth_signal(&mut auth_receiver).await;
+
+        // A new default arrived while the first replacement was opening. Its
+        // answer must not install a stream bound to the previous endpoint.
+        assert!(engine.on_default_output_changed());
+        assert!(!engine.tick_audio_device(&auth_sender));
+        let new_answer = receive_auth_signal(&mut auth_receiver).await;
+        assert!(!engine.on_auth_signal(old_answer, player_sender.clone()));
+        assert!(engine.player.is_none());
+        assert!(engine.on_auth_signal(new_answer, player_sender));
+
+        assert_eq!(device.opened(), 2, "one open per notified default change");
+        assert!(engine.player.is_some() && engine.audio_unavailable.is_none());
+        assert!(engine.state.playing);
+        assert!(engine.state.position_ms >= 42_000);
+        assert!(!engine.current_needs_load, "the same track was reloaded");
+        assert!(!session.is_invalid());
+        receive_load(&mut player_receiver).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_output_switch_keeps_paused_transport_paused() {
+        let device = TestAudioDevice::present();
+        let (mut engine, _) =
+            test_engine_with_audio(PathBuf::new(), device.opener(), device.presence());
+        let probe = SinkProbe::new();
+        let (player, session) = probe_player(&probe);
+        engine.state = playback_state(240_000);
+        engine.state.playing = false;
+        engine.player = Some(player);
+        engine.session = Some(session);
+        engine.update_position(32_000);
+        let (auth_sender, mut auth_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(engine.on_default_output_changed());
+        assert!(!engine.tick_audio_device(&auth_sender));
+        let answer = receive_auth_signal(&mut auth_receiver).await;
+        assert!(engine.on_auth_signal(answer, player_sender));
+        assert!(engine.player.is_some());
+        assert!(!engine.state.playing);
+        assert_eq!(engine.state.position_ms, 32_000);
+        assert!(engine.current_needs_load, "play will load from the paused position");
     }
 
     /// A device that disappears mid-track lands in the same recoverable state,

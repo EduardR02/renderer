@@ -191,6 +191,10 @@ pub struct AppState {
     pub me_id: String,
     #[serde(skip)]
     pub playlists_fetched_at: Option<i64>,
+    /// This process received an authenticated rootlist, not just disk cache.
+    /// The initial get_state pull can race the `library` event.
+    #[serde(skip)]
+    pub library_fresh: bool,
     /// Most-recently-opened first; limited to [`TRACKS_CACHE_MAX`] entries.
     #[serde(skip)]
     pub tracks_cache: Vec<PlaylistTracksEntry>,
@@ -251,6 +255,7 @@ impl AppState {
             playlists: Vec::new(),
             me_id: String::new(),
             playlists_fetched_at: None,
+            library_fresh: false,
             tracks_cache: Vec::new(),
             data_dir,
             playlist_refreshing: HashSet::new(),

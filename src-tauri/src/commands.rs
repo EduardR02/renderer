@@ -695,6 +695,7 @@ pub async fn get_state(state: State<'_, Mutex<AppState>>) -> Result<AppStateSnap
     Ok(AppStateSnapshot {
         playback: guard.playback.clone(),
         playlists: guard.playlists.clone(),
+        library_fresh: guard.library_fresh,
         me_id: guard.me_id.clone(),
     })
 }
@@ -1023,14 +1024,17 @@ pub async fn consume_states(app: AppHandle) {
     let client = app.state::<Arc<EngineClient>>().inner().clone();
     let mut lines = client.subscribe_lines();
 
-    // Instant first paint: hydrate `AppState` from the on-disk library
-    // snapshot and emit it before the engine is ready, so a returning user
-    // sees their playlists immediately (the frontend may also pull it via
-    // get_state). The ready-transition fetch below supersedes it.
+    // Hydrate the sidebar and detail routes from disk before the engine is
+    // ready (the frontend may also pull it via get_state). This is cached
+    // data, not a fresh rootlist: Home waits for the authenticated fetch.
     load_library_from_disk(&app);
 
     let mut previous_identity: Option<(String, String)> = None;
     let mut last_error = String::new();
+    // The first authenticated line may be held while the playback queue is
+    // restored. Rootlist browse is independent of those transport setters.
+    let mut library_refresh_during_restore = false;
+    let mut restore_started_at = None;
 
     loop {
         let state = match lines.recv().await {
@@ -1105,6 +1109,31 @@ pub async fn consume_states(app: AppHandle) {
         // queue/settings are restored. Start restoration once and suppress
         // that blank state plus every intermediate setter state. EngineClient
         // clears the plan only when the final state matches.
+        if state.auth_state == "ready" && !state.username.is_empty() {
+            let managed = app.state::<Mutex<AppState>>();
+            let mut guard = managed.lock();
+            if guard.me_id != state.username {
+                guard.me_id = state.username.clone();
+                guard.library_fresh = false;
+                guard.library_generation = guard.library_generation.wrapping_add(1);
+            }
+        }
+        if state.auth_state != "ready" {
+            library_refresh_during_restore = false;
+            restore_started_at = None;
+            if matches!(state.auth_state.as_str(), "logged_out" | "needs_login") {
+                app.state::<Mutex<AppState>>().lock().library_fresh = false;
+            }
+        }
+        if state.auth_state == "ready" && client.restore_is_pending() {
+            if !library_refresh_during_restore {
+                // Playback restoration hides intermediate transport states,
+                // but rootlist browse can run beside those sequential setters.
+                spawn_refresh_library(app.clone());
+                library_refresh_during_restore = true;
+                restore_started_at = Some(std::time::Instant::now());
+            }
+        }
         if let Some(snapshot) = client.begin_pending_restore(&state) {
             if let Err(error) = restore_playback(&client, &snapshot).await {
                 log::warn(&format!("could not restore playback: {error}"));
@@ -1177,7 +1206,15 @@ pub async fn consume_states(app: AppHandle) {
             );
         }
         if became_ready {
-            spawn_refresh_library(app.clone());
+            if let Some(started) = restore_started_at.take() {
+                log::info(&format!(
+                    "playback restore held ready state for {} ms",
+                    started.elapsed().as_millis()
+                ));
+            }
+            if !std::mem::take(&mut library_refresh_during_restore) {
+                spawn_refresh_library(app.clone());
+            }
         }
 
         previous_identity = Some((state.auth_state, state.username));
@@ -1202,9 +1239,8 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> 
     Ok(())
 }
 
-/// Hydrates `AppState` from the on-disk library snapshot (instant first
-/// paint) and emits it as `library`; the engine refresh that supersedes it
-/// is spawned separately once the engine reports ready.
+/// Hydrates `AppState` from the on-disk library snapshot and emits it as
+/// `library_cached`; the authenticated engine refresh supersedes it.
 fn load_library_from_disk(app: &AppHandle) {
     let dir = data_dir();
     let mut playlists = load_playlist_list(&dir);
@@ -1220,13 +1256,14 @@ fn load_library_from_disk(app: &AppHandle) {
         if let Some(cache) = &playlists {
             guard.playlists = cache.playlists.clone();
             guard.playlists_fetched_at = cache.fetched_at;
+            guard.library_fresh = false;
             if !cache.me_id.is_empty() {
                 guard.me_id = cache.me_id.clone();
             }
         }
     }
     if let Some(cache) = playlists {
-        let _ = app.emit("library", &cache.playlists);
+        let _ = app.emit("library_cached", &cache.playlists);
     }
 }
 
@@ -1576,6 +1613,7 @@ async fn fetch_library(
         order_by_last_activity(&mut playlists);
         guard.playlists = playlists.clone();
         guard.playlists_fetched_at = Some(fetched_at);
+        guard.library_fresh = true;
         (
             guard.data_dir.clone(),
             PlaylistListCache {
