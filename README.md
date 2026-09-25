@@ -106,7 +106,7 @@ you intend to run (Windows for NSIS, macOS for `.app`); Cargo compiles every
 dependency from source, so the build directory ends up several GB. On macOS,
 install Xcode Command Line Tools (`xcode-select --install`) and use macOS 14
 or later: the ambient haze uses WebKit worker OffscreenCanvas WebGL, which
-needs macOS 14+. Both Intel and Apple Silicon builds use the host architecture.
+needs macOS 14+. Local builds use your Mac's architecture.
 
 ```bash
 bun install
@@ -125,13 +125,13 @@ with `bun run build:engine` if you have not already built it. Checks are
 `cargo test -p renderer-engine`, `cargo test -p renderer`, `bun test`, and
 `bun run build`.
 
-The [manual macOS build workflow](../../actions/workflows/macos-build.yml)
+The [macOS build workflow](../../actions/workflows/macos-build.yml)
 (`Actions` → `macOS build` → `Run workflow`, or
-`gh workflow run macos-build.yml`) runs the tests and the same Tauri build
-on Apple Silicon and Intel macOS 15 runners. Choose the artifact matching your
-Mac's architecture. Each `renderer-macos-adhoc-*` artifact contains a
-`renderer-macos.zip` archive of the ad-hoc-signed `.app` for launch testing,
-not a DMG or a release. Ad-hoc signing is not Apple Developer ID signing;
+`gh workflow run macos-build.yml`) runs the tests and Tauri build on an
+Apple Silicon macOS 15 runner. The `renderer-macos-adhoc-ARM64` artifact
+contains a `renderer-macos.zip` archive of the ad-hoc-signed `.app` for
+launch testing on Apple Silicon Macs, not a DMG or a release.
+Ad-hoc signing is not Apple Developer ID signing;
 distribution to other users requires a proper Developer ID signature and
 Apple notarization. Without those, Gatekeeper may block the app.
 

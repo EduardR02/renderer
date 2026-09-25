@@ -2,15 +2,12 @@ name: macOS build
 
 on:
   push:
-    branches: [main, macos-port]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        runner: [macos-15, macos-15-intel]
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
