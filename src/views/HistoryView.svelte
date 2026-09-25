@@ -126,6 +126,10 @@
      the handful of rows that need it, rather than for all of them.
      ===================================================================== */
   const KINDS = { playlist: "Playlist", album: "Album", artist: "Artist", radio: "Radio" };
+  // The source column can contain a screenful of playlist contexts. Index
+  // the library once per change instead of scanning it for every visible row.
+  const playlistById = $derived(new Map(library.map((entry) => [entry.id, entry])));
+
 
   function sourceLabel(context) {
     if (!context) return "";
@@ -136,7 +140,7 @@
     const kind = separator === -1 ? context : context.slice(0, separator);
     const id = separator === -1 ? "" : context.slice(separator + 1);
     if (kind === "playlist" && id) {
-      const playlist = library.find((entry) => entry.id === id);
+      const playlist = playlistById.get(id);
       if (playlist?.name) return playlist.name;
     }
     return KINDS[kind] || "Queue";
@@ -283,7 +287,9 @@
       error = String(reason || "Could not load listening history.");
       loaded = true;
     } finally {
-      inflight.delete(index);
+      // A stale generation must not remove the newer request for this index
+      // after reload() has cleared and reused the in-flight set.
+      if (mine === generation) inflight.delete(index);
     }
   }
 

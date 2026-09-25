@@ -116,8 +116,10 @@ export function boundedMisses(max, { within = WINDOW_MS } = {}) {
   const misses = new Map();
   return {
     miss(url) {
+      const now = Date.now();
       const previous = misses.get(url);
-      misses.set(url, { count: (previous?.count ?? 0) + 1, at: Date.now() });
+      const count = previous && now - previous.at < within ? previous.count + 1 : 1;
+      misses.set(url, { count, at: now });
       if (misses.size > max) misses.delete(misses.keys().next().value);
     },
     resolved(url) {

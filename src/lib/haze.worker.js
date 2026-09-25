@@ -74,13 +74,18 @@ function readSource(source) {
   const k = PROBE / Math.max(sw, sh);
   const w = Math.max(8, Math.round(sw * k));
   const h = Math.max(8, Math.round(sh * k));
-  probeCtx.clearRect(0, 0, PROBE, PROBE);
+  probeCtx.clearRect(0, 0, w, h);
   probeCtx.drawImage(source, 0, 0, w, h);
   try {
-    read.clearRect(0, 0, PROBE, PROBE);
+    read.clearRect(0, 0, w, h);
     read.drawImage(probe, 0, 0, w, h, 0, 0, w, h);
     return { data: read.getImageData(0, 0, w, h).data, w, h };
   } catch {
+    /* A CORS-tainted image poisons both canvases, not just this read.
+       Resizing clears their origin-clean flags for the next source. */
+    probe.width = PROBE;
+    read.canvas.width = PROBE;
+    probeCtx.imageSmoothingQuality = "high";
     return null; // tainted: a cover served without CORS
   }
 }

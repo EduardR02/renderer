@@ -677,9 +677,7 @@ export function createGlHaze() {
         const x0 = Math.min(w - 1, Math.ceil(frame.x)), lw = w - x0;
         const rows = new Uint8Array(lw * h * 4);
         gl.readPixels(x0, 0, lw, h, gl.RGBA, gl.UNSIGNED_BYTE, rows);
-        const data = new Uint8Array(rows.length);
-        for (let y = 0; y < h; y++) data.set(rows.subarray((h - 1 - y) * lw * 4, (h - y) * lw * 4), y * lw * 4);
-        light = lightOf({ data, w: lw, h }, [0, 0, lw, h]);
+        light = lightOf({ data: rows, w: lw, h }, [0, 0, lw, h], true);
       } else {
         light = lightOf(src, plan.shown);
       }

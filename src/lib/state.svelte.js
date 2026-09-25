@@ -453,8 +453,10 @@ async function backfillLazyQueue(force = false) {
       if (generation === lazyQueue.generation) lazyQueue.retryAfter = performance.now() + 5000;
       throw error;
     } finally {
-      if (generation === lazyQueue.generation) lazyQueue.loading = false;
-      lazyBackfillPromise = null;
+      if (generation === lazyQueue.generation) {
+        lazyQueue.loading = false;
+        lazyBackfillPromise = null;
+      }
     }
   })();
   return lazyBackfillPromise;
@@ -2456,12 +2458,23 @@ function handlePlaylistRefresh(e) {
 export async function initEvents() {
   if (bootstrapped) return;
   bootstrapped = true;
+  // A startup snapshot may arrive after live events. The independent event
+  // lanes must not overwrite one another while the initial pull is in flight.
+  let stateEvents = 0;
+  let volumeEvents = 0;
+  let positionEvents = 0;
+  let sessionEvents = 0;
+  let libraryEvents = 0;
 
   // Subscriptions reject only when the event bridge itself is broken
   // (missing plugin, webview teardown). Swallowing that left a permanently
   // deaf UI, so the first failure surfaces as a playback error banner.
   const targets = [
-    ["state", (e) => applyPlayback(e.payload)],
+    ["state", (e) => {
+      if ("ready" in e.payload) stateEvents += 1;
+      else if ("volume" in e.payload) volumeEvents += 1;
+      applyPlayback(e.payload);
+    }],
     // Heartbeats carry only the projected compiled position as a scalar; the
     // full state event remains authoritative for duration and queue metadata.
     [
@@ -2469,22 +2482,31 @@ export async function initEvents() {
       (e) => {
         const position = Number(e.payload);
         if (!Number.isFinite(position)) return;
+        positionEvents += 1;
         playback.position_ms = Math.max(0, Math.round(position));
         anchorPlayhead(playback.position_ms);
       },
     ],
     ["playlist", handlePlaylistRefresh],
-    ["session", (e) => applySession(e.payload)],
+    ["session", (e) => {
+      sessionEvents += 1;
+      applySession(e.payload);
+    }],
     // The shell's index of what is saved changed — a like or an unlike, here or
     // in another client. The first page of Saved Tracks is the one piece of
     // that collection this hub keeps, and it must not outlive the news.
     ["memberships_changed", () => invalidateLikedFirstPage()],
     // The one authoritative rootlist answer; the only writer that promotes
     // `libraryState.fresh` (a completed play may also, via promotePlaylist).
-    ["library", (e) => setLibrary(e.payload, { fresh: true })],
+    ["library", (e) => {
+      libraryEvents += 1;
+      setLibrary(e.payload, { fresh: true });
+    }],
     // A mutation's refreshed summary patches the one library row it names;
     // full rootlist answers still arrive as `library`.
-    ["playlist_summary", (e) => applyPlaylistSummary(e.payload)],
+    ["playlist_summary", (e) => {
+      if (applyPlaylistSummary(e.payload)) libraryEvents += 1;
+    }],
   ];
 
   const results = await Promise.allSettled(
@@ -2503,11 +2525,34 @@ export async function initEvents() {
   // library snapshot (hydrated by the Rust side at startup) is applied here
   // for an instant paint. Once ready, the coalesced library event supplies
   // fresh rootlist data without issuing a duplicate browse request.
+  const stateAtPull = stateEvents;
+  const volumeAtPull = volumeEvents;
+  const positionAtPull = positionEvents;
+  const sessionAtPull = sessionEvents;
+  const libraryAtPull = libraryEvents;
   api
     .getState()
     .then((payload) => {
-      applyPlayback(payload?.playback ?? payload);
-      if (payload && Array.isArray(payload.playlists)) setLibrary(payload.playlists);
+      if (stateEvents === stateAtPull) {
+        let snapshot = payload?.playback ?? payload;
+        if (snapshot && (
+          volumeEvents !== volumeAtPull ||
+          positionEvents !== positionAtPull ||
+          sessionEvents !== sessionAtPull
+        )) {
+          snapshot = { ...snapshot };
+          if (volumeEvents !== volumeAtPull) snapshot.volume = playback.volume;
+          if (positionEvents !== positionAtPull) snapshot.position_ms = playback.position_ms;
+          if (sessionEvents !== sessionAtPull) {
+            snapshot.auth_state = playback.auth_state;
+            snapshot.username = playback.username;
+          }
+        }
+        applyPlayback(snapshot);
+      }
+      if (libraryEvents === libraryAtPull && Array.isArray(payload?.playlists)) {
+        setLibrary(payload.playlists);
+      }
     })
     .catch(() => {});
 }

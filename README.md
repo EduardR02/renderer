@@ -117,6 +117,12 @@ from that. The playhead is animated with a transform instead of a width, so it
 doesn't force layout on every tick. Long lists are virtualized. The engine sends
 a small position update on each heartbeat rather than the whole state.
 
+The glass panes use a cached, frosted twin of the ambient haze rather than
+re-blurring the entire window as content moves; the haze worker redraws when
+its source or layout changes, not on every frame. Track dragging similarly
+updates its hit test on movement or scroll, with continuous frames only while
+edge autoscroll is moving. These keep the visual treatment intact at rest.
+
 Two processes. `engine/` wraps [librespot](https://github.com/librespot-org/librespot)
 and handles everything to do with sound. The Tauri shell in `src-tauri/`
 supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.

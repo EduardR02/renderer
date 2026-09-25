@@ -157,6 +157,9 @@
     // No sort is the common case and the list can be thousands long; the
     // comparator below would run and decide nothing.
     if (sortState.key === null || (sortState.key === "order" && sortState.direction === "asc")) return tracks;
+    // Reverse the stored sequence directly: sorting decorated rows here costs
+    // O(n log n) comparisons and O(n) transient objects for a pure reversal.
+    if (sortState.key === "order") return tracks.slice().reverse();
     const sortKey = sortState.key;
     const direction = sortState.direction === "asc" ? 1 : -1;
     return tracks

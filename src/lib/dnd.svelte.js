@@ -5,11 +5,9 @@
  *   - onto a sidebar playlist row          -> COPY there (add only; the
  *     source keeps the track — dropping on any other list adds too)
  *
- * Everything spatial runs in ONE requestAnimationFrame loop that exists only
- * while a drag is live: hit-testing, the landing slot, autoscroll of the two
- * scrollable regions (the content pane and the library rail), and the ghost's
- * position. `pointermove` only records coordinates; it never reads layout.
- * When no drag runs, this module's steady-state cost is exactly zero.
+ * Spatial work is scheduled when the pointer or a scroller moves, and runs
+ * continuously only while autoscrolling. `pointermove` only records coordinates;
+ * it never reads layout. When no drag runs, this module's cost is zero.
  *
  * Reactivity contract: `trackDrag` is the reactive projection components read
  * (TrackList draws the insertion bar and parts its rows around the slot;
@@ -30,9 +28,6 @@ export const trackDrag = $state({
    */
   sourcePlaylistId: null,
   sourceIndex: -1,
-  /** Latest pointer position, window coordinates. */
-  x: 0,
-  y: 0,
   /** Wrapper element of the hovered reorder zone, or null. */
   listEl: null,
   /**
@@ -89,13 +84,15 @@ const PILL_ANCHOR_Y = ROW_H / 2;
 const GHOST_SCALE = 1.028;
 
 let press = null; // pending press before the threshold, then live drag state
+let pointerX = 0;
+let pointerY = 0;
 let ghostWrap = null; // positioned wrap holding the pill ghost
 let pillEl = null; // the pill inside ghostWrap; its margins carry the anchor
 let originRect = null; // where the ghost came from (fly-back target)
 let layer = null; // #drag-layer, created once per activation
 let rafId = 0;
 let lastFrame = 0;
-let scrollers = []; // [{ el }] resolved once per drag
+let scrollers = []; // scrollable elements resolved once per drag
 let cleanupTimer = 0;
 
 /**
@@ -115,6 +112,7 @@ export function pressTrack(ctx) {
   press = {
     active: false,
     ctx,
+    pointerId: e.pointerId,
     rowEl: ctx.rowEl,
     startX: e.clientX,
     startY: e.clientY,
@@ -136,10 +134,13 @@ function releaseListeners() {
 }
 
 function onPressMove(e) {
-  if (!press) return;
-  trackDrag.x = e.clientX;
-  trackDrag.y = e.clientY;
-  if (press.active) return;
+  if (!press || e.pointerId !== press.pointerId) return;
+  pointerX = e.clientX;
+  pointerY = e.clientY;
+  if (press.active) {
+    scheduleFrame();
+    return;
+  }
   const dx = e.clientX - press.startX;
   const dy = e.clientY - press.startY;
   if (dx * dx + dy * dy < PRESS_THRESHOLD * PRESS_THRESHOLD) return;
@@ -153,14 +154,15 @@ function onPressKey(e) {
   endDrag(false);
 }
 
-function onPressUp() {
-  if (!press) return;
-  const commit = press.active;
-  endDrag(commit);
+function onPressUp(e) {
+  if (!press || e.pointerId !== press.pointerId) return;
+  pointerX = e.clientX;
+  pointerY = e.clientY;
+  endDrag(press.active);
 }
 
-function onPressCancel() {
-  if (!press) return;
+function onPressCancel(e) {
+  if (!press || e.pointerId !== press.pointerId) return;
   endDrag(false);
 }
 
@@ -182,14 +184,15 @@ function activate() {
 
   scrollers = [];
   const paneScroller = press.rowEl.closest(".scroll");
-  if (paneScroller) scrollers.push({ el: paneScroller });
+  if (paneScroller) scrollers.push(paneScroller);
   const rail = document.querySelector(".lib-list");
-  if (rail) scrollers.push({ el: rail });
+  if (rail && rail !== paneScroller) scrollers.push(rail);
+  for (const el of scrollers) el.addEventListener("scroll", scheduleFrame, { passive: true });
 
   document.documentElement.classList.add("dragging-track");
   positionGhost();
   lastFrame = performance.now();
-  rafId = requestAnimationFrame(frame);
+  scheduleFrame();
 }
 
 function ensureLayer() {
@@ -221,8 +224,8 @@ function ensureLayer() {
 function buildGhost(rowEl) {
   const rect = rowEl.getBoundingClientRect();
   originRect = rect;
-  press.grabX = trackDrag.x - rect.left;
-  press.grabY = trackDrag.y - rect.top;
+  press.grabX = pointerX - rect.left;
+  press.grabY = pointerY - rect.top;
 
   const wrap = document.createElement("div");
   wrap.className = "tl-drag-ghost";
@@ -258,7 +261,7 @@ function buildGhost(rowEl) {
 function positionGhost() {
   if (!ghostWrap) return;
   ghostWrap.style.transform =
-    `translate3d(${trackDrag.x - press.grabX}px, ${trackDrag.y - press.grabY}px, 0) scale(${GHOST_SCALE})`;
+    `translate3d(${pointerX - press.grabX}px, ${pointerY - press.grabY}px, 0) scale(${GHOST_SCALE})`;
 }
 
 /** Ease-in weight for the autoscroll band: gentle at the edge, brisk deeper. */
@@ -309,38 +312,43 @@ function hitTest(x, y) {
   return { zoneEl, slot, dropRow };
 }
 
-/**
- * One layout pass per frame while dragging: hover state, landing slot,
- * autoscroll, ghost position. Every write to reactive state is guarded by an
- * equality check, so idling the pointer notifies nobody.
- */
+/** A frame runs on movement and keeps running only while an edge is scrolling. */
+function scheduleFrame() {
+  if (!press?.active || rafId) return;
+  lastFrame = performance.now();
+  rafId = requestAnimationFrame(frame);
+}
+
 function frame(now) {
+  rafId = 0;
   if (!press?.active) return;
   const dt = Math.min(48, now - lastFrame) / 1000;
   lastFrame = now;
   const d = trackDrag;
+  let scrolling = false;
 
-  for (const { el } of scrollers) {
+  for (const el of scrollers) {
     if (el.scrollHeight <= el.clientHeight) continue;
     const r = el.getBoundingClientRect();
-    if (d.x < r.left || d.x > r.right) continue;
-    const fromTop = d.y - r.top;
-    const fromBottom = r.bottom - d.y;
+    if (pointerX < r.left || pointerX > r.right) continue;
+    const fromTop = pointerY - r.top;
+    const fromBottom = r.bottom - pointerY;
+    const before = el.scrollTop;
     if (fromTop >= 0 && fromTop < EDGE_BAND) {
       el.scrollTop -= MAX_SCROLL_SPEED * bandPenetration(fromTop) * dt;
     } else if (fromBottom >= 0 && fromBottom < EDGE_BAND) {
       el.scrollTop += MAX_SCROLL_SPEED * bandPenetration(fromBottom) * dt;
     }
+    if (el.scrollTop !== before) scrolling = true;
   }
 
-  const { zoneEl, slot, dropRow } = hitTest(d.x, d.y);
-
+  const { zoneEl, slot, dropRow } = hitTest(pointerX, pointerY);
   if (d.listEl !== zoneEl) d.listEl = zoneEl;
   if (d.slot !== slot) d.slot = slot;
   press.dropRow = dropRow;
 
   positionGhost();
-  rafId = requestAnimationFrame(frame);
+  if (scrolling) scheduleFrame();
 }
 
 function endDrag(commit) {
@@ -348,22 +356,22 @@ function endDrag(commit) {
   press = null;
   releaseListeners();
   cancelAnimationFrame(rafId);
+  rafId = 0;
+  for (const el of scrollers) el.removeEventListener("scroll", scheduleFrame);
+  scrollers = [];
 
   const d = trackDrag;
   const wasActive = d.active;
   let outcome = "cancel";
 
   if (commit && wasActive) {
-    /* The pointer can come up before the first frame after activation has
-       run — a flick-release over the rail, or a machine under load. No frame
-       loop pass has resolved a target then; do it synchronously from the
-       final pointer position so the drop doesn't degrade into a cancel. */
-    if (d.listEl === null && d.slot < 0 && p.dropRow === null) {
-      const hit = hitTest(d.x, d.y);
-      d.listEl = hit.zoneEl;
-      d.slot = hit.slot;
-      p.dropRow = hit.dropRow;
-    }
+    /* The last pointermove may still be waiting for its frame when the pointer
+       comes up. Resolve at the final coordinates rather than using the
+       previous frame's target. */
+    const hit = hitTest(pointerX, pointerY);
+    d.listEl = hit.zoneEl;
+    d.slot = hit.slot;
+    p.dropRow = hit.dropRow;
     let matched = null;
     if (d.listEl) {
       for (const z of zones) {

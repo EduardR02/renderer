@@ -76,27 +76,16 @@
     if (trackDrag.active) showingArtists = false;
   });
 
-  /* Which collection the rail's scroll offset belongs to, so switching lists
-     can be told apart from the list already on screen growing. A plain `let`:
-     nothing renders from it. */
+  /* The observer and scroll listener belong to the element, not to the
+     changing filter/results. Keep them mounted while queries are typed or
+     playlists arrive; only the fade measurement needs scheduling then. */
   let scrolledMode = false;
+  let scrolledQuery = "";
+  let scheduleFades = () => {};
 
   $effect(() => {
-    const query = filterQuery;
-    const mode = showingArtists;
-    filteredLibrary.length;
-    filteredArtists.length;
-    library.length;
     const list = libList;
     if (!list) return;
-
-    /* A filtered collection is a new result set, not the old list at its old
-       scroll offset, and so is the other collection entirely. Reset before
-       measuring so both mask edges describe the rows that are actually
-       visible now. */
-    if (query || mode !== scrolledMode) list.scrollTop = 0;
-    scrolledMode = mode;
-
     let frame = 0;
     const updateFades = () => {
       frame = 0;
@@ -104,11 +93,9 @@
       fadeTop = list.scrollTop > 1;
       fadeBottom = list.scrollTop < maxScroll - 1;
     };
-    const scheduleFades = () => {
-      if (frame) return;
-      frame = requestAnimationFrame(updateFades);
+    scheduleFades = () => {
+      if (!frame) frame = requestAnimationFrame(updateFades);
     };
-
     scheduleFades();
     list.addEventListener("scroll", scheduleFades, { passive: true });
     const resizeObserver = new ResizeObserver(scheduleFades);
@@ -117,7 +104,23 @@
       list.removeEventListener("scroll", scheduleFades);
       resizeObserver.disconnect();
       if (frame) cancelAnimationFrame(frame);
+      scheduleFades = () => {};
     };
+  });
+
+  $effect(() => {
+    const query = filterQuery;
+    const mode = showingArtists;
+    if (mode) filteredArtists.length;
+    else filteredLibrary.length;
+    const list = libList;
+    if (!list) return;
+    /* A new result set begins at the top; updating the current result set
+       must not kick someone back to the top of a filtered list. */
+    if (query !== scrolledQuery || mode !== scrolledMode) list.scrollTop = 0;
+    scrolledQuery = query;
+    scrolledMode = mode;
+    scheduleFades();
   });
 
   $effect(() => {

@@ -779,11 +779,10 @@
     else clampWindow(length);
   });
 
+  // Re-measure when the list changes without rebuilding the scroll listener
+  // and ResizeObserver on every playlist reorder, sort or track edit.
   $effect(() => {
     if (disableWindowing) return;
-    // Re-runs when the list identity, its length, or its presentation context
-    // changes; deliberately does not depend on firstRow/lastRow, which change
-    // on every scroll frame.
     const list = tracks;
     list.length;
     playlistId;
@@ -792,27 +791,33 @@
     if (!scroller) {
       // No scroll ancestor (embedded use): render everything, as before.
       curFirst = 0;
-      curLast = tracks.length;
+      curLast = list.length;
       firstRow = 0;
-      lastRow = tracks.length;
+      lastRow = list.length;
       return;
     }
-    let queued = false;
+    untrack(() => measure(scroller));
+  });
+
+  $effect(() => {
+    if (disableWindowing || !bodyEl) return;
+    const scroller = bodyEl.closest(".scroll");
+    if (!scroller) return;
+    let scrollFrame = 0;
     const onScroll = () => {
-      if (queued) return;
-      queued = true;
-      requestAnimationFrame(() => {
-        queued = false;
+      if (scrollFrame) return;
+      scrollFrame = requestAnimationFrame(() => {
+        scrollFrame = 0;
         measure(scroller);
       });
     };
     scroller.addEventListener("scroll", onScroll, { passive: true });
     const ro = new ResizeObserver(() => measure(scroller));
     ro.observe(scroller);
-    measure(scroller);
     return () => {
       scroller.removeEventListener("scroll", onScroll);
       ro.disconnect();
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
     };
   });
 

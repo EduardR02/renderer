@@ -142,21 +142,18 @@ export function scrollbar(node, options = {}) {
     node.scrollBy({ top: event.deltaY, left: 0, behavior: "instant" });
   }
 
-  /* Content growth shows up as a direct child resizing. A child that
-     arrives is measured by the observer's own first report and one that
-     leaves by its last (a removed target reports once, at zero size) —
-     both after layout, so nothing here forces one mid-update. */
+  /* Direct-child changes can alter scrollHeight without resizing any surviving
+     observed child (notably when the tallest child is removed). Reconcile
+     targets and measure after the mutation; resize reports cover later growth. */
   const watched = new Set();
-  const resize = new ResizeObserver(() => {
+  const resize = new ResizeObserver(measure);
+  function watchChildren() {
     for (const child of watched) {
       if (child.parentNode !== node) {
         watched.delete(child);
         resize.unobserve(child);
       }
     }
-    measure();
-  });
-  function watchChildren() {
     for (const child of node.children) {
       if (!watched.has(child)) {
         watched.add(child);
@@ -164,7 +161,10 @@ export function scrollbar(node, options = {}) {
       }
     }
   }
-  const mutations = new MutationObserver(watchChildren);
+  const mutations = new MutationObserver(() => {
+    watchChildren();
+    measure();
+  });
 
   resize.observe(node);
   watchChildren();

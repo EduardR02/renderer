@@ -565,9 +565,10 @@ const BOTTOM_START = 0.58;
 /**
  * How bright a picture is under the panel's type: the relative luminance
  * of the bright end (90th percentile) of the top and bottom bands of
- * `shown`, the rectangle the panel covers.
+ * `shown`, the rectangle the panel covers. `bottomUp` reads WebGL's
+ * readPixels rows without copying them into top-down order.
  */
-export function lightOf(src, shown) {
+export function lightOf(src, shown, bottomUp = false) {
   const [x0, y0, x1, y1] = shown;
   const rows = y1 - y0;
   const topEnd = y0 + Math.max(1, Math.round(rows * TOP_END));
@@ -575,7 +576,10 @@ export function lightOf(src, shown) {
   const band = (from, to) => {
     const out = new Float32Array((to - from) * (x1 - x0));
     let n = 0;
-    for (let y = from; y < to; y++) for (let x = x0; x < x1; x++) out[n++] = lum8(src.data, (y * src.w + x) * 4);
+    for (let y = from; y < to; y++) {
+      const row = (bottomUp ? src.h - 1 - y : y) * src.w;
+      for (let x = x0; x < x1; x++) out[n++] = lum8(src.data, (row + x) * 4);
+    }
     return out.length ? round3(select(out, Math.min(out.length - 1, Math.floor(out.length * 0.9)))) : 0;
   };
   return { top: band(y0, topEnd), bottom: band(lowStart, y1) };
