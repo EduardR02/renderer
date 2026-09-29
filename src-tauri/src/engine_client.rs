@@ -497,6 +497,25 @@ struct RestorePlan {
     preview_lease_id: Option<u64>,
 }
 
+fn claim_restore_plan(pending: &mut Option<RestorePlan>) -> Option<RestoreSnapshot> {
+    let plan = pending
+        .as_mut()
+        .filter(|plan| !plan.only_if_preview && !plan.sent)?;
+    plan.sent = true;
+    Some(plan.snapshot.clone())
+}
+
+fn retry_restore_plan(pending: &mut Option<RestorePlan>) -> Option<Duration> {
+    let plan = pending.as_mut().filter(|plan| !plan.only_if_preview)?;
+    plan.attempts += 1;
+    if plan.attempts >= RESTORE_RETRY_ATTEMPTS {
+        *pending = None;
+        return None;
+    }
+    plan.sent = false;
+    Some(restore_retry_delay(plan.attempts))
+}
+
 /// Whether a payload carried its queue rows.
 ///
 /// A fact about the wire, not about the parsed fields: the engine sends
@@ -624,6 +643,9 @@ pub struct EngineClient {
     /// snapshot while a preview is live.
     preview_active: AtomicBool,
     restore_pending: Mutex<Option<RestorePlan>>,
+    /// Invalidates an in-flight restore attempt when its engine exits or the
+    /// session is explicitly cleared.
+    restore_generation: AtomicU64,
     persist_tx: SyncSender<PersistCommand>,
     persist_generation: AtomicU64,
     /// Bumped under the retained-state lock whenever a state line installs a
@@ -662,6 +684,7 @@ impl EngineClient {
             delta_base: Mutex::new(DeltaBase::default()),
             preview_active: AtomicBool::new(false),
             restore_pending: Mutex::new(restore_pending),
+            restore_generation: AtomicU64::new(0),
             persist_tx,
             persist_generation: AtomicU64::new(0),
             queue_generation: AtomicU64::new(0),
@@ -685,14 +708,28 @@ impl EngineClient {
     /// Starts the pending startup/crash restore exactly once, after a fresh
     /// engine reports that authentication is ready. Preview leases are kept
     /// separate from this path and are never consumed here.
-    pub fn begin_pending_restore(&self, state: &PlaybackState) -> Option<RestoreSnapshot> {
-        let mut pending = self.restore_pending.lock();
-        let plan = pending.as_mut()?;
-        if plan.only_if_preview || plan.sent || state.auth_state != "ready" {
+    /// The generation is captured under the same lock that claims the plan,
+    /// so a failed old attempt cannot re-arm a replacement after an EOF.
+    pub fn begin_pending_restore_with_generation(
+        &self,
+        state: &PlaybackState,
+    ) -> Option<(RestoreSnapshot, u64)> {
+        if state.auth_state != "ready" {
             return None;
         }
-        plan.sent = true;
-        Some(plan.snapshot.clone())
+        let mut pending = self.restore_pending.lock();
+        let snapshot = claim_restore_plan(&mut pending)?;
+        Some((snapshot, self.restore_generation.load(Ordering::Acquire)))
+    }
+
+    /// Claims the already-authenticated restore when its backoff expires.
+    /// An old timer cannot claim a replacement plan after an engine exit.
+    pub fn begin_pending_retry(&self, generation: u64) -> Option<RestoreSnapshot> {
+        let mut pending = self.restore_pending.lock();
+        if self.restore_generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        claim_restore_plan(&mut pending)
     }
 
     pub fn restore_is_pending(&self) -> bool {
@@ -762,21 +799,25 @@ impl EngineClient {
         }
     }
 
-    /// Re-arms the durable restore for another attempt after a failure,
-    /// returning the backoff to wait before that attempt. At the attempt cap
-    /// the plan is disarmed (`None`) — the engine keeps whatever state it
-    /// reached instead of the shell hammering a broken restore forever.
-    /// Preview leases are never consumed here.
-    pub fn retry_pending_restore(&self) -> Option<Duration> {
+    /// Re-arms the durable restore after a failed attempt, returning its
+    /// backoff. At the attempt cap the plan is disarmed (`Ok(None)`); a failure
+    /// from an exited engine or a cleared plan cannot mutate its replacement
+    /// (`Err(())`). Preview leases are never consumed here.
+    pub fn retry_pending_restore_for_generation(
+        &self,
+        generation: u64,
+    ) -> Result<Option<Duration>, ()> {
         let mut pending = self.restore_pending.lock();
-        let plan = pending.as_mut().filter(|plan| !plan.only_if_preview)?;
-        plan.attempts += 1;
-        if plan.attempts >= RESTORE_RETRY_ATTEMPTS {
-            *pending = None;
-            return None;
+        if self.restore_generation.load(Ordering::Acquire) != generation {
+            return Err(());
         }
-        plan.sent = false;
-        Some(restore_retry_delay(plan.attempts))
+        if !pending
+            .as_ref()
+            .is_some_and(|plan| !plan.only_if_preview && plan.sent)
+        {
+            return Err(());
+        }
+        Ok(retry_restore_plan(&mut pending))
     }
 
     /// Respawn loop: waits for the reader thread to signal EOF, sleeps with
@@ -1281,6 +1322,7 @@ impl EngineClient {
             let mut pending = self.restore_pending.lock();
             let mut last_state = self.last_state.lock();
             *pending = None;
+            self.restore_generation.fetch_add(1, Ordering::AcqRel);
             *last_state = None;
         }
         self.preview_active.store(false, Ordering::Release);
@@ -1320,6 +1362,42 @@ impl EngineClient {
             .request("browse_playlists", json!({"length": length}))
             .await?;
         parse_data(reply, "browse_playlists")
+    }
+
+    pub async fn browse_playlist_tree(
+        &self,
+        length: usize,
+    ) -> Result<Vec<renderer_engine::protocol::LibraryNode>, String> {
+        let reply = self
+            .request("browse_playlist_tree", json!({"length": length}))
+            .await?;
+        parse_data(reply, "browse_playlist_tree")
+    }
+
+    pub async fn browse_show(
+        &self,
+        id: &str,
+    ) -> Result<renderer_engine::protocol::ShowBrowse, String> {
+        let reply = self.request("browse_show", json!({"id": id})).await?;
+        parse_data(reply, "browse_show")
+    }
+
+    pub async fn browse_episode(
+        &self,
+        id: &str,
+    ) -> Result<renderer_engine::protocol::EpisodeRef, String> {
+        let reply = self.request("browse_episode", json!({"id": id})).await?;
+        parse_data(reply, "browse_episode")
+    }
+
+    pub async fn browse_profile(
+        &self,
+        username: &str,
+    ) -> Result<renderer_engine::protocol::UserProfile, String> {
+        let reply = self
+            .request("browse_profile", json!({"username": username}))
+            .await?;
+        parse_data(reply, "browse_profile")
     }
 
     pub async fn browse_playlist(
@@ -1888,6 +1966,7 @@ impl EngineClient {
         }
         drop(pending);
         let mut restore = self.restore_pending.lock();
+        self.restore_generation.fetch_add(1, Ordering::AcqRel);
         let last = self.last_state.lock().clone();
         if let Some(last) = last.filter(|state| state.auth_state == "ready") {
             *restore = Some(RestorePlan {
@@ -2268,6 +2347,7 @@ mod tests {
             preview_active: AtomicBool::new(false),
             restore_pending: Mutex::new(None),
             persist_tx,
+            restore_generation: AtomicU64::new(0),
             persist_generation: AtomicU64::new(0),
             queue_generation: AtomicU64::new(0),
             persist_thread: Mutex::new(None),
@@ -3361,11 +3441,13 @@ mod tests {
             previous.queue,
             "fresh-child blank state must not erase the crash snapshot"
         );
-        let restore = client
-            .begin_pending_restore(&blank)
+        let (restore, _) = client
+            .begin_pending_restore_with_generation(&blank)
             .expect("ready state starts restore");
         assert!(!restore.resume_playing);
-        assert!(client.begin_pending_restore(&blank).is_none());
+        assert!(client
+            .begin_pending_restore_with_generation(&blank)
+            .is_none());
 
         let mut restored = previous;
         restored.playing = false;
@@ -3393,7 +3475,7 @@ mod tests {
         // disarms the durable restore instead of looping forever.
         let mut delays = Vec::new();
         loop {
-            match client.retry_pending_restore() {
+            match retry_restore_plan(&mut client.restore_pending.lock()) {
                 Some(delay) => delays.push(delay),
                 None => break,
             }
@@ -3403,7 +3485,7 @@ mod tests {
         assert_eq!(delays[1], Duration::from_secs(10));
         assert_eq!(*delays.last().unwrap(), Duration::from_secs(40));
         assert!(client.restore_pending.lock().is_none());
-        assert!(client.retry_pending_restore().is_none());
+        assert!(retry_restore_plan(&mut client.restore_pending.lock()).is_none());
 
         // A preview lease is never consumed (nor disarmed) by this path.
         *client.restore_pending.lock() = Some(RestorePlan {
@@ -3411,12 +3493,67 @@ mod tests {
             only_if_preview: true,
             ..plan()
         });
-        assert!(client.retry_pending_restore().is_none());
+        assert!(retry_restore_plan(&mut client.restore_pending.lock()).is_none());
         assert!(client
             .restore_pending
             .lock()
             .as_ref()
             .is_some_and(|plan| plan.only_if_preview && plan.attempts == 0));
+    }
+
+    #[test]
+    fn due_restore_claims_its_generation_without_a_status_request() {
+        let mut state = PlaybackState::default();
+        state.auth_state = "ready".to_owned();
+        let client = client_with_last_state(state.clone());
+        *client.restore_pending.lock() = Some(RestorePlan {
+            snapshot: RestoreSnapshot::from_playback(&state, false),
+            sent: false,
+            attempts: 0,
+            only_if_preview: false,
+            preview_lease_id: None,
+        });
+        let (_, generation) = client
+            .begin_pending_restore_with_generation(&state)
+            .expect("first attempt");
+        assert_eq!(
+            client.retry_pending_restore_for_generation(generation),
+            Ok(Some(Duration::from_secs(5)))
+        );
+        assert!(client.begin_pending_retry(generation).is_some());
+        assert!(client.begin_pending_retry(generation).is_none());
+    }
+
+    #[test]
+    fn failed_restore_from_dead_engine_cannot_rearm_replacement_plan() {
+        let mut state = PlaybackState::default();
+        state.auth_state = "ready".to_owned();
+        let client = client_with_last_state(state.clone());
+        *client.restore_pending.lock() = Some(RestorePlan {
+            snapshot: RestoreSnapshot::from_playback(&state, false),
+            sent: false,
+            attempts: 0,
+            only_if_preview: false,
+            preview_lease_id: None,
+        });
+
+        let (_, old_generation) = client
+            .begin_pending_restore_with_generation(&state)
+            .expect("first engine claims restore");
+        client.on_eof();
+        assert!(client.restore_is_pending(), "crash retains a fresh plan");
+        assert_eq!(
+            client.retry_pending_restore_for_generation(old_generation),
+            Err(())
+        );
+        assert!(client.begin_pending_retry(old_generation).is_none());
+        let pending = client.restore_pending.lock();
+        let replacement = pending.as_ref().unwrap();
+        assert_eq!(replacement.attempts, 0);
+        assert!(
+            !replacement.sent,
+            "replacement remains ready for its own attempt"
+        );
     }
 
     #[test]

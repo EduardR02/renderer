@@ -290,12 +290,16 @@
 
               <span class="c-title">
                 <span class="t-name">{track.name}</span>
-                <ArtistLinks
-                  class="t-artists"
-                  names={track.artist_names}
-                  ids={track.artist_ids ?? []}
-                  id={track.artist_id}
-                />
+                {#if track.uri?.startsWith("spotify:episode:")}
+                  <button class="t-artists" disabled={!track.album_id} onclick={() => navigate("show", track.album_id)}>{track.album_name || track.artist_names?.[0]}</button>
+                {:else}
+                  <ArtistLinks
+                    class="t-artists"
+                    names={track.artist_names}
+                    ids={track.artist_ids ?? []}
+                    id={track.artist_id}
+                  />
+                {/if}
               </span>
 
               <span class="c-time">{formatTime(track.duration_ms)}</span>
@@ -344,7 +348,7 @@
   {:else}
     <div class="empty">
       <p class="h">The queue is empty.</p>
-      <p class="sub">Play a playlist or add single tracks from any track menu.</p>
+      <p class="sub">Play music or an audio podcast, or add songs from a track menu.</p>
       <div class="actions">
         <button class="btn-ghost" onclick={() => navigate("library")}>
           <Icon name="library" size={14} />Go to your library

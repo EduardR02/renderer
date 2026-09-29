@@ -17,8 +17,9 @@
  *                          hands the remote https URL straight to <img>.
  *   status                 makes the engine re-broadcast state to the real window.
  *   cancel_track_waveform  cancels engine work.
- * Everything that mutates (play/pause/seek/queue/playlist edits/track edits/
- * settings/login/logout/touch_playlist*) stays on the harness mock.
+ * Personal grant configuration/authorization/library writes/transfer are never
+ * forwarded. Real mode rejects them and directs the user to the native app.
+ * Simulated local playback stays on the harness mock.
  */
 export const READ_COMMANDS = new Set([
   // In-memory snapshot of playback, library and me_id. No I/O.
@@ -52,6 +53,16 @@ export const READ_COMMANDS = new Set([
   "browse_track_credits",
   "browse_canvas",
   "browse_followed_artists",
+  "browse_show",
+  "browse_episode",
+  "browse_profile",
+  "browse_playlist_tree",
+  // Native-bound personal reads only. These are never prewarmed; the UI asks
+  // for devices only after an explicit enabled/authorized picker action.
+  "personal_api_status",
+  "personal_api_contains",
+  "personal_api_saved_shows",
+  "personal_api_devices",
   // Walks the cache directories, memoised for a minute.
   "get_cache_stats",
 ]);

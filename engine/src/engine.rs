@@ -1788,9 +1788,13 @@ impl Engine {
             | Command::SetNormalisation { .. }
             | Command::BrowsePlaylists { .. }
             | Command::BrowsePlaylist { .. }
+            | Command::BrowsePlaylistTree { .. }
             | Command::BrowseRadio { .. }
             | Command::BrowsePlaylistRecommendations { .. }
             | Command::BrowseTrack { .. }
+            | Command::BrowseEpisode { .. }
+            | Command::BrowseShow { .. }
+            | Command::BrowseProfile { .. }
             | Command::BrowseAlbum { .. }
             | Command::BrowseArtist { .. }
             | Command::BrowseArtistSongwriter { .. }
@@ -2114,9 +2118,12 @@ impl Engine {
 
     fn resolve_queue_edits(&self, queue: &mut [TrackRef]) {
         for track in queue {
-            track.effective_edit =
+            track.effective_edit = if track.uri.starts_with("spotify:track:") {
                 self.track_edits
-                    .resolve(&track.id, track.duration_ms, &track.context);
+                    .resolve(&track.id, track.duration_ms, &track.context)
+            } else {
+                None
+            };
         }
     }
     /// Eligibility is intentionally derived from the live row context and
@@ -2280,8 +2287,11 @@ impl Engine {
             return Err(format!("queue index {index} is out of range"));
         }
         for track in queue {
-            parse_track_uri(track)?;
+            let uri = parse_track_uri(track)?;
             if let Some(edit) = &track.effective_edit {
+                if !matches!(uri, SpotifyUri::Track { .. }) {
+                    return Err("podcast episodes cannot have song edits".to_owned());
+                }
                 validate_definition(&track.id, track.duration_ms, &edit.cuts, edit.loop_range)?;
             }
         }
@@ -2745,11 +2755,19 @@ impl Engine {
             .ok_or_else(|| "the queue has no current track".to_owned())?;
         if let Some(index) = self.previous_index() {
             self.leave_preview_mode();
-            if self.state.shuffle
-                && self.automatic_track_eligible(current)
-                && !self.shuffle_pool.contains(&current)
-            {
-                self.shuffle_pool.push(current);
+            if self.state.shuffle {
+                // A repeated visit can already be scheduled in the bag. Once
+                // it becomes current, it must leave that future plan.
+                if let Some(position) = self.shuffle_pool.iter().position(|pooled| *pooled == index)
+                {
+                    self.shuffle_pool.remove(position);
+                }
+                if self.automatic_track_eligible(current)
+                    && current != index
+                    && !self.shuffle_pool.contains(&current)
+                {
+                    self.shuffle_pool.push(current);
+                }
             }
             self.state.current_index = Some(index);
             self.queue_changed();
@@ -2954,7 +2972,6 @@ impl Engine {
         parse_track_uri(&track)?;
         self.state.queue.push(track);
         self.queue_changed();
-        self.history.clear();
         self.splice_new_rows_into_shuffle_pool(self.state.queue.len() - 1);
         self.preload_next();
         Ok(true)
@@ -2976,7 +2993,6 @@ impl Engine {
         let first_new = self.state.queue.len();
         self.state.queue.extend(tracks);
         self.queue_changed();
-        self.history.clear();
         self.splice_new_rows_into_shuffle_pool(first_new);
         self.preload_next();
         Ok(true)
@@ -2993,7 +3009,16 @@ impl Engine {
         }
         self.state.queue.remove(index);
         self.queue_changed();
-        self.history.clear();
+        self.history.retain_mut(|visited| {
+            if *visited == index {
+                false
+            } else {
+                if *visited > index {
+                    *visited -= 1;
+                }
+                true
+            }
+        });
         let mut reload = false;
 
         match current {
@@ -3066,7 +3091,9 @@ impl Engine {
         if let Some(current) = self.state.current_index {
             self.state.current_index = Some(remap_current_index_after_move(current, from, to));
         }
-        self.history.clear();
+        for visited in &mut self.history {
+            *visited = remap_current_index_after_move(*visited, from, to);
+        }
         // A move is a permutation of the queue, so the bag is remapped through
         // the very function that just moved `current_index`. Writing the
         // arithmetic out a second time here would be an opportunity for the two
@@ -3944,6 +3971,9 @@ fn with_preview_edit(
     cuts: Vec<TimeRange>,
     loop_range: Option<LoopRange>,
 ) -> Result<TrackRef, String> {
+    if !matches!(parse_track_uri(&track)?, SpotifyUri::Track { .. }) {
+        return Err("podcast episodes cannot have song edits".to_owned());
+    }
     let edit = TrackEdit { cuts, loop_range };
     validate_definition(&track.id, track.duration_ms, &edit.cuts, edit.loop_range)?;
     track.effective_edit = Some(edit);
@@ -3952,10 +3982,10 @@ fn with_preview_edit(
 
 fn parse_track_uri(track: &TrackRef) -> Result<SpotifyUri, String> {
     let uri = SpotifyUri::from_uri(&track.uri)
-        .map_err(|error| format!("invalid Spotify track URI '{}': {error}", track.uri))?;
-    if !matches!(&uri, SpotifyUri::Track { .. }) {
+        .map_err(|error| format!("invalid Spotify audio URI '{}': {error}", track.uri))?;
+    if !matches!(&uri, SpotifyUri::Track { .. } | SpotifyUri::Episode { .. }) {
         return Err(format!(
-            "queue item is not a Spotify track URI: {}",
+            "queue item is not a Spotify audio URI: {}",
             track.uri
         ));
     }
@@ -4140,6 +4170,27 @@ mod tests {
     use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume, softmixer::SoftMixer};
     use librespot_playback::player::{Player, PlayerEvent};
     use renderer_engine::protocol::{Command, LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
+
+    #[test]
+    fn audio_queue_accepts_episodes_but_refuses_song_edits_for_them() {
+        let episode = TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:episode:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 12_345,
+            ..TrackRef::default()
+        };
+        assert!(matches!(super::parse_track_uri(&episode), Ok(SpotifyUri::Episode { .. })));
+        assert!(Engine::validate_queue(std::slice::from_ref(&episode), 0).is_ok());
+        assert!(with_preview_edit(episode.clone(), Vec::new(), None).is_err());
+        let mut with_edit = episode.clone();
+        with_edit.effective_edit = Some(TrackEdit::default());
+        assert!(Engine::validate_queue(&[with_edit], 0).is_err());
+        let not_audio = TrackRef {
+            uri: "spotify:show:0123456789ABCDEFGHIJKL".to_owned(),
+            ..episode
+        };
+        assert!(super::parse_track_uri(&not_audio).is_err());
+    }
 
     fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {
         test_engine_in(PathBuf::new())
@@ -5387,6 +5438,98 @@ mod tests {
         assert_eq!(engine.move_queue(0, 2), Ok(true));
         assert_eq!(engine.state.current_index, Some(1));
         assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn moving_rows_preserves_repeat_visits_for_shuffle_previous() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 3, &[1]);
+        engine.history = vec![1, 0, 1];
+
+        assert_eq!(engine.move_queue(0, 2), Ok(true));
+        assert_eq!(engine.history, vec![0, 2, 0]);
+        assert_eq!(engine.state.current_index, Some(3));
+        assert_shuffle_pool_invariants(&engine);
+
+        engine.state.position_ms = 5_000;
+        assert_eq!(engine.previous_index(), None, "a late press restarts");
+        assert_eq!(engine.history, vec![0, 2, 0]);
+        engine.state.position_ms = 0;
+        for (target, track_id) in [(0, QUEUE_IDS[1]), (2, QUEUE_IDS[0]), (0, QUEUE_IDS[1])] {
+            assert!(
+                engine.previous().is_err(),
+                "the capture engine has no player"
+            );
+            assert_eq!(engine.state.current_index, Some(target));
+            assert_eq!(engine.state.queue[target].id, track_id);
+            assert_shuffle_pool_invariants(&engine);
+        }
+        assert!(engine.history.is_empty());
+        assert_eq!(
+            engine.previous_index(),
+            None,
+            "shuffle has no ordered fallback"
+        );
+        drop(directory);
+    }
+
+    #[test]
+    fn removing_a_row_drops_its_visits_and_shifts_later_visits() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 3, &[2, 1, 0]);
+        engine.history = vec![0, 1, 2, 1, 3, 2];
+
+        assert_eq!(engine.remove_queue(1), Ok(true));
+        assert_eq!(engine.history, vec![0, 1, 2, 1]);
+        assert_eq!(engine.state.current_index, Some(2));
+        assert_shuffle_pool_invariants(&engine);
+        assert!(
+            engine.previous().is_err(),
+            "the capture engine has no player"
+        );
+        assert_eq!(engine.state.current_index, Some(1));
+        assert_eq!(engine.state.queue[1].id, QUEUE_IDS[2]);
+        assert_shuffle_pool_invariants(&engine);
+        drop(directory);
+    }
+
+    #[test]
+    fn appending_one_or_a_lazy_batch_keeps_previous_visits() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 2, &[3]);
+        engine.history = vec![0, 1];
+
+        assert_eq!(
+            engine.add_queue(
+                contextual_track("4abcdefghijklmnopqrstu", "playlist:playlist"),
+                "playlist:playlist".to_owned(),
+            ),
+            Ok(true)
+        );
+        assert_eq!(engine.history, vec![0, 1]);
+        assert_eq!(
+            engine.add_queue_batch(
+                vec![
+                    contextual_track("5abcdefghijklmnopqrstu", "playlist:playlist"),
+                    contextual_track("6abcdefghijklmnopqrstu", "playlist:playlist"),
+                ],
+                "playlist:playlist".to_owned(),
+            ),
+            Ok(true)
+        );
+        assert_eq!(engine.history, vec![0, 1]);
+        assert_eq!(engine.state.current_index, Some(2));
+        assert_shuffle_pool_invariants(&engine);
+        for (target, track_id) in [(1, QUEUE_IDS[1]), (0, QUEUE_IDS[0])] {
+            assert!(
+                engine.previous().is_err(),
+                "the capture engine has no player"
+            );
+            assert_eq!(engine.state.current_index, Some(target));
+            assert_eq!(engine.state.queue[target].id, track_id);
+            assert_shuffle_pool_invariants(&engine);
+        }
         drop(directory);
     }
 

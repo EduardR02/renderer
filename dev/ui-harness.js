@@ -95,6 +95,39 @@ const fixtures = {
     { id: "p3", name: "Night Drive", owner_id: "eduard", tracks_total: 0 },
   ],
 };
+fixtures.episode = {
+  id: "ep1", uri: "spotify:episode:ep1", name: "A Walk Through the Night",
+  show_id: "show1", show_name: "Listening Notes", description: "A short audio-only journey through city sounds.",
+  cover_url: "", duration_ms: 1820000, published_at: Date.UTC(2026, 8, 20),
+  unavailable: false, unavailable_reason: null,
+  track: {
+    id: "ep1", uri: "spotify:episode:ep1", name: "A Walk Through the Night",
+    artist_names: ["Listening Notes"], artist_ids: [], album_id: "show1",
+    album_name: "Listening Notes", duration_ms: 1820000, unavailable: false,
+  },
+};
+fixtures.show = {
+  id: "show1", uri: "spotify:show:show1", name: "Listening Notes",
+  publisher: "Renderer Radio", description: "Stories told entirely in sound.",
+  cover_url: "", episodes: [
+    fixtures.episode,
+    { ...fixtures.episode, id: "ep2", uri: "spotify:episode:ep2",
+      name: "A Quiet Morning", published_at: Date.UTC(2026, 8, 21),
+      track: { ...fixtures.episode.track, id: "ep2", uri: "spotify:episode:ep2", name: "A Quiet Morning" } },
+  ],
+};
+fixtures.profile = {
+  username: "eduard", name: "Eduard", image_url: "", playlists: fixtures.playlists,
+};
+fixtures.playlistTree = [
+  { kind: "folder", id: "f1", name: "Trips", children: [
+    { kind: "playlist", playlist: fixtures.playlists[0] },
+    { kind: "folder", id: "f2", name: "Late drives", children: [
+      { kind: "playlist", playlist: fixtures.playlists[2] },
+    ] },
+  ] },
+  { kind: "playlist", playlist: fixtures.playlists[1] },
+];
 fixtures.playlistDetail = {
   id: "p1",
   name: "Road Trip",
@@ -189,9 +222,8 @@ fixtures.songwriterPlaylist = clone(songwriterPlaylist);
 /**
  * Who the fixture account follows.
  *
- * Read-only, like the real thing: this app cannot follow or unfollow anybody
- * (see the engine's `follow` module), so there is no mutation for the harness
- * to fake. What it does reproduce is the shape the rail has to survive — a
+ * Collection reads mirror the playback-session engine; optional writes use
+ * the personal API fixture handlers below. The rail fixture reproduces a
  * mix of artists with portraits and without, and names long enough to reach
  * the ellipsis in a 212px rail.
  *
@@ -772,6 +804,12 @@ function trackCreditsPayload(id) {
 }
 
 
+const personalStatus = {
+  client_id: "00000000000000000000000000000000", connected: true, account_id: "eduard",
+  devices_enabled: false, devices_authorized: true, authorization_pending: false, error: null,
+};
+const personalSaved = new Set(["spotify:track:t0", "spotify:artist:ar1"]);
+
 window.__fixtures = fixtures;
 /** How long `get_cover` pretends the network takes. See the command below. */
 let coverDelayMs = 0;
@@ -796,6 +834,73 @@ const mock = {
         const track = findTrack(args.uri ?? args.trackId);
         const ids = track ? [...(memberships.get(track.id) || [])] : [];
         return ids.map((id) => ({ id, name: id === "liked" ? "Liked Songs" : playlistNames.get(id) || id }));
+      }
+      case "search":
+        if (!/podcast|episode|listening|night/i.test(String(args.query ?? ""))) {
+          return { top: null, tracks: [], albums: [], artists: [], playlists: [], shows: [], episodes: [] };
+        }
+        return {
+          top: { kind: "show", ...clone(fixtures.show), episodes: undefined },
+          tracks: [], albums: [], artists: [], playlists: [],
+          shows: [{ ...clone(fixtures.show), episodes: undefined }],
+          episodes: [clone(fixtures.episode)],
+        };
+      case "browse_show":
+        return clone(fixtures.show);
+      case "browse_episode":
+        return clone(fixtures.show.episodes.find((episode) => episode.id === args.id) ?? fixtures.episode);
+      case "browse_profile":
+        return clone(args.username === "eduard" ? fixtures.profile : {
+          username: args.username, name: "Another Listener", image_url: "",
+          playlists: [fixtures.playlists[1]],
+        });
+      case "browse_playlist_tree":
+        return clone(fixtures.playlistTree);
+      case "personal_api_status":
+        return clone(personalStatus);
+      case "personal_api_configure":
+        personalStatus.client_id = args.clientId;
+        personalStatus.connected = false;
+        emit("personal-api-changed", clone(personalStatus));
+        return clone(personalStatus);
+      case "personal_api_authorize":
+        personalStatus.authorization_pending = true;
+        emit("personal-api-changed", clone(personalStatus));
+        return { url: "https://accounts.spotify.com/authorize?fixture=1" };
+      case "personal_api_disconnect":
+        personalStatus.connected = false;
+        personalStatus.authorization_pending = false;
+        emit("personal-api-changed", clone(personalStatus));
+        return clone(personalStatus);
+      case "personal_api_set_devices_enabled":
+        personalStatus.devices_enabled = !!args.enabled;
+        emit("personal-api-changed", clone(personalStatus));
+        return clone(personalStatus);
+      case "personal_api_contains":
+        return args.uris.map((uri) => personalSaved.has(uri));
+      case "personal_api_set_saved":
+        for (const uri of args.uris) {
+          if (args.saved) personalSaved.add(uri);
+          else personalSaved.delete(uri);
+        }
+        return null;
+      case "personal_api_devices":
+        return [
+          { id: "remote-1", name: "Living room speaker", type: "Speaker", is_active: true,
+            is_restricted: false, is_private_session: false, volume_percent: 65, supports_volume: true },
+          { id: "remote-2", name: "Kitchen display", type: "Computer", is_active: false,
+            is_restricted: false, is_private_session: false, volume_percent: 30, supports_volume: true },
+        ];
+      case "personal_api_transfer":
+        return null;
+      case "personal_api_saved_shows": {
+        const offset = Number(args.offset ?? 0);
+        const items = offset === 0 ? [{ added_at: "2026-09-20", show: {
+          id: fixtures.show.id, uri: fixtures.show.uri, name: fixtures.show.name,
+          description: fixtures.show.description, publisher: fixtures.show.publisher,
+          images: [], total_episodes: fixtures.show.episodes.length,
+        } }] : [];
+        return { items, offset, limit: 50, total: 1, next: null, previous: null, href: "" };
       }
       case "browse_artist":
         return clone(fixtures.artist);
@@ -1154,6 +1259,11 @@ window.__harness = {
   unlisten: unregisterListener,
   emit,
   invoke: (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args),
+  setPersonalStatus: (changes) => {
+    Object.assign(personalStatus, changes);
+    emit("personal-api-changed", clone(personalStatus));
+    return clone(personalStatus);
+  },
   getState: () => ({ ...clone(playback), queue_revision: queueRevision, upcoming: upcomingIndices() }),
   /** Deterministic skip controls for browser checks: patch the store,
       refresh the open detail, and report the resulting ids. No timers. */
@@ -1337,8 +1447,8 @@ Object.assign(window.__harness, {
 
 if (new URLSearchParams(location.search).has("real")) {
   const { createRealMode } = await import("./ui-harness-real.js");
-  // Null when neither the app nor anything stored answers get_state; the
-  // harness then boots on its fixtures, as it would without `?real`.
+  // Missing live/cache state stays unavailable; real mode never uses a
+  // fixture account in its place.
   realMode = await createRealMode({
     playback,
     settings,

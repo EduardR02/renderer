@@ -16,6 +16,8 @@
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
   import Slider from "./Slider.svelte";
+  import PersonalSave from "./PersonalSave.svelte";
+  import DevicePicker from "./DevicePicker.svelte";
   import { formatTime } from "../lib/time.js";
   import { morphLayout } from "../lib/layout.js";
   import { frost } from "../lib/ambient.svelte.js";
@@ -432,8 +434,8 @@
       {#if current}
         <button
           class="p-art-btn"
-          title="Go to album"
-          onclick={() => current.album_id && navigate("album", current.album_id)}
+          title={current.uri?.startsWith("spotify:episode:") ? "Go to podcast" : "Go to album"}
+          onclick={() => current.album_id && navigate(current.uri?.startsWith("spotify:episode:") ? "show" : "album", current.album_id)}
         >
           <Cover
             src={current.cover_url}
@@ -448,19 +450,23 @@
             {#if current.album_id}
               <button
                 class="p-title"
-                title="Go to album"
-                onclick={() => navigate("album", current.album_id)}
+                title={current.uri?.startsWith("spotify:episode:") ? "Go to podcast" : "Go to album"}
+                onclick={() => navigate(current.uri?.startsWith("spotify:episode:") ? "show" : "album", current.album_id)}
               >{current.name}</button>
             {:else}
               <span class="p-title">{current.name}</span>
             {/if}
           </span>
-          <ArtistLinks
-            class="p-artists"
-            names={current.artist_names}
-            ids={current.artist_ids ?? []}
-            id={current.artist_id}
-          />
+          {#if current.uri?.startsWith("spotify:episode:")}
+            <button class="p-artists" disabled={!current.album_id} onclick={() => navigate("show", current.album_id)}>{current.album_name || current.artist_names?.[0]}</button>
+          {:else}
+            <ArtistLinks
+              class="p-artists"
+              names={current.artist_names}
+              ids={current.artist_ids ?? []}
+              id={current.artist_id}
+            />
+          {/if}
         </span>
         {#if nowSaved.refs.length}
           <!-- Marks live BESIDE the two-line text block, not inside its first
@@ -484,6 +490,9 @@
               </span>
             </span>
           </span>
+        {/if}
+        {#if current.uri?.startsWith("spotify:track:")}
+          <PersonalSave uri={current.uri} compact />
         {/if}
         {#if editIndicator}
           <span
@@ -627,6 +636,7 @@
           {/each}
         </div>
       </div>
+      <DevicePicker />
       <button
         class="btn-icon"
         class:on={ui.nowPlayingOpen}

@@ -1,4 +1,4 @@
-name: macOS build
+name: Signed desktop release
 
 on:
   release:
@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  macos:
+    runs-on: macos-15-arm64
     permissions:
       contents: read
-    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -18,28 +18,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install dependencies
         run: bun install --frozen-lockfile
-      - name: Test and build frontend
+      - name: Verify release version
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          bun -e 'const v = require("./package.json").version; const tag = process.env.RELEASE_TAG.replace(/^v/, ""); if (v !== tag || require("./src-tauri/tauri.conf.json").version !== tag) throw Error(`Release tag ${tag} must match app version ${v}`)'
+      - name: Test frontend, engine and shell
         run: |
           bun test
-          bun run build
-      - name: Build engine resource
-        run: bun run build:engine
-      - name: Test engine and shell
-        run: |
           cargo test -p renderer-engine
           cargo test -p renderer
-      - name: Build macOS app
-        run: bun tauri build
-      - name: Verify and sign app
+      - name: Build and sign macOS app and updater archive
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          bun tauri build
           app=target/release/bundle/macos/renderer.app
-          test -d "$app"
           test -x "$app/Contents/Resources/PlaybackEngine"
+          codesign --verify --deep --strict "$app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.renderer.client
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 14.0
-          codesign --force --sign - "$app/Contents/Resources/PlaybackEngine"
-          codesign --force --sign - "$app"
-          codesign --verify --deep --strict "$app"
+          archive="$app.tar.gz"
+          test -s "$archive"
+          test -s "$archive.sig"
+          mkdir -p archive-check
+          tar -xzf "$archive" -C archive-check
+          codesign --verify --deep --strict archive-check/renderer.app
+          ditto -c -k --sequesterRsrc --keepParent "$app" renderer-macos.zip
+          mkdir -p release-assets
+          cp "$archive" release-assets/renderer-macos-aarch64.app.tar.gz
+          cp "$archive.sig" release-assets/renderer-macos-aarch64.app.tar.gz.sig
+          cp renderer-macos.zip release-assets/renderer-macos-aarch64.zip
       - name: Smoke-launch the app and bundled engine
         shell: bash
         run: |
@@ -63,26 +75,101 @@ jobs:
           cat runner-app.log
           test ! -f "$log" || cat "$log"
           exit 1
-      - name: Archive app
-        run: |
-          ditto -c -k --sequesterRsrc --keepParent target/release/bundle/macos/renderer.app renderer-macos.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: renderer-macos-adhoc-${{ runner.arch }}
-          path: renderer-macos.zip
+          name: renderer-macos-aarch64
+          path: release-assets/
           if-no-files-found: error
           retention-days: 14
+
+  windows:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Verify release version
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          bun -e 'const v = require("./package.json").version; const tag = process.env.RELEASE_TAG.replace(/^v/, ""); if (v !== tag || require("./src-tauri/tauri.conf.json").version !== tag) throw Error(`Release tag ${tag} must match app version ${v}`)'
+      - name: Build signed NSIS updater
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          bun tauri build
+          shopt -s nullglob
+          installers=(target/release/bundle/nsis/*-setup.exe)
+          test "${#installers[@]}" -eq 1
+          test -s "${installers[0]}"
+          test -s "${installers[0]}.sig"
+          mkdir -p release-assets
+          cp "${installers[0]}" release-assets/renderer-windows-x86_64-setup.exe
+          cp "${installers[0]}.sig" release-assets/renderer-windows-x86_64-setup.exe.sig
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renderer-windows-x86_64
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     if: github.event_name == 'release'
-    needs: build
+    needs: [macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: renderer-macos-adhoc-ARM64
-      - name: Attach macOS app to release
+          pattern: renderer-*
+          merge-multiple: true
+          path: release-assets
+      - name: Publish complete signed release and latest.json
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" renderer-macos.zip --repo "$GITHUB_REPOSITORY"
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          mac=renderer-macos-aarch64.app.tar.gz
+          win=renderer-windows-x86_64-setup.exe
+          for file in "$mac" "$mac.sig" "$win" "$win.sig" renderer-macos-aarch64.zip; do
+            test -s "$file"
+          done
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release.json
+          version="${RELEASE_TAG#v}"
+          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false and .prerelease == false' release.json > /dev/null
+          jq -n \
+            --arg version "$version" \
+            --arg notes "$(jq -r '.body // ""' release.json)" \
+            --arg pub_date "$(jq -r '.published_at' release.json)" \
+            --arg mac_url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$mac" \
+            --arg win_url "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$win" \
+            --rawfile mac_sig "$mac.sig" \
+            --rawfile win_sig "$win.sig" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": { url: $mac_url, signature: ($mac_sig | rtrimstr("\n")) },
+                "windows-x86_64": { url: $win_url, signature: ($win_sig | rtrimstr("\n")) }
+              }
+            }' > latest.json
+          jq -e '.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$")' latest.json > /dev/null
+          jq -e '.pub_date != "null" and (.platforms | length == 2) and (.platforms | all(.[]; (.url | startswith("https://")) and (.signature | length > 0)))' latest.json > /dev/null
+          gh release upload "$RELEASE_TAG" "$mac" "$mac.sig" "$win" "$win.sig" renderer-macos-aarch64.zip --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$RELEASE_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"

@@ -10,23 +10,33 @@ test("every supported kind builds its canonical open.spotify.com page", () => {
   expect(spotifyLink("album", ID)).toBe(`https://open.spotify.com/album/${ID}`);
   expect(spotifyLink("artist", ID)).toBe(`https://open.spotify.com/artist/${ID}`);
   expect(spotifyLink("playlist", ID)).toBe(`https://open.spotify.com/playlist/${ID}`);
+  expect(spotifyLink("show", ID)).toBe(`https://open.spotify.com/show/${ID}`);
+  expect(spotifyLink("episode", ID)).toBe(`https://open.spotify.com/episode/${ID}`);
 });
 
 test("a resource carrying only its URI still yields its id", () => {
   expect(spotifyLink("track", `spotify:track:${ID}`)).toBe(`https://open.spotify.com/track/${ID}`);
   expect(spotifyLink("playlist", `spotify:playlist:${ID}`)).toBe(`https://open.spotify.com/playlist/${ID}`);
+  expect(spotifyLink("episode", `spotify:episode:${ID}`)).toBe(`https://open.spotify.com/episode/${ID}`);
 });
 
 test("what this app copies is what this app parses back", () => {
-  for (const kind of ["track", "album", "artist", "playlist"]) {
+  for (const kind of ["track", "album", "artist", "playlist", "show", "episode"]) {
     expect(parseSpotifyLink(spotifyLink(kind, ID))).toEqual({ kind, id: ID });
   }
 });
 
 test("nothing to build from removes the link instead of guessing one", () => {
-  expect(spotifyLink("episode", ID)).toBe("");
+  expect(spotifyLink("user", ID)).toBe("");
   expect(spotifyLink("track", "")).toBe("");
   expect(spotifyLink("track", "spotify:track:")).toBe("");
   expect(spotifyLink("track", null)).toBe("");
   expect(spotifyLink("track", undefined)).toBe("");
+});
+
+test("podcast share URLs and URIs open locally without losing their kind", () => {
+  expect(parseSpotifyLink(`https://open.spotify.com/intl-de/show/${ID}?si=share`)).toEqual({ kind: "show", id: ID });
+  expect(parseSpotifyLink(`spotify:episode:${ID}`)).toEqual({ kind: "episode", id: ID });
+  expect(parseSpotifyLink("spotify:episode:short")).toHaveProperty("error");
+  expect(parseSpotifyLink(`https://example.com/episode/${ID}`)).toHaveProperty("error");
 });

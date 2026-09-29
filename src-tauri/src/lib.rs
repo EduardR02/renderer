@@ -4,6 +4,7 @@ mod covers;
 mod engine_client;
 mod log;
 mod media_keys;
+mod personal_api;
 mod types;
 
 use std::sync::Arc;
@@ -66,6 +67,8 @@ pub fn run() {
             restore_main_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -108,6 +111,10 @@ pub fn run() {
             commands::browse_artist_songwriter,
             commands::browse_artist_catalogue,
             commands::browse_liked_songs,
+            commands::browse_show,
+            commands::browse_episode,
+            commands::browse_profile,
+            commands::browse_playlist_tree,
             commands::browse_track_credits,
             commands::browse_canvas,
             commands::browse_followed_artists,
@@ -121,6 +128,16 @@ pub fn run() {
             commands::login,
             commands::logout,
             commands::set_normalisation,
+            commands::personal_api_status,
+            commands::personal_api_configure,
+            commands::personal_api_authorize,
+            commands::personal_api_disconnect,
+            commands::personal_api_contains,
+            commands::personal_api_set_saved,
+            commands::personal_api_saved_shows,
+            commands::personal_api_devices,
+            commands::personal_api_transfer,
+            commands::personal_api_set_devices_enabled,
             commands::get_state,
             commands::get_cover,
             commands::get_cache_stats,
@@ -161,6 +178,7 @@ pub fn run() {
             // ready-transition reconciliation supersedes stale rows.
             state.lock().memberships = load_membership(&dir);
             app.manage(state);
+            app.manage(personal_api::PersonalApi::new().map_err(std::io::Error::other)?);
 
             // Spawn the playback engine and keep it alive across crashes.
             let client = EngineClient::start();

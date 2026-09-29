@@ -1,6 +1,6 @@
 [package]
 name = "renderer"
-version = "0.1.18"
+version = "0.1.19"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -28,10 +28,17 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "system-proxy"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread", "net", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "system-proxy", "json"] }
 sha1 = "0.10"
 souvlaki = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+keyring = { version = "3.6", default-features = false, features = ["windows-native", "apple-native"] }
+url = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 renderer-engine = { path = "../engine" }
 
 [target.'cfg(windows)'.dependencies]

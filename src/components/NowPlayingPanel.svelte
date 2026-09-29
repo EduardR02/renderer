@@ -29,7 +29,7 @@
      has decoded, filling the panel; otherwise — no Canvas, not yet, or the
      cover asked for — it is the cover, in the hero. Changing between them
      is a crossfade of two elements that never move. */
-  const canvasTrackKey = $derived(current?.id || current?.uri || "");
+  const canvasTrackKey = $derived(current?.uri?.startsWith("spotify:track:") ? (current.id || current.uri) : "");
   /** The source the <video> holds. */
   let canvasUrl = $state("");
   /** THIS record's Canvas has decoded. Cleared the moment the track changes:
@@ -164,7 +164,7 @@
   function openAlbum(event) {
     if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
-    if (current?.album_id) navigate("album", current.album_id);
+    if (current?.album_id) navigate(current.uri?.startsWith("spotify:episode:") ? "show" : "album", current.album_id);
   }
 
   /**
@@ -343,7 +343,7 @@
      the track — only while the panel is mounted, cached per track id. */
   $effect(() => {
     const track = current;
-    if (track) untrack(() => loadTrackCredits(track));
+    if (track?.uri?.startsWith("spotify:track:")) untrack(() => loadTrackCredits(track));
   });
 
   /** Groups worth showing inline; the rest live behind "all credits". */
@@ -427,12 +427,12 @@
             <button
               class="np-card glass-card np-album"
               disabled={!current.album_id}
-              onclick={() => current.album_id && navigate("album", current.album_id)}
+              onclick={() => current.album_id && navigate(current.uri?.startsWith("spotify:episode:") ? "show" : "album", current.album_id)}
             >
               <Cover src={current.cover_url} id={current.album_id || current.uri} name={current.album_name || ""} size={40} />
               <span class="np-album-copy">
-                <span class="np-label">Album</span>
-                <span class="np-album-name">{current.album_name || "Unknown album"}</span>
+                <span class="np-label">{current.uri?.startsWith("spotify:episode:") ? "Podcast" : "Album"}</span>
+                <span class="np-album-name">{current.album_name || (current.uri?.startsWith("spotify:episode:") ? "Unknown podcast" : "Unknown album")}</span>
               </span>
               {#if current.album_id}<Icon name="fwd" size={13} />{/if}
             </button>
@@ -440,6 +440,7 @@
 
           <!-- Gold is the app's "who made it" hue, and the one warm accent with
                enough chroma to survive as 11px caps. -->
+          {#if current.uri?.startsWith("spotify:track:")}
           <section class="np-card glass-card np-credits">
             <div class="np-section-head">
               <span class="tag credit">Credits</span>
@@ -477,6 +478,7 @@
               <p class="np-muted">No contributors listed for this track.</p>
             {/if}
           </section>
+          {/if}
 
           {#if next}
             <section class="np-card glass-card np-upnext">
@@ -520,19 +522,23 @@
 {#snippet identity()}
   <h2 class="np-title">
     {#if current.album_id}
-      <span class="np-title-link" role="link" tabindex="0" title="Go to album" onclick={openAlbum} onkeydown={openAlbum}
+      <span class="np-title-link" role="link" tabindex="0" title={current.uri?.startsWith("spotify:episode:") ? "Go to podcast" : "Go to album"} onclick={openAlbum} onkeydown={openAlbum}
         >{current.name}</span
       >
     {:else}
       {current.name}
     {/if}
   </h2>
-  <ArtistLinks
-    class="np-artists"
-    names={current.artist_names}
-    ids={current.artist_ids ?? []}
-    id={current.artist_id}
-  />
+  {#if current.uri?.startsWith("spotify:episode:")}
+    <button class="np-artists" disabled={!current.album_id} onclick={() => navigate("show", current.album_id)}>{current.album_name || current.artist_names?.[0]}</button>
+  {:else}
+    <ArtistLinks
+      class="np-artists"
+      names={current.artist_names}
+      ids={current.artist_ids ?? []}
+      id={current.artist_id}
+    />
+  {/if}
   <div class="np-meta-row">
     <p class="np-meta">
       {#if current.duration_ms}<span class="tnum">{formatTime(current.duration_ms)}</span>{/if}
@@ -541,7 +547,7 @@
     </p>
     <!-- The one hint that the hero is the top of a column: the details are
          a scroll away, and this is the scroll. -->
-    <button class="np-more glass-plate" type="button" title="Album, credits and up next" onclick={revealDetails}>
+    <button class="np-more glass-plate" type="button" title={current.uri?.startsWith("spotify:episode:") ? "Podcast and up next" : "Album, credits and up next"} onclick={revealDetails}>
       <Icon name="chevron-down" size={15} />
     </button>
   </div>

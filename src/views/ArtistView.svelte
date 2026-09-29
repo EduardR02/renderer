@@ -17,6 +17,7 @@
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
+  import PersonalSave from "../components/PersonalSave.svelte";
   import Biography from "../components/Biography.svelte";
   import GalleryLightbox from "../components/GalleryLightbox.svelte";
   import { GROUPS, RELEASE_KEYS } from "../lib/discography.svelte.js";
@@ -1094,11 +1095,7 @@
           </div>
         {/if}
       </div>
-      <!-- No Follow button. Spotify's artist follow is a protobuf collection
-           write against an internal service librespot ships no schema for, so
-           this app can read who you follow and cannot change it; the engine's
-           `follow` module records what a write would take. A control that
-           cannot act is worse than no control. -->
+      <PersonalSave uri={`spotify:artist:${artist.id}`} label="Follow" savedLabel="Unfollow" unsavedLabel="Follow" />
     </div>
 
     {#if top.length}

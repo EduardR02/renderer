@@ -13,8 +13,11 @@
 </script>
 
 <script>
+  import { untrack } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import {
     detail,
+    library,
     api,
     playback,
     navigate,
@@ -36,6 +39,8 @@
   import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { formatTotal } from "../lib/time.js";
   import { detailArtSize } from "../lib/layout.js";
+  import { isPinned, togglePin, loadPins } from "../lib/pins.svelte.js";
+  $effect(() => { loadPins(session.username); });
 
   const pl = $derived(detail.playlist);
   /* The cover gives way before the title does when the pane is narrow. */
@@ -225,35 +230,184 @@
   const ownOrderShown = $derived(sortState.key === null || sortState.key === "order");
 
   /**
-   * Applies the landed position immediately — the row must be where the drop
-   * put it the moment the ghost dissolves — then lets the backend confirm.
-   *
-   * `from`/`to` are VIEW indices. Under "# descending" the view mirrors
-   * storage, so both ends translate (view v lives at n-1-v) before the
-   * splice and the backend MOV touch storage coordinates; a two-slot drag
-   * at the top of the view is then the same two-slot move, read from the
-   * other end. The `playlist` refresh that follows replaces `tracks`
-   * wholesale anyway, because its row order differs; the revert below only
-   * covers the window where Spotify refused the MOV and no refresh has
-   * landed yet.
+   * Drag feedback changes the displayed array immediately. The backend MOV
+   * uses indices, so commands must follow that same order, one at a time.
+   * Tokens distinguish repeated tracks while a failed command is reconciled
+   * against the authoritative sequence before later drags are sent.
    */
-  async function reorderTracks(from, to) {
+  let reorderSession = null;
+  let reorderBlocked = $state(false);
+
+  function trackTokens(list) {
+    const counts = new Map();
+    return list.map((track) => {
+      const key = `${track.uri ?? track.id}\u0000${track.added_at ?? ""}`;
+      const occurrence = counts.get(key) ?? 0;
+      counts.set(key, occurrence + 1);
+      return `${key}\u0000${occurrence}`;
+    });
+  }
+
+  function move(list, from, to) {
+    const [item] = list.splice(from, 1);
+    list.splice(to, 0, item);
+  }
+
+  function activeReorder(session) {
+    return reorderSession === session && route.name === "playlist" &&
+      route.id === session.id && detail.playlist?.id === session.id;
+  }
+
+  async function fetchReorderRefresh(session) {
+    const generation = ++session.refreshGeneration;
+    let settle;
+    const refreshed = new Promise((resolve) => { settle = resolve; });
+    const unlisten = await listen("playlist", ({ payload }) => {
+      if (!activeReorder(session) || generation !== session.refreshGeneration ||
+        payload?.id !== session.id) return;
+      // A refresh started before our successful MOVs cannot describe them.
+      if (session.successes && payload.snapshot_id === session.startSnapshot) return;
+      settle(payload);
+    });
+    session.cancelRefresh = () => settle(null);
+    let timeout;
+    try {
+      if (!activeReorder(session)) return null;
+      const followed = library.some((entry) => entry.id === session.id);
+      const response = await api.browsePlaylist(session.id);
+      if (!activeReorder(session)) return null;
+      // Unfollowed playlists have no shell track-cache hit: this command
+      // performed the real fetch itself, without scheduling a later event.
+      if (!followed) return response;
+      return await Promise.race([
+        refreshed,
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("The playlist refresh did not finish.")), 30000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+      session.cancelRefresh = null;
+      unlisten();
+    }
+  }
+
+  async function flushReorders(session) {
+    if (session.running) return;
+    session.running = true;
+    try {
+      while (activeReorder(session) && session.pending.length) {
+        const job = session.pending[0];
+        try {
+          await api.reorderPlaylistTracks(session.id, job.from, job.to);
+          if (!activeReorder(session)) return;
+          session.pending.shift();
+          session.successes++;
+          move(session.confirmedTokens, job.from, job.to);
+        } catch (error) {
+          if (!activeReorder(session)) return;
+          reorderBlocked = true;
+          ui.error = `Could not reorder playlist: ${String(error?.message ?? error)}`;
+          let fresh;
+          try {
+            fresh = await fetchReorderRefresh(session);
+          } catch (refreshError) {
+            if (activeReorder(session)) {
+              ui.error = `Could not refresh playlist after reorder failed: ${String(refreshError?.message ?? refreshError)}`;
+              session.pending.length = 0;
+            }
+            return;
+          }
+          if (!activeReorder(session)) return;
+          session.pending.shift(); // the failed move never reached storage
+          if (!fresh || fresh.id !== session.id || !Array.isArray(fresh.tracks)) {
+            ui.error = "Could not refresh playlist after reorder failed.";
+            session.pending.length = 0;
+            return;
+          }
+          detail.playlist = fresh;
+          const list = detail.playlist.tracks;
+          const freshTokens = trackTokens(list);
+          // Keep duplicate rows' tokens attached to their confirmed storage
+          // positions when the server reports the order of successful MOVs.
+          session.tokens = freshTokens.length === session.confirmedTokens.length &&
+            freshTokens.every((token, index) =>
+              token.slice(0, token.lastIndexOf("\u0000")) ===
+              session.confirmedTokens[index].slice(0, session.confirmedTokens[index].lastIndexOf("\u0000")))
+            ? session.confirmedTokens.slice()
+            : freshTokens;
+          session.confirmedTokens = session.tokens.slice();
+          // A downward drag lands AFTER its preceding row; an upward drag
+          // lands BEFORE its following row. Their anchors survive rollback.
+          const remaining = session.pending.splice(0);
+          for (const pending of remaining) {
+            const from = session.tokens.indexOf(pending.token);
+            const neighbor = session.tokens.indexOf(pending.neighbor);
+            if (from < 0 || neighbor < 0) {
+              ui.error = "Playlist changed while reordering; a pending move could not be applied.";
+              continue;
+            }
+            const to = pending.after
+              ? (neighbor < from ? neighbor + 1 : neighbor)
+              : (neighbor < from ? neighbor : neighbor - 1);
+            if (from === to) continue;
+            move(session.tokens, from, to);
+            move(list, from, to);
+            session.pending.push({ ...pending, from, to });
+          }
+          reorderBlocked = false;
+        }
+      }
+    } finally {
+      session.running = false;
+    }
+  }
+
+  function reorderTracks(from, to) {
+    if (reorderBlocked) return;
     const list = detail.playlist?.tracks;
-    if (!Array.isArray(list) || from === to || from < 0 || to < 0) return;
-    if (from >= list.length || to >= list.length) return;
+    const id = pl?.id;
+    if (!id || route.name !== "playlist" || route.id !== id || !Array.isArray(list) ||
+      from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) return;
     const mirrored = sortState.key === "order" && sortState.direction === "desc";
     const last = list.length - 1;
     const actualFrom = mirrored ? last - from : from;
     const actualTo = mirrored ? last - to : to;
-    const [moved] = list.splice(actualFrom, 1);
-    list.splice(actualTo, 0, moved);
-    try {
-      await api.reorderPlaylistTracks(pl.id, actualFrom, actualTo);
-    } catch {
-      const [taken] = list.splice(actualTo, 1);
-      list.splice(actualFrom, 0, taken);
+    if (!reorderSession || reorderSession.id !== id) {
+      const tokens = trackTokens(list);
+      reorderSession = {
+        id, tokens, confirmedTokens: tokens.slice(), pending: [], running: false,
+        startSnapshot: pl.snapshot_id, successes: 0, refreshGeneration: 0, cancelRefresh: null,
+      };
     }
+    const session = reorderSession;
+    move(list, actualFrom, actualTo);
+    move(session.tokens, actualFrom, actualTo);
+    session.pending.push({
+      from: actualFrom,
+      to: actualTo,
+      token: session.tokens[actualTo],
+      after: actualTo > actualFrom,
+      neighbor: session.tokens[actualTo > actualFrom ? actualTo - 1 : actualTo + 1],
+    });
+    flushReorders(session);
   }
+  // Edit refreshes can arrive between two queued MOV replies. A refresh of
+  // the first move must not erase the second drag's already visible position.
+  $effect(() => {
+    const list = pl?.tracks;
+    if (!list) return;
+    untrack(() => {
+      const session = reorderSession;
+      if (!session?.pending.length || !activeReorder(session)) return;
+      const incoming = trackTokens(list);
+      if (incoming.length !== session.tokens.length ||
+        incoming.every((token, index) => token === session.tokens[index])) return;
+      const rows = new Map(incoming.map((token, index) => [token, list[index]]));
+      if (session.tokens.some((token) => !rows.has(token))) return;
+      list.splice(0, list.length, ...session.tokens.map((token) => rows.get(token)));
+    });
+  });
 
   /* Fallback for a playlist the backend has not swept yet: derive the mosaic
      candidates from the tracks we already have on screen. */
@@ -297,15 +451,41 @@
   /* Idle, landed, refused — the copy item's three faces. */
   let copyState = $state("idle");
   let copyTimer = 0;
-  /* The confirmation outlives the menu by design, so the timer has to die with
-     the page: a navigation inside its window would otherwise leave it writing
-     to a component that is gone. */
-  $effect(() => () => clearTimeout(copyTimer));
   let deleteOpen = $state(false);
   let deleting = $state(false);
   let deleteError = $state("");
   let cleanupId = $state(null);
-
+  /* The component is reused when one playlist route replaces another. Reset
+     page-owned interactions before the incoming playlist can render them. */
+  let activeId = null;
+  let identity = 0;
+  let renameId = $state(null);
+  let deleteId = $state(null);
+  $effect.pre(() => {
+    const id = route.name === "playlist" ? route.id : null;
+    if (id === activeId) return;
+    activeId = id;
+    identity++;
+    reorderSession?.cancelRefresh?.();
+    reorderSession = null;
+    reorderBlocked = false;
+    clearTimeout(copyTimer);
+    copyTimer = 0;
+    copyState = "idle";
+    menuOpen = false;
+    renaming = false;
+    nameDraft = "";
+    renameId = null;
+    renameSaving = false;
+    renameError = "";
+    deleteOpen = false;
+    deleteId = null;
+    deleting = false;
+    deleteError = "";
+    cleanupId = null;
+  });
+  $effect(() => () => clearTimeout(copyTimer));
+  $effect(() => () => reorderSession?.cancelRefresh?.());
   $effect(() => {
     if (cleanupId && (route.name !== "playlist" || route.id !== cleanupId || pl?.id !== cleanupId || !editable)) {
       cleanupId = null;
@@ -565,8 +745,11 @@
    */
   function closeMenu(returnFocus = false) {
     const menuHadFocus = !!menu?.contains(document.activeElement);
+    const started = identity;
     menuOpen = false;
-    if (returnFocus && menuHadFocus) queueMicrotask(() => menuButton?.focus());
+    if (returnFocus && menuHadFocus) queueMicrotask(() => {
+      if (started === identity) menuButton?.focus();
+    });
   }
 
   function toggleMenu() {
@@ -594,11 +777,17 @@
    * exists to prevent, and the item is also the retry.
    */
   async function copyLink() {
-    const link = spotifyLink("playlist", pl?.id);
-    if (!link) return;
-    copyState = (await writeClipboard(link)) ? "copied" : "failed";
+    const id = pl?.id;
+    const link = spotifyLink("playlist", id);
+    if (!link || route.id !== id) return;
+    const started = identity;
+    const copied = await writeClipboard(link);
+    if (started !== identity || route.id !== id) return;
+    copyState = copied ? "copied" : "failed";
     clearTimeout(copyTimer);
-    if (copyState === "copied") copyTimer = setTimeout(() => closeMenu(true), 900);
+    if (copied) copyTimer = setTimeout(() => {
+      if (started === identity && route.id === id) closeMenu(true);
+    }, 900);
   }
 
   function onMenuKeyDown(event) {
@@ -627,9 +816,10 @@
   }
 
   function startRename() {
-    if (!editable) return;
+    if (!editable || pl?.id !== route.id) return;
     closeMenu();
-    nameDraft = pl?.name ?? "";
+    renameId = pl.id;
+    nameDraft = pl.name ?? "";
     renameError = "";
     renaming = true;
   }
@@ -637,13 +827,16 @@
   function cancelRename() {
     if (renameSaving) return;
     renaming = false;
+    renameId = null;
     nameDraft = "";
     renameError = "";
   }
 
   async function commitRename() {
+    const id = renameId;
+    const started = identity;
     const n = nameDraft.trim();
-    if (!pl || !editable || renameSaving) return;
+    if (!renaming || !id || pl?.id !== id || route.id !== id || !editable || renameSaving) return;
     if (!n) {
       renameError = "Playlist name cannot be empty.";
       return;
@@ -655,35 +848,48 @@
     renameSaving = true;
     renameError = "";
     try {
-      await api.renamePlaylist(pl.id, n);
-      renaming = false;
+      await api.renamePlaylist(id, n);
+      if (started === identity && renameId === id && route.id === id) {
+        renaming = false;
+        renameId = null;
+      }
     } catch (error) {
-      renameError = error instanceof Error ? error.message : String(error || "Could not rename this playlist.");
+      if (started === identity && renameId === id && route.id === id) {
+        renameError = error instanceof Error ? error.message : String(error || "Could not rename this playlist.");
+      }
     } finally {
-      renameSaving = false;
+      if (started === identity && renameId === id && route.id === id) renameSaving = false;
     }
   }
 
   function requestDelete() {
     cleanupId = null;
-    if (!editable) return;
+    if (!editable || pl?.id !== route.id) return;
     closeMenu();
+    deleteId = pl.id;
     deleteError = "";
     deleteOpen = true;
   }
 
   async function deletePlaylist() {
-    if (!pl || !editable || deleting) return;
+    const id = deleteId;
+    const started = identity;
+    if (!deleteOpen || !id || pl?.id !== id || route.id !== id || !editable || deleting) return;
     deleting = true;
     deleteError = "";
     try {
-      await api.deletePlaylist(pl.id);
-      deleteOpen = false;
-      navigate("library");
+      await api.deletePlaylist(id);
+      if (started === identity && deleteId === id && route.id === id) {
+        deleteOpen = false;
+        deleteId = null;
+        navigate("library");
+      }
     } catch (error) {
-      deleteError = error instanceof Error ? error.message : String(error || "Could not delete this playlist.");
+      if (started === identity && deleteId === id && route.id === id) {
+        deleteError = error instanceof Error ? error.message : String(error || "Could not delete this playlist.");
+      }
     } finally {
-      deleting = false;
+      if (started === identity && deleteId === id && route.id === id) deleting = false;
     }
   }
 </script>
@@ -757,7 +963,7 @@
       />
       <div>
         <span class="tag">Playlist</span>
-        {#if renaming && editable}
+        {#if renaming && renameId === pl.id && route.id === renameId && editable}
           <form
             class="rename-form"
             aria-label="Rename playlist"
@@ -794,7 +1000,7 @@
           <h1 class="detail-title">{pl.name}</h1>
         {/if}
         <p class="detail-meta">
-          <span class="who">{pl.owner}</span>
+          <button class="who link-more" onclick={() => navigate("profile", pl.owner_id || pl.owner)}>{pl.owner}</button>
           <span class="sep">/</span><span class="num">{tracks.length} songs</span>
           {#if tracks.length}
             <span class="sep">/</span><span class="num">{formatTotal(tracks)}</span>
@@ -812,6 +1018,9 @@
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
             <Icon name="shuffle" size={14} />Shuffle
           </button>
+          {#if library.some((entry) => entry.id === pl.id)}
+            <button class="btn-ghost" onclick={() => togglePin(pl.id)}>{isPinned(pl.id) ? "Unpin" : "Pin to sidebar"}</button>
+          {/if}
           <div class="playlist-menu-wrap">
             <button
               class="btn-icon"
@@ -881,7 +1090,7 @@
           sortDirection={sortState.direction}
           onSort={toggleSort}
           excludedTrackIds={excludedTrackIds}
-          onReorder={editable && ownOrderShown ? reorderTracks : null}
+          onReorder={editable && ownOrderShown && !reorderBlocked ? reorderTracks : null}
         />
       </div>
     {:else}
@@ -942,7 +1151,7 @@
     </div>
   {/if}
 </section>
-{#if deleteOpen && editable}
+{#if deleteOpen && deleteId === pl?.id && route.name === "playlist" && route.id === deleteId && editable}
   <ConfirmDialog
     open={deleteOpen}
     title="Delete this playlist?"
@@ -954,6 +1163,7 @@
     onConfirm={deletePlaylist}
     onCancel={() => {
       deleteOpen = false;
+      deleteId = null;
       deleteError = "";
     }}
   />

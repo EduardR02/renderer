@@ -17,6 +17,10 @@
   import Cover from "./Cover.svelte";
   import LikedMark from "./LikedMark.svelte";
   import { scrollbar } from "../lib/scrollbar.js";
+  import PlaylistRailRow from "./PlaylistRailRow.svelte";
+  import { loadPins, isPinned, togglePin } from "../lib/pins.svelte.js";
+  import { session } from "../lib/state.svelte.js";
+  import { watchPersonal } from "../lib/personal.svelte.js";
   import { frost } from "../lib/ambient.svelte.js";
 
   let creating = $state(false);
@@ -41,10 +45,49 @@
    */
   let showingArtists = $state(false);
 
+  let tree = $state(null);
+  let treeError = $state("");
+  let treeGeneration = $state(0);
+  $effect(() => { loadPins(session.username); });
+  $effect(() => watchPersonal());
+  $effect(() => {
+    const account = session.username;
+    const loaded = libraryState.loaded;
+    const retry = treeGeneration;
+    tree = null;
+    treeError = "";
+    if (!account || !loaded) return;
+    let active = true;
+    api.browsePlaylistTree().then((nodes) => { if (active) tree = nodes; })
+      .catch((error) => { if (active) treeError = String(error); });
+    return () => { active = false; };
+  });
   const filteredLibrary = $derived.by(() => {
     const query = filterQuery.trim().toLocaleLowerCase();
-    if (!query) return library;
-    return library.filter((playlist) => playlist.name?.toLocaleLowerCase().includes(query));
+    const byId = new Map(library.map((playlist) => [playlist.id, playlist]));
+    const entries = [];
+    const seen = new Set();
+    function visit(nodes, depth) {
+      for (const node of nodes) {
+        if (node.kind === "folder") {
+          entries.push({ kind: "folder", id: node.id, name: node.name, depth });
+          visit(node.children ?? [], depth + 1);
+        } else if (node.kind === "playlist") {
+          const id = node.playlist?.id;
+          if (id && !seen.has(id)) {
+            seen.add(id);
+            entries.push({ kind: "playlist", playlist: byId.get(id) ?? node.playlist, depth });
+          }
+        }
+      }
+    }
+    if (Array.isArray(tree)) visit(tree, 0);
+    for (const playlist of library) {
+      if (!seen.has(playlist.id)) entries.push({ kind: "playlist", playlist, depth: 0 });
+    }
+    if (query) return entries.filter((entry) => entry.kind === "playlist" && entry.playlist.name?.toLocaleLowerCase().includes(query));
+    const pinned = entries.filter((entry) => entry.kind === "playlist" && isPinned(entry.playlist.id));
+    return [...pinned.map((entry) => ({ ...entry, depth: 0 })), ...entries.filter((entry) => entry.kind === "folder" || !isPinned(entry.playlist.id))];
   });
 
   const filteredArtists = $derived.by(() => {
@@ -245,6 +288,15 @@
     <button class="nav-item" class:active={route.name === "history"} onclick={() => navigate("history")}>
       <Icon name="clock" size={17} /><span>History</span>
     </button>
+    <button class="nav-item" class:active={route.name === "podcasts"} onclick={() => navigate("podcasts")}>
+      <Icon name="note" size={17} /><span>Podcasts</span>
+    </button>
+    {#if session.username}
+      <button class="nav-item" class:active={route.name === "profile" && route.id === session.username}
+        onclick={() => navigate("profile", session.username)}>
+        <Icon name="library" size={17} /><span>My profile</span>
+      </button>
+    {/if}
   </nav>
 
   <div class="lib">
@@ -371,38 +423,27 @@
           <p class="lib-filter-empty">You are not following any artists yet</p>
         {/if}
       {:else}
-        <button
-          class="lib-row liked-row"
-          class:active={route.name === "liked"}
-          onclick={() => navigate("liked")}
-        >
-          <!-- The same mark the collection page shows at 176px. It used to be a
-               different picture here, drawn by different CSS. -->
-          <LikedMark size={32} />
-          <span class="lib-name">Liked Songs</span>
-        </button>
-        {#each filteredLibrary as pl (pl.id)}
-          <button
-            class="lib-row"
-            class:active={route.name === "playlist" && route.id === pl.id}
-            class:playing={playingId === pl.id}
-            class:no-drop={trackDrag.active && trackDrag.sourcePlaylistId === pl.id}
-            data-pid={pl.id}
-            onclick={() => navigate("playlist", pl.id)}
-          >
-            <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} size={32} />
-            <span class="lib-name">{pl.name}</span>
-            {#if trackDrag.active}
-              <!-- While a song is in flight the count cedes its slot to the
-                   affordance: every user playlist is a valid destination (the
-                   source itself wears .no-drop), and "+" says what a drop does
-                   without a word of prose. -->
-              <span class="lib-drop-hint" aria-hidden="true">+</span>
-            {:else if pl.tracks_total}
-              <span class="lib-count">{pl.tracks_total}</span>
-            {/if}
-          </button>
+        {#if isPinned("liked")}
+          <div class="lib-row liked-row" class:active={route.name === "liked"}>
+            <button class="pin-liked-open" onclick={() => navigate("liked")}><LikedMark size={32} /><span class="lib-name">Liked Songs</span></button>
+            <button class="pin-liked-toggle" title="Unpin Liked Songs" aria-label="Unpin Liked Songs" onclick={() => togglePin("liked")}>◆</button>
+          </div>
+        {/if}
+        {#each filteredLibrary as entry (entry.kind === "folder" ? `folder:${entry.id}` : `playlist:${entry.playlist.id}`)}
+          {#if entry.kind === "folder"}
+            <div class="lib-folder" style:padding-left={`${12 + entry.depth * 16}px`}>▾ {entry.name}</div>
+          {:else}
+            <PlaylistRailRow playlist={entry.playlist} depth={entry.depth}
+              active={route.name === "playlist" && route.id === entry.playlist.id} playing={playingId === entry.playlist.id} />
+          {/if}
         {/each}
+        {#if !isPinned("liked")}
+          <div class="lib-row liked-row" class:active={route.name === "liked"}>
+            <button class="pin-liked-open" onclick={() => navigate("liked")}><LikedMark size={32} /><span class="lib-name">Liked Songs</span></button>
+            <button class="pin-liked-toggle" title="Pin Liked Songs" aria-label="Pin Liked Songs" onclick={() => togglePin("liked")}>◇</button>
+          </div>
+        {/if}
+        {#if treeError}<p class="lib-filter-empty">Folders unavailable: {treeError} <button class="link-more" onclick={() => treeGeneration++}>Retry</button></p>{/if}
         {#if !libraryState.loaded && !library.length}
           <!-- The rail's own loading frame. Rows at the real height with the
                real tile and name geometry, so the list does not jump when the

@@ -76,20 +76,17 @@ export async function createRealMode(h) {
   const { playback, settings, mock, state, emit, emitState, setCurrent, clone } = h;
 
   const boot = await bridge("get_state");
-  if (!boot.ok || !boot.value?.playback) {
-    console.error(`[real] no real state (${boot.error ?? boot.source}); booting on fixtures instead.`);
-    return null;
-  }
-  const bootSource = boot.source;
-  const real = boot.value;
+  const available = boot.ok && !!boot.value?.playback;
+  if (!available) console.error(`[real] no real state (${boot.error ?? boot.source}); no fixture account will be substituted.`);
+  const bootSource = available ? boot.source : "none";
+  const real = available ? boot.value : { playback: {}, playlists: [], me_id: "" };
   const library = real.playlists ?? [];
   const meId = real.me_id ?? "";
-
   /** Where each command's last answer came from: live, cache, disk or mock. */
   const sources = {};
-  /** Commands that fell back to the fixture backend, with the reason. */
+  /** Reads that were unavailable, with the reason. */
   const misses = {};
-  /** Mutations accepted without effect, by command. */
+  /** Mutations refused by the read-only bridge, by command. */
   const ignored = {};
   /** uri → canvas url or null, as far as this page has learned. */
   const canvases = new Map();
@@ -98,12 +95,12 @@ export async function createRealMode(h) {
 
   const seeded = real.playback;
   Object.assign(playback, {
-    ready: true,
-    auth_state: "ready",
-    auth_url: "",
+    ready: seeded.ready === true,
+    auth_state: seeded.auth_state || "needs_login",
+    auth_url: seeded.auth_url || "",
     // Simulated playback runs, so the Canvas and the meters move; press
     // pause in the harness to see the paused surfaces.
-    playing: true,
+    playing: available && !!seeded.queue?.length,
     preview: false,
     username: seeded.username || meId,
     position_ms: seeded.position_ms ?? 0,
@@ -112,7 +109,7 @@ export async function createRealMode(h) {
     repeat: seeded.repeat ?? "off",
     playback_speed: seeded.playback_speed ?? 1,
     queue: clone(seeded.queue ?? []),
-    error: "",
+    error: available ? seeded.error || "" : `Real account state unavailable: ${boot.error || "start the native app with its DevTools bridge."}`,
   });
   setCurrent(seeded.current_index ?? 0, false);
   playback.duration_ms = seeded.duration_ms || playback.queue[playback.current_index]?.duration_ms || 0;
@@ -168,16 +165,9 @@ export async function createRealMode(h) {
       sources[cmd] = answer.source;
       return answer.value;
     }
-    // The real command itself refused: reject with its message, the way a
-    // Tauri `Result<_, String>` reaches the frontend.
-    if (answer.source === "live") {
-      sources[cmd] = "live";
-      return Promise.reject(answer.error);
-    }
-    sources[cmd] = "mock";
-    if (!misses[cmd]) console.warn(`[real] ${cmd}: ${answer.error} — answering from the fixtures.`);
+    sources[cmd] = answer.source || "none";
     misses[cmd] = answer.error;
-    return mock.invoke(cmd, args);
+    throw new Error(answer.source === "live" ? answer.error : `${cmd} is unavailable from the live app or its cache: ${answer.error || "no real data"}. Start the native app; no fixture data is used in real mode.`);
   }
 
   async function invoke(cmd, args = {}) {
@@ -191,7 +181,7 @@ export async function createRealMode(h) {
         return clone(settings);
       case "get_cover": {
         const url = String(args.url ?? "");
-        return /^https?:/.test(url) ? url : mock.invoke(cmd, args);
+        return /^https?:/.test(url) ? url : null;
       }
       case "play_queue": {
         playback.queue = clone(Array.isArray(args.queue) ? args.queue : []);
@@ -224,12 +214,8 @@ export async function createRealMode(h) {
     }
     if (READ_COMMANDS.has(cmd)) return forward(cmd, args);
     if (LOCAL_MOCK.has(cmd)) return mock.invoke(cmd, args);
-    // A mutation of the real library, an edit, or a preference: accepted and
-    // dropped. The fixture handlers are written against fixture ids and would
-    // corrupt real rows (they zero track counts and strip queue edits).
-    if (!ignored[cmd]) console.info(`[real] ${cmd} accepted without effect (real mode never mutates).`);
     ignored[cmd] = (ignored[cmd] ?? 0) + 1;
-    return null;
+    throw new Error(`${cmd} cannot run in the read-only real-account harness. Use the native Renderer app for authorization, library changes, settings, or remote Spotify transfers.`);
   }
 
   /* ------------------------------------------------------------- scene */
@@ -241,6 +227,7 @@ export async function createRealMode(h) {
     if (kind === "playlist" && id) state.navigate("playlist", id);
     else if (kind === "album" && id) state.navigate("album", id);
     else if (kind === "radio" && id) state.navigate("radio", id);
+    else if (kind === "show" && id) state.navigate("show", id);
     else if (kind === "artist" && id) state.navigateArtist(id, current()?.artist_names?.[0] ?? "");
     else if (kind === "liked") state.navigate("liked");
     else state.navigate("library");
@@ -250,7 +237,7 @@ export async function createRealMode(h) {
   /* ---------------------------------------------------------- canvases */
 
   async function canvasOf(track, mode = "fill") {
-    if (!track) return null;
+    if (!track?.uri?.startsWith("spotify:track:")) return null;
     if (canvases.has(track.uri)) return canvases.get(track.uri);
     const answer = await bridge("browse_canvas", { id: track.id || track.uri }, { mode, maxAgeMs: WARM_MAX_AGE_MS });
     // Only a real answer counts; an outage is "unknown", not "no Canvas".
@@ -297,7 +284,7 @@ export async function createRealMode(h) {
     const jobs = [];
     const fill = (cmd, args) => jobs.push([cmd, args]);
     for (const track of playback.queue.slice(0, WARM_QUEUE_LIMIT)) {
-      if (!track.id) continue;
+      if (!track.id || !track.uri?.startsWith("spotify:track:")) continue;
       fill("browse_canvas", { id: track.id });
       fill("browse_track_credits", { id: track.id });
       fill("get_track_playlists", { uri: track.uri });
@@ -306,7 +293,7 @@ export async function createRealMode(h) {
     const [kind, id] = String(now?.context ?? "").split(":");
     if (kind === "playlist" && id) fill("browse_playlist", { id });
     if (kind === "radio" && id) fill("browse_radio", { id });
-    if (now?.album_id) fill("browse_album", { id: now.album_id });
+    if (now?.uri?.startsWith("spotify:track:") && now.album_id) fill("browse_album", { id: now.album_id });
     fill("browse_followed_artists", {});
     fill("browse_liked_songs", { cursor: null });
     fill("get_history", { offset: 0, limit: 100, query: "", sort: "recent" });

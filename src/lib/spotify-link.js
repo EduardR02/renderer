@@ -1,11 +1,11 @@
 /* The kinds this app can name. One list, read from both directions: `RESOURCE`
    is what search accepts, and `spotifyLink` builds only these. */
-const KINDS = ["track", "album", "artist", "playlist"];
+const KINDS = ["track", "album", "artist", "playlist", "show", "episode"];
 const SPOTIFY_ID = "[A-Za-z0-9]{22}";
 const RESOURCE = `(${KINDS.join("|")})`;
 const URI_PATTERN = new RegExp(`^spotify:${RESOURCE}:(${SPOTIFY_ID})$`);
 const PATH_PATTERN = new RegExp(`^/(?:intl-[a-z]{2}(?:-[a-z]{2})?/)?${RESOURCE}/(${SPOTIFY_ID})/?$`, "i");
-const INVALID_LINK = "Use a Spotify song, album, artist or playlist link with a valid Spotify ID.";
+const INVALID_LINK = "Use a Spotify song, album, artist, playlist, podcast or episode link with a valid Spotify ID.";
 const SHORT_LINK = "Short Spotify links aren't supported here yet. Copy the full open.spotify.com link instead.";
 
 /** Null means ordinary search text. Links are parsed locally, never opened or fetched. */

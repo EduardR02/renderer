@@ -323,6 +323,14 @@ pub enum Command {
     BrowseTrack {
         id: String,
     },
+    /// One audio podcast episode through metadata4.
+    BrowseEpisode { id: String },
+    /// A show's metadata and its episode rows in source order.
+    BrowseShow { id: String },
+    /// User identity and public playlists from the private profile service.
+    BrowseProfile { username: String },
+    /// Folder hierarchy from the signed-in user's rootlist.
+    BrowsePlaylistTree { length: usize },
     /// Album metadata/tracks plus play counts from the official pathfinder
     /// album query.
     /// Responded to with a `browse_album` message.
@@ -1138,10 +1146,72 @@ pub struct Canvas {
     pub canvas_type: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ShowRef {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub publisher: String,
+    pub description: String,
+    pub cover_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EpisodeRef {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub show_id: String,
+    pub show_name: String,
+    pub description: String,
+    pub cover_url: Option<String>,
+    pub duration_ms: u32,
+    pub published_at: Option<i64>,
+    pub unavailable: bool,
+    pub unavailable_reason: Option<String>,
+    /// Audio-only queue representation. No episode is a song edit target.
+    pub track: TrackRef,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ShowBrowse {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub publisher: String,
+    pub description: String,
+    pub cover_url: Option<String>,
+    pub episodes: Vec<EpisodeRef>,
+}
+
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UserProfile {
+    pub username: String,
+    pub name: String,
+    pub image_url: Option<String>,
+    pub playlists: Vec<PlaylistRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LibraryNode {
+    Folder {
+        id: String,
+        name: String,
+        children: Vec<LibraryNode>,
+    },
+    Playlist { playlist: PlaylistRef },
+}
+
 /// The single best answer to a query, whatever kind of thing it turns out
 /// to be.
 ///
-/// The four result groups are each ranked only *within* their own kind, so
+/// The result groups are each ranked only *within* their own kind, so
 /// "the first artist" answers a question nobody asked: a search for `top 50`
 /// has no artist worth naming, and `Bohemian Rhapsody` is a song. The
 /// `searchDesktop` response already carries a cross-kind ranking in
@@ -1149,8 +1219,8 @@ pub struct Canvas {
 /// it costs nothing, because it travels in the response we were already
 /// asking for.
 ///
-/// Kinds this app has no destination for (podcasts, episodes, users) are
-/// dropped rather than shown, so the field is an `Option`.
+/// Kinds this app has no destination for (such as users in search) are dropped
+/// rather than shown, so the field is an `Option`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum SearchTopRef {
@@ -1158,6 +1228,8 @@ pub enum SearchTopRef {
     Album(AlbumRef),
     Artist(ArtistRef),
     Playlist(PlaylistRef),
+    Show(ShowRef),
+    Episode(EpisodeRef),
 }
 
 /// Payload of a successful [`Command::BrowseSearch`] response.
@@ -1171,6 +1243,10 @@ pub struct SearchBrowse {
     pub artists: Vec<ArtistRef>,
     #[serde(default)]
     pub playlists: Vec<PlaylistRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shows: Vec<ShowRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episodes: Vec<EpisodeRef>,
 }
 
 /// Envelope for every `browse_*` response: the payload travels in `data` on

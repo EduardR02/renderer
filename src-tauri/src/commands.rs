@@ -19,11 +19,16 @@ use crate::covers;
 use crate::engine_client::{EngineClient, PositionHeartbeat, RestoreSnapshot, StateLine};
 use crate::log;
 use crate::media_keys;
+use crate::personal_api::{
+    Authorization as PersonalAuthorization, Device as PersonalDevice, PersonalApi,
+    SavedShowsPage, Status as PersonalStatus,
+};
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail,
-    CacheStats, HistoryPageDetail, LikedSongsDetail, Playlist, PlaylistDetail,
-    PlaylistRecommendationsDetail, RadioDetail, SearchResult, SongwriterPlaylist, Track,
-    TrackCreditsDetail, TrackPlaylistRef, TrackWaveform,
+    CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail,
+    Playlist, PlaylistDetail, PlaylistRecommendationsDetail, ProfileDetail, RadioDetail,
+    SearchResult, ShowDetail, SongwriterPlaylist, Track, TrackCreditsDetail, TrackPlaylistRef,
+    TrackWaveform,
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -446,6 +451,27 @@ pub async fn browse_liked_songs(
     ))
 }
 
+#[tauri::command]
+pub async fn browse_show(client: State<'_, Arc<EngineClient>>, id: String) -> Result<ShowDetail, String> {
+    client.browse_show(&id).await.map(ShowDetail::from)
+}
+
+#[tauri::command]
+pub async fn browse_episode(client: State<'_, Arc<EngineClient>>, id: String) -> Result<EpisodeDetail, String> {
+    client.browse_episode(&id).await.map(EpisodeDetail::from)
+}
+
+#[tauri::command]
+pub async fn browse_profile(client: State<'_, Arc<EngineClient>>, username: String) -> Result<ProfileDetail, String> {
+    client.browse_profile(&username).await.map(ProfileDetail::from)
+}
+
+#[tauri::command]
+pub async fn browse_playlist_tree(client: State<'_, Arc<EngineClient>>, length: Option<usize>) -> Result<Vec<LibraryNodeDetail>, String> {
+    client.browse_playlist_tree(length.unwrap_or(1000)).await
+        .map(|nodes| nodes.into_iter().map(LibraryNodeDetail::from).collect())
+}
+
 /// Songwriter/producer/performer credits for one track.
 ///
 /// Returned only, never emitted: credits are opened for one track at a time
@@ -681,8 +707,94 @@ pub async fn set_normalisation(
 }
 
 #[tauri::command]
-pub async fn logout(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
+pub async fn logout(
+    app: AppHandle,
+    client: State<'_, Arc<EngineClient>>,
+    personal: State<'_, Arc<PersonalApi>>,
+) -> Result<(), String> {
+    personal.disconnect(&app).await?;
     client.logout().await
+}
+
+#[tauri::command]
+pub async fn personal_api_status(personal: State<'_, Arc<PersonalApi>>) -> Result<PersonalStatus, String> {
+    personal.status().await
+}
+
+#[tauri::command]
+pub async fn personal_api_configure(
+    app: AppHandle,
+    personal: State<'_, Arc<PersonalApi>>,
+    client_id: String,
+) -> Result<PersonalStatus, String> {
+    personal.configure(&app, client_id).await
+}
+
+#[tauri::command]
+pub async fn personal_api_authorize(
+    app: AppHandle,
+    personal: State<'_, Arc<PersonalApi>>,
+    enable_devices: bool,
+) -> Result<PersonalAuthorization, String> {
+    personal.authorize(app, enable_devices).await
+}
+
+#[tauri::command]
+pub async fn personal_api_disconnect(app: AppHandle, personal: State<'_, Arc<PersonalApi>>) -> Result<PersonalStatus, String> {
+    personal.disconnect(&app).await
+}
+
+#[tauri::command]
+pub async fn personal_api_contains(
+    app: AppHandle,
+    personal: State<'_, Arc<PersonalApi>>,
+    uris: Vec<String>,
+) -> Result<Vec<bool>, String> {
+    personal.contains(&app, uris).await
+}
+
+#[tauri::command]
+pub async fn personal_api_set_saved(
+    app: AppHandle,
+    personal: State<'_, Arc<PersonalApi>>,
+    uris: Vec<String>,
+    saved: bool,
+) -> Result<(), String> {
+    personal.set_saved(&app, uris, saved).await
+}
+
+#[tauri::command]
+pub async fn personal_api_saved_shows(
+    app: AppHandle,
+    personal: State<'_, Arc<PersonalApi>>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<SavedShowsPage, String> {
+    personal.saved_shows(&app, offset.unwrap_or(0), limit.unwrap_or(20)).await
+}
+
+#[tauri::command]
+pub async fn personal_api_devices(app: AppHandle, personal: State<'_, Arc<PersonalApi>>) -> Result<Vec<PersonalDevice>, String> {
+    personal.devices(&app).await
+}
+
+#[tauri::command]
+pub async fn personal_api_transfer(
+    app: AppHandle,
+    personal: State<'_, Arc<PersonalApi>>,
+    device_id: String,
+    play: bool,
+) -> Result<(), String> {
+    personal.transfer(&app, device_id, play).await
+}
+
+#[tauri::command]
+pub async fn personal_api_set_devices_enabled(
+    app: AppHandle,
+    personal: State<'_, Arc<PersonalApi>>,
+    enabled: bool,
+) -> Result<PersonalStatus, String> {
+    personal.set_devices_enabled(&app, enabled).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1125,92 @@ fn volume_state_payload(volume: u8) -> Value {
     json!({ "volume": volume })
 }
 
+/// A failed restore may re-arm its plan immediately, but a ready state must
+/// not start the next attempt until the returned backoff expires. The
+/// consumer continues to receive scalar and lifecycle lines in the meantime.
+#[derive(Default)]
+struct RestoreRetry {
+    deadline: Option<tokio::time::Instant>,
+    generation: u64,
+    username: String,
+}
+
+impl RestoreRetry {
+    fn schedule(
+        &mut self,
+        delay: Duration,
+        now: tokio::time::Instant,
+        generation: u64,
+        username: &str,
+    ) {
+        self.deadline = Some(now + delay);
+        self.generation = generation;
+        self.username.clear();
+        self.username.push_str(username);
+    }
+
+    fn waiting(&self, now: tokio::time::Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now < deadline)
+    }
+
+    fn take_due(&mut self, now: tokio::time::Instant) -> Option<(u64, String)> {
+        if self.waiting(now) {
+            return None;
+        }
+        self.deadline.take()?;
+        Some((self.generation, std::mem::take(&mut self.username)))
+    }
+
+    fn cancel(&mut self) {
+        self.deadline = None;
+        self.username.clear();
+    }
+}
+
+fn request_restore_state(client: Arc<EngineClient>) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = client.status().await {
+            log::warn(&format!(
+                "could not re-request engine state for restore: {error}"
+            ));
+        }
+    });
+}
+
+async fn run_restore_attempt(
+    app: &AppHandle,
+    client: &Arc<EngineClient>,
+    snapshot: &RestoreSnapshot,
+    generation: u64,
+    username: &str,
+    restore_retry: &mut RestoreRetry,
+    restore_error: &mut Option<(String, String)>,
+) {
+    if let Err(error) = restore_playback(client, snapshot).await {
+        log::warn(&format!("could not restore playback: {error}"));
+        match client.retry_pending_restore_for_generation(generation) {
+            Ok(Some(delay)) => {
+                restore_retry.schedule(delay, tokio::time::Instant::now(), generation, username);
+            }
+            Ok(None) => {
+                let message = format!("could not restore the previous session: {error}");
+                *restore_error = Some((username.to_owned(), message.clone()));
+                let _ = app.emit(
+                    "session",
+                    json!({
+                        "auth_state": "ready",
+                        "username": username,
+                        "error": message,
+                    }),
+                );
+                // With the plan disarmed, publish the engine's actual state.
+                request_restore_state(client.clone());
+            }
+            Err(()) => {} // An exited engine or cleared plan owns no retry or error.
+        }
+    }
+}
+
 /// Consumes engine state lines, mirrors them into `AppState`, and emits the
 /// `state`/`position`/`session` events. The scalar lanes are forwarded in the
 /// shape the window already applies: a position heartbeat goes out as the
@@ -1031,13 +1229,39 @@ pub async fn consume_states(app: AppHandle) {
 
     let mut previous_identity: Option<(String, String)> = None;
     let mut last_error = String::new();
+    let mut restore_error: Option<(String, String)> = None;
     // The first authenticated line may be held while the playback queue is
     // restored. Rootlist browse is independent of those transport setters.
     let mut library_refresh_during_restore = false;
+    let mut restore_retry = RestoreRetry::default();
     let mut restore_started_at = None;
 
     loop {
-        let state = match lines.recv().await {
+        let retry_deadline = restore_retry.deadline;
+        let state = match tokio::select! {
+            line = lines.recv() => line,
+            _ = async {
+                tokio::time::sleep_until(retry_deadline.expect("retry is scheduled")).await
+            }, if retry_deadline.is_some() => {
+                if let Some((generation, username)) =
+                    restore_retry.take_due(tokio::time::Instant::now())
+                {
+                    if let Some(snapshot) = client.begin_pending_retry(generation) {
+                        run_restore_attempt(
+                            &app,
+                            &client,
+                            &snapshot,
+                            generation,
+                            &username,
+                            &mut restore_retry,
+                            &mut restore_error,
+                        )
+                        .await;
+                    }
+                }
+                continue;
+            }
+        } {
             Ok(StateLine::State(state)) => state,
             Ok(StateLine::Position(heartbeat)) => {
                 // A heartbeat only moved the playhead: freshen the snapshot
@@ -1063,6 +1287,8 @@ pub async fn consume_states(app: AppHandle) {
                 continue;
             }
             Ok(StateLine::Disconnected) => {
+                restore_retry.cancel();
+                restore_error = None;
                 let disconnected = {
                     let managed = app.state::<Mutex<AppState>>();
                     let mut guard = managed.lock();
@@ -1116,11 +1342,16 @@ pub async fn consume_states(app: AppHandle) {
                 guard.me_id = state.username.clone();
                 guard.library_fresh = false;
                 guard.library_generation = guard.library_generation.wrapping_add(1);
+                guard.memberships.clear();
+                drop(guard);
+                let _ = app.emit("memberships_changed", ());
             }
         }
         if state.auth_state != "ready" {
             library_refresh_during_restore = false;
             restore_started_at = None;
+            restore_retry.cancel();
+            restore_error = None;
             if matches!(state.auth_state.as_str(), "logged_out" | "needs_login") {
                 app.state::<Mutex<AppState>>().lock().library_fresh = false;
             }
@@ -1134,25 +1365,24 @@ pub async fn consume_states(app: AppHandle) {
                 restore_started_at = Some(std::time::Instant::now());
             }
         }
-        if let Some(snapshot) = client.begin_pending_restore(&state) {
-            if let Err(error) = restore_playback(&client, &snapshot).await {
-                log::warn(&format!("could not restore playback: {error}"));
-                // Exhausted attempts disarm the plan (`None`): the engine
-                // keeps its freshly synced state and retrying would only
-                // hammer a broken restore forever. The user still hears
-                // about it once on the sticky session channel.
-                if client.retry_pending_restore().is_none() {
-                    let _ = app.emit(
-                        "session",
-                        json!({
-                            "auth_state": state.auth_state,
-                            "username": state.username,
-                            "error": format!("could not restore the previous session: {error}"),
-                        }),
-                    );
-                }
-                let _ = client.status().await;
-            }
+        if !client.restore_is_pending() {
+            restore_retry.cancel();
+        }
+        if state.auth_state == "ready" && restore_retry.waiting(tokio::time::Instant::now()) {
+            continue;
+        }
+        restore_retry.cancel();
+        if let Some((snapshot, generation)) = client.begin_pending_restore_with_generation(&state) {
+            run_restore_attempt(
+                &app,
+                &client,
+                &snapshot,
+                generation,
+                &state.username,
+                &mut restore_retry,
+                &mut restore_error,
+            )
+            .await;
             continue;
         }
         if client.restore_is_pending() && state.auth_state == "ready" {
@@ -1190,6 +1420,12 @@ pub async fn consume_states(app: AppHandle) {
                 guard.me_id = state.username.clone();
             }
         }
+        if session_changed && (state.auth_state == "ready" || state.auth_state == "logged_out") {
+            app.state::<Arc<PersonalApi>>()
+                .account_changed(&app, if state.auth_state == "ready" { &state.username } else { "" })
+                .await;
+        }
+
 
         // Full states are reserved for real changes; the scalar lanes were
         // already forwarded above as their own events.
@@ -1201,7 +1437,9 @@ pub async fn consume_states(app: AppHandle) {
                 json!({
                     "auth_state": state.auth_state,
                     "username": state.username,
-                    "error": state.error,
+                    "error": restore_error.as_ref()
+                        .filter(|(username, _)| username == &state.username)
+                        .map_or(state.error.as_str(), |(_, error)| error.as_str()),
                 }),
             );
         }
@@ -1747,6 +1985,34 @@ mod tests {
             .map(|attempt| library_retry_delay(attempt).as_secs())
             .collect();
         assert_eq!(delays, vec![5, 10, 20, 40, 60, 60]);
+    }
+
+    #[test]
+    fn failed_restore_waits_for_deadline_and_disconnect_cancels_old_retry() {
+        let started = tokio::time::Instant::now();
+        let mut retry = RestoreRetry::default();
+        assert!(!retry.waiting(started), "initial restore has no backoff");
+
+        retry.schedule(Duration::from_secs(5), started, 7, "listener");
+        assert!(retry.waiting(started));
+        assert!(retry.waiting(started + Duration::from_secs(4)));
+        assert_eq!(retry.take_due(started + Duration::from_secs(4)), None);
+        assert_eq!(retry.deadline, Some(started + Duration::from_secs(5)));
+        assert_eq!(
+            retry.take_due(started + Duration::from_secs(5)),
+            Some((7, "listener".to_owned()))
+        );
+        assert_eq!(retry.deadline, None);
+
+        retry.schedule(
+            Duration::from_secs(10),
+            started + Duration::from_secs(5),
+            8,
+            "new",
+        );
+        assert!(retry.waiting(started + Duration::from_secs(14)));
+        retry.cancel(); // Disconnect or a matched/cleared plan.
+        assert_eq!(retry.take_due(started + Duration::from_secs(15)), None);
     }
 
     #[test]

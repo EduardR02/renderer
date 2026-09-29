@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use renderer_engine::protocol::{
     normalize_canonical_playlist_description, AlbumBrowse, AlbumRef, ArtistBrowse,
     ArtistCataloguePage, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef,
-    ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist, CreditRole,
-    HistoryItem as EngineHistoryItem, HistoryPage as EngineHistoryPage,
+    ArtistReleaseCounts, ArtistReleases, ArtistTopCity, CreditArtist, CreditRole, EpisodeRef,
+    HistoryItem as EngineHistoryItem, HistoryPage as EngineHistoryPage, LibraryNode,
     LikedSongsPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef, RadioBrowse,
-    SearchBrowse, SearchTopRef, SongwriterPlaylist as EngineSongwriterPlaylist, TrackCredits,
-    TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform,
+    SearchBrowse, SearchTopRef, ShowBrowse, ShowRef, SongwriterPlaylist as EngineSongwriterPlaylist,
+    TrackCredits, TrackEdit, TrackRef, TrackWaveform as EngineTrackWaveform, UserProfile,
 };
 
 /// The verified songwriter playlist returned by the artist's separate
@@ -808,6 +808,142 @@ impl From<ArtistBrowse> for ArtistDetail {
     }
 }
 
+/// Search result metadata for a podcast show.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Show {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub publisher: String,
+    pub description: String,
+    pub cover_url: String,
+}
+
+impl From<ShowRef> for Show {
+    fn from(reference: ShowRef) -> Self {
+        Self {
+            id: reference.id,
+            uri: reference.uri,
+            name: reference.name,
+            publisher: reference.publisher,
+            description: reference.description,
+            cover_url: reference.cover_url.unwrap_or_default(),
+        }
+    }
+}
+
+/// An episode retains its audio-only queue row for direct playback.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct EpisodeDetail {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    pub show_id: String,
+    pub show_name: String,
+    pub description: String,
+    pub cover_url: String,
+    pub duration_ms: u32,
+    pub published_at: Option<i64>,
+    pub unavailable: bool,
+    pub unavailable_reason: Option<String>,
+    pub track: Track,
+}
+
+impl From<EpisodeRef> for EpisodeDetail {
+    fn from(reference: EpisodeRef) -> Self {
+        Self {
+            id: reference.id,
+            uri: reference.uri,
+            name: reference.name,
+            show_id: reference.show_id,
+            show_name: reference.show_name,
+            description: reference.description,
+            cover_url: reference.cover_url.unwrap_or_default(),
+            duration_ms: reference.duration_ms,
+            published_at: reference.published_at,
+            unavailable: reference.unavailable,
+            unavailable_reason: reference.unavailable_reason,
+            track: Track::from(reference.track),
+        }
+    }
+}
+
+/// A show's metadata plus its source-ordered episodes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ShowDetail {
+    #[serde(flatten)]
+    pub show: Show,
+    pub episodes: Vec<EpisodeDetail>,
+}
+
+impl From<ShowBrowse> for ShowDetail {
+    fn from(browse: ShowBrowse) -> Self {
+        Self {
+            show: Show {
+                id: browse.id,
+                uri: browse.uri,
+                name: browse.name,
+                publisher: browse.publisher,
+                description: browse.description,
+                cover_url: browse.cover_url.unwrap_or_default(),
+            },
+            episodes: browse.episodes.into_iter().map(EpisodeDetail::from).collect(),
+        }
+    }
+}
+
+/// Spotify username is the navigation identity; name is only the display label.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProfileDetail {
+    pub username: String,
+    pub name: String,
+    pub image_url: Option<String>,
+    pub playlists: Vec<Playlist>,
+}
+
+impl From<UserProfile> for ProfileDetail {
+    fn from(profile: UserProfile) -> Self {
+        Self {
+            username: profile.username,
+            name: profile.name,
+            image_url: profile.image_url,
+            playlists: profile.playlists.iter().map(Playlist::from).collect(),
+        }
+    }
+}
+
+/// The rootlist's folder order and hierarchy, with the standard playlist
+/// conversion applied at every depth.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LibraryNodeDetail {
+    Folder {
+        id: String,
+        name: String,
+        children: Vec<LibraryNodeDetail>,
+    },
+    Playlist { playlist: Playlist },
+}
+
+impl From<LibraryNode> for LibraryNodeDetail {
+    fn from(node: LibraryNode) -> Self {
+        match node {
+            LibraryNode::Folder { id, name, children } => Self::Folder {
+                id,
+                name,
+                children: children.into_iter().map(Self::from).collect(),
+            },
+            LibraryNode::Playlist { playlist } => Self::Playlist {
+                playlist: Playlist::from(&playlist),
+            },
+        }
+    }
+}
+
 /// The one best answer to a query, of whatever kind. Serialized internally
 /// tagged, so the frontend reads `top.kind` and then the entity's own fields
 /// off the same object.
@@ -818,6 +954,8 @@ pub enum SearchTop {
     Album(Album),
     Artist(Artist),
     Playlist(Playlist),
+    Show(Show),
+    Episode(EpisodeDetail),
 }
 
 impl From<SearchTopRef> for SearchTop {
@@ -827,6 +965,8 @@ impl From<SearchTopRef> for SearchTop {
             SearchTopRef::Album(reference) => Self::Album(Album::from(reference)),
             SearchTopRef::Artist(reference) => Self::Artist(Artist::from(reference)),
             SearchTopRef::Playlist(reference) => Self::Playlist(Playlist::from(&reference)),
+            SearchTopRef::Show(reference) => Self::Show(Show::from(reference)),
+            SearchTopRef::Episode(reference) => Self::Episode(EpisodeDetail::from(reference)),
         }
     }
 }
@@ -841,6 +981,8 @@ pub struct SearchResult {
     pub artists: Vec<Artist>,
     #[serde(default)]
     pub playlists: Vec<Playlist>,
+    pub shows: Vec<Show>,
+    pub episodes: Vec<EpisodeDetail>,
 }
 
 impl From<SearchBrowse> for SearchResult {
@@ -851,6 +993,8 @@ impl From<SearchBrowse> for SearchResult {
             albums: browse.albums.into_iter().map(Album::from).collect(),
             artists: browse.artists.into_iter().map(Artist::from).collect(),
             playlists: browse.playlists.iter().map(Playlist::from).collect(),
+            shows: browse.shows.into_iter().map(Show::from).collect(),
+            episodes: browse.episodes.into_iter().map(EpisodeDetail::from).collect(),
         }
     }
 }
@@ -1084,6 +1228,126 @@ mod tests {
             tracks: covers.iter().map(|url| track(url).into()).collect(),
             excluded_track_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn show_and_episode_detail_keep_playback_and_availability_fields() {
+        let episode = EpisodeRef {
+            id: "ep".into(),
+            uri: "spotify:episode:ep".into(),
+            name: "Interview".into(),
+            show_id: "show".into(),
+            show_name: "The Show".into(),
+            description: "Audio episode".into(),
+            cover_url: Some("episode-cover".into()),
+            duration_ms: 83_000,
+            published_at: Some(1_726_000_000),
+            unavailable: true,
+            unavailable_reason: Some("Region restricted".into()),
+            track: TrackRef {
+                id: "ep".into(),
+                uri: "spotify:episode:ep".into(),
+                context: "show:show".into(),
+                ..TrackRef::default()
+            },
+        };
+        let show = ShowDetail::from(ShowBrowse {
+            id: "show".into(),
+            uri: "spotify:show:show".into(),
+            name: "The Show".into(),
+            publisher: "Publisher".into(),
+            description: "About the show".into(),
+            cover_url: Some("show-cover".into()),
+            episodes: vec![episode],
+        });
+        let json = serde_json::to_value(show).unwrap();
+        assert_eq!(json["name"], "The Show");
+        assert_eq!(json["publisher"], "Publisher");
+        assert_eq!(json["cover_url"], "show-cover");
+        assert_eq!(json["episodes"][0]["uri"], "spotify:episode:ep");
+        assert_eq!(json["episodes"][0]["show_name"], "The Show");
+        assert_eq!(json["episodes"][0]["published_at"], 1_726_000_000_i64);
+        assert_eq!(json["episodes"][0]["duration_ms"], 83_000);
+        assert_eq!(json["episodes"][0]["unavailable"], true);
+        assert_eq!(json["episodes"][0]["unavailable_reason"], "Region restricted");
+        assert_eq!(json["episodes"][0]["track"]["context"], "show:show");
+    }
+
+    #[test]
+    fn profile_and_nested_rootlist_keep_playlist_metadata_and_order() {
+        let playlist = PlaylistRef {
+            id: "mix".into(),
+            uri: "spotify:playlist:mix".into(),
+            name: "Mixtape".into(),
+            description: Some("<p>Mixed&nbsp;tapes</p>".into()),
+            owner_id: "dj".into(),
+            owner_name: "DJ Name".into(),
+            cover_url: Some("cover".into()),
+            track_count: Some(12),
+        };
+        let profile = ProfileDetail::from(UserProfile {
+            username: "dj".into(),
+            name: "DJ Name".into(),
+            image_url: Some("portrait".into()),
+            playlists: vec![playlist.clone()],
+        });
+        assert_eq!(profile.username, "dj");
+        assert_eq!(profile.name, "DJ Name");
+        assert_eq!(profile.image_url.as_deref(), Some("portrait"));
+        assert_eq!(profile.playlists[0].owner, "DJ Name");
+        assert_eq!(profile.playlists[0].description, "Mixed tapes");
+        assert_eq!(profile.playlists[0].cover_url, "cover");
+
+        let node = LibraryNodeDetail::from(LibraryNode::Folder {
+            id: "parent".into(),
+            name: "Archive".into(),
+            children: vec![LibraryNode::Folder {
+                id: "child".into(),
+                name: "2026".into(),
+                children: vec![LibraryNode::Playlist { playlist }],
+            }],
+        });
+        let json = serde_json::to_value(node).unwrap();
+        assert_eq!(json["kind"], "folder");
+        assert_eq!(json["children"][0]["kind"], "folder");
+        assert_eq!(json["children"][0]["children"][0]["kind"], "playlist");
+        assert_eq!(json["children"][0]["children"][0]["playlist"]["owner"], "DJ Name");
+        assert_eq!(json["children"][0]["children"][0]["playlist"]["tracks_total"], 12);
+    }
+
+    #[test]
+    fn search_keeps_podcast_groups_and_ranked_top() {
+        let show = ShowRef {
+            id: "show".into(),
+            name: "The Show".into(),
+            publisher: "Publisher".into(),
+            ..ShowRef::default()
+        };
+        let episode = EpisodeRef {
+            id: "ep".into(),
+            show_id: "show".into(),
+            name: "Interview".into(),
+            track: TrackRef {
+                uri: "spotify:episode:ep".into(),
+                ..TrackRef::default()
+            },
+            ..EpisodeRef::default()
+        };
+        let results = SearchResult::from(SearchBrowse {
+            top: Some(SearchTopRef::Episode(episode.clone())),
+            shows: vec![show.clone()],
+            episodes: vec![episode],
+            ..SearchBrowse::default()
+        });
+        let json = serde_json::to_value(results).unwrap();
+        assert_eq!(json["top"]["kind"], "episode");
+        assert_eq!(json["top"]["show_id"], "show");
+        assert_eq!(json["top"]["track"]["uri"], "spotify:episode:ep");
+        assert_eq!(json["shows"][0]["publisher"], "Publisher");
+        assert_eq!(json["episodes"][0]["name"], "Interview");
+        let top_show = serde_json::to_value(SearchTop::from(SearchTopRef::Show(show))).unwrap();
+        assert_eq!(top_show["kind"], "show");
+        assert_eq!(top_show["name"], "The Show");
     }
 
     #[test]

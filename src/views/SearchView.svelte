@@ -17,7 +17,9 @@
   const albums = $derived(search.results?.albums ?? []);
   const playlists = $derived(search.results?.playlists ?? []);
   const artists = $derived(search.results?.artists ?? []);
-  const empty = $derived(!tracks.length && !albums.length && !playlists.length && !artists.length);
+  const shows = $derived(search.results?.shows ?? []);
+  const episodes = $derived(search.results?.episodes ?? []);
+  const empty = $derived(!tracks.length && !albums.length && !playlists.length && !artists.length && !shows.length && !episodes.length);
   const visibleTracks = $derived(tracks.slice(0, 5));
 
   /* Top result: Spotify's own cross-kind ranking, not "whichever artist
@@ -30,7 +32,7 @@
 
      `sub` is the credit line under the name. An artist has none: the kind
      line already says everything a portrait and a name do not. */
-  const TOP_LABEL = { track: "Song", album: "Album", artist: "Artist", playlist: "Playlist" };
+  const TOP_LABEL = { track: "Song", album: "Album", artist: "Artist", playlist: "Playlist", show: "Podcast", episode: "Episode" };
   const top = $derived.by(() => {
     const hit = search.results?.top;
     if (!hit) return null;
@@ -39,12 +41,10 @@
        one line in a 320px column: "Dein tägliches Update zu den aktuell am…"
        is not an answer, and "Spotify" is exactly the fact that separates the
        official Discover Weekly from someone's copy of it. */
-    const sub =
-      hit.kind === "artist"
-        ? ""
-        : hit.kind === "playlist"
-          ? hit.owner || playlistSubtitle(hit)
-          : (hit.artist_names ?? []).join(", ");
+    const sub = hit.kind === "artist" ? "" : hit.kind === "playlist"
+      ? hit.owner || playlistSubtitle(hit) : hit.kind === "show"
+        ? hit.publisher : hit.kind === "episode"
+          ? hit.show_name : (hit.artist_names ?? []).join(", ");
     return { ...hit, label: TOP_LABEL[hit.kind] ?? "Result", sub };
   });
 
@@ -53,6 +53,8 @@
     if (top.kind === "artist") return navigateArtist(top.id, top.name);
     if (top.kind === "album") return navigate("album", top.id);
     if (top.kind === "playlist") return navigate("playlist", top.id);
+    if (top.kind === "show") return navigate("show", top.id);
+    if (top.kind === "episode") return navigate("episode", top.id);
     /* A song opens by playing. Start the queue at the ranked track's own
        position when the Songs list contains it, so what plays next is the
        rest of the list rather than a one-track queue that stops dead. */
@@ -159,7 +161,7 @@
          quiet line does, and it occupies a fixed slot so the results below it
          do not shift when it appears. -->
     <p class="search-status" class:on={search.busy && (!!search.results || !!search.link)} role="status">
-      {search.busy ? (search.link ? "Opening song…" : "Searching…") : ""}
+      {search.busy ? (search.link ? "Opening Spotify link…" : "Searching…") : ""}
     </p>
   </div>
 
@@ -184,7 +186,7 @@
     {:else}
       <div class="empty">
         <p class="h">Nothing searched yet.</p>
-        <p class="sub">Songs, albums, playlists and artists all come back from one query.</p>
+        <p class="sub">Songs, albums, playlists, artists and audio podcasts all come back from one query.</p>
         <div class="actions">
           <button class="btn-ghost" onclick={focusSearch}>
             <Icon name="search" size={14} />Search
@@ -435,6 +437,32 @@
 
     {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
 
+    {#if shows.length}
+      <div class="section">
+        <div class="section-head"><h2 class="section-title">Podcasts</h2></div>
+        <div class="grid">
+          {#each shows as show (show.id)}
+            <button class="card" onclick={() => navigate("show", show.id)}>
+              <span class="card-art"><Cover src={show.cover_url} id={show.id} name={show.name} fill lg /></span>
+              <span class="card-copy"><span class="card-name">{show.name}</span><span class="card-sub">{show.publisher}</span></span>
+            </button>
+          {/each}
+        </div>
+      </div>
+    {/if}
+    {#if episodes.length}
+      <div class="section">
+        <div class="section-head"><h2 class="section-title">Episodes · audio only</h2></div>
+        <div class="grid">
+          {#each episodes as episode (episode.id)}
+            <button class="card" onclick={() => navigate("episode", episode.id)}>
+              <span class="card-art"><Cover src={episode.cover_url} id={episode.id} name={episode.name} fill lg /></span>
+              <span class="card-copy"><span class="card-name">{episode.name}</span><span class="card-sub">{episode.show_name}</span></span>
+            </button>
+          {/each}
+        </div>
+      </div>
+    {/if}
     {#if artists.length}
       <div class="section">
         <div class="section-head"><h2 class="section-title">Artists</h2></div>

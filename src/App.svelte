@@ -4,6 +4,8 @@
     initEvents,
     route,
     loadDetail,
+    detail,
+    libraryState,
     playback,
     credits,
     togglePlay,
@@ -44,6 +46,9 @@
   import HistoryView from "./views/HistoryView.svelte";
   import TrackEditorView from "./views/TrackEditorView.svelte";
   import LoginView from "./views/LoginView.svelte";
+  import PodcastView from "./views/PodcastView.svelte";
+  import SavedShowsView from "./views/SavedShowsView.svelte";
+  import ProfileView from "./views/ProfileView.svelte";
 
   $effect(() => {
     initEvents();
@@ -82,15 +87,10 @@
      even one frame.
 
      Detail pages fetch their body after mounting, so a remembered offset
-     routinely exceeds what is laid out yet. Restoration then stays
-     pending: it follows layout growth with a ResizeObserver over the
-     view's children and applies once the scroll range can represent the
-     target. While pending, every scroll event is noise — the browser's
-     clamp, our own zeroing, view-internal autoscrolls — and is ignored, so
-     none of them can overwrite the saved target. Once applied, programmatic
-     scrolls simply re-record the same offset under the incoming key.
-     No timers, no polling: growth itself wakes the observer, and every
-     exit path disconnects both it and the listener. */
+     routinely exceeds what is laid out yet. Restoration follows layout growth
+     while content is loading, then settles at the attainable end if the final
+     range is shorter. Intentional scrolling cancels the wait. No polling or
+     extra fetch: child resizes and DOM replacements wake the check. */
   let scrollEl = $state(null);
   const SCROLL_MEMORY_MAX = 50; // matches the navigation history scale
   const scrollMemory = new Map(); // route identity -> last pane offset
@@ -137,64 +137,108 @@
     const target = scrollMemory.get(key) ?? 0;
     let disposed = false;
     let observer = null;
+    let mutations = null;
+    const watched = new Set();
 
-    function fitsTarget() {
-      return node.scrollHeight - node.clientHeight >= target;
-    }
     function stopWaiting() {
-      if (observer) {
-        observer.disconnect();
-        observer = null;
-      }
+      observer?.disconnect();
+      mutations?.disconnect();
+      observer = null;
+      mutations = null;
       if (pendingRestoreKey === key) pendingRestoreKey = null;
     }
-    function followGrowth() {
-      pendingRestoreKey = key;
-      const watching = new Set();
-      // Observing a child that leaves the DOM reports it with a zero rect,
-      // so a wholesale skeleton-for-content swap re-enters here on its own
-      // and picks up the replacement nodes; growth inside a child reports
-      // directly. Either wake rechecks the range against the target.
-      function watchChildren() {
-        for (const child of node.children) {
-          if (!watching.has(child)) {
-            watching.add(child);
-            observer.observe(child);
-          }
-        }
-        for (const child of watching) {
-          if (!child.isConnected) {
-            watching.delete(child);
-            observer.unobserve(child);
-          }
+    function contentPending() {
+      const name = route.name;
+      const id = route.id;
+      if (["playlist", "radio", "album", "artist", "discography",
+        "fans-also-like", "appears-on", "artist-playlists", "discovered-on"].includes(name)) {
+        const payload = name === "playlist" ? detail.playlist
+          : name === "radio" ? detail.radio
+          : name === "album" ? detail.album : detail.artist;
+        return !detail.error && payload?.id !== id;
+      }
+      if (name === "library" && !libraryState.loaded) return true;
+      // History and Liked Songs own their first fetch inside their view.
+      // Their placeholder rows disappear when the first answer is rendered.
+      return (name === "history" || name === "liked") && !!node.querySelector(".sk-row");
+    }
+    function apply(top) {
+      node.scrollTo({ top, behavior: "instant" });
+    }
+    function check() {
+      if (disposed || pendingRestoreKey !== key) return;
+      const range = Math.max(0, node.scrollHeight - node.clientHeight);
+      if (range >= target || !contentPending()) {
+        stopWaiting();
+        apply(Math.min(target, range));
+      }
+    }
+    function watchChildren() {
+      if (!observer) return;
+      for (const child of watched) {
+        if (child.parentNode !== node) {
+          observer.unobserve(child);
+          watched.delete(child);
         }
       }
+      for (const child of node.children) {
+        if (watched.has(child)) continue;
+        watched.add(child);
+        observer.observe(child);
+      }
+    }
+    function cancelForUser() {
+      if (pendingRestoreKey !== key) return;
+      stopWaiting();
+      remember(key, node.scrollTop);
+    }
+    function onKey(event) {
+      if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key) &&
+        (node.contains(document.activeElement) || document.activeElement === document.body)) {
+        cancelForUser();
+      }
+    }
+    function onPointer(event) {
+      if (event.target.closest?.(".sb")?.previousElementSibling === node) cancelForUser();
+    }
+    function onWheel(event) {
+      if (event.target.closest?.(".sb")?.previousElementSibling === node) cancelForUser();
+    }
+    node.addEventListener("wheel", cancelForUser, { passive: true });
+    node.addEventListener("touchstart", cancelForUser, { passive: true });
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("pointerdown", onPointer, true);
+
+    window.addEventListener("wheel", onWheel, { passive: true });
+    // Wait for the incoming view before testing its scroll range. Only a
+    // still-short loading view needs observers; normal restores are one write.
+    tick().then(() => {
+      if (disposed || pendingRestoreKey !== key) return;
+      check();
+      if (pendingRestoreKey !== key) return;
       observer = new ResizeObserver(() => {
         watchChildren();
-        if (!disposed && fitsTarget()) {
-          stopWaiting();
-          apply();
-        }
+        check();
       });
+      observer.observe(node);
       watchChildren();
-    }
-    function apply() {
-      node.scrollTo({ top: target, behavior: "instant" });
-    }
-
-    // Restore only after Svelte commits the incoming view, so the range we
-    // measure belongs to the new route.
-    tick().then(() => {
-      if (disposed) return;
-      if (fitsTarget()) {
-        stopWaiting();
-        apply();
-      } else followGrowth();
+      mutations = new MutationObserver(() => {
+        watchChildren();
+        check();
+      });
+      // Child resizes cover virtualized tables; mutations cover skeleton
+      // replacement even if the replacement is shorter.
+      mutations.observe(node, { childList: true, subtree: true });
     });
 
     return () => {
       disposed = true;
       stopWaiting();
+      node.removeEventListener("wheel", cancelForUser);
+      node.removeEventListener("touchstart", cancelForUser);
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("pointerdown", onPointer, true);
+      window.removeEventListener("wheel", onWheel);
     };
   });
 
@@ -383,6 +427,12 @@
         <AppearsOnView />
       {:else if route.name === "artist-playlists" || route.name === "discovered-on"}
         <ArtistPlaylistCollectionView />
+      {:else if route.name === "show" || route.name === "episode"}
+        <PodcastView />
+      {:else if route.name === "podcasts"}
+        <SavedShowsView />
+      {:else if route.name === "profile"}
+        <ProfileView />
       {:else if route.name === "queue"}
         <QueueView />
       {:else if route.name === "history"}

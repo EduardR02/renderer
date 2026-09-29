@@ -125,7 +125,7 @@
      names a play does not carry) falls back to the kind — one generic word for
      the handful of rows that need it, rather than for all of them.
      ===================================================================== */
-  const KINDS = { playlist: "Playlist", album: "Album", artist: "Artist", radio: "Radio" };
+  const KINDS = { playlist: "Playlist", album: "Album", artist: "Artist", radio: "Radio", show: "Podcast" };
   // The source column can contain a screenful of playlist contexts. Index
   // the library once per change instead of scanning it for every visible row.
   const playlistById = $derived(new Map(library.map((entry) => [entry.id, entry])));

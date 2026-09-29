@@ -1,14 +1,15 @@
 # Renderer
 
-A desktop Spotify client for Windows and macOS 14 or later. I built it because
-the official app used more CPU than I want a music player to use. My computer
-has a liquid-cooled Ryzen 9 5950X, and the native desktop app would constantly
-boost it to 80 °C.
-WTF? Literal benchmarks that use all cores at max don't go that high. A music
-player is constantly open, and randomly spinning my CPU to absurd temps is
-insane, so I had to make this. It's worse if you have open-back headphones,
-because you need your PC to be as silent as possible — every time I started a
-song in the normal Spotify app it would spin my fans and distract me.
+A music-first Spotify client for Windows and macOS 14+. It keeps the useful
+parts of a desktop player—library, discovery, queue, and playback—without
+turning the music view into a podcast-video feed or a home page full of
+promotions. Audio podcasts are browsable; video podcasts are not played.
+
+I built it because the official desktop client used more CPU than I wanted
+from an app that stays open all day. On my Ryzen 9 5950X, starting a song
+could spin the fans loudly enough to distract me through open-back headphones.
+The aim here is a calm interface and predictable resource use, not a
+universal replacement for every Spotify feature.
 
 <p align="center">
   <img src="docs/library.png" alt="Playlist with album artwork in the Now Playing sidebar" width="900">
@@ -22,9 +23,9 @@ Windows: grab the NSIS setup from [Releases](../../releases) and run it. You nee
 a Spotify Premium account; the app opens a Spotify login in your browser on
 first launch.
 
-macOS 14+ on Apple Silicon: download `renderer-macos.zip` from
-[Releases](../../releases), extract `renderer.app`, and open it. You can also
-[build it yourself](#building). The Mac ZIP is ad-hoc signed, not notarized;
+macOS 14+ on Apple Silicon: download `renderer-macos-aarch64.zip` from
+[Releases](../../releases), extract `renderer.app`, and open it. You can
+also [build it yourself](#building). The Mac ZIP is ad-hoc signed, not notarized;
 Gatekeeper may require manual approval. Only bypass Gatekeeper for builds you
 trust.
 
@@ -41,15 +42,13 @@ No audio, metadata or artwork ships with this repository.
 
 ## Features
 
-Mostly a normal client: playlists, albums, artist pages, search, queue, credits,
-radio.
+Music comes first: playlists, albums, artist pages, search, queue, credits,
+radio, and audio podcasts with shows and episodes you can browse and play.
+Artist pages have discographies, popular tracks, bios, monthly listeners and
+top cities; the interface has no merch, concert tickets, AI DJ, or promotional
+home feed. Podcast video and audiobooks are not played.
 
-The pages only contain the music parts. An artist page has the discography,
-popular tracks, bio, monthly listeners and top cities. No merch, no concert
-tickets. There are no podcasts or audiobooks anywhere, no AI DJ, and no home
-feed.
-
-Audio is 320 kbps and gapless. Media keys work when the app isn't focused, and
+Music plays at 320 kbps with gapless transitions. Media keys work when the app isn't focused, and
 it shows up in Windows Quick Settings and on the lock screen. Played tracks are
 cached, so replaying them uses no network. It can launch at login, minimized if
 you want. Playlists can be created, renamed, deleted and reordered, and tracks
@@ -57,10 +56,15 @@ added or removed by drag and drop or in bulk by rules — artist, album, title,
 length — with a preview of exactly which entries go. Settings has an audio cache
 size limit and a volume normalisation toggle.
 
+The sidebar preserves playlist folders and lets you pin or unpin playlists,
+including Liked Songs. Pins stay local to each account. User profiles show
+public playlists, and playlist owners link to their profiles using display
+names when Spotify supplies them.
+
 Some extra things I added because we control playback here:
 
-- Paste a shared Spotify link — song, album, artist, playlist — into search and
-  it opens here instead of the web player.
+- Paste a shared Spotify link — song, album, artist, playlist, show, episode,
+  or user — into search and open it here instead of the web player.
 - Cut a section out of a song, or loop an exact range. Set per playlist, edited
   in a waveform view.
 - Playback speed from 0.5× to 2×, pitch preserving.
@@ -98,12 +102,20 @@ It doesn't matter much in practice. 320 kbps Vorbis and lossless aren't
 something people reliably pick apart in a blind ABX test. There's a difference
 on paper, but not at a level that affects listening.
 
-Liked Songs is read-only. You can browse and play it, but liking and unliking
-has to happen in the Spotify app. Adding it needs another API surface and I
-didn't want that tradeoff yet.
+Library editing and controlling other Spotify devices are optional. With only
+the playback sign-in, Liked Songs and followed artists remain readable; saving
+songs, following artists or users, and the remote-device picker require
+connecting your own Spotify Developer Mode app in Settings. This is a second
+authorization for the **same** Spotify account, not another account. Create
+the app with your Premium account, register
+`http://127.0.0.1:5589/personal-api/callback`, and paste its **Client ID** into
+Settings, never its Client Secret or a bearer token. Saved podcasts are also
+available with this optional authorization.
 
-No Spotify Connect. You can't control other devices from here or send playback
-to them. I don't use it.
+The device picker is off by default and makes no background device requests.
+It transfers an existing **remote Spotify session**, without moving Renderer's
+local song or queue. Local playback still follows your system default audio
+output; its controls remain independent of the remote session.
 
 ## Building
 
@@ -131,18 +143,37 @@ with `bun run build:engine` if you have not already built it. Checks are
 `cargo test -p renderer-engine`, `cargo test -p renderer`, `bun test`, and
 `bun run build`.
 
-The [macOS build workflow](../../actions/workflows/macos-build.yml) runs
-the tests and Tauri build on an Apple Silicon macOS 15 runner when a GitHub
-release is published, then attaches `renderer-macos.zip` to that release.
-A manually dispatched workflow run uploads the
-`renderer-macos-adhoc-ARM64` artifact instead. Apple Developer Program
-membership is not needed to build or upload either ZIP; a Developer ID
-signature and Apple notarization are needed for friction-free Gatekeeper
-installation.
+The [desktop release workflow](../../actions/workflows/macos-build.yml)
+builds and tests Windows x64 and Apple Silicon macOS when a GitHub release is
+published. It attaches a Windows NSIS installer, an ad-hoc-signed macOS ZIP,
+and signed updater artifacts for both systems; the updater manifest is
+published only after all platform artifacts are ready. Install v0.1.19
+manually: older releases did not include the updater. Later versions can
+be checked and installed from Settings. Updater signatures use
+a separate release-signing key, not an Apple Developer ID certificate;
+Gatekeeper may still require manual approval for an initial macOS install.
 
-Credentials go to Spotify, never through this app. The token, audio cache,
-covers and history stay under `%LOCALAPPDATA%\SpotifyRenderer` on Windows or
-`~/Library/Application Support/SpotifyRenderer` on macOS.
+Playback credentials and caches stay under `%LOCALAPPDATA%\SpotifyRenderer`
+on Windows or `~/Library/Application Support/SpotifyRenderer` on macOS. The
+optional personal Web API grant is stored in the operating system credential
+store. Neither sign-in gives this project your Spotify password.
+
+### Real-account UI harness (Windows)
+
+Quit the native app, start Vite with `bun run dev`, then run
+`bun dev/real-app.js --debug --build`. Open
+`http://127.0.0.1:1420/dev/ui-harness.html?real`. The harness reads from the
+native app, with cached answers available when it is closed; inspect
+`window.__harness.real.sources()` to distinguish live and cached data.
+Missing real data produces an error, not fixture content.
+
+Harness playback is simulated and account writes are refused. Use the native
+app for actual audio, authorization, library writes, and device transfers.
+The explicit debug build is needed from elevated shells because recent
+WebView2 runtimes ignore environment-supplied debug flags there. It opens a
+localhost debugging port that can control the native app; close that copy
+after UI work. Production builds do not enable the port by default. Keep the ignored
+`dev/.real-cache/` account data out of commits and public screenshots.
 
 ## How it works
 
@@ -167,6 +198,12 @@ At startup the sidebar can use the on-disk playlist snapshot, while Home waits
 for the authenticated rootlist so stale shelves do not flash. That rootlist
 fetch runs alongside playback-state restoration rather than waiting for the
 queue and settings to finish restoring.
+
+If restoring playback fails, retries use capped backoff without delaying the
+library refresh. Adding, moving or removing queue rows preserves Previous's
+history for tracks still in the queue, including during shuffle. Playlist track
+drags update the view immediately but send index-based edits sequentially; a
+failed edit refreshes the playlist before later drags are applied.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.

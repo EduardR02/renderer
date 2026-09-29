@@ -23,9 +23,10 @@ use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
 use renderer_engine::protocol::{
-    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistRef, Canvas, Command, HistoryQuery,
-    LikedSongsPage, LikedUrisPage, PlaylistBrowse, PlaylistRecommendations, PlaylistRef,
-    RadioBrowse, Response, SearchBrowse, SongwriterPlaylist, TrackCredits, TrackRef, TrackWaveform,
+    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistRef, Canvas, Command, EpisodeRef,
+    HistoryQuery, LibraryNode, LikedSongsPage, LikedUrisPage, PlaylistBrowse,
+    PlaylistRecommendations, PlaylistRef, RadioBrowse, Response, SearchBrowse,
+    ShowBrowse, SongwriterPlaylist, TrackCredits, TrackRef, TrackWaveform, UserProfile,
 };
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -65,6 +66,22 @@ enum BrowseOutcome {
     Artist {
         request_id: String,
         result: Result<ArtistBrowse, String>,
+    },
+    Show {
+        request_id: String,
+        result: Result<ShowBrowse, String>,
+    },
+    Episode {
+        request_id: String,
+        result: Result<EpisodeRef, String>,
+    },
+    Profile {
+        request_id: String,
+        result: Result<UserProfile, String>,
+    },
+    PlaylistTree {
+        request_id: String,
+        result: Result<Vec<LibraryNode>, String>,
     },
     ArtistSongwriter {
         request_id: String,
@@ -454,6 +471,62 @@ async fn run(
                                     }
                                 }
                             }
+                            Command::BrowseEpisode { id } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::episode_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::Episode { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Episode { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
+                            Command::BrowseShow { id } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::show_browse(&session, &id).await;
+                                            let _ = sender.send(BrowseOutcome::Show { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Show { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
+                            Command::BrowseProfile { username } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::user_profile_browse(&session, &username).await;
+                                            let _ = sender.send(BrowseOutcome::Profile { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::Profile { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
+                            Command::BrowsePlaylistTree { length } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::playlist_tree_browse(&session, length).await;
+                                            let _ = sender.send(BrowseOutcome::PlaylistTree { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::PlaylistTree { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
                             Command::BrowseTrack { id } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -805,6 +878,18 @@ async fn run(
                         }
                         BrowseOutcome::Track { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_track", &result)?;
+                        }
+                        BrowseOutcome::Episode { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_episode", &result)?;
+                        }
+                        BrowseOutcome::Show { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_show", &result)?;
+                        }
+                        BrowseOutcome::Profile { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_profile", &result)?;
+                        }
+                        BrowseOutcome::PlaylistTree { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_playlist_tree", &result)?;
                         }
                         BrowseOutcome::Album { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_album", &result)?;

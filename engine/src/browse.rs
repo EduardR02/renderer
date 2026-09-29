@@ -54,7 +54,7 @@ use http::{Method, Request};
 use librespot_core::cache::Cache;
 use librespot_core::error::ErrorKind;
 use librespot_core::{FileId, Session, SpotifyId, SpotifyUri};
-use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
+use librespot_metadata::{Album, Artist, Episode, Metadata, Playlist, Show, Track, image::Images};
 use librespot_protocol::canvaz;
 use librespot_protocol::extended_metadata::{
     BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
@@ -65,9 +65,9 @@ use serde::Deserialize;
 
 use renderer_engine::protocol::{
     AlbumRef, ArtistImage, ArtistOverview, ArtistPick, ArtistPickItem, ArtistRef, ArtistTopCity,
-    Canvas,
-    CreditArtist, CreditRole, PlaylistRecommendations, PlaylistRef, RadioBrowse,
-    SongwriterPlaylist, TrackCredits, TrackRef, sanitize_playlist_description,
+    Canvas, CreditArtist, CreditRole, EpisodeRef, LibraryNode, PlaylistRecommendations, PlaylistRef,
+    RadioBrowse, ShowBrowse, ShowRef, SongwriterPlaylist, TrackCredits, TrackRef,
+    UserProfile, sanitize_playlist_description,
 };
 
 /// Public artwork base; every cover URL is `{COVER_BASE}{40-hex-file-id}`.
@@ -247,7 +247,23 @@ fn permanent_unavailability(track: &Track, policy: &AvailabilityPolicy) -> Optio
     {
         return Some(RELEASE_EMBARGO_REASON.to_owned());
     }
-    for restriction in track.restrictions.iter().filter(|restriction| {
+    if let Some(reason) = country_unavailability(&track.restrictions, policy) {
+        return Some(reason);
+    }
+    // Librespot resolves an alternative lazily and chooses the first one that
+    // is playable. No base file is therefore permanent only when there is no
+    // alternative to try.
+    if track.files.is_empty() && track.alternatives.is_empty() {
+        return Some("no playable audio file".to_owned());
+    }
+    None
+}
+
+fn country_unavailability(
+    restrictions: &librespot_metadata::restriction::Restrictions,
+    policy: &AvailabilityPolicy,
+) -> Option<String> {
+    for restriction in restrictions.iter().filter(|restriction| {
         restriction
             .catalogue_strs
             .iter()
@@ -267,12 +283,6 @@ fn permanent_unavailability(track: &Track, policy: &AvailabilityPolicy) -> Optio
         {
             return Some("not available in your country".to_owned());
         }
-    }
-    // Librespot resolves an alternative lazily and chooses the first one that
-    // is playable. No base file is therefore permanent only when there is no
-    // alternative to try.
-    if track.files.is_empty() && track.alternatives.is_empty() {
-        return Some("no playable audio file".to_owned());
     }
     None
 }
@@ -1092,6 +1102,300 @@ pub async fn track_browse(session: &Session, id: &str) -> Result<TrackRef, Strin
         .ok_or_else(|| "This song is no longer available on Spotify.".to_owned())
 }
 
+fn podcast_uri(kind: &str, id: &str) -> Result<SpotifyUri, String> {
+    if id.len() != 22 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(format!("invalid Spotify {kind} id"));
+    }
+    SpotifyUri::from_uri(&format!("spotify:{kind}:{id}"))
+        .map_err(|error| format!("invalid Spotify {kind} id: {error}"))
+}
+
+fn show_ref(show: &Show) -> ShowRef {
+    ShowRef {
+        id: id_of(&show.id),
+        uri: uri_of(&show.id),
+        name: show.name.clone(),
+        publisher: show.publisher.clone(),
+        description: show.description.clone(),
+        cover_url: cover_url(&show.covers),
+    }
+}
+
+fn episode_ref(episode: &Episode, show_id: String, policy: &AvailabilityPolicy) -> EpisodeRef {
+    use librespot_metadata::audio::file::AudioFileFormat as Format;
+    let playable_audio = episode.audio.keys().any(|format| matches!(
+        format,
+        Format::OGG_VORBIS_96 | Format::OGG_VORBIS_160 | Format::OGG_VORBIS_320
+            | Format::MP3_96 | Format::MP3_160 | Format::MP3_256 | Format::MP3_320
+    ));
+    let now = librespot_core::date::Date::now_utc();
+    let unavailable_reason = if episode.duration <= 0 {
+        Some("Episode has no playable duration".to_owned())
+    } else if episode.is_audiobook_chapter {
+        Some("Audiobook chapters are not podcast episodes".to_owned())
+    } else if policy.filter_explicit && episode.is_explicit {
+        Some("Explicit episodes are filtered for this account".to_owned())
+    } else if !episode.availability.is_empty()
+        && episode.availability.iter().all(|availability| now < availability.start)
+    {
+        Some(RELEASE_EMBARGO_REASON.to_owned())
+    } else if let Some(reason) = country_unavailability(&episode.restrictions, policy) {
+        Some(reason)
+    } else if playable_audio {
+        None
+    } else if !episode.videos.is_empty() {
+        Some("Video-only episodes cannot be played as audio".to_owned())
+    } else if !episode.external_url.is_empty() {
+        Some("Externally hosted episode has no Spotify audio".to_owned())
+    } else {
+        Some("Episode has no supported Spotify audio".to_owned())
+    };
+    let id = id_of(&episode.id);
+    let uri = uri_of(&episode.id);
+    let cover_url = cover_url(&episode.covers);
+    let duration_ms = u32::try_from(episode.duration).unwrap_or_default();
+    let track = TrackRef {
+        id: id.clone(),
+        uri: uri.clone(),
+        name: episode.name.clone(),
+        artist_names: vec![episode.show_name.clone()],
+        album_id: show_id.clone(),
+        album_name: episode.show_name.clone(),
+        cover_url: cover_url.clone().unwrap_or_default(),
+        duration_ms,
+        unavailable: unavailable_reason.is_some(),
+        unavailable_reason: unavailable_reason.clone(),
+        ..TrackRef::default()
+    };
+    EpisodeRef {
+        id,
+        uri,
+        name: episode.name.clone(),
+        show_id,
+        show_name: episode.show_name.clone(),
+        description: episode.description.clone(),
+        cover_url,
+        duration_ms,
+        published_at: (episode.publish_time.as_timestamp_ms() > 0)
+            .then(|| episode.publish_time.as_timestamp_ms()),
+        unavailable: unavailable_reason.is_some(),
+        unavailable_reason,
+        track,
+    }
+}
+
+fn parse_episode_payload(entity_uri: &str, payload: &[u8], policy: &AvailabilityPolicy) -> Option<EpisodeRef> {
+    let message = librespot_protocol::metadata::Episode::parse_from_bytes(payload).ok()?;
+    let uri = SpotifyUri::from_uri(entity_uri).ok()?;
+    let episode = Episode::parse(&message, &uri).ok()?;
+    let show_id = message.show.gid.as_deref()
+        .and_then(|gid| SpotifyId::from_raw(gid).ok())
+        .and_then(|id| id.to_base62().ok())
+        .unwrap_or_default();
+    Some(episode_ref(&episode, show_id, policy))
+}
+
+pub async fn episode_browse(session: &Session, id: &str) -> Result<EpisodeRef, String> {
+    let uri = podcast_uri("episode", id)?;
+    let policy = AvailabilityPolicy::for_session(session);
+    fetch_extended(
+        session,
+        [&uri],
+        ExtensionKind::EPISODE_V4,
+        |uri, payload| parse_episode_payload(uri, payload, &policy),
+    )
+    .await?
+    .into_iter()
+    .next()
+    .ok_or_else(|| "This podcast episode is not available on Spotify.".to_owned())
+}
+
+pub async fn show_browse(session: &Session, id: &str) -> Result<ShowBrowse, String> {
+    let uri = podcast_uri("show", id)?;
+    let show: Show = metadata_get(session, &uri, "show").await?;
+    if show.is_audiobook {
+        return Err("Audiobooks are not podcast shows".to_owned());
+    }
+    let header = show_ref(&show);
+    let policy = AvailabilityPolicy::for_session(session);
+    let resolved = fetch_extended(
+        session,
+        show.episodes.iter(),
+        ExtensionKind::EPISODE_V4,
+        |uri, payload| parse_episode_payload(uri, payload, &policy),
+    )
+    .await?;
+    let mut by_uri: HashMap<String, EpisodeRef> = resolved
+        .into_iter()
+        .map(|episode| (episode.uri.clone(), episode))
+        .collect();
+    let episodes = show
+        .episodes
+        .iter()
+        .filter_map(|uri| by_uri.remove(&uri_of(uri)))
+        .map(|mut episode| {
+            episode.show_id = header.id.clone();
+            episode.track.album_id = header.id.clone();
+            episode
+        })
+        .collect();
+    Ok(ShowBrowse {
+        id: header.id,
+        uri: header.uri,
+        name: header.name,
+        publisher: header.publisher,
+        description: header.description,
+        cover_url: header.cover_url,
+        episodes,
+    })
+}
+
+
+#[derive(Deserialize)]
+struct PrivateProfileJson {
+    name: String,
+    #[serde(default)]
+    image_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PrivateProfilePlaylistsJson {
+    public_playlists: Vec<PrivateProfilePlaylistJson>,
+}
+
+#[derive(Deserialize)]
+struct PrivateProfilePlaylistJson {
+    uri: String,
+    name: String,
+}
+
+fn parse_user_profile(payload: &[u8], username: &str) -> Result<UserProfile, String> {
+    let parsed: PrivateProfileJson = serde_json::from_slice(payload)
+        .map_err(|error| format!("unparseable private user profile: {error}"))?;
+    if parsed.name.trim().is_empty() {
+        return Err("private user profile did not supply a display name".to_owned());
+    }
+    Ok(UserProfile {
+        username: username.to_owned(),
+        name: parsed.name,
+        image_url: parsed.image_url.filter(|url| url.starts_with("https://")),
+        playlists: Vec::new(),
+    })
+}
+
+fn parse_profile_playlists(payload: &[u8], username: &str, name: &str) -> Result<(Vec<PlaylistRef>, usize), String> {
+    let value: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|error| format!("unparseable private profile public playlists: {error}"))?;
+    let object = value.as_object()
+        .ok_or("private profile public playlists response is not an object")?;
+    // Empty repeated protobuf fields can be omitted. The independent
+    // private-profile client also defaults an omitted public_playlists to [].
+    // Accept only the empty object; unknown/error objects must not look empty.
+    if object.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    if object.contains_key("error") || object.contains_key("errors") {
+        return Err("private profile public playlists returned an error object".to_owned());
+    }
+    let parsed: PrivateProfilePlaylistsJson = serde_json::from_value(value)
+        .map_err(|error| format!("unparseable private profile public playlists: {error}"))?;
+    let row_count = parsed.public_playlists.len();
+    let playlists = parsed.public_playlists.into_iter().filter_map(|item| {
+        let SpotifyUri::Playlist { id, .. } = SpotifyUri::from_uri(&item.uri).ok()? else {
+            return None;
+        };
+        (!item.name.trim().is_empty()).then_some(PlaylistRef {
+            id: id.to_base62().ok()?,
+            uri: item.uri,
+            name: item.name,
+            owner_id: username.to_owned(),
+            owner_name: name.to_owned(),
+            description: None,
+            cover_url: None,
+            track_count: None,
+        })
+    }).collect();
+    Ok((playlists, row_count))
+}
+
+fn profile_username_path(username: &str) -> Result<String, String> {
+    if username.is_empty() || username.len() > 256 || matches!(username, "." | "..")
+        || username.chars().any(char::is_control)
+    {
+        return Err("invalid Spotify username".to_owned());
+    }
+    // Form encoding escapes path delimiters too, but a path needs %20, not +.
+    Ok(url::form_urlencoded::byte_serialize(username.as_bytes())
+        .map(|part| if part == "+" { "%20" } else { part })
+        .collect())
+}
+
+#[derive(Clone)]
+struct ProfileHeaderEntry {
+    fetched_at: Instant,
+    profile: UserProfile,
+}
+
+// Header-only, on demand. The async lock deduplicates concurrent opens; no
+// rootlist row launches a profile request and no library playlists are cached.
+static PROFILE_HEADERS: LazyLock<tokio::sync::Mutex<HashMap<(String, String), ProfileHeaderEntry>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+async fn user_profile_header(session: &Session, username: &str) -> Result<UserProfile, String> {
+    let encoded = profile_username_path(username)?;
+    let key = (session.username(), username.to_owned());
+    let mut entries = PROFILE_HEADERS.lock().await;
+    const TTL: Duration = Duration::from_secs(300);
+    entries.retain(|_, entry| entry.fetched_at.elapsed() < TTL);
+    if let Some(entry) = entries.get(&key) {
+        return Ok(entry.profile.clone());
+    }
+    let payload = session.spclient().get_user_profile(&encoded, Some(0), Some(0)).await
+        .map_err(|error| format!("private user profile request failed: {error}"))?;
+    let profile = parse_user_profile(&payload, username)?;
+    evict_oldest_for_fresh_key(&mut entries, 64, 1, true, |entry| entry.fetched_at);
+    entries.insert(key, ProfileHeaderEntry {
+        fetched_at: Instant::now(),
+        profile: profile.clone(),
+    });
+    Ok(profile)
+}
+
+pub async fn user_profile_browse(session: &Session, username: &str) -> Result<UserProfile, String> {
+    let encoded = profile_username_path(username)?;
+    let mut profile = user_profile_header(session, username).await?;
+    // Current profiles may omit the total count. Read the dedicated route
+    // until an empty page, advancing by raw rows even if the server caps a
+    // page below the requested size or a row is not an openable playlist.
+    const PAGE_SIZE: usize = 100;
+    let mut offset = 0;
+    loop {
+        let endpoint = format!(
+            "/user-profile-view/v3/profile/{encoded}/playlists?offset={offset}&limit={PAGE_SIZE}&market=from_token"
+        );
+        let body = session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await
+            .map_err(|error| format!("private profile public playlists request failed: {error}"))?;
+        let (page, row_count) = parse_profile_playlists(&body, username, &profile.name)
+            .map_err(|error| {
+                // Response field names only, never field values or credentials.
+                let shape = match serde_json::from_slice::<serde_json::Value>(&body) {
+                    Ok(serde_json::Value::Object(object)) => format!(
+                        "top-level keys: [{}]", object.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                    Ok(_) => "non-object JSON".to_owned(),
+                    Err(_) => "invalid JSON".to_owned(),
+                };
+                format!("private profile public playlists GET {endpoint} at offset {offset}: {error}; {shape}")
+            })?;
+        if row_count == 0 {
+            break;
+        }
+        profile.playlists.extend(page);
+        offset += row_count;
+    }
+    Ok(profile)
+}
+
 /// Playlist item attributes carry the only trustworthy "added" timestamp.
 /// A protobuf default of zero means the field was absent, not January 1970,
 /// so it must remain missing in the browse payload.
@@ -1136,8 +1440,20 @@ async fn fetch_playlist_tracks(
     items: &[(SpotifyUri, Option<i64>)],
     policy: &AvailabilityPolicy,
 ) -> Result<Vec<TrackRef>, String> {
-    let resolved =
-        fetch_tracks_with_policy(session, items.iter().map(|(uri, _)| uri), policy).await?;
+    let mut resolved = fetch_tracks_with_policy(
+        session,
+        items.iter().filter_map(|(uri, _)| matches!(uri, SpotifyUri::Track { .. }).then_some(uri)),
+        policy,
+    ).await?;
+    if items.iter().any(|(uri, _)| matches!(uri, SpotifyUri::Episode { .. })) {
+        let episodes = fetch_extended(
+            session,
+            items.iter().filter_map(|(uri, _)| matches!(uri, SpotifyUri::Episode { .. }).then_some(uri)),
+            ExtensionKind::EPISODE_V4,
+            |uri, payload| parse_episode_payload(uri, payload, policy),
+        ).await?;
+        resolved.extend(episodes.into_iter().map(|episode| episode.track));
+    }
     Ok(playlist_tracks_from_resolved(items, resolved))
 }
 
@@ -1445,15 +1761,16 @@ pub async fn playlist_recommendations_browse(
 // playlist library (rootlist)
 // ---------------------------------------------------------------------------
 
-/// Raw protobuf-JSON of the rootlist response. Every field is optional so an
-/// unexpected server shape degrades to an empty library instead of an error
-/// storm; field names follow the protobuf-JSON camelCase mapping.
+/// Test-only decoder for aligned playlist metadata fixtures. Production reads
+/// the rootlist tree and rejects incomplete folder data instead of dropping it.
+#[cfg(test)]
 #[derive(Default, Deserialize)]
 struct RootlistJson {
     #[serde(default)]
     contents: Option<RootlistContentsJson>,
 }
 
+#[cfg(test)]
 #[derive(Default, Deserialize)]
 struct RootlistContentsJson {
     #[serde(default)]
@@ -1565,6 +1882,92 @@ fn playlist_ref_from_rootlist(
     })
 }
 
+fn rootlist_nodes(contents: &serde_json::Value) -> Result<Vec<LibraryNode>, String> {
+    let items = contents.get("items").and_then(|v| v.as_array())
+        .ok_or("rootlist contents did not contain an items array")?;
+    let metas = contents.get("metaItems").and_then(|v| v.as_array())
+        .ok_or("rootlist contents did not contain a metaItems array")?;
+    if metas.len() != items.len() {
+        return Err("rootlist items and metadata have different lengths".to_owned());
+    }
+    let mut nodes = Vec::with_capacity(items.len());
+    let mut folders: Vec<(String, String, Vec<LibraryNode>)> = Vec::new();
+    for (item, meta) in items.iter().zip(metas) {
+        let Some(uri) = item.get("uri").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let raw_item = RootlistItemJson { uri: Some(uri.to_owned()) };
+        let raw_meta: RootlistMetaItemJson = serde_json::from_value(meta.clone())
+            .map_err(|error| format!("invalid rootlist item metadata: {error}"))?;
+        let node = if let Some(playlist) = playlist_ref_from_rootlist(&raw_item, &raw_meta) {
+            LibraryNode::Playlist { playlist }
+        } else if let Some(group) = uri.strip_prefix("spotify:start-group:") {
+            let mut parts = group.splitn(2, ':');
+            let id = parts.next().unwrap_or_default().to_owned();
+            let name = raw_meta.attributes.as_ref().and_then(|a| a.name.clone())
+                .unwrap_or_else(|| {
+                    parts.next().map(|name| {
+                        let encoded = format!("name={name}");
+                        url::form_urlencoded::parse(encoded.as_bytes())
+                            .next().map(|(_, value)| value.into_owned()).unwrap_or_default()
+                    }).unwrap_or_default()
+                });
+            folders.push((id, name, Vec::new()));
+            continue;
+        } else if let Some(end_id) = uri.strip_prefix("spotify:end-group:") {
+            let (id, name, children) = folders.pop()
+                .ok_or("rootlist folder end has no matching start")?;
+            if id != end_id {
+                return Err("rootlist folder end does not match its opening group".to_owned());
+            }
+            LibraryNode::Folder { id, name, children }
+        } else if uri.starts_with("spotify:folder:") || uri.contains(":folder:") {
+            let contents = item.get("contents")
+                .or_else(|| item.get("folder").and_then(|folder| folder.get("contents")));
+            let children = match contents {
+                Some(contents) => rootlist_nodes(contents)?,
+                None if raw_meta.length == Some(0) => Vec::new(),
+                None => return Err(format!(
+                    "folder {uri} has no child data in this rootlist response"
+                )),
+            };
+            LibraryNode::Folder {
+                id: uri.rsplit(':').next().unwrap_or_default().to_owned(),
+                name: raw_meta.attributes.and_then(|attributes| attributes.name).unwrap_or_default(),
+                children,
+            }
+        } else {
+            continue;
+        };
+        if let Some((_, _, children)) = folders.last_mut() {
+            children.push(node);
+        } else {
+            nodes.push(node);
+        }
+    }
+    if !folders.is_empty() {
+        return Err("rootlist folder hierarchy ended before its closing group".to_owned());
+    }
+    Ok(nodes)
+}
+
+fn parse_rootlist_tree(payload: &[u8]) -> Result<Vec<LibraryNode>, String> {
+    let value: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|error| format!("unparseable rootlist response: {error}"))?;
+    let contents = value.get("contents")
+        .ok_or("rootlist response did not contain contents")?;
+    rootlist_nodes(contents)
+}
+
+fn flatten_library_nodes(nodes: Vec<LibraryNode>, playlists: &mut Vec<PlaylistRef>) {
+    for node in nodes {
+        match node {
+            LibraryNode::Playlist { playlist } => playlists.push(playlist),
+            LibraryNode::Folder { children, .. } => flatten_library_nodes(children, playlists),
+        }
+    }
+}
+
 /// The user's playlist library from the spclient rootlist endpoint. The GET
 /// is retried with the bounded capped-exponential schedule: the spclient
 /// front door answers transient 502/503s that a retry absorbs before the
@@ -1576,6 +1979,16 @@ pub async fn playlists_browse(
     session: &Session,
     length: usize,
 ) -> Result<Vec<PlaylistRef>, String> {
+    let nodes = playlist_tree_browse(session, length).await?;
+    let mut playlists = Vec::new();
+    flatten_library_nodes(nodes, &mut playlists);
+    Ok(playlists)
+}
+
+pub async fn playlist_tree_browse(
+    session: &Session,
+    length: usize,
+) -> Result<Vec<LibraryNode>, String> {
     let length = length.clamp(1, MAX_PLAYLISTS);
     let endpoint = format!(
         "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from=0&length={length}",
@@ -1614,15 +2027,7 @@ pub async fn playlists_browse(
             }
         }
     };
-    let parsed: RootlistJson = serde_json::from_slice(&body)
-        .map_err(|error| format!("unparseable rootlist response: {error}"))?;
-    let contents = parsed.contents.unwrap_or_default();
-    Ok(contents
-        .items
-        .iter()
-        .zip(contents.meta_items.iter())
-        .filter_map(|(item, meta)| playlist_ref_from_rootlist(item, meta))
-        .collect())
+    parse_rootlist_tree(&body)
 }
 
 // ---------------------------------------------------------------------------
@@ -1705,12 +2110,20 @@ pub async fn playlist_browse(
 ) -> Result<renderer_engine::protocol::PlaylistBrowse, String> {
     let uri = playlist_uri(id)?;
     let playlist: Playlist = metadata_get(session, &uri, "playlist").await?;
-    let (owner_id, owner_name) = match &playlist.id {
-        SpotifyUri::Playlist { user, .. } => (
-            user.clone().unwrap_or_default(),
-            user.clone().unwrap_or_default(),
-        ),
-        _ => (String::new(), String::new()),
+    let owner_id = match &playlist.id {
+        SpotifyUri::Playlist { user, .. } => user.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+    let owner_name = if owner_id.is_empty() {
+        String::new()
+    } else {
+        match user_profile_header(session, &owner_id).await {
+            Ok(profile) => profile.name,
+            Err(error) => {
+                eprintln!("playlist owner display name unavailable: {error}");
+                String::new()
+            }
+        }
     };
     let user = session.username();
     let revision = hex(&playlist.revision);
@@ -2446,12 +2859,8 @@ fn official_songwriter_playlist_ref(
         uri,
         name: playlist.name().to_owned(),
         description: playlist_description(&playlist.attributes.description),
-        owner_id: owner_id.clone(),
-        owner_name: if search_reference.owner_name.is_empty() {
-            owner_id.clone()
-        } else {
-            search_reference.owner_name.clone()
-        },
+        owner_id,
+        owner_name: search_reference.owner_name.clone(),
         cover_url: playlist_attributes_cover(&playlist.attributes),
         track_count: u32::try_from(playlist.length).ok(),
     })
@@ -3531,6 +3940,10 @@ struct SearchV2Json {
     artists: SearchArtistSectionJson,
     #[serde(default)]
     playlists: Option<SearchPlaylistSectionJson>,
+    #[serde(default)]
+    podcasts: Option<SearchPodcastSectionJson>,
+    #[serde(default)]
+    episodes: Option<SearchPodcastSectionJson>,
 }
 
 /// The cross-kind ranking. `numberOfTopResults` in the request variables is
@@ -3564,10 +3977,69 @@ enum SearchTopDataJson {
     Album(SearchAlbumHitJson),
     Artist(SearchArtistHitJson),
     Playlist(SearchPlaylistHitJson),
-    /// Podcasts, episodes, audiobooks and users rank here too. The app has
-    /// nowhere to send them, so they are skipped and the next hit is tried.
+    Podcast(SearchPodcastHitJson),
+    Episode(SearchPodcastHitJson),
     #[serde(other)]
     Unsupported,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchPodcastSectionJson {
+    #[serde(default)]
+    items: Vec<SearchPodcastWrapperJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchPodcastWrapperJson {
+    #[serde(default)]
+    data: Option<SearchPodcastHitJson>,
+    #[serde(default)]
+    item: Option<SearchPodcastItemJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchPodcastItemJson {
+    #[serde(default)]
+    data: Option<SearchPodcastHitJson>,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(non_snake_case)] // GraphQL schema field names
+struct SearchPodcastHitJson {
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    publisher: Option<SearchProfileJson>,
+    #[serde(default)]
+    coverArt: Option<SearchCoverArtJson>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    duration: Option<SearchDurationJson>,
+    #[serde(default)]
+    podcastV2: Option<SearchPodcastParentJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchPodcastParentJson {
+    #[serde(default)]
+    data: Option<SearchPodcastIdentityJson>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchPodcastIdentityJson {
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl SearchPodcastWrapperJson {
+    fn hit(&self) -> Option<&SearchPodcastHitJson> {
+        self.data.as_ref().or_else(|| self.item.as_ref().and_then(|item| item.data.as_ref()))
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -4057,6 +4529,86 @@ fn top_match_rank(query: &str, name: &str) -> u8 {
     0
 }
 
+fn podcast_show_hit(hit: &SearchPodcastHitJson) -> Option<ShowRef> {
+    let uri = hit.uri.as_deref()?;
+    let SpotifyUri::Show { id } = SpotifyUri::from_uri(uri).ok()? else {
+        return None;
+    };
+    let name = hit.name.as_deref()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(ShowRef {
+        id: id.to_base62().ok()?,
+        uri: uri.to_owned(),
+        name: name.to_owned(),
+        publisher: hit.publisher.as_ref().and_then(|publisher| publisher.name.clone()).unwrap_or_default(),
+        description: hit.description.clone().unwrap_or_default(),
+        cover_url: hit_image(hit.coverArt.as_ref()),
+    })
+}
+
+fn podcast_episode_hit(hit: &SearchPodcastHitJson) -> Option<EpisodeRef> {
+    let uri = hit.uri.as_deref()?;
+    let SpotifyUri::Episode { id } = SpotifyUri::from_uri(uri).ok()? else {
+        return None;
+    };
+    let name = hit.name.as_deref()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let id = id.to_base62().ok()?;
+    let show = hit.podcastV2.as_ref().and_then(|podcast| podcast.data.as_ref());
+    let show_id = show.and_then(|show| show.uri.as_deref())
+        .and_then(|uri| match SpotifyUri::from_uri(uri).ok()? {
+            SpotifyUri::Show { id } => id.to_base62().ok(),
+            _ => None,
+        }).unwrap_or_default();
+    let show_name = show.and_then(|show| show.name.clone()).unwrap_or_default();
+    let cover_url = hit_image(hit.coverArt.as_ref());
+    let duration_ms = hit.duration.as_ref()
+        .and_then(|duration| parse_count(duration.totalMilliseconds.as_ref())).unwrap_or_default();
+    Some(EpisodeRef {
+        id: id.clone(),
+        uri: uri.to_owned(),
+        name: name.to_owned(),
+        show_id: show_id.clone(),
+        show_name: show_name.clone(),
+        description: hit.description.clone().unwrap_or_default(),
+        cover_url: cover_url.clone(),
+        duration_ms,
+        unavailable: true,
+        unavailable_reason: Some("Open this episode to check audio availability".to_owned()),
+        track: TrackRef {
+            id,
+            uri: uri.to_owned(),
+            name: name.to_owned(),
+            artist_names: (!show_name.is_empty()).then(|| show_name.clone()).into_iter().collect(),
+            album_id: show_id,
+            album_name: show_name,
+            cover_url: cover_url.unwrap_or_default(),
+            duration_ms,
+            unavailable: true,
+            unavailable_reason: Some("Open this episode to check audio availability".to_owned()),
+            ..TrackRef::default()
+        },
+        ..EpisodeRef::default()
+    })
+}
+
+fn resolved_search_top(
+    top: Option<renderer_engine::protocol::SearchTopRef>,
+    episodes: &[EpisodeRef],
+) -> Option<renderer_engine::protocol::SearchTopRef> {
+    use renderer_engine::protocol::SearchTopRef;
+    match top {
+        Some(SearchTopRef::Episode(hit)) => Some(SearchTopRef::Episode(
+            episodes.iter().find(|episode| episode.uri == hit.uri).cloned().unwrap_or(hit),
+        )),
+        other => other,
+    }
+}
+
 /// Picks the top result: best name match wins, and Spotify's own order breaks
 /// ties within a match quality. Their ranking is good, it just answers a
 /// different question than the one the search box asked.
@@ -4090,6 +4642,16 @@ fn search_top_ref(
                     let reference = playlist_ref_from_hit(hit);
                     let (id, name) = (reference.id.clone(), reference.name.clone());
                     (SearchTopRef::Playlist(reference), id, name)
+                }
+                SearchTopDataJson::Podcast(hit) => {
+                    let reference = podcast_show_hit(hit)?;
+                    let (id, name) = (reference.id.clone(), reference.name.clone());
+                    (SearchTopRef::Show(reference), id, name)
+                }
+                SearchTopDataJson::Episode(hit) => {
+                    let reference = podcast_episode_hit(hit)?;
+                    let (id, name) = (reference.id.clone(), reference.name.clone());
+                    (SearchTopRef::Episode(reference), id, name)
                 }
                 SearchTopDataJson::Unsupported => return None,
             };
@@ -5246,8 +5808,50 @@ pub async fn search_browse(
         };
         let parsed: SearchDesktopResponse = serde_json::from_slice(&payload)
             .map_err(|error| format!("unparseable search response: {error}"))?;
+        let search = &parsed.data.searchV2;
+        let mut shows = search.podcasts.as_ref()
+            .into_iter()
+            .flat_map(|section| section.items.iter())
+            .filter_map(|item| item.hit().and_then(podcast_show_hit))
+            .collect::<Vec<_>>();
+        let mut episodes = search.episodes.as_ref()
+            .into_iter()
+            .flat_map(|section| section.items.iter())
+            .filter_map(|item| item.hit().and_then(podcast_episode_hit))
+            .collect::<Vec<_>>();
+        for item in &search.topResultsV2.itemsV2 {
+            match item.item.as_ref().and_then(|item| item.data.as_ref()) {
+                Some(SearchTopDataJson::Podcast(hit)) => {
+                    shows.extend(podcast_show_hit(hit));
+                }
+                Some(SearchTopDataJson::Episode(hit)) => {
+                    episodes.extend(podcast_episode_hit(hit));
+                }
+                _ => {}
+            }
+        }
+        let mut episodes = openable_by_id(episodes, |episode| (episode.id.as_str(), episode.name.as_str()));
+        let episode_uris = episodes.iter()
+            .filter_map(|episode| SpotifyUri::from_uri(&episode.uri).ok())
+            .collect::<Vec<_>>();
+        if !episode_uris.is_empty() {
+            let policy = AvailabilityPolicy::for_session(session);
+            if let Ok(resolved) = fetch_extended(
+                session, episode_uris.iter(), ExtensionKind::EPISODE_V4,
+                |uri, payload| parse_episode_payload(uri, payload, &policy),
+            ).await {
+                let mut by_uri = resolved.into_iter()
+                    .map(|episode| (episode.uri.clone(), episode))
+                    .collect::<HashMap<_, _>>();
+                for episode in &mut episodes {
+                    if let Some(resolved) = by_uri.remove(&episode.uri) {
+                        *episode = resolved;
+                    }
+                }
+            }
+        }
         return Ok(renderer_engine::protocol::SearchBrowse {
-            top: search_top_ref(query.trim(), &parsed.data.searchV2.topResultsV2),
+            top: resolved_search_top(search_top_ref(query.trim(), &search.topResultsV2), &episodes),
             tracks: parsed
                 .data
                 .searchV2
@@ -5291,6 +5895,8 @@ pub async fn search_browse(
                     .collect(),
                 |playlist| (playlist.id.as_str(), playlist.name.as_str()),
             ),
+            shows: openable_by_id(shows, |show| (show.id.as_str(), show.name.as_str())),
+            episodes,
         });
     }
     Err(format!(
@@ -5312,6 +5918,219 @@ mod tests {
     use super::*;
 
     use librespot_core::date::Date;
+
+    #[test]
+    fn profile_username_is_one_encoded_path_segment() {
+        assert_eq!(profile_username_path("a b/+?#%é").unwrap(), "a%20b%2F%2B%3F%23%25%C3%A9");
+        assert!(profile_username_path("").is_err());
+        assert!(profile_username_path("a\nb").is_err());
+        assert!(profile_username_path(&"a".repeat(257)).is_err());
+        assert!(profile_username_path("..").is_err());
+    }
+
+    #[test]
+    fn podcast_search_keeps_show_identity_and_uses_resolved_audio_for_top() {
+        // Direct data wrappers and podcastV2 fields follow Spotifly's
+        // searchAll.ts and SpotifyScraper's captured searchDesktop schema.
+        let response: SearchDesktopResponse = serde_json::from_str(r#"{"data":{"searchV2":{
+            "podcasts":{"items":[{"data":{
+                "uri":"spotify:show:0123456789ABCDEFGHIJKL","name":"A show",
+                "publisher":{"name":"A publisher"},
+                "coverArt":{"sources":[{"width":300,"url":"https://i.scdn.co/image/show"}]}
+            }}]},
+            "episodes":{"items":[{"data":{
+                "uri":"spotify:episode:1abcdefghijklmnopqrstu","name":"An episode",
+                "duration":{"totalMilliseconds":12000},"description":"A description",
+                "podcastV2":{"data":{"uri":"spotify:show:0123456789ABCDEFGHIJKL","name":"A show"}}
+            }}]},
+            "topResultsV2":{"itemsV2":[{"item":{"data":{
+                "__typename":"Episode","uri":"spotify:episode:1abcdefghijklmnopqrstu","name":"An episode"
+            }}}]}
+        }}}"#).unwrap();
+        let search = response.data.searchV2;
+        let show = podcast_show_hit(search.podcasts.as_ref().unwrap().items[0].hit().unwrap()).unwrap();
+        assert_eq!(show.publisher, "A publisher");
+        assert_eq!(show.cover_url.as_deref(), Some("https://i.scdn.co/image/show"));
+        let mut episode = podcast_episode_hit(search.episodes.as_ref().unwrap().items[0].hit().unwrap()).unwrap();
+        assert_eq!(episode.track.album_id, show.id);
+        assert_eq!(episode.track.album_name, "A show");
+        assert_eq!(episode.track.duration_ms, 12000);
+        assert!(episode.unavailable, "search alone cannot prove playable audio");
+        assert!(podcast_episode_hit(search.podcasts.as_ref().unwrap().items[0].hit().unwrap()).is_none());
+        episode.unavailable = false;
+        episode.unavailable_reason = None;
+        episode.track.unavailable = false;
+        episode.track.unavailable_reason = None;
+        let top = resolved_search_top(search_top_ref("An episode", &search.topResultsV2), &[episode]);
+        let Some(renderer_engine::protocol::SearchTopRef::Episode(top)) = top else {
+            panic!("expected the ranked episode");
+        };
+        assert!(!top.unavailable);
+        assert!(!top.track.unavailable);
+        assert_eq!(top.track.album_name, "A show");
+    }
+
+    #[test]
+    fn private_profile_uses_distinct_identity_and_public_playlist_responses() {
+        let profile = parse_user_profile(
+            br#"{"name":"A Listener","total_public_playlists_count":2,"image_url":"https://i.scdn.co/image/123"}"#,
+            "someone",
+        ).unwrap();
+        assert_eq!(profile.username, "someone");
+        assert_eq!(profile.name, "A Listener");
+        assert!(profile.playlists.is_empty());
+        let (playlists, row_count) = parse_profile_playlists(br#"{"public_playlists":[
+            {"uri":"spotify:playlist:0123456789ABCDEFGHIJKL","name":"First"},
+            {"uri":"spotify:playlist:1abcdefghijklmnopqrstu","name":"Second"},
+            {"uri":"spotify:artist:0123456789ABCDEFGHIJKL","name":"Wrong kind"}
+        ]}"#, "someone", &profile.name).unwrap();
+        assert_eq!(playlists.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["First", "Second"]);
+        assert_eq!(row_count, 3, "skipped rows still advance pagination");
+        assert!(playlists.iter().all(|p| p.owner_name == "A Listener"));
+        let without_count = parse_user_profile(br#"{"name":"Listener"}"#, "someone").unwrap();
+        assert_eq!(without_count.name, "Listener");
+        assert!(parse_user_profile(br#"{"name":""}"#, "someone").is_err());
+        let (empty, row_count) = parse_profile_playlists(br#"{"public_playlists":[]}"#, "someone", "Listener").unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(row_count, 0, "an empty server page terminates pagination");
+        let (empty, row_count) = parse_profile_playlists(br#"{}"#, "someone", "Listener").unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(row_count, 0, "omitted repeated field is an empty terminal page");
+        for body in [
+            br#"{"error":{"status":401}}"#.as_slice(),
+            br#"{"errors":[],"public_playlists":[]}"#.as_slice(),
+            br#"{"message":"unexpected response"}"#.as_slice(),
+            br#"{"public_playlists":{}}"#.as_slice(),
+            br#"[]"#.as_slice(),
+            br#"null"#.as_slice(),
+        ] {
+            assert!(parse_profile_playlists(body, "someone", "Listener").is_err());
+        }
+    }
+
+    #[test]
+    fn episode_audio_is_queue_playable_but_video_and_external_only_are_not() {
+        use librespot_metadata::audio::file::{AudioFileFormat, AudioFiles};
+        use librespot_metadata::video::VideoFiles;
+        let mut episode = Episode {
+            id: SpotifyUri::from_uri("spotify:episode:0123456789ABCDEFGHIJKL").unwrap(),
+            name: "An episode".to_owned(),
+            duration: 12_345,
+            audio: AudioFiles::default(),
+            description: String::new(),
+            number: 1,
+            publish_time: Date::from_timestamp_ms(1_700_000_000_000).unwrap(),
+            covers: Images::default(),
+            language: String::new(),
+            is_explicit: false,
+            show_name: "A show".to_owned(),
+            videos: VideoFiles::default(),
+            video_previews: VideoFiles::default(),
+            audio_previews: AudioFiles::default(),
+            restrictions: Default::default(),
+            freeze_frames: Images::default(),
+            keywords: Vec::new(),
+            allow_background_playback: true,
+            availability: Default::default(),
+            external_url: String::new(),
+            episode_type: Default::default(),
+            has_music_and_talk: false,
+            content_rating: Default::default(),
+            is_audiobook_chapter: false,
+        };
+        let policy = AvailabilityPolicy {
+            country: "US".to_owned(),
+            catalogue: "premium".to_owned(),
+            filter_explicit: true,
+        };
+        episode.audio.insert(AudioFileFormat::OGG_VORBIS_96, file_id(1));
+        let available = episode_ref(&episode, String::new(), &policy);
+        assert!(!available.unavailable);
+        assert_eq!(available.track.uri, episode.id.to_uri().unwrap());
+        assert_eq!(available.track.duration_ms, 12_345);
+        episode.audio.clear();
+        episode.videos.push(file_id(2));
+        let video = episode_ref(&episode, String::new(), &policy);
+        assert_eq!(video.unavailable_reason.as_deref(), Some("Video-only episodes cannot be played as audio"));
+        episode.videos.clear();
+        episode.external_url = "https://example.com/audio.mp3".to_owned();
+        let external = episode_ref(&episode, String::new(), &policy);
+        assert_eq!(external.unavailable_reason.as_deref(), Some("Externally hosted episode has no Spotify audio"));
+        episode.audio.insert(AudioFileFormat::OGG_VORBIS_96, file_id(1));
+        episode.videos.push(file_id(2));
+        assert!(!episode_ref(&episode, String::new(), &policy).unavailable,
+            "a video episode with supported audio remains audio-playable");
+        episode.videos.clear();
+        episode.is_explicit = true;
+        assert!(episode_ref(&episode, String::new(), &policy).unavailable);
+        episode.is_explicit = false;
+        episode.restrictions = librespot_metadata::restriction::Restrictions(vec![
+            librespot_metadata::restriction::Restriction {
+                catalogues: librespot_metadata::restriction::RestrictionCatalogues(Vec::new()),
+                restriction_type: Default::default(),
+                catalogue_strs: vec!["premium".to_owned()],
+                countries_allowed: Some(vec!["GB".to_owned()]),
+                countries_forbidden: None,
+            },
+        ]);
+        assert_eq!(episode_ref(&episode, String::new(), &policy).unavailable_reason.as_deref(),
+            Some("not available in your country"));
+        episode.restrictions = Default::default();
+        episode.availability = librespot_metadata::availability::Availabilities(vec![
+            librespot_metadata::availability::Availability {
+                catalogue_strs: Vec::new(),
+                start: Date::from_timestamp_ms(4_102_444_800_000).unwrap(),
+            },
+        ]);
+        assert_eq!(episode_ref(&episode, String::new(), &policy).unavailable_reason.as_deref(),
+            Some(RELEASE_EMBARGO_REASON));
+        episode.availability = Default::default();
+        episode.is_audiobook_chapter = true;
+        assert!(episode_ref(&episode, String::new(), &policy).unavailable);
+    }
+
+    #[test]
+    fn nested_folders_flatten_in_source_order_and_missing_children_error() {
+        let body = br#"{"contents":{"items":[
+            {"uri":"spotify:folder:family","contents":{"items":[
+                {"uri":"spotify:playlist:0123456789ABCDEFGHIJKL"},
+                {"uri":"spotify:folder:deeper","contents":{"items":[
+                    {"uri":"spotify:playlist:1abcdefghijklmnopqrstu"}
+                ],"metaItems":[{"attributes":{"name":"Nested"}}]}}
+            ],"metaItems":[{"attributes":{"name":"First"}},{"length":1,"attributes":{"name":"Deeper"}}]}},
+            {"uri":"spotify:playlist:2abcdefghijklmnopqrstu"}
+        ],"metaItems":[{"length":2,"attributes":{"name":"Family"}},{"attributes":{"name":"Last"}}]}}"#;
+        let tree = parse_rootlist_tree(body).unwrap();
+        assert_eq!(tree.len(), 2);
+        let mut playlists = Vec::new();
+        flatten_library_nodes(tree, &mut playlists);
+        assert_eq!(playlists.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["First", "Nested", "Last"]);
+
+        let missing = br#"{"contents":{"items":[{"uri":"spotify:folder:hidden"}],"metaItems":[{"length":3}]}}"#;
+        assert!(parse_rootlist_tree(missing).unwrap_err().contains("no child data"));
+    }
+
+    #[test]
+    fn flat_group_markers_retain_nested_playlists_without_reordering() {
+        let body = br#"{"contents":{"items":[
+            {"uri":"spotify:start-group:abc:Favorite%20sets"},
+            {"uri":"spotify:playlist:0123456789ABCDEFGHIJKL"},
+            {"uri":"spotify:start-group:def:Deep"},
+            {"uri":"spotify:playlist:1abcdefghijklmnopqrstu"},
+            {"uri":"spotify:end-group:def"},
+            {"uri":"spotify:end-group:abc"},
+            {"uri":"spotify:playlist:2abcdefghijklmnopqrstu"}
+        ],"metaItems":[{},{ "attributes":{"name":"One"} },{},{ "attributes":{"name":"Two"} },{},{},{ "attributes":{"name":"Three"} }]}}"#;
+        let nodes = parse_rootlist_tree(body).unwrap();
+        assert!(matches!(&nodes[0], LibraryNode::Folder { id, children, .. } if id == "abc" && children.len() == 2));
+        let mut playlists = Vec::new();
+        flatten_library_nodes(nodes, &mut playlists);
+        assert_eq!(playlists.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["One", "Two", "Three"]);
+        let malformed = br#"{"contents":{"items":[
+            {"uri":"spotify:start-group:abc:Folder"},{"uri":"spotify:end-group:def"}
+        ],"metaItems":[{},{}]}}"#;
+        assert!(parse_rootlist_tree(malformed).is_err());
+    }
 
     #[test]
     fn canvas_response_keeps_only_official_video_records_for_the_track() {
@@ -5981,6 +6800,7 @@ mod tests {
                 .map(|wrapper| artist_ref_from_hit(&wrapper.data))
                 .collect(),
             playlists: Vec::new(),
+            ..renderer_engine::protocol::SearchBrowse::default()
         };
 
         assert_eq!(converted.tracks.len(), 1);

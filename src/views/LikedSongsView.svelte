@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { api, ui } from "../lib/state.svelte.js";
+  import { api, ui, session, libraryChanges } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Icon from "../components/Icon.svelte";
   import LikedMark from "../components/LikedMark.svelte";
@@ -57,6 +57,8 @@
   }
 
   $effect(() => {
+    const account = session.username;
+    const revision = libraryChanges.savedTracks;
     untrack(reloadCollection);
   });
 

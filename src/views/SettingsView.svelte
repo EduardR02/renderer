@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from "svelte";
   import {
     playback,
     session,
@@ -14,12 +15,33 @@
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import Select from "../components/Select.svelte";
   import { formatBytes } from "../lib/time.js";
+  import UpdateControl from "../components/UpdateControl.svelte";
+  import {
+    personal, personalConnected, watchPersonal, configurePersonal, authorizePersonal,
+    disconnectPersonal, setDevicesEnabled,
+  } from "../lib/personal.svelte.js";
+  let clientId = $state("");
+  let personalBusy = $state(false);
+  let personalError = $state("");
+  $effect(() => watchPersonal());
+  $effect(() => {
+    const stored = personal.status?.client_id;
+    if (stored !== undefined) untrack(() => { clientId = stored; });
+  });
+  async function personalAction(action) {
+    if (personalBusy) return;
+    personalBusy = true;
+    personalError = "";
+    try { await action(); }
+    catch (error) { personalError = String(error); }
+    finally { personalBusy = false; }
+  }
 
   const username = $derived(playback.username || session.username);
 
 
-  /* `status` is a fire-and-forget ping: the engine answers on the event
-     channel, not in the response, so all this can report is reachability. */
+  /* `status` waits for the engine's response (or a timeout). It checks
+     reachability now; auth and playback readiness are reported separately. */
   let ping = $state("idle");
   let clearTarget = $state(null);
   let clearing = $state(false);
@@ -224,6 +246,46 @@
     </div>
 
     <div class="set-group">
+      <h2>Personal Spotify app</h2>
+      <div class="set-row">
+        <div>
+          <div class="k">Developer Client ID</div>
+          <div class="d">Optional. Create your own app in Spotify's developer dashboard and register <code>http://127.0.0.1:5589/personal-api/callback</code> as its redirect URI. Your Client ID stays on this computer; no shared app or token is used in the webview. Without a grant, likes and follows remain read-only.</div>
+          {#if personalError || personal.error}<div class="inline-error" role="alert">{personalError || personal.error}</div>{/if}
+        </div>
+        <div class="set-ctl">
+          <input class="client-id-input" aria-label="Spotify developer Client ID" bind:value={clientId} placeholder="Client ID" autocomplete="off" spellcheck="false" />
+          <button class="btn-ghost" disabled={personalBusy || !clientId.trim()} onclick={() => personalAction(() => configurePersonal(clientId))}>Save</button>
+        </div>
+      </div>
+      <div class="set-row">
+        <div>
+          <div class="k">Personal authorization</div>
+          <div class="d">{personal.loading ? "Checking…" : personal.status?.connected && !personalConnected() ? `Personal grant belongs to ${personal.status.account_id}. Disconnect and authorize this account.` : personal.status?.connected ? `Connected as ${personal.status.account_id}` : personal.status?.authorization_pending ? "Waiting for authorization in your browser…" : personal.status?.client_id ? "Not authorized. Your Spotify playback remains available without this grant." : "Enter your own Client ID to enable library changes."}</div>
+        </div>
+        <div class="set-ctl">
+          {#if personal.status?.connected}
+            <button class="btn-ghost" disabled={personalBusy} onclick={() => personalAction(disconnectPersonal)}>Disconnect</button>
+          {:else}
+            <button class="btn-accent" disabled={personalBusy || !personal.status?.client_id || personal.status?.authorization_pending} onclick={() => personalAction(() => authorizePersonal(false))}>Authorize</button>
+          {/if}
+        </div>
+      </div>
+      <div class="set-row">
+        <div>
+          <div class="k">Spotify Connect devices</div>
+          <div class="d">Optional remote Spotify Connect playback. Renderer keeps playing through this PC's OS default output; transferring a separate Spotify Connect session does not move Renderer audio. Off makes no device requests. Device access needs separate authorization.</div>
+        </div>
+        <div class="set-ctl">
+          <input class="set-check" type="checkbox" aria-label="Enable Spotify Connect" checked={personal.status?.devices_enabled ?? false} disabled={personalBusy || !personalConnected()} onchange={(event) => personalAction(() => setDevicesEnabled(event.currentTarget.checked))} />
+          {#if personal.status?.devices_enabled && !personal.status?.devices_authorized}
+            <button class="btn-ghost" disabled={personalBusy || personal.status?.authorization_pending} onclick={() => personalAction(() => authorizePersonal(true))}>{personal.status?.authorization_pending ? "Waiting for authorization…" : "Authorize devices"}</button>
+          {/if}
+        </div>
+      </div>
+    </div>
+
+    <div class="set-group">
       <h2>Playback &amp; startup</h2>
       <div class="set-row">
         <div>
@@ -384,12 +446,14 @@
       </div>
     </div>
 
+    <div class="set-group"><h2>Updates</h2><UpdateControl /></div>
+
     <div class="set-group">
       <h2>Diagnostics</h2>
       <div class="set-row">
         <div>
           <div class="k">Engine</div>
-          <div class="d">{playback.ready ? "Connected and ready." : "Not reported ready yet."}</div>
+          <div class="d">Check whether the engine answers now. Reachability does not confirm Spotify sign-in or audio output.</div>
         </div>
         <div class="set-ctl">
           <span class="v status" class:ok={ping === "ok"} class:bad={ping === "failed"}>
@@ -399,16 +463,19 @@
         </div>
       </div>
       <div class="set-row">
+        <div>
+          <div class="k">Playback session</div>
+          <div class="d">{playback.ready && playback.auth_state === "ready" ? "Spotify session reports ready. Audio output has not been tested here." : "Spotify session is not ready for playback."}</div>
+        </div>
+        <div class="set-ctl"><span class="v">{playback.ready && playback.auth_state === "ready" ? "Ready" : "Not ready"}</span></div>
+      </div>
+      <div class="set-row">
         <div class="k">Auth state</div>
         <div class="set-ctl">
-          <span class="v status" class:ok={playback.auth_state === "authenticated"}>
+          <span class="v status" class:ok={playback.auth_state === "ready"}>
             <span class="status-dot" aria-hidden="true"></span>{playback.auth_state ?? "unknown"}
           </span>
         </div>
-      </div>
-      <div class="set-row">
-        <div class="k">Version</div>
-        <div class="set-ctl"><span class="v">0.1.0</span></div>
       </div>
     </div>
   </div>
@@ -430,3 +497,12 @@
     }}
   />
 {/if}
+
+<style>
+  .client-id-input {
+    width: 180px; min-width: 0; height: 34px; padding: 0 var(--s2);
+    border: 1px solid var(--line-2); border-radius: var(--r2);
+    background: var(--raise-1); color: var(--fg);
+    font-size: var(--t-12);
+  }
+</style>

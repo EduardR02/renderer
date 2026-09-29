@@ -761,6 +761,23 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   color: var(--count);
 }
 .lib-row.playing .lib-name { color: var(--accent); }
+.lib-folder {
+  display: flex; align-items: center; height: 30px; min-width: 0;
+  color: var(--fg-2); font-size: var(--t-12); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.pin-liked-open {
+  display: grid; grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center; gap: var(--s3); min-width: 0; width: 100%;
+  background: none; border: 0; color: inherit; cursor: pointer;
+  text-align: left; padding: 0;
+}
+.lib-row.liked-row { grid-template-columns: minmax(0, 1fr) auto; }
+.pin-liked-toggle {
+  background: none; border: 0; color: var(--fg-3);
+  cursor: pointer; opacity: .55; padding: 4px;
+}
+.liked-row:hover .pin-liked-toggle, .pin-liked-toggle:focus-visible { opacity: 1; }
 /* The one row in the rail whose selected state is warm, because the thing it
    selects is the saved collection. Everything else selected is foam. */
 .lib-row.liked-row.active {

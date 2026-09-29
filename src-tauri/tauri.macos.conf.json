@@ -1,12 +1,16 @@
 {
   "identifier": "com.renderer.client",
+  "build": {
+    "beforeBuildCommand": "bun run build && bun run build:engine && codesign --force --sign - target/release/PlaybackEngine"
+  },
   "bundle": {
     "targets": ["app"],
     "resources": {
       "../target/release/PlaybackEngine": "PlaybackEngine"
     },
     "macOS": {
-      "minimumSystemVersion": "14.0"
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-"
     }
   }
 }

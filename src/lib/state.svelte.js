@@ -580,6 +580,10 @@ export function applyPlayback(payload) {
   if (loggedOut) {
     playback.username = null;
     session.username = null;
+  } else if (payload.username != null) {
+    // A ready startup snapshot may be the only identity message after reload.
+    // Event wiring already protects it from overwriting a newer session.
+    session.username = payload.username;
   }
   if ("position_ms" in payload) anchorPlayhead(payload.position_ms);
   /* Unconditional, not "only when the advancing flag changed": a payload that
@@ -763,11 +767,8 @@ export function retryDetail() {
 /**
  * The artists this account follows, as the library rail's other list.
  *
- * Read-only, and that is a property of Spotify rather than a shortcut: an
- * artist follow is a protobuf collection write against an internal service
- * librespot carries no schema for (the engine's `follow` module records what
- * it would take). So this app shows the collection and the official client is
- * where it changes.
+ * Collection reads use the playback session. Optional artist follow writes
+ * use the user-owned personal Web API grant; without one this stays read-only.
  *
  * Nothing is fetched until the rail is actually switched to artists. That is
  * the whole point of the rail's design — Following costs nothing at rest —
@@ -814,14 +815,6 @@ export function loadFollowedArtists({ force = false } = {}) {
     });
 }
 
-/** Who you follow is an account fact, so it cannot outlive the account. */
-function resetFollowsForSession() {
-  followedGeneration += 1;
-  followed.artists = [];
-  followed.loaded = false;
-  followed.loading = false;
-  followed.error = "";
-}
 
 export const search = $state({ query: "", results: null, submitted: false, busy: false, error: null, link: null });
 
@@ -1009,9 +1002,9 @@ function observeSearchSession(payload) {
       searchSessionEpoch += 1;
       resetSearchForSession();
       resetPersonalizedDiscoveryForSession();
-      resetFollowsForSession();
-      clearPlaylistRecommendationsCache();
       invalidateLikedFirstPage();
+      savedSeq += 1;
+      nowSaved.refs = [];
       // The previous account's recency must not leak into the next session's
       // Home: shelves stay hidden until the new account's own `library` event.
       libraryState.fresh = false;
@@ -1876,6 +1869,22 @@ function invalidateLikedFirstPage() {
   likedFirstPagePending = null;
 }
 
+export const libraryChanges = $state({ savedTracks: 0 });
+
+/** Invalidate only the collections changed by a confirmed personal API write. */
+export function personalLibraryChanged(uris) {
+  if (uris.some((uri) => uri.startsWith("spotify:track:"))) {
+    invalidateLikedFirstPage();
+    libraryChanges.savedTracks++;
+  }
+  if (uris.some((uri) => uri.startsWith("spotify:artist:"))) {
+    followedGeneration++;
+    followed.loaded = false;
+    followed.loading = false;
+    followed.error = "";
+  }
+}
+
 /* ---------------- Cover resolution ---------------- */
 
 const coverCache = new Map(); // remote url -> cover:// url
@@ -2201,6 +2210,10 @@ export const api = {
   setAnimatedCanvas: (enabled) =>
     mutateAppSettings("set_animated_canvas", { enabled: !!enabled }),
   browsePlaylists: () => invoke("browse_playlists"),
+  browseShow: (id) => invoke("browse_show", { id }),
+  browseEpisode: (id) => invoke("browse_episode", { id }),
+  browseProfile: (username) => invoke("browse_profile", { username }),
+  browsePlaylistTree: (length = 1000) => invoke("browse_playlist_tree", { length }),
   /**
    * The collection is walked by cursor; only the first page is deduplicated and
    * kept for a moment (see [`browseLikedFirstPage`]). Later pages belong to the

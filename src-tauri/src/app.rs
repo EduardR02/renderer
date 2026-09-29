@@ -41,6 +41,10 @@ pub struct AppSettings {
     /// engine over the protocol on change, so only the *initial* value comes
     /// from here.
     pub normalisation: bool,
+    /// User-owned Spotify developer app ID, never an app secret.
+    pub personal_client_id: String,
+    /// Connect permission is explicitly opt-in; disabled means no device traffic.
+    pub personal_devices_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -51,6 +55,8 @@ impl Default for AppSettings {
             start_minimized: false,
             animated_canvas: true,
             normalisation: false,
+            personal_client_id: String::new(),
+            personal_devices_enabled: false,
         }
     }
 }

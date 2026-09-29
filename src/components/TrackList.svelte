@@ -15,6 +15,7 @@
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
+  import PersonalSave from "./PersonalSave.svelte";
   import { formatTime } from "../lib/time.js";
   import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { observeStuck } from "../lib/sticky.js";
@@ -160,6 +161,7 @@
     const row = event.target.closest(".tl-row");
     if (!row) return;
     const index = Number(row.dataset.i);
+    if (!tracks[index]?.uri?.startsWith("spotify:track:")) return;
     pressTrack({
       event,
       rowEl: row,
@@ -497,8 +499,8 @@
     artistPicker.open = false;
     menu.editDefined = false;
     menu.editEnabled = false;
-    menu.editLoading = !!sourcePlaylist;
-    if (sourcePlaylist && track?.id) {
+    menu.editLoading = !!sourcePlaylist && track?.uri?.startsWith("spotify:track:");
+    if (menu.editLoading && track?.id) {
       api.getTrackEdit(track.id, sourcePlaylist)
         .then((status) => {
           if (!menuTargetCurrent(generation, sourcePlaylist, track, i)) return;
@@ -619,7 +621,7 @@
      from anything else, so a row with neither draws no item. Both the string
      and the clipboard write are the shared ones every share surface uses; see
      lib/spotify-link.js. */
-  const menuLink = $derived(spotifyLink("track", menu.track?.id || menu.track?.uri));
+  const menuLink = $derived(spotifyLink(menu.track?.uri?.startsWith("spotify:episode:") ? "episode" : "track", menu.track?.id || menu.track?.uri));
 
   let copyResetTimer = 0;
   /* The confirmation outlives the menu by design, so the timer has to die with
@@ -929,12 +931,16 @@
               <span class="sr-only">Skipped during playlist playback</span>
             </span>
           {/if}
-          <ArtistLinks
-            class="t-artists"
-            names={track.artist_names}
-            ids={track.artist_ids ?? []}
-            id={track.artist_id}
-          />
+          {#if track.uri?.startsWith("spotify:episode:")}
+            <button class="t-artists" disabled={!track.album_id} onclick={() => navigate("show", track.album_id)}>{track.album_name || track.artist_names?.[0]}</button>
+          {:else}
+            <ArtistLinks
+              class="t-artists"
+              names={track.artist_names}
+              ids={track.artist_ids ?? []}
+              id={track.artist_id}
+            />
+          {/if}
         </span>
       </span>
 
@@ -942,7 +948,7 @@
         <!-- Always rendered, even when it repeats the title (single-track
              releases). Blanking those cells leaves holes that read as data
              that failed to load, which is worse than mild redundancy. -->
-        <button class="c-album" onclick={() => track.album_id && navigate("album", track.album_id)}>
+        <button class="c-album" onclick={() => track.album_id && navigate(track.uri?.startsWith("spotify:episode:") ? "show" : "album", track.album_id)}>
           {track.album_name}
         </button>
       {/if}
@@ -1094,8 +1100,11 @@
     <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track, queueSource).catch(() => {}); }}>
       Add to queue
     </button>
-    {#if allowAddToPlaylist}
+    {#if allowAddToPlaylist && menu.track?.uri?.startsWith("spotify:track:")}
       <button class="menu-item" onclick={openPicker}>Add to playlist…</button>
+    {/if}
+    {#if menu.track?.uri?.startsWith("spotify:track:")}
+      <PersonalSave uri={menu.track.uri} />
     {/if}
     {#if menuLink}
       <!-- The confirmation lives on the item, which is why the menu does not
@@ -1115,12 +1124,12 @@
         {menu.copyState === "copied" ? "Link copied" : menu.copyState === "failed" ? "Copy failed" : "Copy link"}
       </button>
     {/if}
-    {#if menu.track?.id}
+    {#if menu.track?.uri?.startsWith("spotify:track:")}
       <button class="menu-item" onclick={() => { menu.open = false; openCredits(menu.track); }}>
         View credits
       </button>
     {/if}
-    {#if menu.track?.id}
+    {#if menu.track?.uri?.startsWith("spotify:track:")}
       <button
         class="menu-item"
         onclick={() => {
@@ -1131,7 +1140,7 @@
         Edit playback…
       </button>
     {/if}
-    {#if playlistId && menu.editDefined}
+    {#if menu.track?.uri?.startsWith("spotify:track:") && playlistId && menu.editDefined}
       <button
         class="menu-item"
         disabled={menu.editLoading}
@@ -1143,7 +1152,7 @@
     {#if menu.editError}
       <p class="menu-error" role="alert">{menu.editError}</p>
     {/if}
-    {#if skipsTracked && menu.track?.id}
+    {#if menu.track?.uri?.startsWith("spotify:track:") && skipsTracked && menu.track?.id}
       <!-- The one playlist-local listening preference. It sits with the edit
            cluster because both are "how this row behaves inside THIS list".
            Unlike Copy link, the row itself acknowledges the click — the skip
@@ -1163,24 +1172,27 @@
     {#if menu.skipError}
       <p class="menu-error" role="alert">{menu.skipError}</p>
     {/if}
-    {#if menu.track?.id}
+    {#if menu.track?.uri?.startsWith("spotify:track:")}
       <button class="menu-item" onclick={() => { menu.open = false; navigate("radio", menu.track.id); }}>
         Go to song radio
       </button>
     {/if}
-    {#if menu.track?.album_id}
+    {#if menu.track?.uri?.startsWith("spotify:episode:") && menu.track?.album_id}
+      <button class="menu-item" onclick={() => { menu.open = false; navigate("show", menu.track.album_id); }}>Go to podcast</button>
+    {/if}
+    {#if menu.track?.uri?.startsWith("spotify:track:") && menu.track?.album_id}
       <button class="menu-item" onclick={() => { menu.open = false; navigate("album", menu.track.album_id); }}>
         Go to album
       </button>
     {/if}
     <!-- One row whatever the track. A collaboration opens a submenu rather than
          printing an extra near-identical line per artist. -->
-    {#if menuArtists.length}
+    {#if menu.track?.uri?.startsWith("spotify:track:") && menuArtists.length}
       <button class="menu-item" onclick={goToArtist}>
         {menuArtists.length > 1 ? "Go to artist…" : "Go to artist"}
       </button>
     {/if}
-    {#if playlistId}
+    {#if menu.track?.uri?.startsWith("spotify:track:") && playlistId}
       <div class="menu-sep"></div>
       <button
         class="menu-item danger"
