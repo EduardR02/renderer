@@ -403,7 +403,7 @@ async fn run_job(
     }
 
     check_cancelled(&cancellation)?;
-    let encrypted = AudioFile::open(&session, file_id, bytes_per_second)
+    let encrypted = AudioFile::open(&session, file_id, bytes_per_second, &item.track_id)
         .await
         .map_err(|error| format!("could not open track audio: {error}"))?;
     check_cancelled(&cancellation)?;

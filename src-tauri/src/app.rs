@@ -43,8 +43,6 @@ pub struct AppSettings {
     pub normalisation: bool,
     /// User-owned Spotify developer app ID, never an app secret.
     pub personal_client_id: String,
-    /// Connect permission is explicitly opt-in; disabled means no device traffic.
-    pub personal_devices_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -56,7 +54,6 @@ impl Default for AppSettings {
             animated_canvas: true,
             normalisation: false,
             personal_client_id: String::new(),
-            personal_devices_enabled: false,
         }
     }
 }
@@ -747,6 +744,34 @@ pub fn upsert_membership(entries: &mut Vec<MembershipEntry>, entry: MembershipEn
     }
 }
 
+/// A confirmed Liked Songs write, applied to the index at once. The index is
+/// what answers "is this in Liked Songs" everywhere — the player bar's mark,
+/// the track menu — so a like made here must not wait for the next reconcile
+/// pass to show. Only track URIs belong to the collection. An index that has
+/// never walked Liked Songs gains the entry on a like (absent already means
+/// "not liked", so an unlike there changes nothing). Returns whether anything
+/// changed.
+pub fn apply_liked_write(entries: &mut Vec<MembershipEntry>, uris: &[String], saved: bool) -> bool {
+    let tracks = uris.iter().filter(|uri| uri.starts_with("spotify:track:"));
+    let liked = match entries.iter_mut().position(|entry| entry.id == LIKED_MEMBERSHIP_ID) {
+        Some(index) => &mut entries[index],
+        None if saved => {
+            entries.push(MembershipEntry {
+                id: LIKED_MEMBERSHIP_ID.to_owned(),
+                revision: String::new(),
+                uris: HashSet::new(),
+            });
+            entries.last_mut().expect("just pushed")
+        }
+        None => return false,
+    };
+    let mut changed = false;
+    for uri in tracks {
+        changed |= if saved { liked.uris.insert(uri.clone()) } else { liked.uris.remove(uri) };
+    }
+    changed
+}
+
 pub fn remove_membership(entries: &mut Vec<MembershipEntry>, id: &str) -> bool {
     let before = entries.len();
     entries.retain(|existing| existing.id != id);
@@ -1188,6 +1213,24 @@ mod tests {
         assert_eq!(entries[0].revision, "rev2");
         assert!(entries[0].contains("spotify:track:b"));
         assert!(!entries[0].contains("spotify:track:a"));
+    }
+
+    #[test]
+    fn liked_writes_update_the_index_and_ignore_non_tracks() {
+        let mut entries = vec![membership("p1", "rev1", &["spotify:track:a"])];
+        // Unliking with no Liked Songs entry: nothing to change.
+        assert!(!apply_liked_write(&mut entries, &["spotify:track:a".into()], false));
+        assert!(apply_liked_write(&mut entries, &["spotify:track:b".into(), "spotify:artist:x".into()], true));
+        let liked = entries.iter().find(|entry| entry.id == LIKED_MEMBERSHIP_ID).unwrap();
+        assert!(liked.contains("spotify:track:b"));
+        assert!(!liked.contains("spotify:artist:x"));
+        // The same like again is not a change; an unlike is.
+        assert!(!apply_liked_write(&mut entries, &["spotify:track:b".into()], true));
+        assert!(apply_liked_write(&mut entries, &["spotify:track:b".into()], false));
+        let liked = entries.iter().find(|entry| entry.id == LIKED_MEMBERSHIP_ID).unwrap();
+        assert!(!liked.contains("spotify:track:b"));
+        // Playlist entries are never touched.
+        assert!(entries.iter().find(|entry| entry.id == "p1").unwrap().contains("spotify:track:a"));
     }
 
     #[test]

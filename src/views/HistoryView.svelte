@@ -502,12 +502,10 @@
           {recorded === 1 ? "play" : "plays"} recorded
         {/if}
       </p>
-      <!-- Literally the topbar's field, not a lookalike: same class, same
-           pill, same focus behaviour. It was a squared-off 6px box with its
-           own hover and its own foam-at-full-strength focus ring, which is the
-           kind of near-miss that makes a page read as assembled. -->
+      <!-- THE FIELD, the topbar's own object: same class, same pill, same
+           focus behaviour. -->
       <div class="history-control history-filter-control">
-        <span class="searchbox">
+        <span class="field">
           <Icon name="search" size={14} />
           <input
             bind:value={query}
@@ -518,7 +516,7 @@
             onkeydown={(event) => event.key === "Escape" && (query = "")}
           />
           {#if query}
-            <button class="search-clear" type="button" aria-label="Clear filter" title="Clear filter" onclick={() => (query = "")}>
+            <button class="field-btn" type="button" aria-label="Clear filter" title="Clear filter" onclick={() => (query = "")}>
               <Icon name="x" size={11} />
             </button>
           {/if}
@@ -533,18 +531,18 @@
           onchange={(value) => (sort = value)}
         />
       </div>
-      <!-- `.danger` is the shared destructive ghost button Settings already
-           uses — neutral at rest, love under the pointer. The page had its own
-           copy of that hover, one shade off. -->
+      <!-- A quiet pill that opens a destructive confirmation: neutral at rest,
+           love under the pointer. -->
       <button
-        class="btn-ghost danger history-clear"
+        class="pill warn"
         type="button"
         aria-label="Clear listening history"
         disabled={!loaded || !recorded}
         onclick={() => (confirmClear = true)}
       >
-        <Icon name="x" size={13} /> Clear history
+        Clear history
       </button>
+
     </div>
 
     {#if hasList}
@@ -579,7 +577,7 @@
     <div class="empty history-empty failed">
       <p class="h">History unavailable</p>
       <p class="why">{error}</p>
-      <div class="actions"><button class="btn-ghost" onclick={reload}>Try again</button></div>
+      <div class="actions"><button class="pill" onclick={reload}>Try again</button></div>
     </div>
   {:else if loaded && !total}
     <div class="empty history-empty">
@@ -591,7 +589,7 @@
       </p>
       {#if filtering}
         <div class="actions">
-          <button class="btn-ghost" type="button" onclick={() => (query = "")}>
+          <button class="pill" type="button" onclick={() => (query = "")}>
             <Icon name="x" size={13} /> Clear filter
           </button>
         </div>
@@ -746,7 +744,6 @@
      beside it. */
   .history-sort-control { flex: 0 0 140px; }
   .history-sort-control :global(.sel-btn) { height: 32px; width: 100%; }
-  .history-clear { color: var(--fg-2); padding: 0 var(--s3); }
 
   /* The column head, in the track table's own language: tracked caps closed
      with a hairline. The hairline is also the whole block's bottom edge, which

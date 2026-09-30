@@ -3,6 +3,14 @@
 [workspace]
 resolver = "3"
 members = ["engine", "src-tauri"]
+exclude = ["vendor/librespot-audio", "vendor/librespot-playback"]
+
+# FileId does not identify songs versus episodes. These pinned 0.8.0 patches
+# carry the audio item's URI into each load (including preload), so only songs
+# can read/write persistent audio cache. No session-wide cache toggles.
+[patch.crates-io]
+librespot-audio = { path = "vendor/librespot-audio" }
+librespot-playback = { path = "vendor/librespot-playback" }
 
 # Release builds are what actually get run, so pay the compile time once for a
 # smaller, faster binary: cross-crate inlining, no parallel-codegen splits, and

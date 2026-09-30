@@ -77,7 +77,7 @@
       <p class="h">No personalized playlists yet.</p>
       <p class="sub">Your Spotify mixes will appear here when they are available.</p>
       <div class="actions">
-        <button class="btn-ghost" type="button" onclick={() => navigate("library")}>Back to Home</button>
+        <button class="pill" type="button" onclick={() => navigate("library")}>Back to Home</button>
       </div>
     </div>
   {/if}

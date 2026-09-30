@@ -9,6 +9,7 @@ use crate::app::{
     carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
     insert_created_playlist, is_followed_playlist, load_app_settings, load_playlist_list, now_secs,
     order_by_last_activity, playlist_detail_from_cache, playlist_qualifies, remove_membership,
+    apply_liked_write,
     save_app_settings, save_membership, save_playlist_list, save_tracks_cache,
     touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, tracks_cache_bytes,
     upsert_membership, upsert_playlist, upsert_tracks_cache, write_tracks_cache_bytes, AppSettings,
@@ -23,6 +24,7 @@ use crate::personal_api::{
     Authorization as PersonalAuthorization, Device as PersonalDevice, PersonalApi,
     SavedShowsPage, Status as PersonalStatus,
 };
+use crate::playback_router::{Action as PlaybackAction, PlaybackRouter};
 use crate::types::{
     AlbumDetail, AppState as AppStateSnapshot, Artist, ArtistCataloguePageDetail, ArtistDetail,
     CacheStats, EpisodeDetail, HistoryPageDetail, LibraryNodeDetail, LikedSongsDetail,
@@ -40,137 +42,140 @@ use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn play(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
-    client.play().await
+pub async fn play(app: AppHandle, router: State<'_, Arc<PlaybackRouter>>) -> Result<(), String> {
+    router.run(&app, PlaybackAction::Play).await
 }
 
 #[tauri::command]
-pub async fn pause(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
-    client.pause().await
+pub async fn pause(app: AppHandle, router: State<'_, Arc<PlaybackRouter>>) -> Result<(), String> {
+    router.run(&app, PlaybackAction::Pause).await
 }
 
 #[tauri::command]
-pub async fn next(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
-    client.next().await
+pub async fn next(app: AppHandle, router: State<'_, Arc<PlaybackRouter>>) -> Result<(), String> {
+    router.run(&app, PlaybackAction::Next).await
 }
 
 #[tauri::command]
-pub async fn previous(client: State<'_, Arc<EngineClient>>) -> Result<(), String> {
-    client.previous().await
+pub async fn previous(app: AppHandle, router: State<'_, Arc<PlaybackRouter>>) -> Result<(), String> {
+    router.run(&app, PlaybackAction::Previous).await
 }
 
 #[tauri::command]
-pub async fn seek(client: State<'_, Arc<EngineClient>>, position_ms: u32) -> Result<(), String> {
-    client.seek(position_ms).await
+pub async fn seek(app: AppHandle, router: State<'_, Arc<PlaybackRouter>>, position_ms: u32) -> Result<(), String> {
+    router.run(&app, PlaybackAction::Seek(position_ms)).await
 }
 
 #[tauri::command]
-pub async fn set_volume(client: State<'_, Arc<EngineClient>>, percent: u8) -> Result<(), String> {
-    if percent > 100 {
-        return Err("volume percent must be between 0 and 100".to_owned());
-    }
-    client.set_volume(percent).await
+pub async fn set_volume(app: AppHandle, router: State<'_, Arc<PlaybackRouter>>, percent: u8) -> Result<(), String> {
+    router.run(&app, PlaybackAction::Volume(percent)).await
 }
 
 #[tauri::command]
 pub async fn set_shuffle(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     enabled: bool,
 ) -> Result<(), String> {
-    client.set_shuffle(enabled).await
+    router.run(&app, PlaybackAction::Shuffle(enabled)).await
 }
 
 #[tauri::command]
-pub async fn set_repeat(client: State<'_, Arc<EngineClient>>, mode: String) -> Result<(), String> {
-    client.set_repeat(&mode).await
+pub async fn set_repeat(app: AppHandle, router: State<'_, Arc<PlaybackRouter>>, mode: String) -> Result<(), String> {
+    router.run(&app, PlaybackAction::Repeat(mode)).await
 }
 
 #[tauri::command]
 pub async fn set_playback_speed(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     speed: f32,
 ) -> Result<(), String> {
-    client.set_playback_speed(speed).await
+    router.run(&app, PlaybackAction::Speed(speed)).await
 }
 
 /// `automatic_start` is optional so clients built before the preference
 /// existed keep direct-play semantics (`false`) when they omit it.
 #[tauri::command]
 pub async fn play_queue(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     queue: Vec<Track>,
     index: usize,
     context: String,
     automatic_start: Option<bool>,
 ) -> Result<(), String> {
-    client
-        .play_queue(&queue, index, 0, &context, automatic_start.unwrap_or(false))
-        .await
+    router.run(&app, PlaybackAction::Queue(queue, index, context, automatic_start.unwrap_or(false))).await
 }
 
 #[tauri::command]
 pub async fn preview_track_edit(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     track: Track,
     cuts: Vec<renderer_engine::protocol::TimeRange>,
     loop_range: Option<renderer_engine::protocol::LoopRange>,
     position_ms: u32,
     preview_lease_id: u64,
 ) -> Result<(), String> {
-    client
-        .preview_track_edit(&track, &cuts, loop_range, position_ms, preview_lease_id)
-        .await
+    router.run(&app, PlaybackAction::Preview(track, cuts, loop_range, position_ms, preview_lease_id)).await
 }
 
 #[tauri::command]
 pub async fn restore_preview(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     preview_lease_id: u64,
 ) -> Result<(), String> {
-    client.restore_preview(preview_lease_id).await
+    router.run(&app, PlaybackAction::RestorePreview(preview_lease_id)).await
 }
 
 #[tauri::command]
 pub async fn play_queue_index(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     index: usize,
 ) -> Result<(), String> {
-    client.play_queue_index(index).await
+    router.run(&app, PlaybackAction::Index(index)).await
 }
 
 #[tauri::command]
 pub async fn add_queue(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     track: Track,
     context: String,
 ) -> Result<(), String> {
-    client.add_queue(&track, &context).await
+    router.run(&app, PlaybackAction::Add(track, context)).await
 }
 
 #[tauri::command]
 pub async fn add_queue_batch(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     tracks: Vec<Track>,
     context: String,
 ) -> Result<(), String> {
-    client.add_queue_batch(&tracks, &context).await
+    router.run(&app, PlaybackAction::AddBatch(tracks, context)).await
 }
 
 #[tauri::command]
 pub async fn remove_queue(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     index: usize,
 ) -> Result<(), String> {
-    client.remove_queue(index).await
+    router.run(&app, PlaybackAction::Remove(index)).await
 }
 
 #[tauri::command]
 pub async fn move_queue(
-    client: State<'_, Arc<EngineClient>>,
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     from: usize,
     to: usize,
 ) -> Result<(), String> {
-    client.move_queue(from, to).await
+    router.run(&app, PlaybackAction::Move(from, to)).await
 }
 
 /// One page of the listening archive. The filter and the order are the
@@ -778,6 +783,7 @@ pub async fn logout(
     client: State<'_, Arc<EngineClient>>,
     personal: State<'_, Arc<PersonalApi>>,
 ) -> Result<(), String> {
+    app.state::<Arc<PlaybackRouter>>().disconnect(&app).await;
     personal.disconnect(&app).await?;
     client.logout().await
 }
@@ -793,6 +799,7 @@ pub async fn personal_api_configure(
     personal: State<'_, Arc<PersonalApi>>,
     client_id: String,
 ) -> Result<PersonalStatus, String> {
+    app.state::<Arc<PlaybackRouter>>().disconnect(&app).await;
     personal.configure(&app, client_id).await
 }
 
@@ -806,7 +813,8 @@ pub async fn personal_api_authorize(
 }
 
 #[tauri::command]
-pub async fn personal_api_disconnect(app: AppHandle, personal: State<'_, Arc<PersonalApi>>) -> Result<PersonalStatus, String> {
+pub async fn personal_api_disconnect(app: AppHandle, personal: State<'_, Arc<PersonalApi>>, router: State<'_, Arc<PlaybackRouter>>) -> Result<PersonalStatus, String> {
+    router.disconnect(&app).await;
     personal.disconnect(&app).await
 }
 
@@ -823,10 +831,27 @@ pub async fn personal_api_contains(
 pub async fn personal_api_set_saved(
     app: AppHandle,
     personal: State<'_, Arc<PersonalApi>>,
+    state: State<'_, Mutex<AppState>>,
     uris: Vec<String>,
     saved: bool,
 ) -> Result<(), String> {
-    personal.set_saved(&app, uris, saved).await
+    personal.set_saved(&app, uris.clone(), saved).await?;
+    // The write landed. The membership index answers "is this in Liked
+    // Songs" everywhere, so it takes the change now rather than at the next
+    // reconcile pass, and the UI hears about it through the one event every
+    // other index change uses (which also drops the cached Liked Songs page).
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    let written = {
+        let mut guard = state.lock();
+        apply_liked_write(&mut guard.memberships, &uris, saved)
+            .then(|| (guard.data_dir.clone(), guard.memberships.clone()))
+    };
+    if let Some((dir, entries)) = written {
+        save_membership(&dir, &entries);
+        let _ = app.emit("memberships_changed", json!({"saved_tracks": true}));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -845,33 +870,24 @@ pub async fn personal_api_devices(app: AppHandle, personal: State<'_, Arc<Person
 }
 
 #[tauri::command]
-pub async fn personal_api_transfer(
+pub async fn select_output(
     app: AppHandle,
-    personal: State<'_, Arc<PersonalApi>>,
-    device_id: String,
-    play: bool,
+    router: State<'_, Arc<PlaybackRouter>>,
+    device_id: Option<String>,
 ) -> Result<(), String> {
-    personal.transfer(&app, device_id, play).await
+    router.select(&app, device_id).await
 }
 
-#[tauri::command]
-pub async fn personal_api_set_devices_enabled(
-    app: AppHandle,
-    personal: State<'_, Arc<PersonalApi>>,
-    enabled: bool,
-) -> Result<PersonalStatus, String> {
-    personal.set_devices_enabled(&app, enabled).await
-}
 
 // ---------------------------------------------------------------------------
 // State + covers
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn get_state(state: State<'_, Mutex<AppState>>) -> Result<AppStateSnapshot, String> {
+pub async fn get_state(state: State<'_, Mutex<AppState>>, router: State<'_, Arc<PlaybackRouter>>) -> Result<AppStateSnapshot, String> {
     let guard = state.lock();
     Ok(AppStateSnapshot {
-        playback: guard.playback.clone(),
+        playback: router.snapshot().unwrap_or_else(|| guard.playback.clone()),
         playlists: guard.playlists.clone(),
         library_fresh: guard.library_fresh,
         me_id: guard.me_id.clone(),
@@ -1328,8 +1344,10 @@ pub async fn consume_states(app: AppHandle) {
                 let mut guard = managed.lock();
                 apply_position_heartbeat(&mut guard, heartbeat);
                 drop(guard);
-                let _ = app.emit("position", heartbeat.position_ms);
-                media_keys::update_position(heartbeat.position_ms);
+                if !app.state::<Arc<PlaybackRouter>>().is_remote() {
+                    let _ = app.emit("position", heartbeat.position_ms);
+                    media_keys::update_position(heartbeat.position_ms);
+                }
                 continue;
             }
             Ok(StateLine::Volume(volume)) => {
@@ -1340,7 +1358,9 @@ pub async fn consume_states(app: AppHandle) {
                 let mut guard = managed.lock();
                 apply_volume_line(&mut guard, volume);
                 drop(guard);
-                let _ = app.emit("state", volume_state_payload(volume));
+                if !app.state::<Arc<PlaybackRouter>>().is_remote() {
+                    let _ = app.emit("state", volume_state_payload(volume));
+                }
                 continue;
             }
             Ok(StateLine::Disconnected) => {
@@ -1354,7 +1374,13 @@ pub async fn consume_states(app: AppHandle) {
                     guard.playback.error = "playback engine disconnected".to_owned();
                     guard.playback.clone()
                 };
-                let _ = app.emit("state", &disconnected);
+                let router = app.state::<Arc<PlaybackRouter>>();
+                if router.is_remote() {
+                    router.suspend(&app, &disconnected.error);
+                } else {
+                    let _ = app.emit("state", &disconnected);
+                    media_keys::update_disconnected();
+                }
                 let _ = app.emit(
                     "session",
                     json!({
@@ -1363,7 +1389,6 @@ pub async fn consume_states(app: AppHandle) {
                         "error": &disconnected.error,
                     }),
                 );
-                media_keys::update_disconnected();
                 previous_identity =
                     Some(("disconnected".to_owned(), disconnected.username.clone()));
                 last_error = disconnected.error;
@@ -1478,6 +1503,10 @@ pub async fn consume_states(app: AppHandle) {
             }
         }
         if session_changed && (state.auth_state == "ready" || state.auth_state == "logged_out") {
+            let router = app.state::<Arc<PlaybackRouter>>();
+            if router.snapshot().is_some_and(|remote| state.auth_state == "logged_out" || remote.username != state.username) {
+                router.disconnect(&app).await;
+            }
             app.state::<Arc<PersonalApi>>()
                 .account_changed(&app, if state.auth_state == "ready" { &state.username } else { "" })
                 .await;
@@ -1486,8 +1515,16 @@ pub async fn consume_states(app: AppHandle) {
 
         // Full states are reserved for real changes; the scalar lanes were
         // already forwarded above as their own events.
-        let _ = app.emit("state", &state);
-        media_keys::update_state(&state);
+        if !app.state::<Arc<PlaybackRouter>>().is_remote() {
+            let _ = app.emit("state", &state);
+            media_keys::update_state(&state);
+        } else if state.playing {
+            // An engine recovery or an un-routed internal action must not
+            // restore local audio underneath an external output.
+            if let Err(error) = client.pause().await {
+                app.state::<Arc<PlaybackRouter>>().report_error(&app, &error);
+            }
+        }
         if session_changed {
             let _ = app.emit(
                 "session",

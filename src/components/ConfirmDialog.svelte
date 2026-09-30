@@ -56,8 +56,8 @@
       {#if error}<p class="dialog-error" role="alert">{error}</p>{/if}
     </div>
     <div class="dialog-actions">
-      <button class="btn-ghost" bind:this={cancelButton} disabled={busy} onclick={cancel}>Cancel</button>
-      <button class="btn-danger" disabled={busy} onclick={onConfirm}>
+      <button class="pill" bind:this={cancelButton} disabled={busy} onclick={cancel}>Cancel</button>
+      <button class="pill danger" disabled={busy} onclick={onConfirm}>
         {busy ? busyLabel : confirmLabel}
       </button>
     </div>

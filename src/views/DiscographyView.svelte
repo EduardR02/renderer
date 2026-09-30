@@ -286,13 +286,13 @@
       {#if paging.loading && paging.releases.length}
         <span class="dx-status">Loading releases…</span>
       {:else if paging.error && paging.nextOffset != null}
-        <button class="btn-ghost" onclick={() => paging.loadNext()}>
+        <button class="pill" onclick={() => paging.loadNext()}>
           Try again
         </button>
       {:else if paging.nextOffset != null && paging.releases.length}
         <!-- Near-footer scrolling does this automatically; the button is the
              keyboard fallback and explicit retry affordance. -->
-        <button class="btn-ghost" onclick={() => paging.loadNext()}>
+        <button class="pill" onclick={() => paging.loadNext()}>
           Load more<Icon name="chevron-down" size={14} />
         </button>
       {:else if paging.releases.length}
@@ -318,7 +318,7 @@
     <div class="empty failed">
       <p class="h">This artist could not be loaded.</p>
       <p class="why">{detail.error}</p>
-      <div class="actions"><button class="btn-ghost" onclick={retryDetail}>Try again</button></div>
+      <div class="actions"><button class="pill" onclick={retryDetail}>Try again</button></div>
     </div>
   {:else}
     <!-- Same frame as the loaded page, so the header does not jump when the

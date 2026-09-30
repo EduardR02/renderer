@@ -692,21 +692,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   text-transform: uppercase; color: var(--label);
 }
 .lib-head-actions { display: flex; align-items: center; margin-right: calc(var(--s1) * -1); }
-.lib-filter {
-  display: flex; align-items: center; gap: var(--s2); width: 100%; min-width: 0;
-  height: 24px; color: var(--fg-2);
-}
-.lib-filter input {
-  min-width: 0; flex: 1; height: 24px; padding: 0;
-  color: var(--fg); background: transparent; border: 0; outline: 0;
-  font-family: var(--font-small); font-size: var(--t-12);
-}
-.lib-filter input::placeholder { color: var(--fg-2); }
-.lib-filter-close {
-  display: grid; place-items: center; width: 22px; height: 22px; flex: none;
-  border-radius: var(--rf); color: var(--fg-2);
-}
-.lib-filter-close:hover { color: var(--fg); background: var(--hover-2); }
 .lib-filter-empty {
   padding: var(--s5) var(--s3); color: var(--fg-2); text-align: center;
   font-family: var(--font-small); font-size: var(--t-11);
@@ -761,11 +746,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   color: var(--count);
 }
 .lib-row.playing .lib-name { color: var(--accent); }
-.lib-folder {
-  display: flex; align-items: center; height: 30px; min-width: 0;
-  color: var(--fg-2); font-size: var(--t-12); overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap;
-}
 /* The one row in the rail whose selected state is warm, because the thing it
    selects is the saved collection. Everything else selected is foam. */
 .lib-row.liked-row.active {
@@ -786,10 +766,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    The other is the same type dimmed — no pill, no underline, no segmented
    track: two words at 11px are already a small enough object that a container
    around them would be the loudest thing in the rail. */
-.lib-modes { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.lib-modes { display: flex; align-items: center; gap: 6px; min-width: 0; }
 /* Sentence case, not the tracked caps every other section label wears, and
-   that is a measurement rather than a preference: two tracked caps words plus
-   the head's two buttons overrun a 212px rail by fourteen pixels. The slot is
+   that is a measurement rather than a preference: tracked caps words plus
+   the head's two buttons overrun the rail. Three collections (Podcasts, with
+   the personal app) fit the 240px rail with 3px to spare; the 212px one lets
+   go of New playlist for them (Sidebar). The slot is
    already sentence case half the time anyway — opening the filter replaces
    this label with a "Filter library" placeholder at the same weight — so the
    head keeps one voice either way. */
@@ -809,7 +791,7 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 /* One dot between them, so the pair reads as one control rather than as a
    heading with a stray word after it. Drawn on the separator itself, which
    costs no element: `gap` already spaces the words. */
-.lib-mode + .lib-mode { position: relative; padding-left: calc(var(--s2) + 2px); }
+.lib-mode + .lib-mode { position: relative; padding-left: var(--s2); }
 .lib-mode + .lib-mode::before {
   content: ""; position: absolute; left: 0; top: 50%;
   width: 2px; height: 2px; margin-top: -1px; border-radius: var(--rf);
@@ -1258,60 +1240,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 }
 .topbar-play:hover { background: var(--accent-hi); }
 
-/* The field fills its grid track, which is where the sizing now lives.
-   `--rf`, not `--r2`: it shares this bar with two round history buttons and a
-   round play button, and at 6px it was the one squared-off object among them —
-   a form control dropped into a row of chrome. The ends also give the
-   magnifier and the clear button somewhere to sit that reads as inside the
-   field rather than jammed against a corner, which is why the inline padding
-   is asymmetric: 16px of lead-in for the glyph, 12px of run-out for a control
-   that carries its own 20px hit circle. */
-.searchbox {
-  display: flex; align-items: center; gap: var(--s2); min-width: 0;
-  width: 100%; height: 32px; padding: 0 var(--s3) 0 var(--s4);
-  border-radius: var(--rf); background: var(--raise-1);
-  border: 1px solid var(--line);
-  /* Owns the magnifier, which inherits it. A glyph carries more ink than text
-     of the same value, so at rest it sits one rung below the placeholder it
-     stands next to and the two read as the same weight. */
-  color: var(--fg-3);
-  transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease),
-              color var(--d1) var(--ease);
-}
-.searchbox:hover:not(:focus-within) { border-color: var(--line-2); }
-/* Focus used to swap the whole perimeter to undiluted foam, which made a text
-   field the loudest object in the window: 340px of saturated ring around the
-   one control that is already announcing itself with a caret. The state to
-   communicate is "typing lands here", and the app has a quieter vocabulary for
-   it — the surface lifts to the same raise every other control uses when it is
-   active, the hairline takes foam at hairline strength, and the magnifier
-   comes up a rung with it. Three small agreeing signals instead of one loud
-   one. */
-.searchbox:focus-within {
-  background: var(--raise-2);
-  border-color: color-mix(in srgb, var(--foam) 46%, transparent);
-  color: var(--fg-1);
-}
-.searchbox input {
-  flex: 1; min-width: 0; height: 100%; border: 0; background: none;
-  outline: none; font-size: var(--t-13); color: var(--fg);
-  /* The field shrinks with the pane, so its placeholder has to end rather
-     than be sliced through a letter. */
-  text-overflow: ellipsis;
-}
-.searchbox input::placeholder { color: var(--fg-2); }
-/* Sits inside the field's own border, so it must not add height: the box is a
-   fixed 32px and a taller child would push the border out. Pulled 4px past the
-   run-out padding so the CIRCLE, not the glyph inside it, is what ends 8px
-   from the pill's edge. */
-.search-clear {
-  flex: none; display: grid; place-items: center;
-  width: 20px; height: 20px; margin-right: -4px;
-  border: 0; border-radius: var(--rf); background: none;
-  color: var(--fg-3); cursor: pointer;
-  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
-}
-.search-clear:hover { color: var(--fg); background: var(--hover-2); }
+/* The search field is THE FIELD (below), filling its grid track, which is
+   where the sizing lives. */
+
 
 /* =====================================================================
    PAGE SCAFFOLD
@@ -1422,6 +1353,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .section-count {
   flex: none; color: var(--count);
   font-family: var(--font-number); font-size: var(--t-12); font-weight: var(--w-med);
+  letter-spacing: 0;
+}
+/* A qualifier on a heading, at the count's size, in grey: a fact, not a link. */
+.section-note {
+  flex: none; color: var(--fg-3);
+  font-family: var(--font-small); font-size: var(--t-12); font-weight: var(--w-body);
   letter-spacing: 0;
 }
 .link-more {
@@ -1588,6 +1525,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   margin: var(--s3) 0 var(--s3);
   overflow-wrap: anywhere;
 }
+/* A long name — an episode's, a remaster's — steps down the shared scale
+   instead of running to four lines, and balances, so its lines are even
+   rather than a full line over a stub. */
+.detail-title.long { font-size: clamp(28px, 3.2vw, 44px); line-height: 1.08; text-wrap: balance; }
 .detail-meta {
   display: flex; align-items: center; gap: var(--s2); min-width: 0;
   font-size: var(--t-12); color: var(--fg-1);
@@ -1597,12 +1538,22 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   color: var(--fg); min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.detail-meta button.who { transition: color var(--d1) var(--ease); }
+/* The owner, the publisher, the show: a name you can go to, in the meta
+   line's own type. */
+.detail-meta button.who { flex: 0 1 auto; text-align: left; transition: color var(--d1) var(--ease); }
 .detail-meta button.who:hover { color: var(--accent); }
 .detail-meta .sep { color: var(--fg-3); flex: none; }
 .detail-meta .num { font-variant-numeric: tabular-nums; flex: none; }
 
-.actions { display: flex; align-items: center; gap: var(--s3); margin-top: var(--s5); flex-wrap: wrap; }
+/* THE HEADER ACTION ROW, one pattern on every page:
+     [● play]  [round icon actions]  [one pill, if it holds a state]  [… menu]
+   The play button stands a step apart from the glyphs after it, the glyphs
+   sit close as one cluster, and anything secondary is in the "…". */
+.actions { display: flex; align-items: center; gap: var(--s2); margin-top: var(--s5); flex-wrap: wrap; }
+.actions > .play-lg { margin-right: var(--s2); }
+.actions > .pill { margin: 0 var(--s1); }
+/* A failed or empty page offers one pill and, at most, a text link. */
+.empty .actions { gap: var(--s4); margin-top: var(--s4); }
 
 /* Automatic playback with nowhere legal to begin — every row skipped or
    unavailable. Said once beside the buttons, in grey type: nothing failed,
@@ -1653,50 +1604,150 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   background: color-mix(in srgb, var(--rose) 84%, var(--bg-0));
 }
 
-.btn-ghost {
-  display: inline-flex; align-items: center; gap: var(--s2); flex: none;
-  height: 32px; padding: 0 var(--s4);
-  border-radius: var(--r2); border: 1px solid var(--line-2);
-  font-size: var(--t-12); color: var(--fg-1); white-space: nowrap;
-  transition: color var(--d1) var(--ease), border-color var(--d1) var(--ease), background-color var(--d1) var(--ease);
-}
-.btn-ghost:hover:not(:disabled) { color: var(--fg); border-color: rgba(255, 255, 255, 0.2); background: var(--hover); }
-/* Destructive, but not alarming at rest: neutral until the pointer is on it,
-   then unmistakably love. A row of permanently red "Clear" buttons in Settings
-   reads as an error state rather than as a set of available actions. */
-.btn-ghost.danger:hover:not(:disabled) {
-  color: var(--love); background: var(--danger-wash);
-  border-color: color-mix(in srgb, var(--love) 45%, transparent);
-}
+/* =====================================================================
+   BUTTONS — three tiers, and each is a shape the glass already makes: the
+   round play button, the round plate, the pill of a tag.
 
-/* the one filled button; the round .play-lg is its detail-header sibling */
-.btn-accent {
-  display: inline-flex; align-items: center; gap: var(--s2); flex: none;
-  height: 34px; padding: 0 var(--s5);
-  border-radius: var(--r2); background: var(--accent); color: var(--accent-ink);
-  font-size: var(--t-13); font-weight: var(--w-semi); white-space: nowrap;
-  transition: background-color var(--d1) var(--ease), transform var(--d1) var(--ease);
-}
-.btn-accent:hover:not(:disabled) { background: var(--accent-hi); }
-.btn-accent:active:not(:disabled) { transform: scale(0.98); }
-.btn-accent:disabled { background: var(--raise-2); color: var(--fg-2); }
+   The rectangle is retired. A 32px box with a 6px corner and a hairline
+   border was the one squared-off object in an interface of circles, pills
+   and soft glass. With one on a page it passed; a header with four of them
+   side by side read as a form.
 
-.btn-icon {
-  display: grid; place-items: center; width: 32px; height: 32px; flex: none;
+     .play-lg     THE action of a page. Round, foam (above).
+     .btn-round   An icon action — shuffle, add to queue, save as playlist,
+                  the "…" of a menu. No border and no fill at rest, only the
+                  glyph in --fg-2 standing on the glass, and a soft circle of
+                  light under the pointer. 32px in bars and rows; 40px (.lg)
+                  in a page header's action row. Always named by `title`.
+     .pill        The few actions that have to stay words: Follow, Log out,
+                  Try again, Save. Fully round, lit one step (--raise-1) and
+                  ringed with the material's hairline; the pointer lifts the
+                  word to --fg. `.accent` fills it with foam, and a form or a
+                  dialog has one at most — its primary action. `.danger`
+                  fills it with love: the act a confirmation cannot undo.
+                  `.warn` is a quiet pill that turns love only under the
+                  pointer, for the button that OPENS such a confirmation.
+
+   `.link-more` stays for tertiary text actions.
+   ===================================================================== */
+.btn-round {
+  display: grid; place-items: center; flex: none;
+  width: 32px; height: 32px;
   border-radius: var(--rf); color: var(--fg-2);
   transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
 }
-.btn-icon:hover { color: var(--fg); background: var(--hover-2); }
-.btn-icon.on { color: var(--accent); }
-/* A toggle that is ON is foam (interactive state); a thing that is SAVED is
-   rose. They are different facts and used to share one class.
-   The INK rose, not the pale one: a filled heart is only about 120 square
-   pixels, and at rose's own chroma that is a pale blob that could as easily be
-   grey. Twice the chroma at the same hue makes it unmistakable at 15px, which
-   is the whole reason the ink token exists. */
-.btn-icon.saved { color: var(--rose-ink); }
-.btn-icon.saved:hover { color: color-mix(in srgb, var(--rose-ink) 55%, var(--fg)); }
-.btn-icon.danger:hover { color: var(--danger); }
+.btn-round.lg { width: 40px; height: 40px; }
+/* An open menu keeps its button lit, so the menu reads as coming from it. */
+.btn-round:hover:not(:disabled),
+.btn-round[aria-expanded="true"] { color: var(--fg); background: var(--hover-2); }
+.btn-round:active:not(:disabled) { background: var(--raise-3); }
+/* A toggle that is ON is foam, the colour of what you can do. */
+.btn-round.on, .btn-round.on:hover:not(:disabled) { color: var(--accent); }
+.btn-round.danger:hover:not(:disabled) { color: var(--danger); }
+
+.pill {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--s2); flex: none;
+  height: 34px; padding: 0 var(--s4);
+  border-radius: var(--rf);
+  background: var(--raise-1);
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  color: var(--fg-1);
+  font-size: var(--t-12); font-weight: var(--w-med); white-space: nowrap;
+  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease),
+              box-shadow var(--d1) var(--ease);
+}
+.pill:hover:not(:disabled) {
+  color: var(--fg); background: var(--raise-2);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17);
+}
+.pill:active:not(:disabled) { background: var(--raise-3); }
+.pill:disabled { opacity: 0.45; }
+/* For a row of small controls inside a sheet or an editor footer. */
+.pill.sm { height: 28px; padding: 0 var(--s3); font-size: var(--t-11); }
+/* A lead glyph sits a hair inside the round end, where the eye reads it
+   as part of the word rather than as a second object. */
+.pill > .icon:first-child { margin-left: -3px; }
+/* A pill that states a fact rather than offering an act — Following, Allowed
+   — keeps its quiet surface and carries the state in its glyph. */
+.pill.on > .icon { color: var(--accent); }
+.pill.accent {
+  background: var(--accent); color: var(--accent-ink); box-shadow: none;
+  font-weight: var(--w-semi);
+}
+.pill.accent:hover:not(:disabled) { background: var(--accent-hi); color: var(--accent-ink); box-shadow: none; }
+.pill.accent:active:not(:disabled) { background: var(--accent-lo); }
+.pill.danger {
+  background: var(--love); color: var(--bg-0); box-shadow: none;
+  font-weight: var(--w-semi);
+}
+.pill.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--love) 86%, var(--rose)); color: var(--bg-0); box-shadow: none;
+}
+/* Neutral until the pointer is on it, then unmistakably love. A row of red
+   "Clear" buttons at rest reads as an error state, not as available acts. */
+.pill.warn:hover:not(:disabled) {
+  color: var(--love); background: var(--danger-wash);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--love) 42%, transparent);
+}
+
+/* =====================================================================
+   THE FIELD — every single-line text input in the app, one object.
+
+   Pressed INTO the glass rather than laid on it: a shade under it and a
+   hairline, in the search box's shape (round ends, a 16px lead-in for its
+   glyph, a 12px run-out for a control that carries its own hit circle).
+   Focus is three small agreeing signals — the hairline takes foam at
+   hairline strength and the glyph comes up a rung — never a loud ring:
+   the caret is already saying where typing lands.
+
+   The field is the wrapper; the <input> inside it is bare. `.sm` is the
+   rail's size, `.lg` a title being renamed in place.
+   ===================================================================== */
+.field {
+  display: flex; align-items: center; gap: var(--s2); min-width: 0;
+  height: 32px; padding: 0 var(--s3) 0 var(--s4);
+  border-radius: var(--rf);
+  background: rgb(0 0 0 / 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  /* Owns the lead glyph, which inherits it: a glyph carries more ink than
+     text of the same value, so it sits one rung below the placeholder. */
+  color: var(--fg-3);
+  transition: border-color var(--d1) var(--ease), color var(--d1) var(--ease);
+}
+.field:hover:not(:focus-within) { border-color: rgba(255, 255, 255, 0.14); }
+.field:focus-within {
+  border-color: color-mix(in srgb, var(--foam) 46%, transparent);
+  color: var(--fg-1);
+}
+.field:has(input[aria-invalid="true"]) { border-color: color-mix(in srgb, var(--love) 55%, transparent); }
+.field:has(input:disabled) { opacity: 0.6; }
+.field input {
+  flex: 1; min-width: 0; height: 100%; padding: 0;
+  border: 0; background: none; outline: none;
+  font-size: var(--t-13); color: var(--fg);
+  /* The field shrinks with its column, so a placeholder ends rather than
+     being sliced through a letter. */
+  text-overflow: ellipsis;
+}
+.field input::placeholder { color: var(--fg-2); }
+/* A control inside the field — clear, reveal. It must not add height: the
+   box is fixed, and a taller child would push the hairline out. Pulled past
+   the run-out so the CIRCLE, not the glyph, ends 8px from the round end. */
+.field-btn {
+  flex: none; display: grid; place-items: center;
+  width: 22px; height: 22px; margin-right: -5px;
+  border-radius: var(--rf); color: var(--fg-3);
+  transition: color var(--d1) var(--ease), background-color var(--d1) var(--ease);
+}
+.field-btn:hover { color: var(--fg); background: var(--hover-2); }
+.field.sm { height: 28px; padding: 0 var(--s3); }
+.field.sm input { font-family: var(--font-small); font-size: var(--t-12); }
+.field.sm .field-btn { width: 20px; height: 20px; margin-right: -6px; }
+.field.lg { height: 52px; padding: 0 var(--s3) 0 var(--s5); }
+.field.lg input {
+  font-family: var(--font-display); font-size: var(--t-23); font-weight: var(--w-bold);
+  letter-spacing: -0.02em;
+}
 
 /* Liked Songs is deliberately its own collection identity, without reusing a
    generated purple/blue music-service tile. The mark itself is a component now
@@ -2334,6 +2385,18 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .menu-item:focus-visible { background: rgba(255, 255, 255, 0.08); color: var(--fg); outline: none; }
 .menu-item .hint { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--fg-2); }
 .menu-item.danger { color: var(--danger); }
+/* A copy that landed takes the colour this app has for a thing you just did;
+   a refused one takes the failure colour, so the two never read alike. */
+.menu-item.done { color: var(--accent); }
+.menu-item.failed { color: var(--love); }
+/* A state on an item — the heart of Liked Songs, the active device — sits at
+   the item's far end, in a fixed slot, so nothing moves when it lands. */
+.menu-item .mark { margin-left: auto; flex: none; display: grid; place-items: center; color: var(--fg-3); }
+.menu-item .mark.on { color: var(--rose-ink); }
+.menu-item[aria-busy="true"] .mark { opacity: 0.45; }
+.menu-item > .icon:first-child { color: var(--fg-2); }
+.menu-item:hover:not(:disabled) > .icon:first-child,
+.menu-item:focus-visible > .icon:first-child { color: var(--fg); }
 .menu-item.danger:hover:not(:disabled),
 .menu-item.danger:focus-visible { background: var(--danger-wash); color: var(--love); }
 .menu-sep { height: 1px; margin: var(--s1) var(--s3); background: rgba(255, 255, 255, 0.08); }
@@ -2345,11 +2408,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    long sits in a label that can. */
 .menu-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
-.playlist-menu-wrap { position: relative; }
-.playlist-actions-menu {
-  position: absolute; z-index: 1;
-  top: calc(100% + var(--s1)); left: 0;
-}
 
 /* Native <dialog> supplies focus containment and Escape semantics; these
    rules only establish the shape and the action hierarchy. The surface is
@@ -2382,16 +2440,6 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .dialog-actions {
   display: flex; justify-content: flex-end; align-items: center;
   gap: var(--s2); margin-top: var(--s6);
-}
-.btn-danger {
-  display: inline-flex; align-items: center; justify-content: center;
-  height: 34px; padding: 0 var(--s4); border-radius: var(--r2);
-  background: var(--love); color: var(--bg-0); font-size: var(--t-13); font-weight: var(--w-bold);
-  transition: background-color var(--d1) var(--ease), box-shadow var(--d1) var(--ease);
-}
-.btn-danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--love) 86%, var(--rose));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bg-0) 18%, transparent);
 }
 
 /* ---------------------------------------------------------------- credits
@@ -2493,26 +2541,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .credits-summary .tnum { color: color-mix(in srgb, var(--gold) 62%, var(--fg-1)); font-weight: var(--w-med); }
 .credits-sep { width: 3px; height: 3px; border-radius: 50%; background: var(--fg-3); flex: none; }
 /* A finder, not a feature: it only appears once the list is long enough that
-   scanning it stops working (see FILTERABLE_FROM). */
-.credits-filter {
-  display: flex; align-items: center; gap: var(--s2); flex: none;
-  width: 236px; height: 30px; padding: 0 var(--s2) 0 var(--s3);
-  /* A field is pressed INTO the glass: a shade under it and a hairline. */
-  border-radius: var(--rf); background: rgb(0 0 0 / 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.08); color: var(--fg-2);
-  transition: border-color var(--d1) var(--ease);
-}
-.credits-filter:focus-within { border-color: color-mix(in srgb, var(--foam) 58%, transparent); }
-.credits-filter input {
-  flex: 1; min-width: 0; height: 100%; border: 0; background: none; outline: none;
-  font-size: var(--t-12); color: var(--fg);
-}
-.credits-filter input::placeholder { color: var(--fg-3); }
-.credits-filter-clear {
-  display: grid; place-items: center; width: 18px; height: 18px; flex: none;
-  border-radius: 50%; color: var(--fg-3);
-}
-.credits-filter-clear:hover { color: var(--fg); background: var(--hover-3); }
+   scanning it stops working (see FILTERABLE_FROM). THE FIELD, at a fixed width. */
+.credits-filter { flex: none; width: 236px; }
+
 
 .credits-body {
   flex: 1; min-height: 200px; padding: 0 var(--s6) var(--s5);
@@ -2767,23 +2798,29 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 
 /* --------------------------------------------------------------- listbox
    Replaces the one native <select>, which rendered as a light OS widget with
-   its own font and radius in the middle of a dark panel. */
+   its own font and radius in the middle of a dark panel. The trigger is a
+   quiet pill with its chevron, the button tier's own shape. */
 .sel { position: relative; flex: none; }
 .sel-btn {
   display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
-  min-width: 140px; height: 34px; padding: 0 var(--s3);
-  border: 1px solid var(--line-2); border-radius: var(--r2);
-  background: var(--raise-1); color: var(--fg);
+  min-width: 140px; height: 34px; padding: 0 var(--s3) 0 var(--s4);
+  border-radius: var(--rf);
+  background: var(--raise-1); box-shadow: inset 0 0 0 1px var(--line-2);
+  color: var(--fg-1);
   font-size: var(--t-12); font-weight: var(--w-med);
-  transition: border-color var(--d1) var(--ease), background-color var(--d1) var(--ease), color var(--d1) var(--ease);
+  transition: box-shadow var(--d1) var(--ease), background-color var(--d1) var(--ease), color var(--d1) var(--ease);
 }
 .sel-btn .icon { color: var(--fg-2); transition: color var(--d1) var(--ease); }
-.sel-btn:hover:not(:disabled) { background: var(--raise-2); border-color: rgba(255, 255, 255, 0.18); }
+.sel-btn:hover:not(:disabled) {
+  background: var(--raise-2); color: var(--fg);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17);
+}
 .sel-btn:hover:not(:disabled) .icon { color: var(--fg-1); }
 .sel-btn.open {
-  border-color: color-mix(in srgb, var(--foam) 62%, transparent);
-  background: var(--raise-2);
+  background: var(--raise-2); color: var(--fg);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 52%, transparent);
 }
+
 .sel-btn.open .icon { color: var(--accent); }
 .sel-btn:disabled { opacity: 0.45; }
 .sel-value { font-family: var(--font-number); font-variant-numeric: tabular-nums; }
@@ -3139,31 +3176,18 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .skeleton.line { display: block; height: 12px; border-radius: var(--r1); margin-bottom: var(--s3); }
 .skeleton.line.sm { width: 84px; }
 .skeleton.line.lg { width: 320px; height: 40px; }
+/* A card's artwork before it arrives: the tile's own square and corner. */
+.skeleton.tile { display: block; width: 100%; aspect-ratio: 1; border-radius: var(--r3); }
 
-/* Inline rename keeps the title's scale, but uses explicit Save/Cancel actions
-   so focus loss can never turn an Escape cancellation into an accidental save. */
-.rename-form { width: 100%; max-width: 620px; }
-.rename {
-  width: 100%;
-  font-family: var(--font-display);
-  font-size: clamp(30px, 4.4vw, var(--t-56)); font-weight: var(--w-bold); line-height: 1.03;
-  letter-spacing: -0.028em;
-  color: var(--fg); background: transparent;
-  border: none; border-bottom: 2px solid var(--accent);
-  padding: 0 0 var(--s1); outline: none;
-}
-.rename:disabled { opacity: 0.7; }
+/* Inline rename: THE FIELD at title size, in place of the title, with explicit
+   Save/Cancel pills so focus loss can never turn an Escape cancellation into
+   an accidental save. */
+.rename-form { width: 100%; max-width: 620px; margin: var(--s3) 0; }
 .rename-controls { display: flex; align-items: center; gap: var(--s2); margin-top: var(--s3); }
 .inline-error { margin-top: var(--s2); color: var(--love); font-size: var(--t-12); }
 
-.lib-create { padding: 0 var(--s2) var(--s2); }
-.lib-create input {
-  width: 100%; height: 32px; padding: 0 var(--s3);
-  font-size: var(--t-13); color: var(--fg);
-  background: var(--raise-1); border: 1px solid var(--line-2);
-  border-radius: var(--r1); outline: none;
-}
-.lib-create input:focus { border-color: var(--accent); }
+.lib-create { padding: 0 0 var(--s2); }
+
 
 .sub { color: var(--fg-2); font-size: var(--t-12); }
 

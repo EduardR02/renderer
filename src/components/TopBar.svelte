@@ -15,6 +15,7 @@
     canGoBack,
     canGoForward,
     getTrackEditorTrack,
+    pageTitle,
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
 
@@ -97,7 +98,10 @@
                     ? (detail.artist ? `${detail.artist.name} / Appears On` : "")
                     : route.name === "track-editor"
                       ? (getTrackEditorTrack(route.id, route.param)?.name ?? "Track edit")
-                      : ""
+                      : ["show", "episode", "profile"].includes(route.name) &&
+                          pageTitle.route === `${route.name}\u0000${route.id ?? ""}`
+                        ? pageTitle.text
+                        : ""
   );
 
   /**
@@ -166,7 +170,7 @@
     {/if}
   </div>
 
-  <form class="searchbox" onsubmit={onSubmit}>
+  <form class="field" onsubmit={onSubmit}>
     <Icon name="search" size={14} />
     <input
       bind:this={field}
@@ -179,7 +183,7 @@
       onfocus={() => route.name !== "search" && navigate("search")}
     />
     {#if search.query}
-      <button type="button" class="search-clear" title="Clear search" onclick={clearSearch}>
+      <button type="button" class="field-btn" title="Clear search" onclick={clearSearch}>
         <Icon name="x" size={11} />
       </button>
     {/if}

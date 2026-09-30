@@ -34,7 +34,7 @@
   <div class="empty">
     <div class="actions">
       <button
-        class="btn-accent"
+        class="pill accent"
         disabled={!playback.auth_url || session.authPending}
         onclick={openAuthUrl}
       >

@@ -17,8 +17,8 @@
  *                          hands the remote https URL straight to <img>.
  *   status                 makes the engine re-broadcast state to the real window.
  *   cancel_track_waveform  cancels engine work.
- * Personal grant configuration/authorization/library writes/transfer are never
- * forwarded. Real mode rejects them and directs the user to the native app.
+ * Personal grant configuration/authorization/library writes/output selection
+ * are never forwarded. Real mode directs those actions to the native app.
  * Simulated local playback stays on the harness mock.
  */
 export const READ_COMMANDS = new Set([
@@ -59,8 +59,9 @@ export const READ_COMMANDS = new Set([
   "browse_episode",
   "browse_profile",
   "browse_playlist_tree",
-  // Native-bound personal reads only. These are never prewarmed; the UI asks
-  // for devices only after an explicit enabled/authorized picker action.
+  // Native-bound personal reads only, never prewarmed. Contains answers only
+  // whether a profile's user is followed, once when the profile opens; the
+  // UI asks for devices only when the device menu is opened.
   "personal_api_status",
   "personal_api_contains",
   "personal_api_saved_shows",

@@ -135,9 +135,9 @@
       {#if paging.loading && paging.releases.length}
         <span class="aux-status">Loading releases…</span>
       {:else if paging.error && paging.nextOffset != null}
-        <button class="btn-ghost" onclick={() => paging.loadNext()}>Try again</button>
+        <button class="pill" onclick={() => paging.loadNext()}>Try again</button>
       {:else if paging.nextOffset != null && paging.releases.length}
-        <button class="btn-ghost" onclick={() => paging.loadNext()}>Load more<Icon name="chevron-down" size={14} /></button>
+        <button class="pill" onclick={() => paging.loadNext()}>Load more<Icon name="chevron-down" size={14} /></button>
       {:else if paging.releases.length}
         <span class="aux-status"><span class="tnum">{paging.releases.length}</span>{paging.total && paging.total !== paging.releases.length ? ` of ${paging.total}` : ""} releases</span>
       {/if}

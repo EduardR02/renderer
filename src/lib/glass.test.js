@@ -218,3 +218,46 @@ test("a modal sheet keeps its contrast over its own dimmed page", () => {
     expect(c).toBeGreaterThanOrEqual(target);
   }
 });
+
+test("the button tier and the field keep their type legible on the planes", () => {
+  // The pill is the plane's glass lit a step, then a step more under the
+  // pointer, where its word goes to --fg; the round button's hover circle is
+  // --hover-2 under a --fg glyph. Both sit on either plane over the
+  // brightest haze.
+  const pill = rule(".pill").replace(/\s+/g, " ");
+  expect(pill).toContain("background: var(--raise-1);");
+  expect(pill).toContain("color: var(--fg-1);");
+  const pillHover = rule(".pill:hover:not(:disabled)").replace(/\s+/g, " ");
+  expect(pillHover).toContain("color: var(--fg); background: var(--raise-2);");
+  const roundHover = rule(".btn-round:hover:not(:disabled),\n.btn-round[aria-expanded=\"true\"]").replace(/\s+/g, " ");
+  expect(roundHover).toContain("color: var(--fg); background: var(--hover-2);");
+  // The field is pressed INTO the glass: its shade can only darken the
+  // ground, so its placeholder (--fg-2) keeps at least the plane's margin.
+  const field = rule(".field").replace(/\s+/g, " ");
+  expect(field).toContain("background: rgb(0 0 0 / 0.22);");
+  expect(rule(".field input::placeholder")).toContain("color: var(--fg-2);");
+
+  const floor = brightestFrost(parseFrost(token("--frost-plane"), 1));
+  const rest = rgba(token("--raise-1"));
+  const lit = rgba(token("--raise-2"));
+  const round = rgba(token("--hover-2"));
+  const shade = rgba("rgb(0 0 0 / 0.22)");
+  for (const plane of ["--tint-chrome", "--tint-pane"]) {
+    const tint = rgba(token(plane));
+    const glass = over(over(floor, tint.rgb, tint.a), [1, 1, 1], sheenOf());
+    const checks = [
+      ["--fg-1", "a pill at rest", over(glass, rest.rgb, rest.a), 4.5],
+      ["--fg", "a lit pill", over(glass, lit.rgb, lit.a), 7],
+      ["--fg", "a lit round button", over(glass, round.rgb, round.a), 7],
+      ["--fg-2", "a field's placeholder", over(glass, shade.rgb, shade.a), 4.5],
+      ["--fg", "a field's text", over(glass, shade.rgb, shade.a), 7],
+    ];
+    for (const [name, where, bg, target] of checks) {
+      const c = contrast(hex(token(name)), bg);
+      if (c < target) throw new Error(`${name} on ${plane}, ${where}: ${c.toFixed(2)} under ${target}`);
+      expect(c).toBeGreaterThanOrEqual(target);
+    }
+  }
+  // The accent pill is ink on foam, and holds body contrast on its own fill.
+  expect(contrast(hex(token("--foam")), hex(token("--bg-0")))).toBeGreaterThanOrEqual(7);
+});

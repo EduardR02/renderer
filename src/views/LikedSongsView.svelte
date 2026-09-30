@@ -123,7 +123,7 @@
   {:else if error}
     <div class="empty">
       <p class="h">Liked Songs unavailable</p><p class="sub">{error}</p>
-      <div class="actions"><button class="btn-ghost" onclick={() => loadPage()}>Try again</button></div>
+      <div class="actions"><button class="pill" onclick={() => loadPage()}>Try again</button></div>
     </div>
   {:else}
     <div class="empty"><p class="h">No liked songs found.</p><p class="sub">Songs saved to your Spotify library will appear here.</p></div>
@@ -133,7 +133,7 @@
     <div class="liked-more">
       {#if error}<p class="inline-error" role="alert">{error}</p>{/if}
       {#if nextCursor}
-        <button class="btn-ghost" disabled={loading} onclick={() => loadPage(nextCursor)}>
+        <button class="pill" disabled={loading} onclick={() => loadPage(nextCursor)}>
           {loading ? "Loading…" : "Load more"}
         </button>
       {/if}

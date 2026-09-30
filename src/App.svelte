@@ -44,15 +44,16 @@
   import QueueView from "./views/QueueView.svelte";
   import SettingsView from "./views/SettingsView.svelte";
   import HistoryView from "./views/HistoryView.svelte";
-  import TrackEditorView from "./views/TrackEditorView.svelte";
   import LoginView from "./views/LoginView.svelte";
   import PodcastView from "./views/PodcastView.svelte";
-  import SavedShowsView from "./views/SavedShowsView.svelte";
   import ProfileView from "./views/ProfileView.svelte";
 
   $effect(() => {
     initEvents();
   });
+
+  let trackEditor = null;
+  const loadTrackEditor = () => (trackEditor ??= import("./views/TrackEditorView.svelte"));
 
   /* The content pane's own width, published for the track table.
      A ResizeObserver rather than a window resize listener, because the pane
@@ -396,7 +397,7 @@
       {#if bannerError}
         <div class="error-banner glass-card" role="alert">
           <span class="error-text">{bannerError}</span>
-          <button class="btn-icon" title="Dismiss" onclick={dismissBanner}>
+          <button class="btn-round" title="Dismiss" onclick={dismissBanner}>
             <Icon name="x" size={14} />
           </button>
         </div>
@@ -432,8 +433,6 @@
         <ArtistPlaylistCollectionView />
       {:else if route.name === "show" || route.name === "episode"}
         <PodcastView />
-      {:else if route.name === "podcasts"}
-        <SavedShowsView />
       {:else if route.name === "profile"}
         <ProfileView />
       {:else if route.name === "queue"}
@@ -441,7 +440,11 @@
       {:else if route.name === "history"}
         <HistoryView />
       {:else if route.name === "track-editor"}
-        <TrackEditorView />
+        <!-- The editor and its waveform are the heaviest page in the app and
+             the least visited: loaded the first time they are opened. -->
+        {#await loadTrackEditor() then { default: TrackEditorView }}
+          <TrackEditorView />
+        {/await}
       {:else if route.name === "settings"}
         <SettingsView />
       {/if}

@@ -36,11 +36,10 @@
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import PlaylistCleanup from "../components/PlaylistCleanup.svelte";
   import { coverTone } from "../lib/covertone.svelte.js";
-  import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { formatTotal } from "../lib/time.js";
   import { detailArtSize } from "../lib/layout.js";
-  import { isPinned, togglePin, loadPins } from "../lib/pins.svelte.js";
-  $effect(() => { loadPins(session.username); });
+  import HeaderMenu from "../components/HeaderMenu.svelte";
+  import PlaylistActions, { playlistRequest } from "../components/PlaylistActions.svelte";
 
   const pl = $derived(detail.playlist);
   /* The cover gives way before the title does when the pane is narrow. */
@@ -445,12 +444,7 @@
   let renameInput = $state(null);
   let renameSaving = $state(false);
   let renameError = $state("");
-  let menuOpen = $state(false);
-  let menuButton = $state(null);
-  let menu = $state(null);
-  /* Idle, landed, refused — the copy item's three faces. */
-  let copyState = $state("idle");
-  let copyTimer = 0;
+  let headerActions = $state(null);
   let deleteOpen = $state(false);
   let deleting = $state(false);
   let deleteError = $state("");
@@ -469,10 +463,6 @@
     reorderSession?.cancelRefresh?.();
     reorderSession = null;
     reorderBlocked = false;
-    clearTimeout(copyTimer);
-    copyTimer = 0;
-    copyState = "idle";
-    menuOpen = false;
     renaming = false;
     nameDraft = "";
     renameId = null;
@@ -484,7 +474,6 @@
     deleteError = "";
     cleanupId = null;
   });
-  $effect(() => () => clearTimeout(copyTimer));
   $effect(() => () => reorderSession?.cancelRefresh?.());
   $effect(() => {
     if (cleanupId && (route.name !== "playlist" || route.id !== cleanupId || pl?.id !== cleanupId || !editable)) {
@@ -510,18 +499,18 @@
     });
   });
 
-  /* The menu belongs to the page, not to an owner: every playlist has one.
-     Only the items inside it are gated by `editable`. */
+  /* An action the rail's menu asked for (PlaylistActions), carried out once
+     this playlist is the one on screen. */
   $effect(() => {
-    if (!menuOpen) return;
-    queueMicrotask(() => menu?.querySelector('[role="menuitem"]')?.focus());
-
-    function onPointerDown(event) {
-      if (!menu?.contains(event.target) && !menuButton?.contains(event.target)) menuOpen = false;
-    }
-
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
+    const request = playlistRequest.action;
+    if (!request || !pl || pl.id !== playlistRequest.id || route.id !== pl.id) return;
+    untrack(() => {
+      playlistRequest.id = null;
+      playlistRequest.action = null;
+      if (request === "rename") startRename();
+      else if (request === "cleanup" && editable && tracks.length) cleanupId = pl.id;
+      else if (request === "delete") requestDelete();
+    });
   });
 
   // Recommendation tracks live in the session cache. A different playlist or
@@ -737,87 +726,8 @@
     playQueue(queue, automaticStartIndex, { automaticStart: true }).catch(() => {});
   }
 
-  /**
-   * Closes the menu. The button gets its focus back only when the menu was
-   * holding it: the copy confirmation's timer fires while the pointer may be
-   * anywhere by then, and a close that fires behind the user's back must not
-   * pull the caret out of whatever they moved to.
-   */
-  function closeMenu(returnFocus = false) {
-    const menuHadFocus = !!menu?.contains(document.activeElement);
-    const started = identity;
-    menuOpen = false;
-    if (returnFocus && menuHadFocus) queueMicrotask(() => {
-      if (started === identity) menuButton?.focus();
-    });
-  }
-
-  function toggleMenu() {
-    if (menuOpen) {
-      closeMenu(true);
-      return;
-    }
-    /* A copy still counting down must not close the menu that replaces it. */
-    clearTimeout(copyTimer);
-    copyState = "idle";
-    menuOpen = true;
-  }
-
-  /**
-   * Sharing is not editing, so this is the one item every playlist gets,
-   * ours and everybody else's alike — and the reason a playlist the user does
-   * not own has an actions button at all. The link is the page's own id, which
-   * is also the thing our search resolves back to here.
-   *
-   * The menu STAYS OPEN on copy, because the confirmation is on the item
-   * itself and dismissing it would take the only feedback with it. A copy that
-   * landed closes it shortly after, through the same close the keyboard paths
-   * use, so the button gets its focus back. A refused write stays up and says
-   * so: the label that never changes is the dead control the confirmation
-   * exists to prevent, and the item is also the retry.
-   */
-  async function copyLink() {
-    const id = pl?.id;
-    const link = spotifyLink("playlist", id);
-    if (!link || route.id !== id) return;
-    const started = identity;
-    const copied = await writeClipboard(link);
-    if (started !== identity || route.id !== id) return;
-    copyState = copied ? "copied" : "failed";
-    clearTimeout(copyTimer);
-    if (copied) copyTimer = setTimeout(() => {
-      if (started === identity && route.id === id) closeMenu(true);
-    }, 900);
-  }
-
-  function onMenuKeyDown(event) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeMenu(true);
-      return;
-    }
-    if (event.key === "Tab") {
-      closeMenu();
-      return;
-    }
-    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-    event.preventDefault();
-    const items = [...menu.querySelectorAll('[role="menuitem"]:not(:disabled)')];
-    const current = items.indexOf(document.activeElement);
-    const next =
-      event.key === "Home"
-        ? 0
-        : event.key === "End"
-          ? items.length - 1
-          : event.key === "ArrowDown"
-            ? (current + 1) % items.length
-            : (current - 1 + items.length) % items.length;
-    items[next]?.focus();
-  }
-
   function startRename() {
     if (!editable || pl?.id !== route.id) return;
-    closeMenu();
     renameId = pl.id;
     nameDraft = pl.name ?? "";
     renameError = "";
@@ -865,7 +775,6 @@
   function requestDelete() {
     cleanupId = null;
     if (!editable || pl?.id !== route.id) return;
-    closeMenu();
     deleteId = pl.id;
     deleteError = "";
     deleteOpen = true;
@@ -914,8 +823,8 @@
       <p class="h">This playlist could not be loaded.</p>
       <p class="why">{detail.error}</p>
       <div class="actions">
-        <button class="btn-ghost" onclick={retryDetail}>Try again</button>
-        <button class="btn-ghost" onclick={() => navigate("library")}>Back to your library</button>
+        <button class="pill" onclick={retryDetail}>Try again</button>
+        <button class="link-more" onclick={() => navigate("library")}>Back to your library</button>
       </div>
     </div>
   {:else if !pl}
@@ -929,7 +838,7 @@
         <span class="skeleton line sm" style="width:200px"></span>
         <div class="actions">
           <span class="skeleton" style="width:48px;height:48px;border-radius:var(--rf)"></span>
-          <span class="skeleton" style="width:104px;height:32px;border-radius:var(--r2)"></span>
+          <span class="skeleton" style="width:40px;height:40px;border-radius:var(--rf)"></span>
         </div>
       </div>
     </header>
@@ -972,8 +881,8 @@
               commitRename();
             }}
           >
+            <span class="field lg">
             <input
-              class="rename"
               bind:this={renameInput}
               bind:value={nameDraft}
               aria-label="Playlist name"
@@ -988,11 +897,12 @@
               }}
               spellcheck="false"
             />
+            </span>
             <div class="rename-controls">
-              <button class="btn-accent" type="submit" disabled={renameSaving}>
+              <button class="pill accent" type="submit" disabled={renameSaving}>
                 {renameSaving ? "Saving…" : "Save"}
               </button>
-              <button class="btn-ghost" type="button" disabled={renameSaving} onclick={cancelRename}>Cancel</button>
+              <button class="pill" type="button" disabled={renameSaving} onclick={cancelRename}>Cancel</button>
             </div>
             {#if renameError}<p class="inline-error" role="alert">{renameError}</p>{/if}
           </form>
@@ -1000,13 +910,13 @@
           <h1 class="detail-title">{pl.name}</h1>
         {/if}
         <p class="detail-meta">
-          <button class="who link-more" onclick={() => navigate("profile", pl.owner_id || pl.owner)}>{pl.owner}</button>
+          <button class="who" title="Open {pl.owner}'s profile" onclick={() => navigate("profile", pl.owner_id || pl.owner)}>{pl.owner}</button>
           <span class="sep">/</span><span class="num">{tracks.length} songs</span>
           {#if tracks.length}
             <span class="sep">/</span><span class="num">{formatTotal(tracks)}</span>
           {/if}
         </p>
-        <div class="actions">
+        <div class="actions" bind:this={headerActions}>
           <button
             class="play-lg"
             title={playingThis ? (playback.playing ? "Pause" : "Resume") : "Play"}
@@ -1015,58 +925,21 @@
           >
             <Icon name={playingThis && playback.playing ? "pause" : "play"} size={22} />
           </button>
-          <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
-            <Icon name="shuffle" size={14} />Shuffle
+          <button class="btn-round lg" title="Shuffle" aria-label="Shuffle" onclick={shufflePlay} disabled={!tracks.length}>
+            <Icon name="shuffle" size={20} />
           </button>
-          <div class="playlist-menu-wrap">
-            <button
-              class="btn-icon"
-              bind:this={menuButton}
-              aria-label="Playlist actions"
-              aria-haspopup="menu"
-              aria-expanded={menuOpen}
-              aria-controls="playlist-actions-menu"
-              title="Playlist actions"
-              onclick={toggleMenu}
-            >
-              <Icon name="more" size={18} />
-            </button>
-            {#if menuOpen}
-              <div
-                id="playlist-actions-menu"
-                class="menu playlist-actions-menu glass-overlay"
-                role="menu"
-                tabindex="-1"
-                bind:this={menu}
-                onkeydown={onMenuKeyDown}
-              >
-                {#if library.some((entry) => entry.id === pl.id)}
-                  <button class="menu-item" role="menuitem" onclick={() => { togglePin(pl.id); closeMenu(true); }}>{isPinned(pl.id) ? "Unpin from sidebar" : "Pin to sidebar"}</button>
-                {/if}
-                {#if editable}
-                  <button class="menu-item" role="menuitem" onclick={startRename}>Rename playlist</button>
-                  <button class="menu-item" role="menuitem" disabled={!tracks.length} onclick={() => { closeMenu(); cleanupId = pl.id; }}>Remove songs by rules…</button>
-                {/if}
-                <!-- The confirmation lives on the item, which is why the menu
-                     does not close on click: a copy with no feedback is
-                     indistinguishable from a dead control. Sharing does not
-                     require playlist ownership. -->
-                <button
-                  class="menu-item"
-                  role="menuitem"
-                  class:done={copyState === "copied"}
-                  class:failed={copyState === "failed"}
-                  onclick={copyLink}
-                >
-                  {copyState === "copied" ? "Link copied" : copyState === "failed" ? "Copy failed" : "Copy link"}
-                </button>
-                {#if editable}
-                  <div class="menu-sep" role="separator"></div>
-                  <button class="menu-item danger" role="menuitem" onclick={requestDelete}>Delete playlist…</button>
-                {/if}
-              </div>
-            {/if}
-          </div>
+          <HeaderMenu label="Playlist actions">
+            {#snippet children(close)}
+              <PlaylistActions
+                playlist={pl}
+                trackCount={tracks.length}
+                {close}
+                onRename={startRename}
+                onCleanup={() => (cleanupId = pl.id)}
+                onDelete={requestDelete}
+              />
+            {/snippet}
+          </HeaderMenu>
         </div>
         {#if automaticStartBlocked}
           <!-- Calm by design: grey type under the controls, not a red banner.
@@ -1169,14 +1042,6 @@
 {/if}
 {#if cleanupId && cleanupId === pl?.id && route.name === "playlist" && route.id === cleanupId && editable}
   {#key cleanupId}
-    <PlaylistCleanup playlist={pl} onClose={() => { cleanupId = null; queueMicrotask(() => menuButton?.focus()); }} />
+    <PlaylistCleanup playlist={pl} onClose={() => { cleanupId = null; queueMicrotask(() => headerActions?.querySelector('[aria-haspopup="menu"]')?.focus()); }} />
   {/key}
 {/if}
-
-<style>
-  /* A copy that landed: the same label-and-colour pairing the row menu uses,
-     and the one colour this app has for a thing you just did. A refused write
-     takes the failure colour, so the two are never read as the same event. */
-  .menu-item.done { color: var(--accent); }
-  .menu-item.failed { color: var(--love); }
-</style>

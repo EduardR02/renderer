@@ -619,6 +619,8 @@ const playback = {
   auth_url: "",
   playing: true,
   preview: false,
+  output_device_id: "",
+  output_device_name: "",
   username: "eduard",
   position_ms: 45000,
   duration_ms: fixtures.playlistDetail.tracks[0].duration_ms,
@@ -807,9 +809,18 @@ function trackCreditsPayload(id) {
 
 const personalStatus = {
   client_id: "00000000000000000000000000000000", connected: true, account_id: "eduard",
-  devices_enabled: false, devices_authorized: true, authorization_pending: false, error: null,
+  devices_authorized: true, authorization_pending: false, error: null,
 };
-const personalSaved = new Set(["spotify:track:t0", "spotify:artist:ar1"]);
+const outputDevices = [
+  { id: "remote-1", name: "Living room speaker", type: "Speaker", is_active: true,
+    is_restricted: false, is_private_session: false, volume_percent: 65, supports_volume: true },
+  { id: "remote-2", name: "Kitchen display", type: "Computer", is_active: false,
+    is_restricted: false, is_private_session: false, volume_percent: 30, supports_volume: true },
+];
+let outputFailure = "";
+/* Follows the fixture account holds. Likes are the membership index's
+   "liked" container, as they are in the shell. */
+const personalFollows = new Set(["spotify:artist:ar1"]);
 
 window.__fixtures = fixtures;
 /** How long `get_cover` pretends the network takes. See the command below. */
@@ -821,6 +832,11 @@ let coverDelayMs = 0;
  */
 const mock = {
   invoke: async (cmd, args = {}) => {
+    if (playback.output_device_id && ["set_playback_speed", "preview_track_edit", "restore_preview"].includes(cmd)) {
+      const error = "Playback speed and track-editor previews require This computer; Spotify devices play original audio";
+      emit("playback-action-error", error);
+      throw new Error(error);
+    }
     switch (cmd) {
       case "plugin:event|listen": {
         const handlerId = args.handler ?? args.handlerId;
@@ -869,31 +885,52 @@ const mock = {
         emit("personal-api-changed", clone(personalStatus));
         return { url: "https://accounts.spotify.com/authorize?fixture=1" };
       case "personal_api_disconnect":
+        playback.output_device_id = "";
+        playback.output_device_name = "";
+        playback.playing = false;
+        emitState();
         personalStatus.connected = false;
         personalStatus.authorization_pending = false;
         emit("personal-api-changed", clone(personalStatus));
         return clone(personalStatus);
-      case "personal_api_set_devices_enabled":
-        personalStatus.devices_enabled = !!args.enabled;
-        emit("personal-api-changed", clone(personalStatus));
-        return clone(personalStatus);
       case "personal_api_contains":
-        return args.uris.map((uri) => personalSaved.has(uri));
-      case "personal_api_set_saved":
+        return args.uris.map((uri) => personalFollows.has(uri));
+      case "personal_api_set_saved": {
+        let liked = false;
         for (const uri of args.uris) {
-          if (args.saved) personalSaved.add(uri);
-          else personalSaved.delete(uri);
+          if (uri.startsWith("spotify:track:")) {
+            // As the shell does: a landed like goes straight into the index.
+            const id = uri.slice("spotify:track:".length);
+            const set = memberships.get(id) ?? new Set();
+            if (args.saved) set.add("liked");
+            else set.delete("liked");
+            memberships.set(id, set);
+            liked = true;
+          } else if (args.saved) personalFollows.add(uri);
+          else personalFollows.delete(uri);
         }
+        if (liked) emit("memberships_changed", { saved_tracks: true });
         return null;
+      }
       case "personal_api_devices":
-        return [
-          { id: "remote-1", name: "Living room speaker", type: "Speaker", is_active: true,
-            is_restricted: false, is_private_session: false, volume_percent: 65, supports_volume: true },
-          { id: "remote-2", name: "Kitchen display", type: "Computer", is_active: false,
-            is_restricted: false, is_private_session: false, volume_percent: 30, supports_volume: true },
-        ];
-      case "personal_api_transfer":
+        return clone(outputDevices);
+      case "select_output": {
+        const device = args.deviceId ? outputDevices.find((device) => device.id === args.deviceId) : null;
+        if (args.deviceId && (!device || device.is_restricted || !personalStatus.devices_authorized)) {
+          throw new Error("Spotify device is unavailable or unauthorized");
+        }
+        if (outputFailure) {
+          emit("playback-action-error", outputFailure);
+          throw new Error(outputFailure);
+        }
+        playback.output_device_id = device?.id ?? "";
+        playback.output_device_name = device?.name ?? "";
+        if (!device) playback.playing = false;
+        playback.playback_speed = 1;
+        playback.audible_playback_speed = 1;
+        emitState();
         return null;
+      }
       case "personal_api_saved_shows": {
         const offset = Number(args.offset ?? 0);
         const items = offset === 0 ? [{ added_at: "2026-09-20", show: {
@@ -1261,6 +1298,7 @@ window.__harness = {
   unlisten: unregisterListener,
   emit,
   invoke: (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args),
+  setOutputFailure: (error = "") => { outputFailure = String(error); },
   setPersonalStatus: (changes) => {
     Object.assign(personalStatus, changes);
     emit("personal-api-changed", clone(personalStatus));

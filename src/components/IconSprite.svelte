@@ -62,4 +62,20 @@
      1.8 stroke as every other small outline glyph, so it holds its shape at
      the 13px it renders at instead of going mushy. -->
 <symbol id="i-skipped" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M6.1 6.1 17.9 17.9"/></symbol>
+<!-- Added with the round-button tier. Same 1.8 stroke and round joins as the
+     outline set above, drawn to hold at 16-20px in a 32-40px circle. -->
+<symbol id="i-queue-add" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3.8 6.8h11M3.8 11.8h8M3.8 16.8h5.5"/><path d="M17.6 11.6v8M13.6 15.6h8"/></symbol>
+<symbol id="i-playlist-add" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.4" y="7.4" width="13.2" height="13.2" rx="2.6"/><path d="M7.6 3.6h9.8a3 3 0 0 1 3 3v9.8"/><path d="M10 10.8v6M7 13.8h6"/></symbol>
+<symbol id="i-devices" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.4" y="3.4" width="11.2" height="17.2" rx="2.4"/><circle cx="9" cy="14.2" r="2.7"/><circle cx="9" cy="7.7" r=".6" fill="currentColor"/><rect x="17.4" y="8.2" width="3.6" height="12.4" rx="1.3"/></symbol>
+<symbol id="i-speaker" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="5.6" y="2.8" width="12.8" height="18.4" rx="2.6"/><circle cx="12" cy="14.4" r="3.3"/><circle cx="12" cy="7.4" r=".6" fill="currentColor"/></symbol>
+<symbol id="i-computer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.4" width="18" height="12.2" rx="2"/><path d="M8.6 20.2h6.8M12 16.6v3.6"/></symbol>
+<symbol id="i-phone" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6.6" y="2.6" width="10.8" height="18.8" rx="2.6"/><path d="M11 17.8h2"/></symbol>
+<!-- The pin is FILLED: it is drawn at 11px beside a playlist name, where an
+     outline pushpin is two strokes of mush. -->
+<symbol id="i-pin" viewBox="0 0 24 24" fill="currentColor"><path d="M8.4 2.8h7.2l-1.1 5.7 3.6 3.6v2H5.9v-2l3.6-3.6-1.1-5.7Z"/><rect x="11.1" y="13.4" width="1.8" height="8" rx=".9"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.4 12s3.6-6.6 9.6-6.6 9.6 6.6 9.6 6.6-3.6 6.6-9.6 6.6S2.4 12 2.4 12Z"/><circle cx="12" cy="12" r="2.9"/></symbol>
+<symbol id="i-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 5.7c.7-.2 1.4-.3 2.1-.3 6 0 9.6 6.6 9.6 6.6a17 17 0 0 1-2.6 3.4M6.4 7.3C3.9 9 2.4 12 2.4 12s3.6 6.6 9.6 6.6c1.8 0 3.3-.6 4.6-1.4"/><path d="M9.9 9.9a2.9 2.9 0 0 0 4.2 4.2"/><path d="m3.6 3.6 16.8 16.8"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8.4" y="8.4" width="12.2" height="12.2" rx="2.4"/><path d="M15.6 5.2A2 2 0 0 0 13.6 3.4H5.4a2 2 0 0 0-2 2v8.2a2 2 0 0 0 1.8 2"/></symbol>
+<symbol id="i-sort" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.8 6.4h10M3.8 11.8h7M3.8 17.2h4.4"/><path d="M18 5v14m-3.2-3.2L18 19l3.2-3.2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19.6 12.4a7.6 7.6 0 1 1-2.3-5.8"/><path d="M19.8 3.6v4.8H15"/></symbol>
 </defs></svg>

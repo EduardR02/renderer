@@ -169,7 +169,7 @@
           {#if artistLine}<p>{artistLine}</p>{/if}
         </div>
       </div>
-      <button class="btn-icon" aria-label="Close credits" title="Close" onclick={close}>
+      <button class="btn-round" aria-label="Close credits" title="Close" onclick={close}>
         <Icon name="x" size={16} />
       </button>
     </header>
@@ -184,7 +184,7 @@
           {groups.length === 1 ? "role" : "roles"}
         </p>
         {#if filterable}
-          <label class="credits-filter">
+          <label class="field credits-filter">
             <Icon name="search" size={13} />
             <input
               type="text"
@@ -193,7 +193,7 @@
               aria-label="Filter credits"
             />
             {#if query}
-              <button class="credits-filter-clear" aria-label="Clear filter" onclick={() => (query = "")}>
+              <button class="field-btn" title="Clear filter" aria-label="Clear filter" onclick={() => (query = "")}>
                 <Icon name="x" size={12} />
               </button>
             {/if}
@@ -274,7 +274,7 @@
       {:else if source}
         <span class="credit-source">{source}</span>
       {/if}
-      <button class="btn-ghost" onclick={close}>Close</button>
+      <button class="pill" onclick={close}>Close</button>
     </footer>
   </div>
 </dialog>

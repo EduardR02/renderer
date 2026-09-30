@@ -7,7 +7,6 @@
     playback,
     togglePlay,
     library,
-    libraryChanges,
     promotePlaylist,
     openCredits,
     ui,
@@ -16,8 +15,7 @@
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
-  import PersonalSave from "./PersonalSave.svelte";
-  import { personal, personalApi, personalConnected, watchPersonal } from "../lib/personal.svelte.js";
+  import { personalConnected, watchPersonal, setLiked } from "../lib/personal.svelte.js";
   import { formatTime } from "../lib/time.js";
   import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { observeStuck } from "../lib/sticky.js";
@@ -336,7 +334,7 @@
     open: false, x: 0, top: null, bottom: null, maxH: 0,
     track: null, index: -1, copyState: "idle", generation: 0,
     editDefined: false, editEnabled: false, editLoading: false, editError: "",
-    skipPending: false, skipError: "", anchor: null,
+    skipPending: false, skipError: "", anchor: null, liked: null, likeBusy: false,
   });
   let menuEl = $state(null);
   const picker = $state({ open: false, x: 0, top: null, bottom: null, maxH: 0, track: null });
@@ -497,10 +495,24 @@
     menu.skipPending = false;
     menu.skipError = "";
     menu.editError = "";
+    menu.liked = null;
+    menu.likeBusy = false;
     picker.open = false;
     artistPicker.open = false;
     menu.editDefined = false;
     menu.editEnabled = false;
+    /* Liked Songs is answered by the shell's membership index — in memory,
+       one IPC round trip, no network — so the item is drawn in its final
+       place at once and its heart fills a frame later at most. */
+    if (personalConnected() && track?.uri?.startsWith("spotify:track:")) {
+      api.getTrackPlaylists(track.uri)
+        .then((refs) => {
+          if (menuTargetCurrent(generation, sourcePlaylist, track, i)) {
+            menu.liked = (refs ?? []).some((ref) => ref.id === "liked");
+          }
+        })
+        .catch(() => {});
+    }
     menu.editLoading = !!sourcePlaylist && track?.uri?.startsWith("spotify:track:");
     if (menu.editLoading && track?.id) {
       api.getTrackEdit(track.id, sourcePlaylist)
@@ -518,6 +530,24 @@
             menu.editLoading = false;
           }
         });
+    }
+  }
+
+  /** Likes or unlikes the menu's track; the menu stays open on the answer,
+      so the heart it just changed is the confirmation. */
+  async function toggleLiked() {
+    const track = menu.track;
+    const liked = menu.liked;
+    if (!track?.uri || liked === null || menu.likeBusy) return;
+    const generation = menu.generation;
+    menu.likeBusy = true;
+    try {
+      await setLiked([track.uri], !liked);
+      if (menu.open && menu.generation === generation) menu.liked = !liked;
+    } catch (reason) {
+      ui.error = `Could not ${liked ? "remove from" : "save to"} Liked Songs. ${reason instanceof Error ? reason.message : String(reason ?? "")}`.trim();
+    } finally {
+      if (menu.generation === generation) menu.likeBusy = false;
     }
   }
 
@@ -723,42 +753,7 @@
 
   const visible = $derived(disableWindowing ? tracks : tracks.slice(firstRow, lastRow));
 
-  /* One observer warms only painted rows, including short embedded lists.
-     Opening overflow never waits for a request or guesses membership. */
-  const membershipRows = new Map();
-  let membershipObserver = null;
-  function observeMembership(node, uri) {
-    membershipRows.set(node, uri);
-    membershipObserver?.observe(node);
-    return {
-      update(nextUri) {
-        membershipRows.set(node, nextUri);
-        membershipObserver?.unobserve(node);
-        membershipObserver?.observe(node);
-      },
-      destroy() {
-        membershipObserver?.unobserve(node);
-        membershipRows.delete(node);
-      },
-    };
-  }
   $effect(() => watchPersonal());
-  $effect(() => {
-    const root = rootEl;
-    const ready = personalConnected();
-    const revision = personal.membershipRevision;
-    const libraryRevision = libraryChanges.savedTracks;
-    if (!root || !ready) return;
-    const observer = new IntersectionObserver((entries) => {
-      const uris = entries.filter((entry) => entry.isIntersecting)
-        .map((entry) => membershipRows.get(entry.target))
-        .filter((uri) => uri?.startsWith("spotify:track:"));
-      if (uris.length) personalApi.warmMemberships(uris).catch(() => {});
-    }, { root: root.closest(".scroll") });
-    membershipObserver = observer;
-    for (const node of membershipRows.keys()) observer.observe(node);
-    return () => { observer.disconnect(); membershipObserver = null; };
-  });
 
 
   function measure(scroller) {
@@ -912,7 +907,6 @@
       class:skipped={rowSkipped(track)}
       class:drag-source={rowIsSource(i)}
       data-i={i}
-      use:observeMembership={track.uri}
       style:transform={rowDragTransform(i)}
       role="button"
       aria-disabled={track.unavailable ? "true" : undefined}
@@ -1143,8 +1137,21 @@
     {#if allowAddToPlaylist && menu.track?.uri?.startsWith("spotify:track:")}
       <button class="menu-item" onclick={openPicker}>Add to playlist…</button>
     {/if}
-    {#if menu.track?.uri?.startsWith("spotify:track:")}
-      <PersonalSave uri={menu.track.uri} menu savedLabel="Remove from Liked Songs" unsavedLabel="Add to Liked Songs" onSaved={() => closeMenus(true)} />
+    {#if personalConnected() && menu.track?.uri?.startsWith("spotify:track:")}
+      <!-- One label whatever the state; the heart says which. Until the index
+           has answered it is pending — drawn, in place, and inert. -->
+      <button
+        class="menu-item"
+        role="menuitemcheckbox"
+        aria-checked={menu.liked === true}
+        aria-busy={menu.liked === null || menu.likeBusy}
+        disabled={menu.liked === null || menu.likeBusy}
+        title={menu.liked ? "Remove from Liked Songs" : "Save to Liked Songs"}
+        onclick={toggleLiked}
+      >
+        Liked Songs
+        <span class="mark" class:on={menu.liked === true}><Icon name={menu.liked ? "heart-f" : "heart"} size={15} /></span>
+      </button>
     {/if}
     {#if menuLink}
       <!-- The confirmation lives on the item, which is why the menu does not

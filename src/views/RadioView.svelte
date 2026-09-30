@@ -6,6 +6,7 @@
     api,
     insertPlaylist,
     navigate,
+    navigateArtist,
     promotePlaylist,
     retryDetail,
     route,
@@ -14,6 +15,7 @@
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
+  import HeaderMenu from "../components/HeaderMenu.svelte";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { detailArtSize } from "../lib/layout.js";
   import { formatTotal } from "../lib/time.js";
@@ -50,6 +52,10 @@
     artistRadio ? seedArtist?.name || seed?.name || "" : seed?.album_name || seed?.name || "",
   );
   const tone = $derived(coverTone(officialCover || fallbackCover, coverId || "radio"));
+  /* Where the "…" can take you: the record the radio grew from. */
+  const seedArtistId = $derived(artistRadio ? seedArtist?.id || "" : seed?.artist_ids?.[0] || seed?.artist_id || "");
+  const seedArtistName = $derived(artistRadio ? seedArtist?.name || "" : seed?.artist_names?.[0] || "");
+  const seedAlbumId = $derived(artistRadio ? "" : seed?.album_id || "");
   const artSize = $derived(detailArtSize(ui.paneWidth));
 
   const playingThis = $derived.by(() => {
@@ -148,7 +154,7 @@
       <p class="h">This {artistRadio ? "artist" : "song"} radio could not be loaded.</p>
       <p class="why">{detail.error}</p>
       <div class="actions">
-        <button class="btn-ghost" onclick={retryDetail}>Try again</button>
+        <button class="pill" onclick={retryDetail}>Try again</button>
       </div>
     </div>
   {:else if !radio}
@@ -203,12 +209,31 @@
           >
             <Icon name={playingThis && playback.playing ? "pause" : "play"} size={22} />
           </button>
-          <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
-            <Icon name="shuffle" size={14} />Shuffle
+          <button class="btn-round lg" title="Shuffle" aria-label="Shuffle" onclick={shufflePlay} disabled={!tracks.length}>
+            <Icon name="shuffle" size={20} />
           </button>
-          <button class="btn-ghost" onclick={saveAsPlaylist} disabled={!tracks.length || saveState.busy}>
-            {saveState.busy ? "Saving…" : saveState.playlistId ? "Retry save" : "Save as playlist"}
+          <button
+            class="btn-round lg"
+            title={saveState.busy ? "Saving…" : saveState.playlistId ? "Retry saving as a playlist" : "Save as playlist"}
+            aria-label={saveState.playlistId ? "Retry saving as a playlist" : "Save as playlist"}
+            aria-busy={saveState.busy}
+            onclick={saveAsPlaylist}
+            disabled={!tracks.length || saveState.busy}
+          >
+            <Icon name="playlist-add" size={20} />
           </button>
+          {#if seedArtistId || seedAlbumId}
+            <HeaderMenu label="Radio actions">
+              {#snippet children(close)}
+                {#if seedAlbumId}
+                  <button class="menu-item" role="menuitem" onclick={() => { close(); navigate("album", seedAlbumId); }}>Go to album</button>
+                {/if}
+                {#if seedArtistId}
+                  <button class="menu-item" role="menuitem" onclick={() => { close(); navigateArtist(seedArtistId, seedArtistName); }}>Go to artist</button>
+                {/if}
+              {/snippet}
+            </HeaderMenu>
+          {/if}
         </div>
         {#if saveState.error}
           <p class="inline-error" role="alert">{saveState.error}</p>

@@ -220,6 +220,18 @@ export function setNowPlayingOpen(open) {
 /** Live preference bits used by mounted surfaces without polling Settings. */
 export const appSettings = $state({ animated_canvas: true });
 
+/**
+ * The name the sticky top bar shows for a page that loads its own record —
+ * a show, an episode, a profile — rather than going through `detail`. The
+ * view writes it against its route; the bar shows it only while that route
+ * is the one on screen, so a stale name can never label another page.
+ */
+export const pageTitle = $state({ route: "", text: "" });
+export function setPageTitle(text) {
+  pageTitle.route = `${route.name}\u0000${route.id ?? ""}`;
+  pageTitle.text = text ?? "";
+}
+
 const trackEditor = $state({ tracks: {} });
 const trackEditorKeys = [];
 
@@ -293,6 +305,8 @@ export const playback = $state({
   auth_url: null,
   playing: false,
   buffering: false,
+  output_device_id: "",
+  output_device_name: "",
   username: null,
   position_ms: 0,
   duration_ms: 0,
@@ -1800,12 +1814,15 @@ export function setLibrary(playlists, { fresh = false } = {}) {
  * their contents sit. A folder moves with its most recent remaining child;
  * explicitly pinned playlists are lifted out once, never duplicated inside.
  * Filtering is a flat, activity-ordered result set rather than orphaned folder
- * headings or indentation with no parent.
+ * headings or indentation with no parent. A collapsed folder keeps its heading
+ * (with the number of playlists it holds) and hides what is under it; a
+ * filter looks inside collapsed folders too.
  */
-export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "") {
+export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "", collapsedIds = []) {
   const byId = new Map(playlists.map((playlist) => [playlist.id, playlist]));
   const rank = new Map(playlists.map((playlist, index) => [playlist.id, index]));
   const pinned = new Set(pinnedIds);
+  const collapsed = new Set(collapsedIds);
   const seen = new Set();
   const pinnedRows = [];
   const query = filter.trim().toLocaleLowerCase();
@@ -1853,11 +1870,17 @@ export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "")
   roots.sort((left, right) => left.rank === right.rank ? 0 : left.rank - right.rank);
   pinnedRows.sort((left, right) => left.rank === right.rank ? 0 : left.rank - right.rank);
   const entries = pinnedRows.map(({ playlist }) => ({ kind: "playlist", playlist, depth: 0 }));
+  const countOf = (rows) => rows.reduce((sum, row) => sum + (row.kind === "folder" ? countOf(row.children) : 1), 0);
   function flatten(rows, depth) {
     for (const row of rows) {
       if (row.kind === "folder") {
-        if (!query) entries.push({ kind: "folder", id: row.id, name: row.name, depth });
-        flatten(row.children, query ? 0 : depth + 1);
+        if (query) {
+          flatten(row.children, 0);
+          continue;
+        }
+        const shut = collapsed.has(row.id);
+        entries.push({ kind: "folder", id: row.id, name: row.name, depth, collapsed: shut, count: countOf(row.children) });
+        if (!shut) flatten(row.children, depth + 1);
       } else {
         entries.push({ kind: "playlist", playlist: row.playlist, depth });
       }
@@ -2042,17 +2065,30 @@ function invalidateLikedFirstPage() {
 
 export const libraryChanges = $state({ savedTracks: 0 });
 
-/** Invalidate only the collections changed by a confirmed personal API write. */
-export function personalLibraryChanged(uris) {
-  if (uris.some((uri) => uri.startsWith("spotify:track:"))) {
-    invalidateLikedFirstPage();
-    libraryChanges.savedTracks++;
-  }
-  if (uris.some((uri) => uri.startsWith("spotify:artist:"))) {
-    followedGeneration++;
-    followed.loaded = false;
-    followed.loading = false;
-    followed.error = "";
+/**
+ * The shell's membership index says Liked Songs changed — a like made here
+ * (the personal app's write lands in the index at once), in another client, or
+ * a change of account. The cached first page is stale, and whatever shows the
+ * collection reloads on the revision.
+ */
+export function savedTracksChanged() {
+  invalidateLikedFirstPage();
+  libraryChanges.savedTracks++;
+}
+
+/**
+ * A follow or unfollow that landed, applied to the followed list in place:
+ * that list is the local answer to "do I follow this artist", for the rail
+ * and the artist page alike, so re-reading all of it would only be a network
+ * round trip for what we already know. A list never asked for stays unasked.
+ */
+export function artistFollowChanged(artist, following) {
+  if (!followed.loaded || !artist?.id) return;
+  const present = followed.artists.some((entry) => entry.id === artist.id);
+  if (following && !present) {
+    followed.artists = [{ id: artist.id, name: artist.name ?? "", cover_url: artist.cover_url ?? "" }, ...followed.artists];
+  } else if (!following && present) {
+    followed.artists = followed.artists.filter((entry) => entry.id !== artist.id);
   }
 }
 
@@ -2232,6 +2268,13 @@ function requestVolume(percent) {
 
 
 export const api = {
+  selectOutput: (deviceId = null) => {
+    clearLazyQueue();
+    return invoke("select_output", { deviceId }).catch((error) => {
+      ui.error = String(error);
+      throw error;
+    });
+  },
   play: () => requestPlaying(true),
   pause: () => requestPlaying(false),
   next: async () => {
@@ -2662,6 +2705,7 @@ export async function initEvents() {
       else if ("volume" in e.payload) volumeEvents += 1;
       applyPlayback(e.payload);
     }],
+    ["playback-action-error", (e) => { ui.error = String(e.payload); }],
     // Heartbeats carry only the projected compiled position as a scalar; the
     // full state event remains authoritative for duration and queue metadata.
     [
@@ -2682,9 +2726,7 @@ export async function initEvents() {
     // Owned-playlist index updates repaint the saved check but cannot change
     // personal Liked membership or invalidate its cached first page.
     ["memberships_changed", (e) => {
-      if (!e.payload?.saved_tracks) return;
-      invalidateLikedFirstPage();
-      libraryChanges.savedTracks++;
+      if (e.payload?.saved_tracks) savedTracksChanged();
     }],
     // Disk hydration is useful for the sidebar and detail routes, but must
     // never promote Home past its fresh-rootlist loading frame. If a cache

@@ -13,12 +13,11 @@
     lookupSavedIn,
   } from "../lib/state.svelte.js";
   import { library, session } from "../lib/state.svelte.js";
-  import { personal, personalApi, personalConnected, personalSaved, watchPersonal } from "../lib/personal.svelte.js";
+  import { personalConnected, watchPersonal, setLiked } from "../lib/personal.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
   import Slider from "./Slider.svelte";
-  import PersonalSave from "./PersonalSave.svelte";
   import DevicePicker from "./DevicePicker.svelte";
   import { formatTime } from "../lib/time.js";
   import { morphLayout } from "../lib/layout.js";
@@ -287,39 +286,42 @@
     });
   });
   $effect(() => watchPersonal());
+  /* Every change to the index — a like here or elsewhere, a playlist edit —
+     re-reads the mark, so it never waits for the next track change. */
   $effect(() => {
-    const uri = currentUri;
-    const account = session.username;
-    const revision = personal.membershipRevision;
-    if (uri?.startsWith("spotify:track:") && personalConnected()) {
-      untrack(() => personalApi.warmMemberships([uri])).catch(() => {});
-    }
-  });
-  $effect(() => {
-    const event = listen("memberships_changed", () => {
-      lookupSavedIn(currentUri);
-      if (currentUri?.startsWith("spotify:track:") && personalConnected()) {
-        personalApi.warmMemberships([currentUri]).catch(() => {});
-      }
-    });
+    const event = listen("memberships_changed", () => lookupSavedIn(currentUri));
     return () => event.then((off) => off()).catch(() => {});
   });
 
+  /* Saved ANYWHERE — Liked Songs or a playlist of your own — is the check;
+     saved nowhere is the heart outline. Both answered by the shell's index. */
   const savedRefs = $derived.by(() => {
     const owned = new Set(library.filter((item) => item.owner_id === session.username).map((item) => item.id));
-    const liked = personalSaved(currentUri);
-    const refs = nowSaved.refs.filter((ref) => ref.id === "liked" ? liked !== false : owned.has(ref.id));
-    if (liked === true && !refs.some((ref) => ref.id === "liked")) {
-      return [{ id: "liked", name: "Liked Songs" }, ...refs];
-    }
-    return refs;
+    return nowSaved.refs.filter((ref) => ref.id === "liked" || owned.has(ref.id));
   });
+  const inLiked = $derived(savedRefs.some((ref) => ref.id === "liked"));
   const savedLabel = $derived(`Saved in ${savedRefs.map((ref) => ref.name).join(", ")}`);
   let savedMark = $state(null);
-  async function focusSavedMark({ restoreFocus = false } = {}) {
-    if (!restoreFocus) return;
+  let heart = $state(null);
+  let liking = $state(false);
+
+  /** Likes or unlikes the playing track. Focus follows the mark it becomes,
+      so a keyboard like does not drop the caret on the floor. */
+  async function like(saved) {
+    const uri = currentUri;
+    if (!uri || liking || !personalConnected()) return;
+    const hadFocus = document.activeElement === heart || !!savedMark?.parentElement?.contains(document.activeElement);
+    liking = true;
+    try {
+      await setLiked([uri], saved);
+    } catch (reason) {
+      ui.error = `Could not ${saved ? "save to" : "remove from"} Liked Songs. ${reason instanceof Error ? reason.message : String(reason ?? "")}`.trim();
+    } finally {
+      liking = false;
+    }
+    if (!hadFocus || uri !== currentUri) return;
     await tick();
-    savedMark?.focus();
+    (savedRefs.length ? savedMark : heart)?.focus();
   }
 
   function openSaved(id) {
@@ -327,6 +329,8 @@
     else navigate("playlist", id);
   }
 
+
+  const HEART = "M12 20.2l-1.25-1.13C6.2 14.95 3.3 12.3 3.3 9.05 3.3 6.4 5.37 4.35 8 4.35c1.48 0 2.9.69 4 1.8 1.1-1.11 2.52-1.8 4-1.8 2.63 0 4.7 2.05 4.7 4.7 0 3.25-2.9 5.9-7.45 10.03L12 20.2Z";
 
   const pos = $derived(dragPos !== null ? dragPos : positionMs());
   // `track` is the engine's name for repeat-one; anything outside
@@ -475,6 +479,22 @@
   });
 </script>
 
+{#snippet glassHeart()}
+  <!-- Drawn here rather than from the sprite, because its stroke is the
+       glass: light at the top fading down its sides, over a dark hairline
+       that keeps it on the brightest haze, the way a plane's rim does. -->
+  <svg class="glass-heart" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="glass-heart-light" x1="0" y1="0" x2="0" y2="1">
+        <stop class="gh-top" offset="0" />
+        <stop class="gh-foot" offset="1" />
+      </linearGradient>
+    </defs>
+    <path class="gh-edge" d={HEART} />
+    <path class="gh-light" d={HEART} stroke="url(#glass-heart-light)" />
+  </svg>
+{/snippet}
+
 <footer class="player glass-chrome" use:frost>
   <div class="p-body">
     <div class="p-now" class:idle={!current}>
@@ -535,11 +555,36 @@
                     onclick={() => openSaved(ref.id)}
                   >{ref.name}</button>
                 {/each}
+                {#if inLiked && personalConnected()}
+                  <span class="p-saved-sep" aria-hidden="true"></span>
+                  <button class="p-saved-row p-saved-remove" disabled={liking} onclick={() => like(false)}>
+                    Remove from Liked Songs
+                  </button>
+                {/if}
               </span>
             </span>
           </span>
         {:else if current.uri?.startsWith("spotify:track:")}
-          <PersonalSave uri={current.uri} compact onSaved={focusSavedMark} />
+          <!-- Saved nowhere: the heart as an outline of glass, and nothing
+               else — no plate, no ring. It is a state first; with the personal
+               app connected it is also the way to like the song. -->
+          {#if personalConnected()}
+            <button
+              class="p-heart"
+              bind:this={heart}
+              disabled={liking}
+              title="Save to Liked Songs"
+              aria-label="Save to Liked Songs"
+              onclick={() => like(true)}
+            >{@render glassHeart()}</button>
+          {:else}
+            <span
+              class="p-heart inert"
+              role="img"
+              aria-label="Not in Liked Songs"
+              title="Not in Liked Songs. Liking needs your Spotify developer app, in Settings."
+            >{@render glassHeart()}</span>
+          {/if}
         {/if}
         {#if editIndicator}
           <span
@@ -658,7 +703,6 @@
       >
         <div class="speed-head">
           <span class="speed-value">{speedLabel}×</span>
-          <span class="speed-note">pitch preserved</span>
         </div>
         <div class="speed-slider" use:speedWheel>
           <Slider
@@ -689,7 +733,7 @@
       </div>
       <DevicePicker />
       <button
-        class="btn-icon"
+        class="btn-round"
         class:on={ui.nowPlayingOpen}
         title="Now playing details"
         onclick={() => morphLayout(() => setNowPlayingOpen(!ui.nowPlayingOpen))}
@@ -698,7 +742,7 @@
       </button>
       <!-- The first thing a narrow bar lets go of: the rail has Queue too. -->
       <button
-        class="btn-icon p-queue"
+        class="btn-round p-queue"
         class:on={route.name === "queue"}
         title="Queue"
         onclick={() => navigate(route.name === "queue" ? "library" : "queue")}
@@ -707,7 +751,7 @@
       </button>
       <div class="p-volume" bind:this={volumeControl}>
         <button
-          class="btn-icon"
+          class="btn-round"
           class:on={volumePercent === 0}
           title={volumePercent === 0 ? `Unmute (${restoreVolume}%)` : `Mute (${volumePercent}%)`}
           aria-label={volumePercent === 0 ? `Unmute to ${restoreVolume}%` : "Mute"}
@@ -799,7 +843,7 @@
     color: var(--fg-1);
   }
   .speed-slider { display: flex; }
-  .speed-error { margin: var(--s2) 0; color: var(--rose-ink); font-size: var(--t-11); line-height: 1.4; }
+  .speed-error { margin: var(--s2) 0; color: var(--love); font-size: var(--t-11); line-height: 1.4; }
   .p-title-line {
     display: flex;
     align-items: baseline;
@@ -954,6 +998,32 @@
     background: rgba(255, 255, 255, 0.08);
     color: var(--fg);
   }
+  /* The unsaved heart: a 32px target around an 18px glyph, and no surface of
+     its own — the glyph IS the glass. Its light comes up a step under the
+     pointer and warms toward the ink of what is yours. Static at rest. */
+  .p-heart {
+    display: grid; place-items: center; flex: none;
+    width: 32px; height: 32px;
+    --gh-top: rgb(255 255 255 / 0.82);
+    --gh-foot: rgb(255 255 255 / 0.34);
+  }
+  .p-heart.inert { cursor: default; }
+  button.p-heart:hover:not(:disabled), button.p-heart:focus-visible {
+    --gh-top: color-mix(in srgb, var(--rose-ink) 55%, #ffffff);
+    --gh-foot: color-mix(in srgb, var(--rose-ink) 70%, transparent);
+  }
+  button.p-heart:active:not(:disabled) .glass-heart { transform: scale(0.92); }
+  button.p-heart:disabled { opacity: 0.5; }
+  .glass-heart { display: block; overflow: visible; transition: transform var(--d1) var(--ease); }
+  .gh-top { stop-color: var(--gh-top); transition: stop-color var(--d1) var(--ease); }
+  .gh-foot { stop-color: var(--gh-foot); transition: stop-color var(--d1) var(--ease); }
+  .gh-edge { fill: none; stroke: rgb(0 0 0 / 0.32); stroke-width: 3.2; stroke-linejoin: round; }
+  .gh-light { fill: none; stroke-width: 1.7; stroke-linejoin: round; }
+
+  .p-saved-sep { height: 1px; margin: var(--s2) 0 var(--s1); background: rgba(255, 255, 255, 0.08); }
+  .p-saved-row.p-saved-remove { color: var(--fg-2); }
+  .p-saved-row.p-saved-remove:hover { color: var(--fg); }
+
   .p-seek-slider {
     position: relative;
     display: flex;
@@ -999,10 +1069,6 @@
   .speed-value {
     font-size: var(--t-15);
     font-variant-numeric: tabular-nums;
-  }
-  .speed-note {
-    font-size: var(--t-11);
-    color: var(--fg-3);
   }
   /* The presets are menu items laid in a row: the same plate lit under the
      pointer, the same step from --fg-1 to --fg. The current one wears foam. */

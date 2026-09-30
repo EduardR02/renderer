@@ -11,19 +11,37 @@
     api,
     openAuthUrl,
     isLoggedOut,
-    navigate,
   } from "../lib/state.svelte.js";
   import Icon from "../components/Icon.svelte";
+  import Cover from "../components/Cover.svelte";
+  import { openUrl } from "@tauri-apps/plugin-opener";
+  import { avatar, loadAvatar } from "../lib/avatar.svelte.js";
+  import { writeClipboard } from "../lib/spotify-link.js";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import Select from "../components/Select.svelte";
   import { formatBytes } from "../lib/time.js";
   import UpdateControl from "../components/UpdateControl.svelte";
   import {
-    personal, personalConnected, watchPersonal, configurePersonal, authorizePersonal,
-    disconnectPersonal, setDevicesEnabled,
+    personal, personalConnected, personalDevicesAuthorized, watchPersonal, configurePersonal,
+    authorizePersonal, disconnectPersonal,
   } from "../lib/personal.svelte.js";
+
+  /* The redirect the personal app must list, and the one place a person
+     makes that app. Both fixed. */
+  const REDIRECT_URI = "http://127.0.0.1:5589/personal-api/callback";
+  const DASHBOARD = "https://developer.spotify.com/dashboard";
   let clientId = $state("");
   let clientIdVisible = $state(false);
+  const storedClientId = $derived(personal.status?.client_id ?? "");
+  const clientIdDirty = $derived(clientId.trim() !== storedClientId);
+  let uriCopied = $state(false);
+  let uriTimer = 0;
+  $effect(() => () => clearTimeout(uriTimer));
+  async function copyRedirect() {
+    uriCopied = await writeClipboard(REDIRECT_URI);
+    clearTimeout(uriTimer);
+    if (uriCopied) uriTimer = setTimeout(() => (uriCopied = false), 1400);
+  }
   const compact = $derived((ui.paneWidth || 1200) < 560);
   let personalBusy = $state(false);
   let personalError = $state("");
@@ -42,6 +60,7 @@
   }
 
   const username = $derived(playback.username || session.username);
+  $effect(() => { loadAvatar(session.username); });
 
   let clearTarget = $state(null);
   let clearing = $state(false);
@@ -202,7 +221,7 @@
           </div>
           <div class="set-ctl">
             <button
-              class="btn-accent"
+              class="pill accent"
               disabled={!playback.auth_url || session.authPending}
               onclick={openAuthUrl}
             >
@@ -211,17 +230,16 @@
           </div>
         </div>
       {:else}
-        <div class="set-row">
-          <div>
-            <div class="k">{username || "Signed in"}</div>
-            <div class="d">Spotify account</div>
-            <div class="account-links">
-              {#if username}<button class="link-more" onclick={() => navigate("profile", username)}>My profile</button>{/if}
-              <button class="link-more" onclick={() => navigate("podcasts")}>Saved podcasts</button>
+        <div class="set-row account-row">
+          <div class="account-who">
+            <Cover src={avatar.url} id={username || "account"} name={username || "?"} size={40} circle />
+            <div>
+              <div class="k">{username || "Signed in"}</div>
+              <div class="d">Spotify account</div>
             </div>
           </div>
           <div class="set-ctl">
-            <button class="btn-ghost" onclick={() => api.logout().catch(() => {})}>
+            <button class="pill" onclick={() => api.logout().catch(() => {})}>
               <Icon name="logout" size={14} />Log out
             </button>
           </div>
@@ -238,45 +256,96 @@
       {/if}
     </div>
 
+    <!-- What the personal app is FOR, in its name. One sentence, the setup as
+         three short steps while it is not done, then only its state. -->
     <div class="set-group personal-app">
-      <h2>Personal Spotify app</h2>
-      <div class="set-row client-id-row">
-        <form class="client-id-form" onsubmit={(event) => { event.preventDefault(); personalAction(() => configurePersonal(clientId)); }}>
-          <label class="k" for="spotify-client-id">Developer Client ID</label>
-          <div class="d" id="client-id-help">Optional. To enable likes and follows, create an app in Spotify's developer dashboard with this redirect URI: <code>http://127.0.0.1:5589/personal-api/callback</code>. The Client ID is a public app identifier, hidden here for privacy.</div>
-          <input id="spotify-client-id" class="client-id-input" type={clientIdVisible ? "text" : "password"} aria-describedby="client-id-help" bind:value={clientId} placeholder="Client ID" autocomplete="off" spellcheck="false" />
-          {#if personalError || personal.error}<div class="inline-error" role="alert">{personalError || personal.error}</div>{/if}
-          <div class="set-ctl">
-            <button type="button" class="btn-ghost" aria-controls="spotify-client-id" aria-pressed={clientIdVisible} onclick={() => clientIdVisible = !clientIdVisible}>{clientIdVisible ? "Hide Client ID" : "Reveal Client ID"}</button>
-            <button type="submit" class="btn-ghost" disabled={personalBusy || !clientId.trim()}>Save</button>
-          </div>
-        </form>
-      </div>
+      <h2>Likes, follows &amp; devices</h2>
+      <p class="set-intro">
+        Your own free Spotify developer app, for this same account, lets Renderer like songs,
+        follow artists and people, list your saved podcasts and move a Spotify Connect session.
+      </p>
+      {#if !personalConnected()}
+        <ol class="setup">
+          <li>
+            <span class="step">1</span>
+            <span class="step-copy">Create an app in the <button class="link-more inline-link" onclick={() => openUrl(DASHBOARD).catch(() => {})}>Spotify developer dashboard</button>.</span>
+          </li>
+          <li>
+            <span class="step">2</span>
+            <span class="step-copy">
+              Add this redirect URI to it
+              <span class="uri-chip">
+                <code>{REDIRECT_URI}</code>
+                <button class="btn-round uri-copy" class:on={uriCopied} title={uriCopied ? "Copied" : "Copy redirect URI"} aria-label="Copy redirect URI" onclick={copyRedirect}>
+                  <Icon name={uriCopied ? "check" : "copy"} size={13} />
+                </button>
+              </span>
+            </span>
+          </li>
+          <li>
+            <span class="step">3</span>
+            <span class="step-copy">Paste its Client ID here.</span>
+          </li>
+        </ol>
+      {/if}
+      <form class="set-row client-row" onsubmit={(event) => { event.preventDefault(); if (clientIdDirty) personalAction(() => configurePersonal(clientId)); }}>
+        <label class="k" for="spotify-client-id">Client ID</label>
+        <div class="set-ctl client-ctl">
+          <span class="field client-field">
+            <input
+              id="spotify-client-id"
+              type={clientIdVisible ? "text" : "password"}
+              bind:value={clientId}
+              placeholder="32 characters from your app"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button type="button" class="field-btn" aria-controls="spotify-client-id" aria-pressed={clientIdVisible}
+              title={clientIdVisible ? "Hide Client ID" : "Show Client ID"} aria-label={clientIdVisible ? "Hide Client ID" : "Show Client ID"}
+              onclick={() => (clientIdVisible = !clientIdVisible)}>
+              <Icon name={clientIdVisible ? "eye-off" : "eye"} size={14} />
+            </button>
+          </span>
+          <button type="submit" class="pill accent" disabled={personalBusy || !clientIdDirty}>Save</button>
+        </div>
+      </form>
       <div class="set-row">
         <div>
-          <div class="k">Personal authorization</div>
-          <div class="d">{personal.loading ? "Checking…" : personal.status?.connected && !personalConnected() ? `Authorized as ${personal.status.account_id}. Disconnect to authorize this account.` : personal.status?.connected ? `Authorized as ${personal.status.account_id}` : personal.status?.authorization_pending ? "Waiting for authorization in your browser…" : personal.status?.client_id ? "Not authorized. Playback does not need this grant." : "Save a Client ID to authorize library changes."}</div>
+          <div class="v status" class:ok={personalConnected()} class:bad={!!(personalError || personal.error)}>
+            <span class="status-dot"></span>
+            <span class="k status-text">
+              {#if personalConnected()}Connected as {personal.status.account_id}
+              {:else if personal.status?.connected}Connected as {personal.status.account_id}, not this account
+              {:else if personal.status?.authorization_pending}Waiting for Spotify in your browser…
+              {:else if personal.loading && !personal.status}Checking…
+              {:else}Not connected{/if}
+            </span>
+          </div>
+          {#if personalError || personal.error}<div class="inline-error" role="alert">{personalError || personal.error}</div>{/if}
         </div>
         <div class="set-ctl">
           {#if personal.status?.connected}
-            <button class="btn-ghost" disabled={personalBusy} onclick={() => personalAction(disconnectPersonal)}>Disconnect</button>
+            <button class="pill" disabled={personalBusy} onclick={() => personalAction(disconnectPersonal)}>Disconnect</button>
           {:else}
-            <button class="btn-accent" disabled={personalBusy || !personal.status?.client_id || personal.status?.authorization_pending} onclick={() => personalAction(() => authorizePersonal(false))}>Authorize</button>
+            <button class="pill accent" disabled={personalBusy || !storedClientId || personal.status?.authorization_pending} onclick={() => personalAction(() => authorizePersonal(false))}>Connect</button>
           {/if}
         </div>
       </div>
-      <div class="set-row">
-        <div>
-          <div class="k">Spotify Connect devices</div>
-          <div class="d">Control a separate Spotify Connect session. Renderer audio stays on this computer. Requires device authorization; no device requests are made while off.</div>
+      {#if personalConnected()}
+        <div class="set-row">
+          <div>
+            <div class="k">Spotify Connect devices</div>
+            <div class="d">Choose where Renderer plays from the player bar: this computer or another Spotify device.</div>
+          </div>
+          <div class="set-ctl">
+            {#if personalDevicesAuthorized()}
+              <span class="v status ok"><span class="status-dot"></span>Allowed</span>
+            {:else}
+              <button class="pill accent" disabled={personalBusy || personal.status?.authorization_pending} onclick={() => personalAction(() => authorizePersonal(true))}>Allow</button>
+            {/if}
+          </div>
         </div>
-        <div class="set-ctl">
-          <input class="set-check" type="checkbox" aria-label="Enable Spotify Connect" checked={personal.status?.devices_enabled ?? false} disabled={personalBusy || !personalConnected()} onchange={(event) => personalAction(() => setDevicesEnabled(event.currentTarget.checked))} />
-          {#if personal.status?.devices_enabled && !personal.status?.devices_authorized}
-            <button class="btn-ghost" disabled={personalBusy || personal.status?.authorization_pending} onclick={() => personalAction(() => authorizePersonal(true))}>{personal.status?.authorization_pending ? "Waiting for authorization…" : "Authorize devices"}</button>
-          {/if}
-        </div>
-      </div>
+      {/if}
     </div>
 
     <div class="set-group">
@@ -379,7 +448,7 @@
               Unavailable
             {/if}
           </span>
-          <button class="btn-ghost danger" onclick={() => requestClear("audio")}>Clear</button>
+          <button class="pill warn" onclick={() => requestClear("audio")}>Clear</button>
         </div>
         {#if cacheFill !== null}
           <div class="set-meter" style:--p={cacheFill}>
@@ -424,7 +493,7 @@
               Unavailable
             {/if}
           </span>
-          <button class="btn-ghost danger" onclick={() => requestClear("covers")}>Clear</button>
+          <button class="pill warn" onclick={() => requestClear("covers")}>Clear</button>
         </div>
       </div>
       <div class="set-row">
@@ -433,7 +502,7 @@
           <div class="d">{cacheStats.error ?? `${stats.coversResolved} cover requests this session`}</div>
         </div>
         <div class="set-ctl">
-          <button class="btn-ghost" onclick={() => refreshCacheStats().catch(() => {})} disabled={cacheStats.loading}>
+          <button class="pill" onclick={() => refreshCacheStats().catch(() => {})} disabled={cacheStats.loading}>
             {cacheStats.loading ? "Measuring…" : "Refresh"}
           </button>
         </div>
@@ -474,19 +543,39 @@
 {/if}
 
 <style>
-  .account-links { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); margin-top: var(--s2); }
-  .account-links .link-more { font-size: var(--t-12); }
-  .client-id-row, .engine-error-row { grid-template-columns: minmax(0, 1fr); }
-  .client-id-form { display: grid; gap: var(--s3); min-width: 0; }
-  .client-id-form .set-ctl { flex-wrap:wrap; }
-  .compact .personal-app .set-row { grid-template-columns:minmax(0, 1fr); gap:var(--s3); }
-  .compact .personal-app .set-ctl { justify-content:flex-start; flex-wrap:wrap; }
-  .client-id-form .d { margin-top: calc(-1 * var(--s2)); }
-  .client-id-form code { overflow-wrap: anywhere; }
-  .client-id-input {
-    width: 100%; min-width: 0; height: 34px; padding: 0 var(--s2);
-    border: 1px solid var(--line-2); border-radius: var(--r2);
-    background: var(--raise-1); color: var(--fg);
-    font-size: var(--t-12);
+  .account-row .account-who { display: flex; align-items: center; gap: var(--s4); min-width: 0; }
+  .account-row .account-who :global(.art) { flex: none; }
+
+  .set-intro { max-width: 60ch; margin: var(--s1) 0 var(--s2); color: var(--fg-2); font-size: var(--t-12); line-height: 1.6; }
+  /* The setup, as three short numbered lines rather than a paragraph with a
+     URI buried in it. */
+  .setup { list-style: none; margin: 0; padding: var(--s2) 0 var(--s1); display: grid; gap: var(--s3); }
+  .setup li { display: flex; align-items: center; gap: var(--s3); color: var(--fg-1); font-size: var(--t-12); }
+  .step {
+    display: grid; place-items: center; width: 20px; height: 20px; flex: none;
+    border-radius: var(--rf); box-shadow: inset 0 0 0 1px var(--line-2);
+    color: var(--fg-2); font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
   }
+  .step-copy { min-width: 0; line-height: 1.6; }
+  .inline-link { font-size: inherit; color: var(--fg); text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px; }
+  .inline-link:hover { text-decoration-color: currentColor; }
+  /* The URI in the field's own pressed material, with its copy glyph inside. */
+  .uri-chip {
+    display: inline-flex; align-items: center; gap: var(--s2); min-width: 0; max-width: 100%;
+    height: 28px; margin-left: var(--s2); padding: 0 2px 0 var(--s3); vertical-align: middle;
+    border-radius: var(--rf); background: rgb(0 0 0 / 0.22); border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .uri-chip code {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--font-mono); font-size: var(--t-11); color: var(--fg-1); user-select: all;
+  }
+  .uri-copy { width: 24px; height: 24px; }
+  .client-row { align-items: center; }
+  .client-ctl { flex: 1; min-width: 0; justify-content: flex-end; }
+  .client-field { flex: 0 1 320px; min-width: 0; height: 34px; }
+  .client-field input { font-family: var(--font-mono); font-size: var(--t-12); }
+  .status-text { color: inherit; }
+  .engine-error-row { grid-template-columns: minmax(0, 1fr); }
+  .compact .personal-app .set-row { grid-template-columns: minmax(0, 1fr); gap: var(--s3); }
+  .compact .personal-app .set-ctl { justify-content: flex-start; flex-wrap: wrap; }
 </style>

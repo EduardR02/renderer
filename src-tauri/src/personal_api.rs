@@ -57,20 +57,30 @@ struct Identity {
 
 #[derive(Deserialize, Serialize)]
 pub struct Device {
-    id: Option<String>,
-    is_active: bool,
-    is_private_session: bool,
-    is_restricted: bool,
-    name: String,
+    pub id: Option<String>,
+    pub is_active: bool,
+    pub is_private_session: bool,
+    pub is_restricted: bool,
+    pub name: String,
     #[serde(rename = "type")]
-    kind: String,
-    volume_percent: Option<u8>,
-    supports_volume: bool,
+    pub kind: String,
+    pub volume_percent: Option<u8>,
+    pub supports_volume: bool,
 }
 
 #[derive(Deserialize)]
 struct Devices {
     devices: Vec<Device>,
+}
+
+#[derive(Deserialize)]
+pub struct PlayerState {
+    pub device: Device,
+    pub is_playing: bool,
+    pub progress_ms: Option<u32>,
+    pub item: Option<serde_json::Value>,
+    pub shuffle_state: bool,
+    pub repeat_state: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,7 +124,6 @@ pub struct Status {
     pub client_id: String,
     pub connected: bool,
     pub account_id: Option<String>,
-    pub devices_enabled: bool,
     pub devices_authorized: bool,
     pub authorization_pending: bool,
     pub error: Option<String>,
@@ -198,7 +207,6 @@ fn status(session: &Session, settings: &AppSettings, active_account: Option<&str
         client_id: settings.personal_client_id.clone(),
         connected: grant.is_some(),
         account_id: grant.map(|grant| grant.account_id.clone()),
-        devices_enabled: settings.personal_devices_enabled,
         devices_authorized: grant.is_some_and(|grant| scopes_contain(&grant.scopes, DEVICE_SCOPES)),
         authorization_pending: session.pending.is_some(),
         error: session.error.clone(),
@@ -293,6 +301,19 @@ fn api_request(http: &Client, token: &str, method: Method, url: Url, body: Optio
     request
 }
 
+fn player_path(device_id: &str, endpoint: &str, query: &[(&str, String)]) -> Result<String, String> {
+    if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
+        return Err("invalid Spotify device ID".to_owned());
+    }
+    let mut url = Url::parse("https://api.spotify.com/v1/me/player/").expect("static player URL")
+        .join(endpoint).expect("internal player endpoint");
+    url.query_pairs_mut().append_pair("device_id", device_id);
+    for (key, value) in query {
+        url.query_pairs_mut().append_pair(key, value);
+    }
+    Ok(format!("me/player/{}?{}", endpoint, url.query().unwrap_or_default()))
+}
+
 impl PersonalApi {
     pub fn new() -> Result<Arc<Self>, String> {
         let http = Client::builder().timeout(Duration::from_secs(15)).build()
@@ -346,22 +367,6 @@ impl PersonalApi {
         if settings.personal_client_id != client_id {
             self.disconnect_locked(app)?;
             settings.personal_client_id = client_id.to_owned();
-            settings.personal_devices_enabled = false;
-            save_app_settings(&settings)?;
-            emit(app, &self.session.lock());
-        }
-        Ok(app_status(app, &self.session.lock(), &settings))
-    }
-
-    pub async fn set_devices_enabled(&self, app: &AppHandle, enabled: bool) -> Result<Status, String> {
-        let _operation = self.operation.lock().await;
-        self.ensure_loaded()?;
-        let mut settings = load_app_settings();
-        if enabled && settings.personal_client_id.is_empty() {
-            return Err("configure your Spotify Client ID first".to_owned());
-        }
-        if settings.personal_devices_enabled != enabled {
-            settings.personal_devices_enabled = enabled;
             save_app_settings(&settings)?;
             emit(app, &self.session.lock());
         }
@@ -373,9 +378,6 @@ impl PersonalApi {
         let settings = load_app_settings();
         if !valid_client_id(&settings.personal_client_id) {
             return Err("configure your own Spotify developer Client ID first".to_owned());
-        }
-        if enable_devices && !settings.personal_devices_enabled {
-            return Err("enable Spotify Connect before requesting its permissions".to_owned());
         }
         let playback_account = active_username(&app)?;
         if self.session.lock().pending.is_some() {
@@ -499,9 +501,6 @@ impl PersonalApi {
     async fn access_token(&self, app: &AppHandle, devices: bool) -> Result<String, String> {
         self.ensure_loaded()?;
         let settings = load_app_settings();
-        if devices && !settings.personal_devices_enabled {
-            return Err("Spotify Connect is disabled".to_owned());
-        }
         let grant = {
             let session = self.session.lock();
             let grant = session.grant.as_ref().filter(|grant| grant.client_id == settings.personal_client_id)
@@ -609,6 +608,31 @@ impl PersonalApi {
         Ok(())
     }
 
+    /// Every transport write names the selected device, never Spotify's
+    /// unrelated account-wide active session.
+    pub async fn player_command(&self, app: &AppHandle, device_id: &str, method: Method, endpoint: &str, query: &[(&str, String)], body: Option<serde_json::Value>) -> Result<(), String> {
+        let path = player_path(device_id, endpoint, query)?;
+        let _operation = self.operation.lock().await;
+        self.request(app, true, method, &path, None, body).await?;
+        Ok(())
+    }
+
+    pub async fn player_state(&self, app: &AppHandle) -> Result<Option<PlayerState>, String> {
+        let _operation = self.operation.lock().await;
+        let response = self.request(app, true, Method::GET, "me/player?additional_types=track,episode", None, None).await?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        response.json().await.map(Some).map_err(|_| "Spotify returned an invalid playback state".to_owned())
+    }
+
+    pub async fn player_queue(&self, app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+        let _operation = self.operation.lock().await;
+        let value: serde_json::Value = self.request(app, true, Method::GET, "me/player/queue", None, None).await?
+            .json().await.map_err(|_| "Spotify returned an invalid playback queue".to_owned())?;
+        value["queue"].as_array().cloned().ok_or_else(|| "Spotify returned no playback queue".to_owned())
+    }
+
     pub async fn account_changed(&self, app: &AppHandle, username: &str) {
         let _operation = self.operation.lock().await;
         let needs_disconnect = self.ensure_loaded().is_ok()
@@ -686,6 +710,16 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> Result<R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_controls_target_and_encode_the_selected_device() {
+        let path = player_path("phone & room", "seek", &[("position_ms", "4312".into())]).unwrap();
+        let url = Url::parse(&format!("https://api.spotify.com/v1/{path}")).unwrap();
+        assert_eq!(url.path(), "/v1/me/player/seek");
+        assert_eq!(url.query_pairs().collect::<Vec<_>>(), vec![("device_id".into(), "phone & room".into()), ("position_ms".into(), "4312".into())]);
+        assert!(player_path("", "play", &[]).is_err());
+        assert!(player_path("phone\n", "play", &[]).is_err());
+    }
 
     async fn length_required_exchange(method: Method, body: Option<serde_json::Value>) -> (StatusCode, Option<usize>, Vec<u8>) {
         tokio::time::timeout(Duration::from_secs(3), async move {
@@ -796,7 +830,6 @@ mod tests {
         let authorized = status(&session, &settings, Some("account-a"));
         assert!(authorized.connected);
         assert!(authorized.devices_authorized);
-        assert!(!authorized.devices_enabled);
     }
 
     #[test]

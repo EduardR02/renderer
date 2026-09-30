@@ -98,8 +98,9 @@ pub struct TrackRef {
     pub unavailable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
-    /// Whether this track's audio is already on disk in the app-owned
-    /// librespot cache, so playing it costs no download.
+    /// Whether this song's audio is already on disk in the app-owned
+    /// librespot cache, so playing it costs no download. Podcast episodes use
+    /// temporary streaming storage only and always report false.
     ///
     /// Answered where the track's metadata is parsed, because that is the one
     /// place the file ids are already in hand: knowing this anywhere else would

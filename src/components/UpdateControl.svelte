@@ -2,6 +2,12 @@
   import { onMount } from "svelte";
   import { checkForUpdate, getCurrentVersion, downloadAndInstall, restartApp } from "../lib/update.js";
 
+  /**
+   * Updates, as one row: the version and where it stands, and the one thing
+   * worth doing about it — check, or install when there is something to
+   * install. A download shows as a thin bar in the row's own material.
+   * Nothing here runs until asked.
+   */
   let currentVersion = $state("");
   let update = $state(null);
   let phase = $state("idle");
@@ -26,8 +32,20 @@
     };
   });
 
+  const busy = $derived(phase === "checking" || phase === "downloading" || phase === "installing");
+  const progress = $derived(total ? Math.min(1, downloaded / total) : 0);
+  const status = $derived(
+    phase === "checking" ? "Checking for updates…"
+      : phase === "current" ? "Up to date"
+      : phase === "available" && update ? `Version ${update.version} is available`
+      : phase === "downloading" ? `Downloading ${update?.version ?? "the update"}${total ? ` · ${Math.floor(progress * 100)}%` : "…"}`
+      : phase === "installing" ? "Installing…"
+      : phase === "installed" ? "Installed · restart to finish"
+      : "",
+  );
+
   async function checkUpdates() {
-    if (phase === "checking" || phase === "downloading" || phase === "installing") return;
+    if (busy) return;
     phase = "checking";
     errorMessage = "";
     if (update) {
@@ -97,29 +115,24 @@
   }
 </script>
 
-<div class="set-row update-row">
+<div class="set-row">
   <div>
-    <div class="k">App updates</div>
-    <div class="d">Version {currentVersion || "unavailable"}</div>
-    {#if phase === "current"}<div class="d" role="status">No newer release is available.</div>{/if}
-    {#if phase === "available" && update}
-      <div class="d" role="status">Version {update.version} is available.</div>
-    {/if}
-    {#if phase === "downloading"}<div class="d" role="status">Downloading update{total ? `: ${Math.min(100, Math.floor(downloaded * 100 / total))}%` : "…"}</div>{/if}
-    {#if phase === "installing"}<div class="d" role="status">Installing update…</div>{/if}
-    {#if phase === "installed"}<div class="d" role="status">Update installed. Restart the app to use it.</div>{/if}
+    <div class="k">Renderer {currentVersion || ""}</div>
+    {#if status}<div class="d" role="status">{status}</div>{/if}
     {#if errorMessage}<div class="inline-error" role="alert">{errorMessage}</div>{/if}
   </div>
   <div class="set-ctl">
     {#if phase === "available" && update}
-      <button class="btn-accent" onclick={install}>Install and restart</button>
+      <button class="pill accent" onclick={install}>Install &amp; restart</button>
+    {:else if phase === "installed"}
+      <button class="pill accent" onclick={restart}>Restart now</button>
+    {:else}
+      <button class="pill" onclick={checkUpdates} disabled={busy}>{phase === "checking" ? "Checking…" : "Check"}</button>
     {/if}
-    {#if phase === "installed"}
-      <button class="btn-accent" onclick={restart}>Restart now</button>
-    {/if}
-    <button class="btn-ghost" onclick={checkUpdates} disabled={phase === "checking" || phase === "downloading" || phase === "installing"}>
-      {phase === "checking" ? "Checking…" : "Check for updates"}
-    </button>
   </div>
+  {#if phase === "downloading" || phase === "installing"}
+    <div class="set-meter" style:--p={phase === "installing" ? 1 : progress}>
+      <span class="set-meter-rail"><span class="set-meter-fill"></span></span>
+    </div>
+  {/if}
 </div>
-

@@ -64,6 +64,12 @@
     api.playQueue(queue, Math.max(at, 0), "search").catch((error) => { playError = String(error); });
   }
 
+  /** An episode from the results plays alone: its show is one click away. */
+  function playEpisode(episode) {
+    playError = "";
+    api.playQueue([episode.track], 0, `show:${episode.show_id}`).catch((error) => { playError = String(error); });
+  }
+
   function playTrack(i) {
     playError = "";
     if (tracks.length) api.playQueue(tracks, i, "search").catch((error) => { playError = String(error); });
@@ -188,7 +194,7 @@
         <p class="h">Nothing searched yet.</p>
         <p class="sub">Songs, albums, playlists, artists and audio podcasts all come back from one query.</p>
         <div class="actions">
-          <button class="btn-ghost" onclick={focusSearch}>
+          <button class="pill" onclick={focusSearch}>
             <Icon name="search" size={14} />Search
           </button>
         </div>
@@ -202,9 +208,9 @@
       {#if searchCause}<p class="why">{searchCause}</p>{/if}
       <div class="actions">
         {#if search.link?.error}
-          <button class="btn-ghost" onclick={focusSearch}>Edit link</button>
+          <button class="pill" onclick={focusSearch}>Edit link</button>
         {:else}
-          <button class="btn-ghost" onclick={retrySearch}>Try again</button>
+          <button class="pill" onclick={retrySearch}>Try again</button>
         {/if}
       </div>
     </div>
@@ -280,7 +286,7 @@
       <p class="h">No results for “{search.query}”.</p>
       <p class="sub">Check the spelling, or try a shorter query.</p>
       <div class="actions">
-        <button class="btn-ghost" onclick={focusSearch}>
+        <button class="pill" onclick={focusSearch}>
           <Icon name="search" size={14} />Try another search
         </button>
       </div>
@@ -442,23 +448,47 @@
         <div class="section-head"><h2 class="section-title">Podcasts</h2></div>
         <div class="grid">
           {#each shows as show (show.id)}
-            <button class="card" onclick={() => navigate("show", show.id)}>
-              <span class="card-art"><Cover src={show.cover_url} id={show.id} name={show.name} fill lg /></span>
-              <span class="card-copy"><span class="card-name">{show.name}</span><span class="card-sub">{show.publisher}</span></span>
-            </button>
+            {@const tone = coverTone(show.cover_url, show.id)}
+            <div class="card" style:--tone-glow={tone.glow}>
+              <div class="card-art">
+                <Cover src={show.cover_url} id={show.id} name={show.name} fill lg />
+                <button class="card-open" aria-label={`Open ${show.name}`} onclick={() => navigate("show", show.id)}></button>
+              </div>
+              <button class="card-copy" onclick={() => navigate("show", show.id)}>
+                <span class="card-name">{show.name}</span>
+                <span class="card-sub">{show.publisher || "Podcast"}</span>
+              </button>
+            </div>
           {/each}
         </div>
       </div>
     {/if}
     {#if episodes.length}
       <div class="section">
-        <div class="section-head"><h2 class="section-title">Episodes · audio only</h2></div>
+        <div class="section-head"><h2 class="section-title">Episodes <span class="section-note">audio only</span></h2></div>
         <div class="grid">
           {#each episodes as episode (episode.id)}
-            <button class="card" onclick={() => navigate("episode", episode.id)}>
-              <span class="card-art"><Cover src={episode.cover_url} id={episode.id} name={episode.name} fill lg /></span>
-              <span class="card-copy"><span class="card-name">{episode.name}</span><span class="card-sub">{episode.show_name}</span></span>
-            </button>
+            {@const tone = coverTone(episode.cover_url, episode.id)}
+            <div class="card" style:--tone-glow={tone.glow}>
+              <div class="card-art">
+                <Cover src={episode.cover_url} id={episode.id} name={episode.name} fill lg />
+                <button class="card-open" aria-label={`Open ${episode.name}`} onclick={() => navigate("episode", episode.id)}></button>
+                {#if episode.track && !episode.unavailable && !episode.track.unavailable}
+                  <button
+                    class="card-play"
+                    aria-label={`Play ${episode.name}`}
+                    title={`Play ${episode.name}`}
+                    onclick={() => playEpisode(episode)}
+                  >
+                    <Icon name="play" size={15} />
+                  </button>
+                {/if}
+              </div>
+              <button class="card-copy" onclick={() => navigate("episode", episode.id)}>
+                <span class="card-name">{episode.name}</span>
+                <span class="card-sub">{episode.show_name}</span>
+              </button>
+            </div>
           {/each}
         </div>
       </div>

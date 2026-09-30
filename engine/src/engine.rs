@@ -894,7 +894,7 @@ impl Engine {
         let ids: Vec<String> = [current, current + 1]
             .into_iter()
             .filter_map(|index| self.state.queue.get(index))
-            .filter(|track| !track.cached)
+            .filter(|track| !track.cached && track.uri.starts_with("spotify:track:"))
             .map(|track| track.id.clone())
             .collect();
         if ids.is_empty() {
@@ -906,7 +906,10 @@ impl Engine {
         }
         let mut changed = false;
         for track in &mut self.state.queue {
-            if !track.cached && now_cached.contains(&track.id) {
+            if !track.cached
+                && track.uri.starts_with("spotify:track:")
+                && now_cached.contains(&track.id)
+            {
                 track.cached = true;
                 changed = true;
             }
@@ -2000,10 +2003,15 @@ impl Engine {
             })
     }
 
-    /// Best-effort eviction of cached song/episode audio, off the command loop.
+    /// Best-effort eviction of cached song audio, off the command loop.
     /// A failed load can leave a corrupt/truncated cache entry; removing every
     /// format lets the next attempt fetch clean audio.
     fn evict_track_audio_cache(&self, track_uri: SpotifyUri) {
+        // Episodes never read this cache, including old entries. Do not delete
+        // those files merely because a temporary-only episode load failed.
+        if !matches!(track_uri, SpotifyUri::Track { .. }) {
+            return;
+        }
         let Some(session) = self.session.clone() else {
             return;
         };
@@ -2011,22 +2019,10 @@ impl Engine {
             return;
         };
         tokio::spawn(async move {
-            let files = match track_uri {
-                SpotifyUri::Track { .. } => {
-                    let Ok(track) = librespot_metadata::Track::get(&session, &track_uri).await else {
-                        return;
-                    };
-                    track.files
-                }
-                SpotifyUri::Episode { .. } => {
-                    let Ok(episode) = librespot_metadata::Episode::get(&session, &track_uri).await else {
-                        return;
-                    };
-                    episode.audio
-                }
-                _ => return,
+            let Ok(track) = librespot_metadata::Track::get(&session, &track_uri).await else {
+                return;
             };
-            for file_id in files.values() {
+            for file_id in track.files.values() {
                 if let Err(error) = cache.remove_file(*file_id) {
                     eprintln!("could not evict cached audio file {file_id}: {error}");
                 }
@@ -2185,6 +2181,10 @@ impl Engine {
 
     fn resolve_queue_edits(&self, queue: &mut [TrackRef]) {
         for track in queue {
+            if track.uri.starts_with("spotify:episode:") {
+                // A restored snapshot may still carry an old Downloaded mark.
+                track.cached = false;
+            }
             track.effective_edit = if track.uri.starts_with("spotify:track:") {
                 self.track_edits
                     .resolve(&track.id, track.duration_ms, &track.context)
@@ -4271,6 +4271,30 @@ mod tests {
             ..episode
         };
         assert!(super::parse_track_uri(&not_audio).is_err());
+    }
+
+    #[test]
+    fn restoring_mixed_queue_clears_only_episode_download_marks() {
+        let (mut engine, _) = test_engine();
+        let song = TrackRef {
+            id: "0123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
+            duration_ms: 12_345,
+            cached: true,
+            ..TrackRef::default()
+        };
+        let episode = TrackRef {
+            id: "1123456789ABCDEFGHIJKL".to_owned(),
+            uri: "spotify:episode:1123456789ABCDEFGHIJKL".to_owned(),
+            cached: true,
+            ..song.clone()
+        };
+
+        engine
+            .restore_queue(vec![song, episode], 0, 0, String::new(), 0, false, false)
+            .expect("restore mixed queue");
+        assert!(engine.state.queue[0].cached);
+        assert!(!engine.state.queue[1].cached);
     }
 
     fn test_engine() -> (Engine, Arc<std::sync::Mutex<Vec<u8>>>) {

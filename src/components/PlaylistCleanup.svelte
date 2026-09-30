@@ -404,7 +404,7 @@
         {/if}
       </p>
       {#if removed === null}
-        <button type="button" class="btn-icon cleanup-close" aria-label="Close" title="Close" disabled={busy} onclick={close}>
+        <button type="button" class="btn-round cleanup-close" aria-label="Close" title="Close" disabled={busy} onclick={close}>
           <Icon name="x" size={16} />
         </button>
       {/if}
@@ -415,12 +415,12 @@
         {#if stale && !busy}
           <div class="cleanup-notice glass-card alert" role="alert">
             <p>This playlist changed. Your preview is out of date; nothing more can be removed from it.</p>
-            <button type="button" class="btn-ghost" onclick={useLatest}>Review latest playlist</button>
+            <button type="button" class="pill" onclick={useLatest}>Review latest playlist</button>
           </div>
         {:else if !source?.snapshot_id}
           <div class="cleanup-notice glass-card" role="status">
             <p>Waiting for a verified playlist revision. Reload before reviewing removals.</p>
-            <button type="button" class="btn-ghost" disabled={reloading} onclick={reload}>{reloading ? "Reloading…" : "Reload playlist"}</button>
+            <button type="button" class="pill" disabled={reloading} onclick={reload}>{reloading ? "Reloading…" : "Reload playlist"}</button>
           </div>
         {/if}
 
@@ -486,22 +486,24 @@
                    material is enough to make it belong here. -->
               <div class="cleanup-field">
                 <label class="caps" for="cleanup-value">Date</label>
-                <input
-                  id="cleanup-value"
-                  class="cleanup-input cleanup-date"
+                <span class="field cleanup-date">
+                  <input
+                    id="cleanup-value"
                   bind:this={firstInput}
                   bind:value={dateValue}
                   type="date"
                   aria-invalid={!!draftError}
                   oninput={() => (draftError = "")}
-                />
+                  />
+                </span>
               </div>
             {:else if field === "older"}
               <div class="cleanup-field">
                 <label class="caps" for="cleanup-value">Count</label>
-                <input
-                  id="cleanup-value"
-                  class="cleanup-input cleanup-amount tnum"
+                <span class="field cleanup-amount">
+                  <input
+                    id="cleanup-value"
+                    class="tnum"
                   bind:this={firstInput}
                   bind:value={amount}
                   type="number"
@@ -509,7 +511,8 @@
                   step="1"
                   aria-invalid={!!draftError}
                   oninput={() => (draftError = "")}
-                />
+                  />
+                </span>
               </div>
               <div class="cleanup-field">
                 <span class="caps" aria-hidden="true">Unit</span>
@@ -518,9 +521,9 @@
             {:else if field !== "unavailable"}
               <div class="cleanup-field cleanup-input-wrap">
                 <label class="caps" for="cleanup-value">{field === "artist" || field === "album" ? `Find ${field} in this playlist` : field === "song" ? "Song title text" : "Time (m:ss or seconds)"}</label>
-                <input
-                  id="cleanup-value"
-                  class="cleanup-input"
+                <span class="field">
+                  <input
+                    id="cleanup-value"
                   bind:this={firstInput}
                   bind:value={query}
                   role={field === "artist" || field === "album" ? "combobox" : undefined}
@@ -535,7 +538,8 @@
                   onfocus={openSuggestions}
                   onblur={() => { suggestionsOpen = false; }}
                   onkeydown={suggestionKey}
-                />
+                  />
+                </span>
                 {#if suggestionsOpen && !frozen && (field === "artist" || field === "album")}
                   <div class="cleanup-suggestions glass-overlay" class:up={suggestionsUp} id="cleanup-suggestions" role="listbox" aria-label={`${field === "artist" ? "Artists" : "Albums"} in this playlist${suggestionMatches.length > suggestions.length ? `, showing the first ${suggestions.length} of ${suggestionMatches.length} matches` : ""}`}>
                     <div class="cleanup-suggestions-scroll" use:scrollbar style:max-height="{suggestionsRoom}px">
@@ -571,7 +575,7 @@
               </div>
             {/if}
             {#if field !== "artist" && field !== "album"}
-              <button type="submit" class="btn-ghost cleanup-add">Add rule</button>
+              <button type="submit" class="pill">Add rule</button>
             {/if}
           </form>
           {#if draftError}<p class="inline-error" role="alert">{draftError}</p>{/if}
@@ -711,9 +715,9 @@
           </div>
           {#if pageCount > 1}
             <nav class="cleanup-pagination" aria-label="Removal preview pages">
-              <button class="btn-ghost" disabled={page === 0} onclick={() => { previewPage = page - 1; }}>Previous</button>
+              <button class="pill sm" disabled={page === 0} onclick={() => { previewPage = page - 1; }}>Previous</button>
               <span class="cleanup-count tnum" role="status">{page * PREVIEW_PAGE_SIZE + 1}–{Math.min((page + 1) * PREVIEW_PAGE_SIZE, preview.rows.length)} of {preview.rows.length}</span>
-              <button class="btn-ghost" disabled={page === pageCount - 1} onclick={() => { previewPage = page + 1; }}>Next</button>
+              <button class="pill sm" disabled={page === pageCount - 1} onclick={() => { previewPage = page + 1; }}>Next</button>
             </nav>
           {/if}
         </section>
@@ -723,20 +727,20 @@
     {#if error}
       <div class="cleanup-error" role="alert">
         <p>{error}</p>
-        <button type="button" class="btn-ghost" disabled={busy || reloading} onclick={reload}>{reloading ? "Reloading…" : "Reload playlist"}</button>
+        <button type="button" class="pill" disabled={busy || reloading} onclick={reload}>{reloading ? "Reloading…" : "Reload playlist"}</button>
       </div>
     {/if}
 
     <footer class="dialog-actions cleanup-foot">
       {#if removed !== null}
-        <button class="btn-accent" onclick={close}>Done</button>
+        <button class="pill accent" onclick={close}>Done</button>
       {:else}
-        <button class="btn-ghost" disabled={busy} onclick={close}>Cancel</button>
+        <button class="pill" disabled={busy} onclick={close}>Cancel</button>
         {#if reviewing}
-          <button class="btn-ghost" disabled={busy} onclick={() => { reviewing = false; error = ""; }}>Edit rules</button>
-          <button class="btn-danger" disabled={busy || !ready} onclick={remove}>{busy ? "Removing…" : `${error ? "Retry removing" : "Remove"} ${preview.removalCount} entries`}</button>
+          <button class="pill" disabled={busy} onclick={() => { reviewing = false; error = ""; }}>Edit rules</button>
+          <button class="pill danger" disabled={busy || !ready} onclick={remove}>{busy ? "Removing…" : `${error ? "Retry removing" : "Remove"} ${preview.removalCount} entries`}</button>
         {:else}
-          <button class="btn-accent" disabled={!ready} onclick={() => { reviewing = true; suggestionsOpen = false; }}>Review {preview.removalCount} removals</button>
+          <button class="pill accent" disabled={!ready} onclick={() => { reviewing = true; suggestionsOpen = false; }}>Review {preview.removalCount} removals</button>
         {/if}
       {/if}
     </footer>
@@ -851,23 +855,14 @@
   .cleanup-builder { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s3); margin-top: var(--s4); }
   .cleanup-field { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
   .cleanup-field .caps { margin: 0; }
-  /* 34px tall, like every control it stands beside in this row. */
   .cleanup-input-wrap { flex: 1 1 260px; position: relative; }
-  .cleanup-input-wrap .cleanup-input { width: 100%; }
-  .cleanup-input {
-    height: 34px; padding: 0 var(--s3);
-    /* Pressed into the glass, like every field on it (.credits-filter). */
-    border: 1px solid rgba(255, 255, 255, 0.08); border-radius: var(--r2);
-    background: rgb(0 0 0 / 0.22); color: var(--fg);
-    font: inherit; font-size: var(--t-13);
-  }
-  .cleanup-input::placeholder { color: var(--fg-3); }
+  /* THE FIELD, 34px tall like every control it stands beside in this row. */
+  .cleanup-builder .field { height: 34px; }
   /* A count and a date need no more room than they hold. `color-scheme: dark`
      is set app-wide, which is what keeps the native calendar mark and the
      number spinners light on this sheet rather than the OS's own grey. */
-  .cleanup-amount { width: 76px; }
-  .cleanup-date { width: 152px; }
-  .cleanup-add { height: 34px; }
+  .cleanup-amount { width: 88px; }
+  .cleanup-date { width: 168px; }
 
   /* Overlay glass (.glass-overlay, in the markup): the same object as
      .sel-list and .menu, so the two dropdowns on this sheet are one thing.

@@ -18,7 +18,7 @@ globalThis.window = {
   },
 };
 
-const { api, applyPlayback, personalLibraryChanged } = await import("./state.svelte.js");
+const { api, applyPlayback, savedTracksChanged } = await import("./state.svelte.js");
 
 function page(ids) {
   return {
@@ -72,17 +72,16 @@ test("a cached page does not outlive the account it was walked for", async () =>
   expect(idsOf(await dave)).toEqual(["dave"]);
 });
 
-test("a confirmed personal like invalidates the saved collection but a follow does not", async () => {
+test("a change to Liked Songs in the membership index drops the cached page", async () => {
   applyPlayback({ auth_state: "ready", username: "erin" });
   const first = api.browseLikedSongs(null);
   walks.at(-1).resolve(page(["one"]));
   await first;
   const before = calls.length;
-  personalLibraryChanged(["spotify:artist:artist"]);
   expect(idsOf(await api.browseLikedSongs(null))).toEqual(["one"]);
   expect(calls.length).toBe(before);
 
-  personalLibraryChanged(["spotify:track:two"]);
+  savedTracksChanged();
   const refreshed = api.browseLikedSongs(null);
   expect(calls.length).toBe(before + 1);
   walks.at(-1).resolve(page(["two", "one"]));

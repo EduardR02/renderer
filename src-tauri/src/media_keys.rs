@@ -3,9 +3,7 @@
 //! A dedicated thread owns the `MediaControls`, fed by a channel from the state
 //! consumer. Windows attaches SMTC to the main HWND; macOS attaches to the
 //! application event loop without a window handle. Button presses are
-//! forwarded to the engine client as spawned async tasks.
-use std::future::Future;
-use std::pin::Pin;
+//! forwarded to the selected output through the central playback router.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, OnceLock};
@@ -19,6 +17,8 @@ use souvlaki::{
 use crate::engine_client::EngineClient;
 use crate::log;
 use crate::types::PlaybackState;
+use crate::playback_router::{Action, PlaybackRouter};
+use tauri::{AppHandle, Manager};
 
 /// Last-known playing flag, so the overlay's toggle button maps to the right
 /// engine command even though its press arrives on a foreign thread.
@@ -51,18 +51,19 @@ enum Update {
 
 /// Attaches system media controls. Failures are warnings, never fatal: a
 /// player without media keys still plays.
-pub fn init(client: Arc<EngineClient>, hwnd: Option<usize>) {
+pub fn init(app: AppHandle, client: Arc<EngineClient>, hwnd: Option<usize>) {
     let (sender, receiver) = channel::<Update>();
 
     let result = std::thread::Builder::new()
         .name("media-controls".to_owned())
-        .spawn(move || run_controls(client, hwnd, sender, receiver));
+        .spawn(move || run_controls(app, client, hwnd, sender, receiver));
     if let Err(error) = result {
         log::warn(&format!("could not start the media-key thread: {error}"));
     }
 }
 
 fn run_controls(
+    app: AppHandle,
     client: Arc<EngineClient>,
     hwnd: Option<usize>,
     sender: Sender<Update>,
@@ -81,8 +82,8 @@ fn run_controls(
         }
     };
 
-    let handler_client = client.clone();
-    if let Err(error) = controls.attach(move |event| handle_event(event, &handler_client)) {
+    let handler_app = app.clone();
+    if let Err(error) = controls.attach(move |event| handle_event(event, &handler_app)) {
         log::warn(&format!("could not attach media-key handlers: {error:?}"));
         return;
     }
@@ -173,55 +174,25 @@ fn transport(playing: bool, position_ms: u32) -> MediaPlayback {
     }
 }
 
-fn handle_event(event: MediaControlEvent, client: &Arc<EngineClient>) {
+fn handle_event(event: MediaControlEvent, app: &AppHandle) {
     use MediaControlEvent as E;
-    let client = client.clone();
-    // Each `async move` block is its own anonymous type, so the arms must
-    // erase to one boxed future for the match to typecheck.
-    let task: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = match event {
-        E::Play => Some(Box::pin(async move {
-            let _ = client.play().await;
-        })),
-        E::Pause | E::Stop => Some(Box::pin(async move {
-            let _ = client.pause().await;
-        })),
-        E::Toggle => {
-            if PLAYING.load(Ordering::Relaxed) {
-                Some(Box::pin(async move {
-                    let _ = client.pause().await;
-                }))
-            } else {
-                Some(Box::pin(async move {
-                    let _ = client.play().await;
-                }))
-            }
-        }
-        E::Next => Some(Box::pin(async move {
-            let _ = client.next().await;
-        })),
-        E::Previous => Some(Box::pin(async move {
-            let _ = client.previous().await;
-        })),
-        E::SetPosition(position) => {
-            let position_ms = absolute_seek_target(duration_ms(position.0));
-            Some(Box::pin(async move {
-                let _ = client.seek(position_ms).await;
-            }))
-        }
-        E::SeekBy(direction, amount) => {
-            let position_ms = relative_seek_target(direction, duration_ms(amount));
-            Some(Box::pin(async move {
-                let _ = client.seek(position_ms).await;
-            }))
-        }
-        // Souvlaki exposes Windows' indeterminate FF/RW buttons as `Seek`.
-        // They have no honest target, so those buttons are disabled at attach.
-        E::Seek(_) => None,
-        _ => None,
+    let action = match event {
+        E::Play => Action::Play,
+        E::Pause | E::Stop => Action::Pause,
+        E::Toggle => if PLAYING.load(Ordering::Relaxed) { Action::Pause } else { Action::Play },
+        E::Next => Action::Next,
+        E::Previous => Action::Previous,
+        E::SetPosition(position) => Action::Seek(absolute_seek_target(duration_ms(position.0))),
+        E::SeekBy(direction, amount) => Action::Seek(relative_seek_target(direction, duration_ms(amount))),
+        // Indeterminate FF/RW has no honest target; disabled at attach.
+        E::Seek(_) => return,
+        _ => return,
     };
-    if let Some(task) = task {
-        tauri::async_runtime::spawn(task);
-    }
+    let router = app.state::<Arc<PlaybackRouter>>().inner().clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = router.run(&app, action).await;
+    });
 }
 
 fn duration_ms(duration: Duration) -> u32 {

@@ -81,7 +81,7 @@
     <div class="empty">
       <p class="h">No songs found.</p>
       <p class="sub">{error || "Try a different title, artist, or spelling."}</p>
-      <div class="actions"><button class="btn-ghost" onclick={focusSearch}><Icon name="search" size={14} />Search again</button></div>
+      <div class="actions"><button class="pill" onclick={focusSearch}><Icon name="search" size={14} />Search again</button></div>
     </div>
   {/if}
 </section>

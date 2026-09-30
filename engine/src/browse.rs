@@ -509,10 +509,6 @@ fn remember_track_files(id: &str, track: &Track) {
         files: track.files.values().copied().collect(),
         alternatives: track.alternatives.0.iter().map(id_of).collect(),
     };
-    remember_audio_files(id, entry);
-}
-
-fn remember_audio_files(id: &str, entry: TrackFiles) {
     if let Ok(mut index) = FILE_IDS.write() {
         let key_is_absent = !index.contains_key(id);
         evict_oldest_for_fresh_key(
@@ -759,7 +755,13 @@ fn recompute_cached_marks(tracks: &mut [TrackRef], cache: Option<&Cache>) -> boo
     };
     let marks: Option<Vec<bool>> = tracks
         .iter()
-        .map(|track| resolve_cached(&track.id, &index, cache, false))
+        .map(|track| {
+            if track.uri.starts_with("spotify:episode:") {
+                Some(false)
+            } else {
+                resolve_cached(&track.id, &index, cache, false)
+            }
+        })
         .collect();
     let Some(marks) = marks else {
         return false;
@@ -1156,11 +1158,6 @@ fn episode_ref(episode: &Episode, show_id: String, policy: &AvailabilityPolicy) 
         Some("Episode has no supported Spotify audio".to_owned())
     };
     let id = id_of(&episode.id);
-    remember_audio_files(&id, TrackFiles {
-        fetched_at: Instant::now(),
-        files: episode.audio.values().copied().collect(),
-        alternatives: Vec::new(),
-    });
     let uri = uri_of(&episode.id);
     let cover_url = cover_url(&episode.covers);
     let duration_ms = u32::try_from(episode.duration).unwrap_or_default();
@@ -1194,7 +1191,7 @@ fn episode_ref(episode: &Episode, show_id: String, policy: &AvailabilityPolicy) 
     }
 }
 
-fn parse_episode_payload(entity_uri: &str, payload: &[u8], policy: &AvailabilityPolicy, cache: Option<&Cache>) -> Option<EpisodeRef> {
+fn parse_episode_payload(entity_uri: &str, payload: &[u8], policy: &AvailabilityPolicy) -> Option<EpisodeRef> {
     let message = librespot_protocol::metadata::Episode::parse_from_bytes(payload).ok()?;
     let uri = SpotifyUri::from_uri(entity_uri).ok()?;
     let episode = Episode::parse(&message, &uri).ok()?;
@@ -1202,22 +1199,19 @@ fn parse_episode_payload(entity_uri: &str, payload: &[u8], policy: &Availability
         .and_then(|gid| SpotifyId::from_raw(gid).ok())
         .and_then(|id| id.to_base62().ok())
         .unwrap_or_default();
-    let mut reference = episode_ref(&episode, show_id, policy);
-    reference.track.cached = cache.is_some_and(|cache| episode.audio.values().any(|file| {
-        cache.file_path(*file).is_some_and(|path| path.try_exists().unwrap_or(false))
-    }));
-    Some(reference)
+    // Episode audio is temporary-only; an old file on disk is not an offline
+    // playback source and must not produce a Downloaded badge.
+    Some(episode_ref(&episode, show_id, policy))
 }
 
 pub async fn episode_browse(session: &Session, id: &str) -> Result<EpisodeRef, String> {
     let uri = podcast_uri("episode", id)?;
     let policy = AvailabilityPolicy::for_session(session);
-    let cache = session.cache().cloned();
     fetch_extended(
         session,
         [&uri],
         ExtensionKind::EPISODE_V4,
-        |uri, payload| parse_episode_payload(uri, payload, &policy, cache.as_deref()),
+        |uri, payload| parse_episode_payload(uri, payload, &policy),
     )
     .await?
     .into_iter()
@@ -1233,12 +1227,11 @@ pub async fn show_browse(session: &Session, id: &str) -> Result<ShowBrowse, Stri
     }
     let header = show_ref(&show);
     let policy = AvailabilityPolicy::for_session(session);
-    let cache = session.cache().cloned();
     let resolved = fetch_extended(
         session,
         show.episodes.iter(),
         ExtensionKind::EPISODE_V4,
-        |uri, payload| parse_episode_payload(uri, payload, &policy, cache.as_deref()),
+        |uri, payload| parse_episode_payload(uri, payload, &policy),
     )
     .await?;
     let mut by_uri: HashMap<String, EpisodeRef> = resolved
@@ -1725,12 +1718,11 @@ async fn fetch_playlist_tracks(
         policy,
     ).await?;
     if items.iter().any(|(uri, _)| matches!(uri, SpotifyUri::Episode { .. })) {
-        let cache = session.cache().cloned();
         let episodes = fetch_extended(
             session,
             items.iter().filter_map(|(uri, _)| matches!(uri, SpotifyUri::Episode { .. }).then_some(uri)),
             ExtensionKind::EPISODE_V4,
-            |uri, payload| parse_episode_payload(uri, payload, policy, cache.as_deref()),
+            |uri, payload| parse_episode_payload(uri, payload, policy),
         ).await?;
         resolved.extend(episodes.into_iter().map(|episode| episode.track));
     }
@@ -6140,10 +6132,9 @@ pub async fn search_browse(
             .collect::<Vec<_>>();
         if !episode_uris.is_empty() {
             let policy = AvailabilityPolicy::for_session(session);
-            let cache = session.cache().cloned();
             if let Ok(resolved) = fetch_extended(
                 session, episode_uris.iter(), ExtensionKind::EPISODE_V4,
-                |uri, payload| parse_episode_payload(uri, payload, &policy, cache.as_deref()),
+                |uri, payload| parse_episode_payload(uri, payload, &policy),
             ).await {
                 let mut by_uri = resolved.into_iter()
                     .map(|episode| (episode.uri.clone(), episode))
@@ -9139,7 +9130,7 @@ mod file_index_tests {
     }
 
     #[test]
-    fn podcast_cache_marks_use_episode_audio_not_video_or_previews() {
+    fn old_episode_files_do_not_mark_podcasts_downloaded() {
         use librespot_metadata::audio::file::{AudioFileFormat, AudioFiles};
         use librespot_metadata::video::VideoFiles;
         let root = scratch();
@@ -9177,13 +9168,15 @@ mod file_index_tests {
         let audio_path = cache.file_path(audio).unwrap();
         std::fs::create_dir_all(audio_path.parent().unwrap()).unwrap();
         std::fs::write(&audio_path, b"audio").unwrap();
-        assert_eq!(cached_track_ids(&ids, Some(&cache)), ids);
+        assert!(cached_track_ids(&ids, Some(&cache)).is_empty());
+        assert!(!reference.track.cached);
         let mut tracks = vec![reference.track];
-        assert!(recompute_cached_marks(&mut tracks, Some(&cache)));
-        assert!(tracks[0].cached);
-        std::fs::remove_file(audio_path).unwrap();
+        // Even a stale memoized badge must be cleared without attempting
+        // song-file resolution for an episode.
+        tracks[0].cached = true;
         assert!(recompute_cached_marks(&mut tracks, Some(&cache)));
         assert!(!tracks[0].cached);
+        assert_eq!(std::fs::read(&audio_path).unwrap(), b"audio");
         std::fs::remove_dir_all(root).unwrap();
     }
 

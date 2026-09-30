@@ -57,3 +57,18 @@ test("missing tree data retains sorted library rows and genuinely empty folders"
   expect(ids(libraryRailEntries(library, null))).toEqual(["newer", "older"]);
   expect(ids(libraryRailEntries(library, [folder("empty", [])]))).toEqual(["newer", "older", "folder:empty"]);
 });
+
+test("a collapsed folder keeps its heading and count and hides its rows, except to a filter", () => {
+  const quiet = playlist("quiet", 10, "Road quiet");
+  const recent = playlist("recent", 600, "Road recent");
+  const outside = playlist("outside", 300, "Elsewhere");
+  setLibrary([quiet, outside, recent]);
+  const tree = [folder("outer", [leaf(quiet), folder("inner", [leaf(recent)])]), leaf(outside)];
+  const shut = libraryRailEntries(library, tree, [], "", ["outer"]);
+  expect(ids(shut)).toEqual(["folder:outer", "outside"]);
+  expect(shut[0]).toMatchObject({ collapsed: true, count: 2 });
+  const inner = libraryRailEntries(library, tree, [], "", ["inner"]);
+  expect(ids(inner)).toEqual(["folder:outer", "folder:inner", "quiet", "outside"]);
+  expect(inner[1]).toMatchObject({ collapsed: true, count: 1, depth: 1 });
+  expect(ids(libraryRailEntries(library, tree, [], "road", ["outer"]))).toEqual(["recent", "quiet"]);
+});

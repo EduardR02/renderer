@@ -5,6 +5,7 @@ mod engine_client;
 mod log;
 mod media_keys;
 mod personal_api;
+mod playback_router;
 mod types;
 mod updater;
 
@@ -138,8 +139,7 @@ pub fn run() {
             commands::personal_api_set_saved,
             commands::personal_api_saved_shows,
             commands::personal_api_devices,
-            commands::personal_api_transfer,
-            commands::personal_api_set_devices_enabled,
+            commands::select_output,
             updater::check_update,
             commands::get_state,
             commands::get_cover,
@@ -181,11 +181,16 @@ pub fn run() {
             // ready-transition reconciliation supersedes stale rows.
             state.lock().memberships = load_membership(&dir);
             app.manage(state);
-            app.manage(personal_api::PersonalApi::new().map_err(std::io::Error::other)?);
+            let personal = personal_api::PersonalApi::new().map_err(std::io::Error::other)?;
+            app.manage(personal.clone());
 
             // Spawn the playback engine and keep it alive across crashes.
             let client = EngineClient::start();
             app.manage(client.clone());
+            let router = playback_router::PlaybackRouter::new(client.clone(), personal);
+            app.manage(router.clone());
+            let output_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move { router.watch(output_app).await });
             let supervisor = client.clone();
             tauri::async_runtime::spawn(async move { supervisor.supervise().await });
 
@@ -194,7 +199,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(windows)]
                 match window.hwnd() {
-                    Ok(hwnd) => media_keys::init(client.clone(), Some(hwnd.0 as usize)),
+                    Ok(hwnd) => media_keys::init(app.handle().clone(), client.clone(), Some(hwnd.0 as usize)),
                     Err(error) => log::warn(&format!(
                         "could not get the main window handle for media keys: {error}"
                     )),
@@ -202,7 +207,7 @@ pub fn run() {
                 #[cfg(target_os = "macos")]
                 {
                     let _ = window;
-                    media_keys::init(client.clone(), None);
+                    media_keys::init(app.handle().clone(), client.clone(), None);
                 }
             } else {
                 log::warn("could not find the main window for media keys");

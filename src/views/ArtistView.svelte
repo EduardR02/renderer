@@ -12,12 +12,14 @@
     resolveCoverUrl,
   } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById } from "../lib/play.js";
-  import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
+  import { spotifyLink } from "../lib/spotify-link.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
-  import PersonalSave from "../components/PersonalSave.svelte";
+  import FollowPill from "../components/FollowPill.svelte";
+  import HeaderMenu from "../components/HeaderMenu.svelte";
+  import CopyLinkItem from "../components/CopyLinkItem.svelte";
   import Biography from "../components/Biography.svelte";
   import GalleryLightbox from "../components/GalleryLightbox.svelte";
   import { GROUPS, RELEASE_KEYS } from "../lib/discography.svelte.js";
@@ -266,16 +268,6 @@
   let artistGeneration = 0;
   let busy = $state("");
   let playError = $state("");
-  let menuOpen = $state(false);
-  let menuButton = $state(null);
-  let menu = $state(null);
-  /* Idle, landed, refused — the copy item's three faces. */
-  let copyState = $state("idle");
-  let copyTimer = 0;
-  /* The confirmation outlives the menu by design, so the timer has to die with
-     the page: a navigation inside its window would otherwise leave it writing
-     to a component that is gone. */
-  $effect(() => () => clearTimeout(copyTimer));
 
   /* The artist changed under us — a link from a track row, say. Start the new
      artist on its ranked releases when the overview provides them, otherwise
@@ -302,8 +294,6 @@
     shelfExpanded = false;
     figureIndex = 0;
     lightboxOpen = false;
-    menuOpen = false;
-    copyState = "idle";
   });
 
   /* An overview may be refreshed independently of the catalogue payload. Do
@@ -581,88 +571,6 @@
     if (artist?.id) navigate("radio", `artist:${artist.id}`);
   }
 
-  /* The header's share menu. It hangs off its button the way the playlist
-     header's does: focus the first item on open, close on Escape/Tab or a
-     pointerdown outside it, and give the button its focus back when it
-     closes. */
-  $effect(() => {
-    if (!menuOpen) return;
-    queueMicrotask(() => menu?.querySelector('[role="menuitem"]')?.focus());
-
-    function onPointerDown(event) {
-      if (!menu?.contains(event.target) && !menuButton?.contains(event.target)) menuOpen = false;
-    }
-
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
-  });
-
-  /**
-   * Closes the menu. The button gets its focus back only when the menu was
-   * holding it: the copy confirmation's timer fires while the pointer may be
-   * anywhere by then, and a close that fires behind the user's back must not
-   * pull the caret out of whatever they moved to.
-   */
-  function closeMenu(returnFocus = false) {
-    const menuHadFocus = !!menu?.contains(document.activeElement);
-    menuOpen = false;
-    if (returnFocus && menuHadFocus) queueMicrotask(() => menuButton?.focus());
-  }
-
-  function toggleMenu() {
-    if (menuOpen) {
-      closeMenu(true);
-      return;
-    }
-    /* A copy still counting down must not close the menu that replaces it. */
-    clearTimeout(copyTimer);
-    copyState = "idle";
-    menuOpen = true;
-  }
-
-  function onMenuKeyDown(event) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeMenu(true);
-      return;
-    }
-    if (event.key === "Tab") {
-      closeMenu();
-      return;
-    }
-    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-    event.preventDefault();
-    const items = [...menu.querySelectorAll('[role="menuitem"]:not(:disabled)')];
-    const current = items.indexOf(document.activeElement);
-    const next =
-      event.key === "Home"
-        ? 0
-        : event.key === "End"
-          ? items.length - 1
-          : event.key === "ArrowDown"
-            ? (current + 1) % items.length
-            : (current - 1 + items.length) % items.length;
-    items[next]?.focus();
-  }
-
-  /**
-   * The link is the artist's own id — the page this one is drawn from — so a
-   * paste into our search lands back here.
-   *
-   * The menu STAYS OPEN on copy, because the confirmation is on the item
-   * itself and dismissing it would take the only feedback with it. A copy that
-   * landed closes it shortly after, through the same close the keyboard paths
-   * use, so the button gets its focus back. A refused write stays up and says
-   * so: the label that never changes is the dead control the confirmation
-   * exists to prevent, and the item is also the retry.
-   */
-  async function copyLink() {
-    const link = spotifyLink("artist", artist?.id);
-    if (!link) return;
-    copyState = (await writeClipboard(link)) ? "copied" : "failed";
-    clearTimeout(copyTimer);
-    if (copyState === "copied") copyTimer = setTimeout(() => closeMenu(true), 900);
-  }
 
   /* ------------------------------------------------------- written by
      The verified playlist is an optional enhancement, so it gets its own
@@ -1002,8 +910,8 @@
       <p class="h">This artist could not be loaded.</p>
       <p class="why">{detail.error}</p>
       <div class="actions">
-        <button class="btn-ghost" onclick={retryDetail}>Try again</button>
-        <button class="btn-ghost" onclick={() => navigate("library")}>Back to your library</button>
+        <button class="pill" onclick={retryDetail}>Try again</button>
+        <button class="link-more" onclick={() => navigate("library")}>Back to your library</button>
       </div>
     </div>
   {:else if !artist}
@@ -1013,7 +921,7 @@
     <div aria-hidden="true">
       <div class="actions" style="margin-top:var(--s6)">
         <span class="skeleton" style="width:48px;height:48px;border-radius:var(--rf)"></span>
-        <span class="skeleton" style="width:104px;height:32px;border-radius:var(--r2)"></span>
+        <span class="skeleton" style="width:40px;height:40px;border-radius:var(--rf)"></span>
       </div>
       <div class="section">
         <div class="section-head"><span class="skeleton line" style="width:110px;height:22px"></span></div>
@@ -1052,50 +960,16 @@
       <button class="play-lg" title="Play popular songs" onclick={() => playTop(0)} disabled={!top.length}>
         <Icon name="play" size={22} />
       </button>
-      <button class="btn-ghost" onclick={shuffleTop} disabled={!top.length}>
-        <Icon name="shuffle" size={14} />Shuffle
+      <button class="btn-round lg" title="Shuffle" aria-label="Shuffle popular songs" onclick={shuffleTop} disabled={!top.length}>
+        <Icon name="shuffle" size={20} />
       </button>
-      <button class="btn-ghost" onclick={openArtistRadio} disabled={!artist?.id}>
-        Artist Radio
-      </button>
-      <PersonalSave uri={`spotify:artist:${artist.id}`} label="Follow" savedLabel="Unfollow" unsavedLabel="Follow" />
-      <div class="head-menu-wrap">
-        <button
-          class="btn-icon"
-          bind:this={menuButton}
-          aria-label="Artist actions"
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-          aria-controls="artist-actions-menu"
-          title="Artist actions"
-          onclick={toggleMenu}
-        >
-          <Icon name="more" size={18} />
-        </button>
-        {#if menuOpen}
-          <div
-            id="artist-actions-menu"
-            class="menu head-menu glass-overlay"
-            role="menu"
-            tabindex="-1"
-            bind:this={menu}
-            onkeydown={onMenuKeyDown}
-          >
-            <!-- The confirmation lives on the item, which is why the menu does
-                 not close on click: a copy with no feedback is
-                 indistinguishable from a dead control. -->
-            <button
-              class="menu-item"
-              role="menuitem"
-              class:done={copyState === "copied"}
-              class:failed={copyState === "failed"}
-              onclick={copyLink}
-            >
-              {copyState === "copied" ? "Link copied" : copyState === "failed" ? "Copy failed" : "Copy link"}
-            </button>
-          </div>
-        {/if}
-      </div>
+      <FollowPill {artist} />
+      <HeaderMenu label="Artist actions">
+        {#snippet children(close)}
+          <button class="menu-item" role="menuitem" disabled={!artist?.id} onclick={() => { close(); openArtistRadio(); }}>Go to artist radio</button>
+          <CopyLinkItem link={spotifyLink("artist", artist?.id)} {close} />
+        {/snippet}
+      </HeaderMenu>
     </div>
 
     {#if top.length}
@@ -1601,15 +1475,6 @@
   .dx .seg { margin-bottom: var(--s5); }
   .appears { margin-top: var(--s9); }
 
-  .head-menu-wrap { position: relative; }
-  /* Right-aligned because this button ends the row, and a 216px menu opening
-     to the right of it would leave the pane. */
-  .head-menu { position: absolute; z-index: 1; top: calc(100% + var(--s1)); right: 0; }
-  /* A copy that landed: the same label-and-colour pairing the row menu uses.
-     A refused write takes the failure colour, so the two are never read as
-     the same event. */
-  .menu-item.done { color: var(--accent); }
-  .menu-item.failed { color: var(--love); }
 
   /* One row, always. `repeat(auto-fill, …)` was not an option: it decides how
      many cards fit and then wraps the rest, and a shelf that wraps is a grid.

@@ -676,7 +676,7 @@
 <section class="view page edit-page">
   <button class="page-back" onclick={goBack}><Icon name="back" size={14} />Back</button>
   {#if !track}
-    <div class="empty-state"><h1>Track unavailable</h1><p>Open the editor from a track’s menu.</p></div>
+    <div class="empty"><h1 class="h">Track unavailable</h1><p class="sub">Open the editor from a track’s menu.</p></div>
   {:else}
     <header class="edit-head">
       <Cover src={track.cover_url} id={track.album_id || track.uri} name={track.name} size={76} lg />
@@ -731,7 +731,7 @@
         onseek={seekPreview}
       />
       {#if loading}<p class="definition-status">Loading your saved edit…</p>
-      {:else if loadError}<div class="definition-error" role="alert"><span>{loadError}</span><button class="btn-ghost" onclick={() => (retryGeneration += 1)}>Try again</button></div>{/if}
+      {:else if loadError}<div class="definition-error" role="alert"><span>{loadError}</span><button class="pill" onclick={() => (retryGeneration += 1)}>Try again</button></div>{/if}
 
       <section class="range-section">
         <div class="range-heading"><div><h3>Cuts</h3><p>These sections are removed from playback.</p></div><span class="range-count tnum">{cuts.length}</span></div>
@@ -773,12 +773,12 @@
       <footer class="edit-footer">
         <div class="footer-left">
           <div class="history-actions" aria-label="Edit history">
-            <button class="btn-ghost compact" disabled={!undoStack.length || !ready || saving} onclick={undo} title="Undo (Ctrl+Z)">Undo</button>
-            <button class="btn-ghost compact" disabled={!redoStack.length || !ready || saving} onclick={redo} title="Redo (Ctrl+Shift+Z)">Redo</button>
+            <button class="pill sm" disabled={!undoStack.length || !ready || saving} onclick={undo} title="Undo (Ctrl+Z)">Undo</button>
+            <button class="pill sm" disabled={!redoStack.length || !ready || saving} onclick={redo} title="Redo (Ctrl+Shift+Z)">Redo</button>
           </div>
           <div class="save-state" class:dirty><span></span>{saving ? "Saving edit…" : dirty ? "Unsaved changes" : definitionExists ? "Saved" : "No edit saved"}</div>
         </div>
-        <div><button class="btn-ghost danger" disabled={!ready || saving || !definitionExists} onclick={removeDefinition}>Delete edit</button><button class="btn-accent" disabled={!dirty || !ready || saving || !!validation.firstError || (!cuts.length && !loopRange)} onclick={save}>{saving ? "Saving…" : "Save edit"}</button></div>
+        <div><button class="pill warn" disabled={!ready || saving || !definitionExists} onclick={removeDefinition}>Delete edit</button><button class="pill accent" disabled={!dirty || !ready || saving || !!validation.firstError || (!cuts.length && !loopRange)} onclick={save}>{saving ? "Saving…" : "Save edit"}</button></div>
       </footer>
     </section>
   {/if}
@@ -788,11 +788,6 @@
 .edit-page { max-width: 1240px; margin-inline: auto; }
 /* Same left-aligned quiet column as every other empty state — centring it
    would dress a missing track up as a modal event. */
-.empty-state { max-width: 560px; padding: var(--s7) 0; color: var(--fg-2); font-size: var(--t-13); }
-.empty-state h1 {
-  margin-bottom: var(--s2); color: var(--fg);
-  font: var(--w-bold) var(--t-20) var(--font-display); letter-spacing: -.015em;
-}
 .edit-head p { font-size: var(--t-12); }
 .edit-head { display: flex; align-items: center; gap: var(--s4); margin-bottom: var(--s5); }
 .edit-head :global(.art) { flex: none; }
@@ -930,7 +925,7 @@
   border-color: color-mix(in srgb, var(--rose-ink) 34%, transparent); color: var(--rose-ink);
   background: color-mix(in srgb, var(--rose-ink) 10%, transparent);
 }
-.range-error { grid-column: 2/-1; color: var(--rose-ink); font-size: var(--t-11); }
+.range-error { grid-column: 2/-1; color: var(--love); font-size: var(--t-11); }
 .enable-row {
   display: flex; align-items: flex-start; gap: var(--s3); margin: 0 var(--s6) var(--s5); padding: var(--s4);
   border: 1px solid var(--line-2); border-radius: var(--r2); background: var(--raise-1);
@@ -949,7 +944,7 @@
   accent-color: var(--accent); cursor: pointer;
 }
 .enable-check:disabled { cursor: default; }
-.edit-error { margin: 0 var(--s6) var(--s3); color: var(--rose-ink); font-size: var(--t-12); }
+.edit-error { margin: 0 var(--s6) var(--s3); color: var(--love); font-size: var(--t-12); }
 .edit-footer {
   position: sticky; z-index: 8; bottom: 0; display: flex; align-items: center;
   justify-content: space-between; min-height: 64px; padding: var(--s3) var(--s6);
@@ -959,7 +954,6 @@
           backdrop-filter: var(--frost-strip);
 }
 .edit-footer>div, .footer-left, .history-actions { display: flex; align-items: center; gap: var(--s2); }
-.btn-ghost.compact { min-height: 30px; padding-inline: 10px; font-size: var(--t-11); }
 .save-state { color: var(--fg-2); font-size: var(--t-12); white-space: nowrap; }
 .save-state>span { display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--fg-3); }
 .save-state.dirty>span { background: var(--gold); }

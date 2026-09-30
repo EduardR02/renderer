@@ -350,7 +350,7 @@
       <p class="h">The queue is empty.</p>
       <p class="sub">Play music or an audio podcast, or add songs from a track menu.</p>
       <div class="actions">
-        <button class="btn-ghost" onclick={() => navigate("library")}>
+        <button class="pill" onclick={() => navigate("library")}>
           <Icon name="library" size={14} />Go to your library
         </button>
       </div>
