@@ -359,6 +359,7 @@ pub async fn create_playlist(session: &Session, name: &str) -> Result<PlaylistRe
         owner_id: session.username(),
         owner_name: String::new(),
         cover_url: None,
+        cover_urls: Vec::new(),
         track_count: Some(0),
     })
 }

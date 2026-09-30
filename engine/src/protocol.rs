@@ -307,6 +307,8 @@ pub enum Command {
     BrowsePlaylist {
         id: String,
     },
+    /// Bounded header/artwork hydration; never fetches full playlist tracks.
+    BrowsePlaylistCovers { playlists: Vec<PlaylistRef> },
     /// Song or artist radio with server-ranked playable tracks. Plain ids use
     /// inspired-by song radio; an `artist:` prefix selects Apollo artist radio.
     /// Responded to with a `browse_radio` message.
@@ -328,7 +330,10 @@ pub enum Command {
     /// A show's metadata and its episode rows in source order.
     BrowseShow { id: String },
     /// User identity and public playlists from the private profile service.
-    BrowseProfile { username: String },
+    BrowseProfile {
+        username: String,
+        known_playlists: Vec<PlaylistRef>,
+    },
     /// Folder hierarchy from the signed-in user's rootlist.
     BrowsePlaylistTree { length: usize },
     /// Album metadata/tracks plus play counts from the official pathfinder
@@ -767,6 +772,8 @@ pub struct PlaylistRef {
     pub owner_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cover_urls: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_count: Option<u32>,
 }
@@ -791,6 +798,7 @@ impl Default for SongwriterPlaylist {
                 owner_id: String::new(),
                 owner_name: String::new(),
                 cover_url: None,
+                cover_urls: Vec::new(),
                 track_count: None,
             },
             tracks: Vec::new(),
@@ -1295,6 +1303,9 @@ pub struct StateEvent<'a> {
     pub shuffle: bool,
     pub repeat: RepeatMode,
     pub playback_speed: f32,
+    /// Rate of the audio currently reaching the output, which can trail a
+    /// requested change until already-queued samples have drained.
+    pub audible_playback_speed: f32,
     pub current_index: Option<usize>,
     pub current_uri: Option<&'a str>,
     /// The queue rows this state describes. Present whenever [`Self::queue_revision`]
@@ -1582,6 +1593,7 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Context,
             playback_speed: 1.0,
+            audible_playback_speed: 1.0,
             current_index: Some(0),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
             queue: Some(&queue),
@@ -1627,6 +1639,7 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
+            audible_playback_speed: 1.0,
             current_index: Some(3),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
             queue: None,
@@ -1659,6 +1672,7 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
+            audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,
             queue: Some(&[]),
@@ -2082,6 +2096,7 @@ mod tests {
             owner_id: "alice".to_owned(),
             owner_name: String::new(),
             cover_url: Some("https://i.scdn.co/image/0123".to_owned()),
+            cover_urls: Vec::new(),
             track_count: Some(42),
         }];
         let payload = SearchBrowse {
@@ -2211,6 +2226,7 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
+            audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,
             queue: Some(&[]),
@@ -2235,6 +2251,7 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
+            audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,
             queue: Some(&[]),
@@ -2421,6 +2438,7 @@ mod tests {
                 owner_id: "spotify".to_owned(),
                 owner_name: "Spotify".to_owned(),
                 cover_url: None,
+                cover_urls: Vec::new(),
                 track_count: Some(37),
             },
             tracks: vec![TrackRef {

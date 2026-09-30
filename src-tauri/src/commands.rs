@@ -462,8 +462,74 @@ pub async fn browse_episode(client: State<'_, Arc<EngineClient>>, id: String) ->
 }
 
 #[tauri::command]
-pub async fn browse_profile(client: State<'_, Arc<EngineClient>>, username: String) -> Result<ProfileDetail, String> {
-    client.browse_profile(&username).await.map(ProfileDetail::from)
+pub async fn browse_profile(
+    client: State<'_, Arc<EngineClient>>,
+    state: State<'_, Mutex<AppState>>,
+    username: String,
+) -> Result<ProfileDetail, String> {
+    let known_playlists = ProfileDetail::library_artwork_refs(&state.lock().playlists);
+    let mut profile = ProfileDetail::from(client.browse_profile(&username, &known_playlists).await?);
+    profile.enrich_library_metadata(&state.lock().playlists);
+    Ok(profile)
+}
+
+/// Visible rootlist rows reuse the profile header resolver. This needs only the
+/// playback login, not a personal Web API grant, and never browses full tracks.
+#[tauri::command]
+pub async fn hydrate_library_covers(
+    app: AppHandle,
+    client: State<'_, Arc<EngineClient>>,
+    state: State<'_, Mutex<AppState>>,
+    ids: Vec<String>,
+) -> Result<Vec<Playlist>, String> {
+    if ids.len() > 32 {
+        return Err("at most 32 visible playlist covers may be requested at once".to_owned());
+    }
+    let (generation, references) = {
+        let guard = state.lock();
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let references: Vec<_> = guard.playlists.iter()
+            .filter(|playlist| wanted.contains(playlist.id.as_str()))
+            .map(Playlist::artwork_ref).collect();
+        (guard.library_generation, references)
+    };
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved = client.browse_playlist_covers(&references).await?;
+    let persistence = state.lock().playlist_persistence.clone();
+    let _serialize = persistence.lock();
+    let (dir, cache, summaries) = {
+        let mut guard = state.lock();
+        if !library_generation_is_current(&guard, generation) {
+            return Ok(Vec::new());
+        }
+        let by_id: std::collections::HashMap<_, _> = resolved.iter()
+            .map(|playlist| (playlist.id.as_str(), playlist)).collect();
+        let mut summaries = Vec::new();
+        let mut changed = false;
+        for playlist in &mut guard.playlists {
+            let Some(metadata) = by_id.get(playlist.id.as_str()) else { continue };
+            // A full browse or rootlist update may have supplied newer artwork
+            // while this header was in flight. Hydration fills gaps only.
+            changed |= playlist.fill_artwork(metadata);
+            summaries.push(playlist.clone());
+        }
+        let cache = changed.then(|| PlaylistListCache {
+            version: 1,
+            fetched_at: guard.playlists_fetched_at,
+            me_id: guard.me_id.clone(),
+            playlists: guard.playlists.clone(),
+        });
+        (guard.data_dir.clone(), cache, summaries)
+    };
+    if let Some(cache) = cache {
+        save_playlist_list(&dir, &cache);
+    }
+    for summary in &summaries {
+        let _ = app.emit("playlist_summary", summary);
+    }
+    Ok(summaries)
 }
 
 #[tauri::command]
@@ -717,8 +783,8 @@ pub async fn logout(
 }
 
 #[tauri::command]
-pub async fn personal_api_status(personal: State<'_, Arc<PersonalApi>>) -> Result<PersonalStatus, String> {
-    personal.status().await
+pub async fn personal_api_status(app: AppHandle, personal: State<'_, Arc<PersonalApi>>) -> Result<PersonalStatus, String> {
+    personal.status(&app).await
 }
 
 #[tauri::command]
@@ -898,25 +964,16 @@ pub fn get_track_playlists(
     }
     let guard = state.lock();
     let mut refs = Vec::new();
-    if guard
-        .memberships
-        .iter()
-        .any(|entry| entry.id == LIKED_MEMBERSHIP_ID && entry.contains(uri))
-    {
+    let containing: HashSet<&str> = guard.memberships.iter()
+        .filter(|entry| entry.contains(uri)).map(|entry| entry.id.as_str()).collect();
+    if containing.contains(LIKED_MEMBERSHIP_ID) {
         refs.push(TrackPlaylistRef {
             id: LIKED_MEMBERSHIP_ID.to_owned(),
             name: "Liked Songs".to_owned(),
         });
     }
     for playlist in &guard.playlists {
-        let Some(entry) = guard
-            .memberships
-            .iter()
-            .find(|entry| entry.id == playlist.id)
-        else {
-            continue;
-        };
-        if entry.contains(uri) {
+        if containing.contains(playlist.id.as_str()) {
             refs.push(TrackPlaylistRef {
                 id: playlist.id.clone(),
                 name: playlist.name.clone(),
@@ -1344,7 +1401,7 @@ pub async fn consume_states(app: AppHandle) {
                 guard.library_generation = guard.library_generation.wrapping_add(1);
                 guard.memberships.clear();
                 drop(guard);
-                let _ = app.emit("memberships_changed", ());
+                let _ = app.emit("memberships_changed", json!({"saved_tracks": true}));
             }
         }
         if state.auth_state != "ready" {
@@ -1636,16 +1693,16 @@ async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client:
             .filter(|playlist| playlist_qualifies(playlist, &guard.me_id))
             .map(|playlist| (playlist.id.clone(), playlist.snapshot_id.clone()))
             .collect();
+        let qualifying_ids: HashSet<&str> = qualifying.iter().map(|(id, _)| id.as_str()).collect();
         guard.memberships.retain(|entry| {
-            entry.id == LIKED_MEMBERSHIP_ID || qualifying.iter().any(|(id, _)| *id == entry.id)
+            entry.id == LIKED_MEMBERSHIP_ID || qualifying_ids.contains(entry.id.as_str())
         });
+        let by_id: std::collections::HashMap<&str, &MembershipEntry> = guard.memberships.iter()
+            .map(|entry| (entry.id.as_str(), entry)).collect();
         let work: Vec<String> = qualifying
             .iter()
             .filter(|(id, revision)| {
-                guard
-                    .memberships
-                    .iter()
-                    .find(|entry| entry.id == *id)
+                by_id.get(id.as_str())
                     .is_none_or(|entry| entry.stale(revision))
             })
             .map(|(id, _)| id.clone())
@@ -1683,7 +1740,7 @@ async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client:
                 };
                 if let Some(entries) = entries {
                     save_membership(&dir, &entries);
-                    let _ = app.emit("memberships_changed", ());
+                    let _ = app.emit("memberships_changed", json!({"saved_tracks": false}));
                 }
             }
             Err(error) => log::warn(&format!(
@@ -1722,7 +1779,7 @@ async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client:
             };
             if let Some(entries) = entries {
                 save_membership(&dir, &entries);
-                let _ = app.emit("memberships_changed", ());
+                let _ = app.emit("memberships_changed", json!({"saved_tracks": true}));
             }
         }
         Err(error) => log::warn(&format!(
@@ -1964,7 +2021,7 @@ async fn fetch_playlist(
         save_membership(&dir, &entries);
         // Hovering the mark must not wait for the next track change: an add
         // to the playing playlist lights it up within one event round trip.
-        let _ = app.emit("memberships_changed", ());
+        let _ = app.emit("memberships_changed", json!({"saved_tracks": false}));
     }
     let _ = app.emit("playlist_summary", &detail.playlist);
     Ok(PlaylistFetchResult {

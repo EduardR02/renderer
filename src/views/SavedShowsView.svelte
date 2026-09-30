@@ -3,6 +3,7 @@
   import { navigate, session, focusSearch } from "../lib/state.svelte.js";
   import { personalApi, personalConnected, watchPersonal } from "../lib/personal.svelte.js";
   import Cover from "../components/Cover.svelte";
+  import Icon from "../components/Icon.svelte";
   let shows = $state([]);
   let offset = $state(0);
   let total = $state(null);
@@ -36,37 +37,50 @@
     finally { if (current === generation) loading = false; }
   }
 </script>
-<section class="view page">
-  <h1 class="page-title">Podcasts</h1>
-  <p>Find audio podcasts and episodes in Search, or paste a Spotify show or episode link.</p>
-  <button class="btn-accent" onclick={focusSearch}>Search podcasts</button>
+
+<section class="view page saved-shows-page">
+  <header class="page-head">
+    <h1 class="page-title">Saved podcasts</h1>
+    <p class="sub">Shows saved to your Spotify library.</p>
+  </header>
   {#if !personalConnected()}
-    <div class="section"><h2 class="section-title">Saved podcasts</h2>
-      <p>To view saved shows, authorize your own Spotify developer app. Podcast search and playback do not require one.</p>
-      <button class="btn-ghost" onclick={() => navigate("settings")}>Set up in Settings</button>
+    <div class="saved-state">
+      <h2 class="section-title">Connect your Spotify library</h2>
+      <p>Authorize your personal Spotify app in Settings to see saved podcasts. You can still find podcasts and episodes in Search.</p>
+      <div class="actions"><button class="btn-ghost" onclick={() => navigate("settings")}>Open Settings</button><button class="btn-ghost" onclick={focusSearch}><Icon name="search" size={14} />Search podcasts</button></div>
     </div>
   {:else}
-    <div class="section"><h2 class="section-title">Saved podcasts</h2>
-    {#if error}<p class="inline-error" role="alert">{error} <button class="link-more" onclick={loadMore}>Try again</button></p>{/if}
-    {#if loading && !shows.length}<p role="status">Loading saved podcasts…</p>{/if}
-    {#if total === 0}<p>No saved podcasts.</p>{/if}
-    <div class="saved-list">
-      {#each shows as show (show.id)}
-        <button class="saved-show" onclick={() => navigate("show", show.id)}>
-          <Cover src={show.images?.[0]?.url} id={show.id} name={show.name} size={64} />
-          <span><strong>{show.name}</strong><small>{show.publisher} · {show.total_episodes} episodes</small></span>
-        </button>
-      {/each}
-    </div>
-    {#if total !== null && offset < total}
-      <button class="btn-ghost" disabled={loading} onclick={loadMore}>{loading ? "Loading…" : "Load more"}</button>
+    {#if error}
+      <div class="saved-state"><h2 class="section-title">Couldn't load saved podcasts</h2><p class="inline-error" role="alert">{error}</p><button class="btn-ghost" onclick={loadMore}>Try again</button></div>
     {/if}
-    </div>
+    {#if loading && !shows.length}
+      <div class="grid" role="status" aria-label="Loading saved podcasts">
+        {#each [0, 1, 2, 3] as item (item)}<div class="card" aria-hidden="true"><span class="skeleton card-skeleton"></span><span class="skeleton line" style="width:70%;margin-top:14px"></span></div>{/each}
+      </div>
+    {:else if total === 0}
+      <div class="saved-state"><h2 class="section-title">No saved podcasts yet</h2><p>Find a show or episode in Search.</p><button class="btn-ghost" onclick={focusSearch}><Icon name="search" size={14} />Search podcasts</button></div>
+    {/if}
+    {#if shows.length}
+      <div class="grid">
+        {#each shows as show (show.id)}
+          <div class="card">
+            <div class="card-art"><Cover src={show.images?.[0]?.url || ""} id={show.id} name={show.name} fill lg /><button class="card-open" aria-label={`Open ${show.name}`} onclick={() => navigate("show", show.id)}></button></div>
+            <button class="card-copy" onclick={() => navigate("show", show.id)}><span class="card-name">{show.name}</span><span class="card-sub">{show.publisher || "Podcast"}</span></button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    {#if total !== null && offset < total}
+      <div class="load-more"><button class="btn-ghost" disabled={loading} onclick={loadMore}>{loading ? "Loading…" : "Load more"}</button></div>
+    {/if}
   {/if}
 </section>
+
 <style>
-  .saved-list { display:grid; gap:8px; margin:24px 0; }
-  .saved-show { display:flex; align-items:center; gap:16px; padding:12px; width:100%; text-align:left; border:0; background:transparent; color:inherit; cursor:pointer; }
-  .saved-show span { display:grid; gap:6px; min-width:0; }
-  .saved-show small { color:var(--fg-2); }
+  .saved-state { padding: var(--s5) 0; max-width: 560px; }
+  .saved-state .section-title { margin-bottom: var(--s3); }
+  .saved-state p { margin: 0 0 var(--s4); color: var(--fg-2); font-size: var(--t-13); line-height: 1.7; overflow-wrap: anywhere; }
+  .saved-state .actions { margin-top: var(--s4); }
+  .load-more { margin-top: var(--s6); }
+  .card-skeleton { display: block; width: 100%; aspect-ratio: 1; border-radius: var(--r3); }
 </style>

@@ -626,6 +626,7 @@ const playback = {
   shuffle: false,
   repeat: "off",
   playback_speed: 1,
+  audible_playback_speed: 1,
   current_index: 0,
   current_uri: fixtures.playlistDetail.tracks[0].uri,
   queue: queueWithEdits(fixtures.playlistDetail.tracks),
@@ -1106,6 +1107,7 @@ const mock = {
         return null;
       case "set_playback_speed":
         playback.playback_speed = Number(args.speed ?? 1);
+        playback.audible_playback_speed = playback.playback_speed;
         emitState();
         return null;
       case "play_queue": {

@@ -300,6 +300,7 @@ export const playback = $state({
   shuffle: false,
   repeat: "off",
   playback_speed: 1,
+  audible_playback_speed: 1,
   current_index: -1,
   current_uri: null,
   queue: [],
@@ -517,7 +518,7 @@ export function positionMs() {
   // progress UI, but use the monotonic clock directly for callers that sample
   // the projection at display refresh cadence (the editor preview marker).
   const now = Math.max(playhead.now, performance.now());
-  const speed = Number(playback.playback_speed);
+  const speed = Number(playback.audible_playback_speed);
   const playbackSpeed = Number.isFinite(speed) && speed > 0 ? speed : 1;
   const elapsed = playback.playing && !playback.buffering ? Math.max(0, now - playhead.at) * playbackSpeed : 0;
   const projected = playhead.base_ms + elapsed;
@@ -555,6 +556,15 @@ function namedQueueRevision(value) {
 
 export function applyPlayback(payload) {
   if (!payload) return;
+  // The requested control value can change before queued audio reaches that
+  // rate. Only an audible boundary changes the clock; a partial rate update
+  // without a position still preserves the old-rate projection at the seam.
+  const rateBoundaryPosition =
+    !("position_ms" in payload) &&
+    "audible_playback_speed" in payload &&
+    payload.audible_playback_speed !== playback.audible_playback_speed
+      ? positionMs()
+      : null;
   if ("playing" in payload) playingAuthorityGeneration += 1;
   if ("volume" in payload) {
     volumeAuthorityGeneration += 1;
@@ -586,6 +596,7 @@ export function applyPlayback(payload) {
     session.username = payload.username;
   }
   if ("position_ms" in payload) anchorPlayhead(payload.position_ms);
+  else if (rateBoundaryPosition !== null) anchorPlayhead(rateBoundaryPosition);
   /* Unconditional, not "only when the advancing flag changed": a payload that
      reports no change then repairs any ticker that drifted, at the price of a
      null check, and no caller has to remember the `buffering` term. */
@@ -709,6 +720,76 @@ export const library = $state([]);
  * mount listening-history rows that the fresh answer immediately reshuffles.
  */
 export const libraryState = $state({ loaded: false, fresh: false });
+
+// Only missing, visible rows enter this queue. Headers reuse the engine's
+// account-scoped profile metadata; the library remains the sole row store.
+const libraryCoverRequests = new Map();
+let libraryCoverQueue = [];
+let libraryCoverRunning = false;
+
+export function sessionEpoch() {
+  return searchSessionEpoch;
+}
+
+export function hydrateLibraryCovers(ids) {
+  if (!isSearchReady()) return Promise.resolve([]);
+  const epoch = searchSessionEpoch;
+  const wanted = new Set(ids);
+  const requests = [];
+  for (const row of library) {
+    if (!wanted.has(row.id) || row.cover_url || row.cover_urls?.length) continue;
+    let request = libraryCoverRequests.get(row.id);
+    if (request?.epoch !== epoch || performance.now() - request.answeredAt >= 300_000) {
+      let resolve, reject;
+      const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      request = { id: row.id, epoch, promise, resolve, reject, answeredAt: Infinity };
+      libraryCoverRequests.set(row.id, request);
+      libraryCoverQueue.push(request);
+    }
+    requests.push(request.promise);
+  }
+  if (!libraryCoverRunning && libraryCoverQueue.length) {
+    libraryCoverRunning = true;
+    queueMicrotask(drainLibraryCovers);
+  }
+  return Promise.all(requests);
+}
+
+async function drainLibraryCovers() {
+  try {
+    while (libraryCoverQueue.length) {
+      const batch = libraryCoverQueue.splice(0, 32);
+      const epoch = batch[0].epoch;
+      if (epoch !== searchSessionEpoch) {
+        for (const request of batch) request.resolve(null);
+        continue;
+      }
+      try {
+        const summaries = await invoke("hydrate_library_covers", { ids: batch.map((request) => request.id) });
+        if (epoch === searchSessionEpoch) {
+          const byId = new Map((summaries ?? []).map((summary) => [summary.id, summary]));
+          for (const row of library) {
+            const summary = byId.get(row.id);
+            if (!summary) continue;
+            if (!row.cover_url && summary.cover_url) row.cover_url = summary.cover_url;
+            if (!row.cover_urls?.length && summary.cover_urls?.length) row.cover_urls = summary.cover_urls;
+          }
+        }
+        for (const request of batch) {
+          request.answeredAt = performance.now();
+          request.resolve(null);
+        }
+      } catch (error) {
+        for (const request of batch) {
+          if (libraryCoverRequests.get(request.id) === request) libraryCoverRequests.delete(request.id);
+          request.reject(error);
+        }
+      }
+    }
+  } finally {
+    libraryCoverRunning = false;
+  }
+}
 /**
  * The payload behind the current detail route, plus why there isn't one.
  *
@@ -1003,6 +1084,14 @@ function observeSearchSession(payload) {
       resetSearchForSession();
       resetPersonalizedDiscoveryForSession();
       invalidateLikedFirstPage();
+      libraryCoverRequests.clear();
+      for (const request of libraryCoverQueue) request.resolve(null);
+      libraryCoverQueue = [];
+      followedGeneration++;
+      followed.artists = [];
+      followed.loaded = false;
+      followed.loading = false;
+      followed.error = "";
       savedSeq += 1;
       nowSaved.refs = [];
       // The previous account's recency must not leak into the next session's
@@ -1693,6 +1782,10 @@ export function setLibrary(playlists, { fresh = false } = {}) {
   });
   library.length = 0;
   library.push(...ordered);
+  const present = new Set(ordered.map((playlist) => playlist.id));
+  for (const id of libraryCoverRequests.keys()) {
+    if (!present.has(id)) libraryCoverRequests.delete(id);
+  }
   // Any answer at all, including an empty one, ends the loading state.
   // Sidebar and all library-derived views now share activity order even when
   // the first payload came from an older on-disk snapshot.
@@ -1700,6 +1793,84 @@ export function setLibrary(playlists, { fresh = false } = {}) {
   // Freshness is opt-in: the cached get_state pull hydrates the grid through
   // this same door without promoting itself to authoritative rootlist data.
   if (fresh) libraryState.fresh = true;
+}
+
+/**
+ * Keep rootlist folders, but let the activity-ordered library decide where
+ * their contents sit. A folder moves with its most recent remaining child;
+ * explicitly pinned playlists are lifted out once, never duplicated inside.
+ * Filtering is a flat, activity-ordered result set rather than orphaned folder
+ * headings or indentation with no parent.
+ */
+export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "") {
+  const byId = new Map(playlists.map((playlist) => [playlist.id, playlist]));
+  const rank = new Map(playlists.map((playlist, index) => [playlist.id, index]));
+  const pinned = new Set(pinnedIds);
+  const seen = new Set();
+  const pinnedRows = [];
+  const query = filter.trim().toLocaleLowerCase();
+  const matches = (playlist) => !query || playlist.name?.toLocaleLowerCase().includes(query);
+
+  function playlistRow(playlist) {
+    const id = playlist?.id;
+    if (!id || seen.has(id)) return null;
+    seen.add(id);
+    playlist = byId.get(id) ?? playlist;
+    if (!matches(playlist)) return null;
+    const row = { kind: "playlist", playlist, rank: rank.get(id) ?? Infinity };
+    if (pinned.has(id)) {
+      pinnedRows.push(row);
+      return null;
+    }
+    return row;
+  }
+
+  function collect(nodes) {
+    const rows = [];
+    for (const node of nodes) {
+      if (node.kind === "folder") {
+        const children = collect(node.children ?? []);
+        // Do not leave empty headings behind a lifted pin. Truly empty folders
+        // still belong to the rootlist and remain visible outside a filter.
+        if (!children.length && (query || node.children?.length)) continue;
+        const folder = { kind: "folder", id: node.id, name: node.name, children, rank: Infinity };
+        for (const child of children) folder.rank = Math.min(folder.rank, child.rank);
+        rows.push(folder);
+      } else if (node.kind === "playlist") {
+        const row = playlistRow(node.playlist);
+        if (row) rows.push(row);
+      }
+    }
+    rows.sort((left, right) => left.rank === right.rank ? 0 : left.rank - right.rank);
+    return rows;
+  }
+
+  const roots = collect(Array.isArray(tree) ? tree : []);
+  for (const playlist of playlists) {
+    const row = playlistRow(playlist);
+    if (row) roots.push(row);
+  }
+  roots.sort((left, right) => left.rank === right.rank ? 0 : left.rank - right.rank);
+  pinnedRows.sort((left, right) => left.rank === right.rank ? 0 : left.rank - right.rank);
+  const entries = pinnedRows.map(({ playlist }) => ({ kind: "playlist", playlist, depth: 0 }));
+  function flatten(rows, depth) {
+    for (const row of rows) {
+      if (row.kind === "folder") {
+        if (!query) entries.push({ kind: "folder", id: row.id, name: row.name, depth });
+        flatten(row.children, query ? 0 : depth + 1);
+      } else {
+        entries.push({ kind: "playlist", playlist: row.playlist, depth });
+      }
+    }
+  }
+  flatten(roots, 0);
+  if (query) {
+    entries.sort((left, right) => {
+      const pinOrder = Number(pinned.has(right.playlist.id)) - Number(pinned.has(left.playlist.id));
+      return pinOrder || (rank.get(left.playlist.id) ?? Infinity) - (rank.get(right.playlist.id) ?? Infinity);
+    });
+  }
+  return entries;
 }
 
 /**
@@ -2092,6 +2263,9 @@ export const api = {
   setRepeat: (mode) => invoke("set_repeat", { mode }),
   setPlaybackSpeed: (speed) => {
     const target = Number(speed);
+    if (!Number.isFinite(target) || target < 0.5 || target > 4) {
+      return Promise.reject(new Error("Playback speed must be between 0.5 and 4.0."));
+    }
     const previous = playback.playback_speed;
     const generation = ++playbackSpeedRequestGeneration;
     // Only the newest command still represents the control's intent. An older
@@ -2505,10 +2679,13 @@ export async function initEvents() {
       sessionEvents += 1;
       applySession(e.payload);
     }],
-    // The shell's index of what is saved changed — a like or an unlike, here or
-    // in another client. The first page of Saved Tracks is the one piece of
-    // that collection this hub keeps, and it must not outlive the news.
-    ["memberships_changed", () => invalidateLikedFirstPage()],
+    // Owned-playlist index updates repaint the saved check but cannot change
+    // personal Liked membership or invalidate its cached first page.
+    ["memberships_changed", (e) => {
+      if (!e.payload?.saved_tracks) return;
+      invalidateLikedFirstPage();
+      libraryChanges.savedTracks++;
+    }],
     // Disk hydration is useful for the sidebar and detail routes, but must
     // never promote Home past its fresh-rootlist loading frame. If a cache
     // event is delivered late, keep the authoritative answer already shown.

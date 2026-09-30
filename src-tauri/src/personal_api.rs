@@ -190,8 +190,10 @@ fn scopes_contain(scopes: &str, wanted: &str) -> bool {
     wanted.split_ascii_whitespace().all(|scope| scopes.split_ascii_whitespace().any(|held| held == scope))
 }
 
-fn status(session: &Session, settings: &AppSettings) -> Status {
-    let grant = session.grant.as_ref().filter(|grant| grant.client_id == settings.personal_client_id);
+fn status(session: &Session, settings: &AppSettings, active_account: Option<&str>) -> Status {
+    let grant = session.grant.as_ref().filter(|grant| grant.client_id == settings.personal_client_id
+        && active_account == Some(grant.account_id.as_str())
+        && scopes_contain(&grant.scopes, LIBRARY_SCOPES));
     Status {
         client_id: settings.personal_client_id.clone(),
         connected: grant.is_some(),
@@ -203,8 +205,12 @@ fn status(session: &Session, settings: &AppSettings) -> Status {
     }
 }
 
+fn app_status(app: &AppHandle, session: &Session, settings: &AppSettings) -> Status {
+    status(session, settings, active_username(app).ok().as_deref())
+}
+
 fn emit(app: &AppHandle, session: &Session) {
-    let _ = app.emit("personal-api-changed", status(session, &load_app_settings()));
+    let _ = app.emit("personal-api-changed", app_status(app, session, &load_app_settings()));
 }
 
 fn active_username(app: &AppHandle) -> Result<String, String> {
@@ -275,6 +281,18 @@ fn spotify_error(status: StatusCode) -> String {
     }
 }
 
+fn api_request(http: &Client, token: &str, method: Method, url: Url, body: Option<serde_json::Value>) -> reqwest::RequestBuilder {
+    let needs_length = method == Method::PUT;
+    let mut request = http.request(method, url).bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    } else if needs_length {
+        // Query-only library writes still need explicit empty-body framing.
+        request = request.header(reqwest::header::CONTENT_LENGTH, 0);
+    }
+    request
+}
+
 impl PersonalApi {
     pub fn new() -> Result<Arc<Self>, String> {
         let http = Client::builder().timeout(Duration::from_secs(15)).build()
@@ -291,10 +309,10 @@ impl PersonalApi {
         Ok(())
     }
 
-    pub async fn status(&self) -> Result<Status, String> {
+    pub async fn status(&self, app: &AppHandle) -> Result<Status, String> {
         let _operation = self.operation.lock().await;
         self.ensure_loaded()?;
-        Ok(status(&self.session.lock(), &load_app_settings()))
+        Ok(app_status(app, &self.session.lock(), &load_app_settings()))
     }
 
     fn disconnect_locked(&self, app: &AppHandle) -> Result<Status, String> {
@@ -310,7 +328,7 @@ impl PersonalApi {
         session.serial = session.serial.wrapping_add(1);
         session.error = None;
         emit(app, &session);
-        Ok(status(&session, &load_app_settings()))
+        Ok(app_status(app, &session, &load_app_settings()))
     }
 
     pub async fn disconnect(&self, app: &AppHandle) -> Result<Status, String> {
@@ -332,11 +350,12 @@ impl PersonalApi {
             save_app_settings(&settings)?;
             emit(app, &self.session.lock());
         }
-        Ok(status(&self.session.lock(), &settings))
+        Ok(app_status(app, &self.session.lock(), &settings))
     }
 
     pub async fn set_devices_enabled(&self, app: &AppHandle, enabled: bool) -> Result<Status, String> {
         let _operation = self.operation.lock().await;
+        self.ensure_loaded()?;
         let mut settings = load_app_settings();
         if enabled && settings.personal_client_id.is_empty() {
             return Err("configure your Spotify Client ID first".to_owned());
@@ -346,8 +365,7 @@ impl PersonalApi {
             save_app_settings(&settings)?;
             emit(app, &self.session.lock());
         }
-        self.ensure_loaded()?;
-        Ok(status(&self.session.lock(), &settings))
+        Ok(app_status(app, &self.session.lock(), &settings))
     }
 
     pub async fn authorize(self: &Arc<Self>, app: AppHandle, enable_devices: bool) -> Result<Authorization, String> {
@@ -484,18 +502,22 @@ impl PersonalApi {
         if devices && !settings.personal_devices_enabled {
             return Err("Spotify Connect is disabled".to_owned());
         }
-        let grant = self.session.lock().grant.clone().filter(|grant| grant.client_id == settings.personal_client_id)
-            .ok_or_else(|| "connect your own Spotify developer app first".to_owned())?;
-        check_account(app, &grant)?;
-        if devices && !scopes_contain(&grant.scopes, DEVICE_SCOPES) {
-            return Err("authorize Spotify Connect permissions to use devices".to_owned());
-        }
-        if !scopes_contain(&grant.scopes, LIBRARY_SCOPES) {
-            return Err("reconnect to grant Spotify library permissions".to_owned());
-        }
-        if grant.expires_at > now().saturating_add(30) {
-            return Ok(grant.access_token);
-        }
+        let grant = {
+            let session = self.session.lock();
+            let grant = session.grant.as_ref().filter(|grant| grant.client_id == settings.personal_client_id)
+                .ok_or_else(|| "connect your own Spotify developer app first".to_owned())?;
+            check_account(app, grant)?;
+            if devices && !scopes_contain(&grant.scopes, DEVICE_SCOPES) {
+                return Err("authorize Spotify Connect permissions to use devices".to_owned());
+            }
+            if !scopes_contain(&grant.scopes, LIBRARY_SCOPES) {
+                return Err("reconnect to grant Spotify library permissions".to_owned());
+            }
+            if grant.expires_at > now().saturating_add(30) {
+                return Ok(grant.access_token.clone());
+            }
+            grant.clone()
+        };
         let token = self.token(&[("grant_type", "refresh_token"), ("refresh_token", &grant.refresh_token), ("client_id", &grant.client_id)]).await;
         let token = match token {
             Ok(token) => token,
@@ -516,19 +538,23 @@ impl PersonalApi {
         Ok(access_token)
     }
 
+    fn check_active_grant(&self, app: &AppHandle) -> Result<(), String> {
+        check_account(app, self.session.lock().grant.as_ref().expect("access_token validated grant"))
+    }
+
     async fn request(&self, app: &AppHandle, devices: bool, method: Method, path: &str, uris: Option<&[String]>, body: Option<serde_json::Value>) -> Result<reqwest::Response, String> {
         let token = self.access_token(app, devices).await?;
         let mut url = Url::parse("https://api.spotify.com/v1/").expect("static API URL").join(path).expect("static API route");
         if let Some(uris) = uris {
             url.query_pairs_mut().append_pair("uris", &uris.join(","));
         }
-        check_account(app, self.session.lock().grant.as_ref().expect("access_token validated grant"))?;
-        let mut request = self.http.request(method, url).bearer_auth(token);
-        if let Some(body) = body { request = request.json(&body); }
-        let response = request.send().await.map_err(|_| "Spotify Web API is unreachable".to_owned())?;
+        self.check_active_grant(app)?;
+        let response = api_request(&self.http, &token, method, url, body).send().await
+            .map_err(|_| "Spotify Web API is unreachable".to_owned())?;
         if !response.status().is_success() {
             return Err(spotify_error(response.status()));
         }
+        self.check_active_grant(app)?;
         Ok(response)
     }
 
@@ -537,6 +563,7 @@ impl PersonalApi {
         let _operation = self.operation.lock().await;
         let result: Vec<bool> = self.request(app, false, Method::GET, "me/library/contains", Some(&uris), None).await?
             .json().await.map_err(|_| "Spotify returned an invalid membership response".to_owned())?;
+        self.check_active_grant(app)?;
         if result.len() != uris.len() {
             return Err("Spotify returned incomplete library membership".to_owned());
         }
@@ -559,14 +586,17 @@ impl PersonalApi {
         }
         let _operation = self.operation.lock().await;
         let path = format!("me/shows?offset={offset}&limit={limit}");
-        self.request(app, false, Method::GET, &path, None, None).await?
-            .json().await.map_err(|_| "Spotify returned an invalid saved shows page".to_owned())
+        let page = self.request(app, false, Method::GET, &path, None, None).await?
+            .json().await.map_err(|_| "Spotify returned an invalid saved shows page".to_owned())?;
+        self.check_active_grant(app)?;
+        Ok(page)
     }
 
     pub async fn devices(&self, app: &AppHandle) -> Result<Vec<Device>, String> {
         let _operation = self.operation.lock().await;
         let devices: Devices = self.request(app, true, Method::GET, "me/player/devices", None, None).await?
             .json().await.map_err(|_| "Spotify returned an invalid devices response".to_owned())?;
+        self.check_active_grant(app)?;
         Ok(devices.devices)
     }
 
@@ -657,6 +687,71 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> Result<R
 mod tests {
     use super::*;
 
+    async fn length_required_exchange(method: Method, body: Option<serde_json::Value>) -> (StatusCode, Option<usize>, Vec<u8>) {
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let path = if body.is_some() { "me/player" } else { "me/library?uris=spotify%3Atrack%3Asmoke,spotify%3Aartist%3Asmoke" };
+            let url = Url::parse(&format!("http://{}/v1/{path}", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "request ended before its headers");
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                    assert!(bytes.len() < 16384, "request headers exceeded the fixture bound");
+                };
+                let head = std::str::from_utf8(&bytes[..end]).unwrap().to_ascii_lowercase();
+                let length = head.lines().find_map(|line| {
+                    line.strip_prefix("content-length:").map(|value| value.trim().parse::<usize>().unwrap())
+                });
+                let length_required = head.starts_with("put ");
+                while bytes.len() - end < length.unwrap_or(0) {
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0, "request ended before its declared body length");
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let status = if length_required && length.is_none() { "411 Length Required" } else { "204 No Content" };
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                (length, bytes[end..].to_vec())
+            });
+            let client = Client::builder().no_proxy().build().unwrap();
+            let response = api_request(&client, "local-fixture", method, url, body).send().await.unwrap();
+            let (length, bytes) = server.await.unwrap();
+            (response.status(), length, bytes)
+        }).await.expect("local HTTP framing exchange timed out")
+    }
+
+    #[tokio::test]
+    async fn query_only_library_additions_pass_length_required_server() {
+        let (status, length, bytes) = length_required_exchange(Method::PUT, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "a bodyless like/follow must not return HTTP 411");
+        assert_eq!(length, Some(0));
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_only_library_removals_keep_working_without_a_body() {
+        let (status, length, bytes) = length_required_exchange(Method::DELETE, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(length, None);
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_device_transfer_preserves_payload_and_nonzero_length() {
+        let body = serde_json::json!({"device_ids": ["local-fixture-device"], "play": false});
+        let (status, length, bytes) = length_required_exchange(Method::PUT, Some(body.clone())).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(length, Some(bytes.len()));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(), body);
+    }
+
     #[test]
     fn uri_validation_rejects_malformed_and_oversized_batches() {
         assert!(validate_uris(&["spotify:artist:abc123".into(), "spotify:user:person_2".into()]).is_ok());
@@ -669,6 +764,39 @@ mod tests {
     fn scope_matching_uses_whole_scope_names() {
         assert!(scopes_contain("user-library-read user-follow-read", "user-follow-read"));
         assert!(!scopes_contain("user-library-read user-follow-readonly", "user-follow-read"));
+    }
+
+    #[test]
+    fn status_excludes_other_accounts_clients_and_incomplete_library_grants() {
+        let mut settings = AppSettings::default();
+        settings.personal_client_id = "owned-app".into();
+        let mut session = Session {
+            grant: Some(Grant {
+                client_id: settings.personal_client_id.clone(), account_id: "account-a".into(),
+                access_token: "local-access".into(), refresh_token: "local-refresh".into(),
+                expires_at: now() + 3600, scopes: LIBRARY_SCOPES.into(),
+            }),
+            ..Session::default()
+        };
+        let connected = status(&session, &settings, Some("account-a"));
+        assert!(connected.connected);
+        assert!(!connected.devices_authorized);
+        for account in [Some("account-b"), None] {
+            let disconnected = status(&session, &settings, account);
+            assert!(!disconnected.connected);
+            assert!(disconnected.account_id.is_none());
+            assert!(!disconnected.devices_authorized);
+        }
+        settings.personal_client_id = "other-app".into();
+        assert!(!status(&session, &settings, Some("account-a")).connected);
+        settings.personal_client_id = "owned-app".into();
+        session.grant.as_mut().unwrap().scopes = "user-library-read".into();
+        assert!(!status(&session, &settings, Some("account-a")).connected);
+        session.grant.as_mut().unwrap().scopes = format!("{LIBRARY_SCOPES} {DEVICE_SCOPES}");
+        let authorized = status(&session, &settings, Some("account-a"));
+        assert!(authorized.connected);
+        assert!(authorized.devices_authorized);
+        assert!(!authorized.devices_enabled);
     }
 
     #[test]

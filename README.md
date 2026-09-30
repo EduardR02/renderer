@@ -47,6 +47,8 @@ radio, and audio podcasts with shows and episodes you can browse and play.
 Artist pages have discographies, popular tracks, bios, monthly listeners and
 top cities; the interface has no merch, concert tickets, AI DJ, or promotional
 home feed. Podcast video and audiobooks are not played.
+Long episode lists window nearby rows and restore your place when
+you return.
 
 Music plays at 320 kbps with gapless transitions. Media keys work when the app isn't focused, and
 it shows up in Windows Quick Settings and on the lock screen. Played tracks are
@@ -56,10 +58,25 @@ added or removed by drag and drop or in bulk by rules — artist, album, title,
 length — with a preview of exactly which entries go. Settings has an audio cache
 size limit and a volume normalisation toggle.
 
-The sidebar preserves playlist folders and lets you pin or unpin playlists,
-including Liked Songs. Pins stay local to each account. User profiles show
-public playlists, and playlist owners link to their profiles using display
-names when Spotify supplies them.
+The sidebar preserves playlist folders and recent activity order. Visible
+playlist rows lazily hydrate missing custom artwork or album-art mosaics using
+the playback login alone, including before a personal Client ID is configured.
+Requests share the profile artwork metadata cache, are deduplicated and bounded,
+and read headers plus at most four source tracks—not a full playlist just for
+its cover. Offscreen rows wait until they become visible.
+Right-click a playlist or Liked Songs to pin or unpin it; pins stay local to each
+account. Liked Songs starts pinned when no preference has been saved, while an
+explicit unpin survives restart. User profiles show public playlists with custom
+artwork or album-art mosaics. My profile and saved shows are available from Settings.
+
+The player's saved check lists owned playlists and Liked Songs containing the
+track. An unsaved track gets a glass-outline heart instead; personal Spotify
+authorization is required to write to Liked Songs. Visible songs and the current
+track prewarm shared, bounded membership reads, so reopening a warmed overflow
+menu needs no additional membership request. Its Liked Songs action stays in
+place while an unknown status is checked, rather than appearing after the other
+items. Setup actions lead to Settings. Artist Follow sits before the overflow
+button.
 
 Some extra things I added because we control playback here:
 
@@ -67,9 +84,18 @@ Some extra things I added because we control playback here:
   or user — into search and open it here instead of the web player.
 - Cut a section out of a song, or loop an exact range. Set per playlist, edited
   in a waveform view.
-- Playback speed from 0.5× to 2×, pitch preserving.
+- Playback speed from 0.5× to 4×, pitch preserving. Scroll the speed control or
+  its slider for 0.05× steps; presets are 0.75×, 1×, 1.5×, and 2×. At exactly
+  1×, unedited audio bypasses time stretching.
+  Rate changes apply in place; audio already queued drains at the rate it was
+  produced. The playhead follows consumed output, not decoder write-ahead.
+  Normal pause retains queued and in-flight audio, time-stretch processing
+  state, and the consumed-output clock for resume.
+  Edited 1× audio avoids an extra intermediate copy. Output packets retain
+  tightly sized buffers so sparse cuts cannot inflate the playback ring's
+  memory beyond its bounded audio-sample budget.
 - Listening history, kept locally.
-- A mark on tracks that are already in the local audio cache.
+- A mark on songs and podcast episodes that are already in the local audio cache.
 
 Canvas works, but only if you have it enabled in the real Spotify app — it's
 an account setting on their servers, not a local one, and their backend returns
@@ -109,8 +135,15 @@ connecting your own Spotify Developer Mode app in Settings. This is a second
 authorization for the **same** Spotify account, not another account. Create
 the app with your Premium account, register
 `http://127.0.0.1:5589/personal-api/callback`, and paste its **Client ID** into
-Settings, never its Client Secret or a bearer token. Saved podcasts are also
-available with this optional authorization.
+Settings, never its Client Secret or a bearer token. The public Client ID is
+masked by default with an explicit reveal/hide control; reopening Settings
+restores the mask. Saved podcasts are also available with this optional
+authorization. Personal connection status refreshes when playback login becomes
+ready, so an early startup read cannot leave connected actions showing setup.
+
+Library saves and follows send URIs in the query string with an explicitly
+empty PUT body (`Content-Length: 0`), avoiding Spotify's HTTP 411 rejection.
+Removals still use DELETE; Connect transfers retain their JSON payload.
 
 The device picker is off by default and makes no background device requests.
 It transfers an existing **remote Spotify session**, without moving Renderer's
@@ -149,9 +182,14 @@ published. It attaches a Windows NSIS installer, an ad-hoc-signed macOS ZIP,
 and signed updater artifacts for both systems; the updater manifest is
 published only after all platform artifacts are ready. Install v0.1.19
 manually: older releases did not include the updater. Later versions can
-be checked and installed from Settings. Updater signatures use
-a separate release-signing key, not an Apple Developer ID certificate;
-Gatekeeper may still require manual approval for an initial macOS install.
+be checked and installed from Settings. Checks first compare the latest public
+GitHub release version with the installed version; a same-version or newer local
+build does not require an updater manifest from an older release. A newer release
+must provide its own pinned, matching-version HTTPS manifest and signed artifacts.
+Missing manifests and remote failures remain errors, not an “up to date” result.
+Updater signatures use a separate release-signing key, not an Apple Developer ID
+certificate; Gatekeeper may still require manual approval for an initial macOS
+install.
 
 Playback credentials and caches stay under `%LOCALAPPDATA%\SpotifyRenderer`
 on Windows or `~/Library/Application Support/SpotifyRenderer` on macOS. The
@@ -199,11 +237,23 @@ for the authenticated rootlist so stale shelves do not flash. That rootlist
 fetch runs alongside playback-state restoration rather than waiting for the
 queue and settings to finish restoring.
 
+The sign-in callback port is held before opening the browser. Accepted sockets
+use bounded blocking reads, including on Windows where they inherit the
+listener's nonblocking mode; a connection arriving before its request bytes
+must not discard the redirect. Startup log rotation holds the writer lock until
+the new file is ready, so concurrent diagnostics cannot enter the old generation.
+
 If restoring playback fails, retries use capped backoff without delaying the
 library refresh. Adding, moving or removing queue rows preserves Previous's
 history for tracks still in the queue, including during shuffle. Playlist track
 drags update the view immediately but send index-based edits sequentially; a
 failed edit refreshes the playlist before later drags are applied.
+
+Cover hydration fills the existing library rows in place without changing
+activity order. Account and request-generation fences keep old cover and
+membership answers from overwriting a new session or a confirmed save; updating
+one song does not discard unrelated visible-row membership answers. Owned
+playlist membership notifications do not trigger unnecessary Liked Songs reads.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.

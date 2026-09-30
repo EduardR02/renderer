@@ -9,8 +9,13 @@ export function loadPins(account = session.username) {
   pins.ids = [];
   if (!account) return;
   try {
-    const stored = JSON.parse(localStorage.getItem(`sr.library-pins:${account}`) || "[]");
-    if (Array.isArray(stored)) pins.ids = stored.filter((id) => typeof id === "string" && (id === LIKED || /^[A-Za-z0-9]{22}$/.test(id)));
+    const value = localStorage.getItem(`sr.library-pins:${account}`);
+    if (value === null) {
+      pins.ids = [LIKED];
+      return;
+    }
+    const stored = JSON.parse(value);
+    if (Array.isArray(stored)) pins.ids = [...new Set(stored.filter((id) => typeof id === "string" && (id === LIKED || /^[A-Za-z0-9]{22}$/.test(id))))];
   } catch { /* Storage may be disabled; pins remain session-local. */ }
 }
 

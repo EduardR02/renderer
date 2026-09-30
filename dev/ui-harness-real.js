@@ -108,6 +108,7 @@ export async function createRealMode(h) {
     shuffle: Boolean(seeded.shuffle),
     repeat: seeded.repeat ?? "off",
     playback_speed: seeded.playback_speed ?? 1,
+    audible_playback_speed: seeded.audible_playback_speed ?? 1,
     queue: clone(seeded.queue ?? []),
     error: available ? seeded.error || "" : `Real account state unavailable: ${boot.error || "start the native app with its DevTools bridge."}`,
   });
@@ -149,9 +150,9 @@ export async function createRealMode(h) {
     return playIndex(playback.current_index + 1);
   }
 
-  function append(tracks) {
+  function append(tracks, context = "") {
     for (const track of tracks) {
-      playback.queue.push(clone(track));
+      playback.queue.push({ ...clone(track), context: track.context || context });
       h.spliceIntoShuffleBag(playback.queue.length - 1);
     }
     emitState();
@@ -184,7 +185,9 @@ export async function createRealMode(h) {
         return /^https?:/.test(url) ? url : null;
       }
       case "play_queue": {
-        playback.queue = clone(Array.isArray(args.queue) ? args.queue : []);
+        playback.queue = Array.isArray(args.queue)
+          ? args.queue.map((track) => ({ ...clone(track), context: track.context || args.context || "" }))
+          : [];
         let start = Number(args.index ?? 0);
         if (args.automaticStart) {
           for (let step = 0; step < playback.queue.length; step += 1) {
@@ -203,10 +206,10 @@ export async function createRealMode(h) {
         return null;
       }
       case "add_queue":
-        append([args.track].filter(Boolean));
+        append([args.track].filter(Boolean), args.context);
         return null;
       case "add_queue_batch":
-        append(Array.isArray(args.tracks) ? args.tracks : []);
+        append(Array.isArray(args.tracks) ? args.tracks : [], args.context);
         return null;
       case "next":
         next();

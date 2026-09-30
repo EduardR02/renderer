@@ -1058,6 +1058,7 @@
       <button class="btn-ghost" onclick={openArtistRadio} disabled={!artist?.id}>
         Artist Radio
       </button>
+      <PersonalSave uri={`spotify:artist:${artist.id}`} label="Follow" savedLabel="Unfollow" unsavedLabel="Follow" />
       <div class="head-menu-wrap">
         <button
           class="btn-icon"
@@ -1095,7 +1096,6 @@
           </div>
         {/if}
       </div>
-      <PersonalSave uri={`spotify:artist:${artist.id}`} label="Follow" savedLabel="Unfollow" unsavedLabel="Follow" />
     </div>
 
     {#if top.length}

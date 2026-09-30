@@ -192,7 +192,7 @@ class AnswerCache {
 
   file(cmd, args) {
     const hash = crypto.createHash("sha1").update(stableStringify(args ?? {})).digest("hex").slice(0, 20);
-    return path.join(this.dir, cmd, `${hash}.json`);
+    return path.join(this.dir, encodeURIComponent(cmd), `${hash}.json`);
   }
 
   read(cmd, args) {

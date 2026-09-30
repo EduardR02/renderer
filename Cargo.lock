@@ -4094,6 +4094,7 @@ dependencies = [
  "rand 0.8.7",
  "renderer-engine",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "sha1",

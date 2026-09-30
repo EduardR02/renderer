@@ -1,13 +1,16 @@
 import { getVersion } from "@tauri-apps/api/app";
-import { check } from "@tauri-apps/plugin-updater";
+import { invoke } from "@tauri-apps/api/core";
+import { Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
 export { getVersion as getCurrentVersion };
 
-// The updater verifies the minisign signature before installation. A failed
-// manifest request rejects; only an actual successful check can return null.
+// Native release metadata avoids requesting a nonexistent legacy manifest when
+// this installation is already current. Newer releases retain the plugin's
+// signed download/install resource; failed checks always reject.
 export async function checkForUpdate() {
-  return check();
+  const metadata = await invoke("check_update");
+  return metadata ? new Update(metadata) : null;
 }
 
 export async function downloadAndInstall(update, onProgress) {

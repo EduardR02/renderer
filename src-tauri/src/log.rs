@@ -29,10 +29,14 @@ const APP_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 pub fn init(logs_dir: PathBuf) {
     let _ = std::fs::create_dir_all(&logs_dir);
     let path = logs_dir.join("renderer.log");
-    // Registering the path before rotating lets the roll itself be logged
-    // into the fresh file.
-    *LOG_FILE.lock().expect("app log lock") = Some(path.clone());
-    rotate_if_large(&path, APP_LOG_MAX_BYTES);
+    // Keep writers out until rotation and its announcement are complete.
+    let mut log_file = LOG_FILE.lock().expect("app log lock");
+    if let Some((bytes, previous)) = rotate_file(&path, APP_LOG_MAX_BYTES) {
+        append_to(&path, "INFO", &format!(
+            "log rolled at {bytes} bytes -> {}", previous.display()
+        ));
+    }
+    *log_file = Some(path);
 }
 
 pub fn info(message: &str) {
@@ -52,24 +56,20 @@ pub fn error(message: &str) {
 /// current file simply keeps growing. Shared with the engine log, which the
 /// shell rotates before each engine spawn.
 pub(crate) fn rotate_if_large(path: &Path, max_bytes: u64) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
-    };
+    if let Some((bytes, previous)) = rotate_file(path, max_bytes) {
+        info(&format!("log rolled at {bytes} bytes -> {}", previous.display()));
+    }
+}
+
+fn rotate_file(path: &Path, max_bytes: u64) -> Option<(u64, PathBuf)> {
+    let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() < max_bytes {
-        return;
+        return None;
     }
     let previous = path.with_extension("log.1");
     let _ = std::fs::remove_file(&previous);
-    if std::fs::rename(path, &previous).is_ok() {
-        // The announcement re-creates the log at `path` (append opens with
-        // create), so callers always see a current-generation file after a
-        // successful roll — not an empty gap until the next write.
-        info(&format!(
-            "log rolled at {} bytes -> {}",
-            metadata.len(),
-            previous.display()
-        ));
-    }
+    std::fs::rename(path, &previous).ok()?;
+    Some((metadata.len(), previous))
 }
 
 fn append(level: &str, message: &str) {
@@ -81,6 +81,10 @@ fn append(level: &str, message: &str) {
     let Some(path) = _guard.as_ref() else {
         return;
     };
+    append_to(path, level, message);
+}
+
+fn append_to(path: &Path, level: &str, message: &str) {
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
@@ -148,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn append_writes_timestamped_lines_to_the_configured_file() {
+    fn append_writes_timestamped_lines() {
         let dir = std::env::temp_dir().join(format!(
             "renderer-log-test-{}-{}",
             std::process::id(),
@@ -157,13 +161,11 @@ mod tests {
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0)
         ));
-        init(dir.clone());
-        info("engine spawned (pid 123)");
-        warn("engine exited; respawning in 2s");
-        let contents =
-            std::fs::read_to_string(dir.join("renderer.log")).expect("log file written");
-        // Other tests (the engine round-trip) may append to the configured
-        // log concurrently, so assert presence, not an exact line count.
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("renderer.log");
+        append_to(&path, "INFO", "engine spawned (pid 123)");
+        append_to(&path, "WARN", "engine exited; respawning in 2s");
+        let contents = std::fs::read_to_string(&path).expect("log file written");
         assert!(
             contents.contains("INFO engine spawned (pid 123)"),
             "info line present: {contents}"
@@ -205,6 +207,7 @@ mod tests {
         assert!(!fresh.contains("xxxxxxxx"), "stale bytes survive a roll: {fresh}");
         let rolled = path.with_extension("log.1");
         assert_eq!(std::fs::metadata(&rolled).unwrap().len(), APP_LOG_MAX_BYTES);
+        *LOG_FILE.lock().expect("app log lock") = None;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

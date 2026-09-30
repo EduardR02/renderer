@@ -570,6 +570,11 @@ fn wait_for_oauth_code_within(
             }
             Err(error) => return Err(format!("Spotify OAuth callback failed: {error}")),
         };
+        // Windows inherits the listener's nonblocking mode. Read timeouts do
+        // not change it, so a redirect accepted before its bytes arrive would
+        // otherwise be dropped immediately with WouldBlock.
+        stream.set_nonblocking(false)
+            .map_err(|error| format!("could not configure the Spotify OAuth callback socket: {error}"))?;
 
         stream
             .set_read_timeout(Some(read_timeout.min(deadline.saturating_duration_since(Instant::now())).max(Duration::from_millis(1))))

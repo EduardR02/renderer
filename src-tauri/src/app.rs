@@ -114,13 +114,14 @@ impl PlaybackSnapshot {
             && self.volume <= 100
             && matches!(self.repeat.as_str(), "off" | "context" | "track")
             && self.playback_speed.is_finite()
-            && (0.5..=2.0).contains(&self.playback_speed)
+            && (0.5..=4.0).contains(&self.playback_speed)
             && self
                 .current_index
                 .is_none_or(|index| index < self.queue.len())
             && (!self.queue.is_empty() || self.current_index.is_none())
             && self.queue.iter().all(|track| {
-                track.uri.starts_with("spotify:track:")
+                (track.uri.starts_with("spotify:track:")
+                    || track.uri.starts_with("spotify:episode:"))
                     && (track.duration_ms > 0 || track.unavailable)
             })
             && match self.current_index {
@@ -842,9 +843,11 @@ pub fn is_followed_playlist(playlists: &[Playlist], id: &str) -> bool {
 /// either (`rename_playlist` rejects one, and so does Spotify), so an empty
 /// fresh name always means "not supplied yet", never "cleared".
 pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
+    let by_id: std::collections::HashMap<&str, &Playlist> =
+        previous.iter().map(|playlist| (playlist.id.as_str(), playlist)).collect();
     for playlist in fresh.iter_mut() {
         playlist.description = normalize_canonical_playlist_description(&playlist.description);
-        if let Some(old) = previous.iter().find(|entry| entry.id == playlist.id) {
+        if let Some(old) = by_id.get(playlist.id.as_str()) {
             if playlist.name.is_empty() {
                 playlist.name = old.name.clone();
             }
@@ -1277,6 +1280,47 @@ mod tests {
         assert!(!playback_state_path(&dir)
             .with_extension("json.tmp")
             .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_episode_queue_restores_at_four_times_speed() {
+        let dir = std::env::temp_dir().join(format!(
+            "renderer-episode-playback-state-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut snapshot = PlaybackSnapshot {
+            version: PLAYBACK_STATE_VERSION,
+            queue: vec![
+                Track { duration_ms: 240_000, ..track("music") },
+                Track {
+                    id: "episode".to_owned(),
+                    uri: "spotify:episode:episode".to_owned(),
+                    duration_ms: 1_800_000,
+                    ..Track::default()
+                },
+            ],
+            current_index: Some(1),
+            position_ms: 42_000,
+            volume: 37,
+            shuffle: false,
+            repeat: "off".to_owned(),
+            playback_speed: 4.0,
+        };
+        save_playback_snapshot_to(&dir, &snapshot).unwrap();
+        assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
+        for speed in [0.5, 1.0, 3.0, 4.0] {
+            snapshot.playback_speed = speed;
+            assert!(snapshot.is_valid(), "valid speed {speed} must restore");
+        }
+        for speed in [0.49, 4.01, f32::NAN, f32::INFINITY] {
+            snapshot.playback_speed = speed;
+            assert!(!snapshot.is_valid(), "invalid speed {speed} must be rejected");
+        }
+        snapshot.playback_speed = 1.0;
+        snapshot.queue[1].uri = "spotify:show:show".to_owned();
+        assert!(!snapshot.is_valid(), "a show is not a playable queue item");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

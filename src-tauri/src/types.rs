@@ -289,6 +289,37 @@ pub struct Playlist {
     pub last_activity: Option<i64>,
 }
 
+impl Playlist {
+    pub fn artwork_ref(&self) -> PlaylistRef {
+        PlaylistRef {
+            id: self.id.clone(),
+            uri: self.uri.clone(),
+            name: self.name.clone(),
+            owner_id: self.owner_id.clone(),
+            owner_name: self.owner.clone(),
+            description: (!self.description.is_empty()).then(|| self.description.clone()),
+            cover_url: (!self.cover_url.is_empty()).then(|| self.cover_url.clone()),
+            cover_urls: self.cover_urls.clone(),
+            track_count: Some(self.tracks_total),
+        }
+    }
+
+    pub fn fill_artwork(&mut self, metadata: &PlaylistRef) -> bool {
+        let mut changed = false;
+        if self.cover_url.is_empty() {
+            if let Some(url) = metadata.cover_url.as_ref().filter(|url| !url.is_empty()) {
+                self.cover_url.clone_from(url);
+                changed = true;
+            }
+        }
+        if self.cover_urls.is_empty() && !metadata.cover_urls.is_empty() {
+            self.cover_urls.clone_from(&metadata.cover_urls);
+            changed = true;
+        }
+        changed
+    }
+}
+
 impl From<&PlaylistRef> for Playlist {
     fn from(reference: &PlaylistRef) -> Self {
         Self {
@@ -305,12 +336,11 @@ impl From<&PlaylistRef> for Playlist {
             },
             owner_id: reference.owner_id.clone(),
             cover_url: reference.cover_url.clone().unwrap_or_default(),
-            // The rootlist reference carries neither the collaborative flag,
-            // nor a revision, nor any track — so the cover candidates have to
-            // be carried over from a browse (see `carry_browse_fields`).
+            // Rootlist metadata has no revision; profile artwork samples can
+            // carry genuine mosaic candidates without a full playlist browse.
             collaborative: false,
             tracks_total: reference.track_count.unwrap_or(0),
-            cover_urls: Vec::new(),
+            cover_urls: reference.cover_urls.clone(),
             snapshot_id: String::new(),
             last_played: None,
             last_activity: None,
@@ -916,6 +946,38 @@ impl From<UserProfile> for ProfileDetail {
     }
 }
 
+impl ProfileDetail {
+    /// Fill only absent browse facts. Public-list order/identity/title and
+    /// local activity are never replaced by the library's sorted snapshot.
+    pub fn enrich_library_metadata(&mut self, library: &[Playlist]) {
+        let by_id: std::collections::HashMap<&str, &Playlist> =
+            library.iter().map(|playlist| (playlist.id.as_str(), playlist)).collect();
+        for playlist in &mut self.playlists {
+            let Some(known) = by_id.get(playlist.id.as_str()) else { continue };
+            if playlist.cover_url.is_empty() {
+                playlist.cover_url.clone_from(&known.cover_url);
+            }
+            if playlist.cover_urls.is_empty() {
+                playlist.cover_urls.clone_from(&known.cover_urls);
+            }
+            if playlist.description.is_empty() {
+                playlist.description.clone_from(&known.description);
+            }
+            if playlist.tracks_total == 0 {
+                playlist.tracks_total = known.tracks_total;
+            }
+        }
+    }
+
+    /// Compact artwork facts for the engine's cache, never full tracks or
+    /// activity timestamps. Rows remain in their public-profile source order.
+    pub fn library_artwork_refs(library: &[Playlist]) -> Vec<PlaylistRef> {
+        library.iter().filter(|playlist|
+            !playlist.cover_url.is_empty() || !playlist.cover_urls.is_empty())
+            .map(Playlist::artwork_ref).collect()
+    }
+}
+
 /// The rootlist's folder order and hierarchy, with the standard playlist
 /// conversion applied at every depth.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1107,6 +1169,7 @@ pub struct PlaybackState {
     /// One of `off`, `context`, `track`.
     pub repeat: String,
     pub playback_speed: f32,
+    pub audible_playback_speed: f32,
     pub current_index: Option<usize>,
     #[serde(deserialize_with = "string_or_default")]
     pub current_uri: String,
@@ -1165,6 +1228,7 @@ impl Default for PlaybackState {
             shuffle: false,
             repeat: "off".to_owned(),
             playback_speed: 1.0,
+            audible_playback_speed: 1.0,
             current_index: None,
             current_uri: String::new(),
             queue: Vec::new(),
@@ -1231,6 +1295,35 @@ mod tests {
     }
 
     #[test]
+    fn artwork_hydration_preserves_existing_covers_and_local_ordering_facts() {
+        let metadata = PlaylistRef {
+            id: "p1".into(), uri: "spotify:playlist:p1".into(), name: "Old title".into(),
+            description: None, owner_id: "owner".into(), owner_name: String::new(),
+            cover_url: Some("remote-custom".into()), cover_urls: vec!["sample".into()],
+            track_count: Some(400),
+        };
+        let mut playlist = Playlist {
+            id: "p1".into(), name: "Renamed".into(), cover_url: "current-custom".into(),
+            cover_urls: vec!["current-mosaic".into()], tracks_total: 9,
+            last_activity: Some(800), last_played: Some(700), snapshot_id: "new".into(),
+            ..Playlist::default()
+        };
+        let before = playlist.clone();
+        assert!(!playlist.fill_artwork(&metadata));
+        assert_eq!(playlist, before);
+        playlist.cover_url.clear();
+        playlist.cover_urls.clear();
+        assert!(playlist.fill_artwork(&metadata));
+        assert_eq!(playlist.cover_url, "remote-custom");
+        assert_eq!(playlist.cover_urls, vec!["sample"]);
+        assert_eq!(playlist.name, "Renamed");
+        assert_eq!(playlist.tracks_total, 9);
+        assert_eq!(playlist.last_activity, Some(800));
+        assert_eq!(playlist.last_played, Some(700));
+        assert_eq!(playlist.snapshot_id, "new");
+    }
+
+    #[test]
     fn show_and_episode_detail_keep_playback_and_availability_fields() {
         let episode = EpisodeRef {
             id: "ep".into(),
@@ -1274,6 +1367,38 @@ mod tests {
     }
 
     #[test]
+    fn profile_library_enrichment_fills_mosaics_without_sorting_or_activity_mutation() {
+        let mut profile = ProfileDetail {
+            playlists: vec![
+                Playlist { id: "b".into(), name: "Public B".into(), owner: "Owner B".into(),
+                    cover_url: "fresh-cover".into(), ..Playlist::default() },
+                Playlist { id: "a".into(), name: "Public A".into(), owner: "Owner A".into(),
+                    ..Playlist::default() },
+            ],
+            ..ProfileDetail::default()
+        };
+        let library = vec![
+            Playlist { id: "a".into(), name: "Old A".into(), owner: "Wrong owner".into(),
+                cover_urls: vec!["album-one".into(), "album-two".into()],
+                description: "Known description".into(), tracks_total: 77,
+                last_activity: Some(999), last_played: Some(888), ..Playlist::default() },
+            Playlist { id: "b".into(), cover_url: "old-cover".into(), ..Playlist::default() },
+        ];
+        let unchanged = library.clone();
+        profile.enrich_library_metadata(&library);
+        assert_eq!(profile.playlists.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!(profile.playlists[0].cover_url, "fresh-cover");
+        assert_eq!(profile.playlists[1].cover_urls, ["album-one", "album-two"]);
+        assert_eq!(profile.playlists[1].description, "Known description");
+        assert_eq!(profile.playlists[1].tracks_total, 77);
+        assert_eq!(profile.playlists[1].name, "Public A");
+        assert_eq!(profile.playlists[1].owner, "Owner A");
+        assert!(profile.playlists[1].last_activity.is_none());
+        assert!(profile.playlists[1].last_played.is_none());
+        assert_eq!(library, unchanged);
+    }
+
+    #[test]
     fn profile_and_nested_rootlist_keep_playlist_metadata_and_order() {
         let playlist = PlaylistRef {
             id: "mix".into(),
@@ -1283,6 +1408,7 @@ mod tests {
             owner_id: "dj".into(),
             owner_name: "DJ Name".into(),
             cover_url: Some("cover".into()),
+            cover_urls: Vec::new(),
             track_count: Some(12),
         };
         let profile = ProfileDetail::from(UserProfile {
@@ -1530,6 +1656,7 @@ mod tests {
                 owner_id: "alice".into(),
                 owner_name: "Alice Example".into(),
                 cover_url: Some("https://i.scdn.co/image/cover".into()),
+                cover_urls: Vec::new(),
                 track_count: Some(42),
             }],
             ..SearchBrowse::default()
@@ -1564,6 +1691,7 @@ mod tests {
             owner_id: String::new(),
             owner_name: String::new(),
             cover_url: None,
+            cover_urls: Vec::new(),
             track_count: None,
         };
         assert_eq!(Playlist::from(&reference).description, "&lt;b&gt;");
@@ -1579,6 +1707,7 @@ mod tests {
             owner_id: String::new(),
             owner_name: String::new(),
             cover_url: None,
+            cover_urls: Vec::new(),
             track_count: None,
         };
         assert_eq!(
@@ -1705,6 +1834,7 @@ mod tests {
                 owner_id: "spotify".into(),
                 owner_name: "Spotify".into(),
                 cover_url: Some("https://i.scdn.co/image/writers".into()),
+                cover_urls: Vec::new(),
                 track_count: Some(37),
             },
             tracks: (0..10)

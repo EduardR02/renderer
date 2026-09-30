@@ -6,6 +6,7 @@ mod log;
 mod media_keys;
 mod personal_api;
 mod types;
+mod updater;
 
 use std::sync::Arc;
 
@@ -103,6 +104,7 @@ pub fn run() {
             commands::search,
             commands::browse_playlists,
             commands::browse_playlist,
+            commands::hydrate_library_covers,
             commands::browse_radio,
             commands::browse_playlist_recommendations,
             commands::browse_track,
@@ -138,6 +140,7 @@ pub fn run() {
             commands::personal_api_devices,
             commands::personal_api_transfer,
             commands::personal_api_set_devices_enabled,
+            updater::check_update,
             commands::get_state,
             commands::get_cover,
             commands::get_cache_stats,

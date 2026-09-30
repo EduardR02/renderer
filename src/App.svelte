@@ -158,6 +158,9 @@
         return !detail.error && payload?.id !== id;
       }
       if (name === "library" && !libraryState.loaded) return true;
+      if (name === "show" || name === "episode") {
+        return !!node.querySelector('.podcast-page[aria-busy="true"]');
+      }
       // History and Liked Songs own their first fetch inside their view.
       // Their placeholder rows disappear when the first answer is rendered.
       return (name === "history" || name === "liked") && !!node.querySelector(".sk-row");

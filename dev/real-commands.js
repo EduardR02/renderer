@@ -24,6 +24,8 @@
 export const READ_COMMANDS = new Set([
   // In-memory snapshot of playback, library and me_id. No I/O.
   "get_state",
+  // Native application metadata; no I/O or mutations.
+  "plugin:app|version",
   // Reads settings.json.
   "get_app_settings",
   // In-memory membership lookup. No I/O.

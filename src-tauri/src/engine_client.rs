@@ -1078,8 +1078,8 @@ impl EngineClient {
     }
 
     pub async fn set_playback_speed(&self, speed: f32) -> Result<(), String> {
-        if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
-            return Err("playback speed must be between 0.5 and 2.0".to_owned());
+        if !speed.is_finite() || !(0.5..=4.0).contains(&speed) {
+            return Err("playback speed must be between 0.5 and 4.0".to_owned());
         }
         self.request("set_playback_speed", json!({"speed": speed}))
             .await
@@ -1393,11 +1393,20 @@ impl EngineClient {
     pub async fn browse_profile(
         &self,
         username: &str,
+        known_playlists: &[renderer_engine::protocol::PlaylistRef],
     ) -> Result<renderer_engine::protocol::UserProfile, String> {
         let reply = self
-            .request("browse_profile", json!({"username": username}))
+            .request("browse_profile", json!({"username": username, "known_playlists": known_playlists}))
             .await?;
         parse_data(reply, "browse_profile")
+    }
+
+    pub async fn browse_playlist_covers(
+        &self,
+        playlists: &[renderer_engine::protocol::PlaylistRef],
+    ) -> Result<Vec<renderer_engine::protocol::PlaylistRef>, String> {
+        let reply = self.request("browse_playlist_covers", json!({"playlists": playlists})).await?;
+        parse_data(reply, "browse_playlist_covers")
     }
 
     pub async fn browse_playlist(

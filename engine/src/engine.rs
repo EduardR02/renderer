@@ -231,6 +231,9 @@ pub struct Engine {
     /// remain cold.
     resume_after_reconnect: bool,
     position_anchor: Option<(u32, Instant)>,
+    /// Actual queued rate can lag the requested setting by the write-ahead.
+    audible_speed: Option<f32>,
+    audio_start_position_ms: u32,
     /// When the last command-driven track change (PlayQueue/Next/Previous)
     /// was dispatched, for pacing rapid presses (see
     /// [`TRACK_CHANGE_MIN_INTERVAL`]). `None` until the first change.
@@ -512,6 +515,8 @@ impl Engine {
             preview_lease_id: 0,
             resume_after_reconnect: false,
             position_anchor: None,
+            audible_speed: None,
+            audio_start_position_ms: 0,
             last_track_change: None,
             recent_track_changes: VecDeque::new(),
             recent_unavailable: VecDeque::new(),
@@ -661,6 +666,7 @@ impl Engine {
             shuffle: self.state.shuffle,
             repeat: self.state.repeat,
             playback_speed: self.state.playback_speed,
+            audible_playback_speed: self.audible_speed.unwrap_or(self.state.playback_speed),
             current_index: self.state.current_index,
             current_uri,
             queue,
@@ -781,6 +787,38 @@ impl Engine {
         self.position_anchor = Some((self.state.position_ms, Instant::now()));
     }
 
+    fn audible_position(&self) -> Option<u32> {
+        let elapsed = crate::audio::audible_elapsed_ms(self.audio_revision)?;
+        Some(self.source_position_after_audio(elapsed))
+    }
+
+    fn source_position_after_audio(&self, elapsed: f64) -> u32 {
+        let timeline = self.current_timeline();
+        let start = timeline.source_to_compiled(self.audio_start_position_ms);
+        timeline.compiled_to_source(
+            start.saturating_add(elapsed.round().min(f64::from(u32::MAX)) as u32)
+                .min(timeline.compiled_duration_ms()),
+        )
+    }
+
+    fn update_player_position(&mut self, position_ms: u32) {
+        // librespot reports the decoder head, up to a ring plus WSOLA
+        // lookahead ahead of the speaker. Corrections must use the consumer's
+        // clock when it exists, not pull audible playback toward decode-ahead.
+        self.update_position(self.audible_position().unwrap_or(position_ms));
+    }
+
+    fn prepare_audio_resume(&mut self) {
+        if !self.state.playing && self.current_load_produced_audio
+            && self.audible_position().is_none()
+        {
+            // An unsolicited stop/device loss may have discarded output. Its
+            // decoder-paused offset is the next real packet's origin. Normal
+            // user pauses retain a consumer clock and never rebuild here.
+            self.configure_current_audio_at_loop_pass(self.state.position_ms, self.loop_pass);
+        }
+    }
+
     /// Advances the reported position from the latest anchor and reports
     /// whether a position heartbeat should be emitted (at most once per
     /// call). While paused the position is static and no heartbeat is
@@ -808,14 +846,23 @@ impl Engine {
     /// playing, and for a decoder that died mid-track the frozen position is
     /// the point it died at, which is where the retry should resume.
     pub fn tick_position(&mut self) -> bool {
+        self.tick_position_at(Instant::now())
+    }
+
+    fn tick_position_at(&mut self, at: Instant) -> bool {
         if !self.state.playing || self.loading_failed || !self.current_load_produced_audio {
             return false;
+        }
+        if let Some(position) = self.audible_position() {
+            self.state.position_ms = position;
+            return true;
         }
         let Some((anchor_position_ms, anchor_time)) = self.position_anchor else {
             return false;
         };
         let elapsed_ms =
-            (anchor_time.elapsed().as_secs_f64() * 1_000.0 * f64::from(self.state.playback_speed))
+            (at.saturating_duration_since(anchor_time).as_secs_f64() * 1_000.0
+                * f64::from(self.audible_speed.unwrap_or(self.state.playback_speed)))
                 .round()
                 .min(f64::from(u32::MAX)) as u32;
         let source_position_ms = {
@@ -1788,6 +1835,7 @@ impl Engine {
             | Command::SetNormalisation { .. }
             | Command::BrowsePlaylists { .. }
             | Command::BrowsePlaylist { .. }
+            | Command::BrowsePlaylistCovers { .. }
             | Command::BrowsePlaylistTree { .. }
             | Command::BrowseRadio { .. }
             | Command::BrowsePlaylistRecommendations { .. }
@@ -1952,11 +2000,9 @@ impl Engine {
             })
     }
 
-    /// Best-effort eviction of a track's cached audio files, run off the
-    /// command loop. A failed load can leave (or find) a corrupt/truncated
-    /// cache entry — "end of stream" Symphonia failures — and evicting the
-    /// entry makes the next attempt a clean refetch. All file ids the track
-    /// exposes are removed (the player may have picked any format).
+    /// Best-effort eviction of cached song/episode audio, off the command loop.
+    /// A failed load can leave a corrupt/truncated cache entry; removing every
+    /// format lets the next attempt fetch clean audio.
     fn evict_track_audio_cache(&self, track_uri: SpotifyUri) {
         let Some(session) = self.session.clone() else {
             return;
@@ -1964,15 +2010,23 @@ impl Engine {
         let Some(cache) = session.cache().cloned() else {
             return;
         };
-        let uri_text = track_uri.to_uri().unwrap_or_default();
         tokio::spawn(async move {
-            let Ok(parsed) = SpotifyUri::from_uri(&uri_text) else {
-                return;
+            let files = match track_uri {
+                SpotifyUri::Track { .. } => {
+                    let Ok(track) = librespot_metadata::Track::get(&session, &track_uri).await else {
+                        return;
+                    };
+                    track.files
+                }
+                SpotifyUri::Episode { .. } => {
+                    let Ok(episode) = librespot_metadata::Episode::get(&session, &track_uri).await else {
+                        return;
+                    };
+                    episode.audio
+                }
+                _ => return,
             };
-            let Ok(track) = librespot_metadata::Track::get(&session, &parsed).await else {
-                return;
-            };
-            for file_id in track.files.values() {
+            for file_id in files.values() {
                 if let Err(error) = cache.remove_file(*file_id) {
                     eprintln!("could not evict cached audio file {file_id}: {error}");
                 }
@@ -2017,6 +2071,19 @@ impl Engine {
 
     pub fn on_audio_signal(&mut self, signal: AudioSignal) -> bool {
         match signal {
+            AudioSignal::SpeedBoundary { speed, revision, at } => {
+                if revision != self.audio_revision {
+                    return false;
+                }
+                if let Some(position) = self.audible_position() {
+                    self.update_position(position);
+                } else {
+                    self.tick_position_at(at);
+                    self.position_anchor = Some((self.state.position_ms, at));
+                }
+                self.audible_speed = Some(speed);
+                true
+            }
             // The one fact librespot's transport events cannot supply: this
             // load is real. Everything that has to tell a playing track from a
             // silent one hangs off it. Revision-gated like every audio signal,
@@ -2144,6 +2211,8 @@ impl Engine {
     }
 
     fn configure_current_audio_at_loop_pass(&mut self, position_ms: u32, loop_pass: u32) {
+        self.audio_start_position_ms = position_ms;
+        self.audible_speed = None;
         let edit = self
             .state
             .current_index
@@ -2158,6 +2227,8 @@ impl Engine {
     }
 
     fn configure_current_audio_after_natural_boundary(&mut self, position_ms: u32) {
+        self.audio_start_position_ms = position_ms;
+        self.audible_speed = None;
         let edit = self
             .state
             .current_index
@@ -2609,7 +2680,9 @@ impl Engine {
             }
             self.load_current(true)?;
         } else {
-            self.player()?.play();
+            let player = Arc::clone(self.player()?);
+            self.prepare_audio_resume();
+            player.play();
         }
         self.state.playing = true;
         self.update_position(self.state.position_ms);
@@ -2662,7 +2735,10 @@ impl Engine {
         // costs one log line and no state change on a stopped or finished one.
         // Skipping it costs audio that keeps playing with no transport control
         // left that can reach it.
-        self.player()?.pause();
+        let player = Arc::clone(self.player()?);
+        crate::audio::pause_output();
+        self.tick_position();
+        player.pause();
         // Only now, with the stop actually issued: a user pause supersedes any
         // in-flight seek transition, so its own Paused event must be delivered
         // rather than suppressed.
@@ -2883,24 +2959,31 @@ impl Engine {
     }
 
     fn set_playback_speed(&mut self, speed: f32) -> Result<bool, String> {
-        if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
-            return Err("playback speed must be between 0.5 and 2.0".to_owned());
+        if !speed.is_finite() || !(0.5..=4.0).contains(&speed) {
+            return Err("playback speed must be between 0.5 and 4.0".to_owned());
         }
         if self.state.playback_speed == speed {
             return Ok(false);
         }
+        // Settle elapsed old-rate time before publishing the request. No
+        // decoder command, queue clear, edit rebuild or listening-history
+        // transition belongs to a speed change.
+        self.tick_position();
+        self.position_anchor = Some((self.state.position_ms, Instant::now()));
+        if let Some(speed) = crate::audio::audible_speed(self.audio_revision) {
+            self.audible_speed = Some(speed);
+        } else if self.state.playing && self.current_load_produced_audio {
+            self.audible_speed = Some(self.audible_speed.unwrap_or(self.state.playback_speed));
+        } else {
+            self.audible_speed = None;
+        }
         self.state.playback_speed = speed;
-        if self.state.current_index.is_some() {
+        if self.current_needs_load || self.state.current_index.is_none() {
             let position = self.state.position_ms;
             self.preserve_loop_pass_for_position(position);
-            self.loop_jump_pending = false;
-            if self.current_needs_load {
-                self.configure_current_audio_at_loop_pass(position, self.loop_pass);
-            } else {
-                self.seek_source_at_loop_pass(position)?;
-            }
+            self.configure_current_audio_at_loop_pass(position, self.loop_pass);
         } else {
-            self.audio_revision = crate::audio::configure_customization(None, speed, 0);
+            crate::audio::set_customization_speed(speed);
         }
         Ok(true)
     }
@@ -3690,7 +3773,7 @@ impl Engine {
                 let was_playing = self.state.playing;
                 let was_failed = self.state.error.is_some();
                 self.state.playing = true;
-                self.update_position(position_ms);
+                self.update_player_position(position_ms);
                 self.state.error = None;
                 !was_playing || was_failed
             }
@@ -3713,8 +3796,7 @@ impl Engine {
                 let was_playing = self.state.playing;
                 // What the state event would say that it does not say already:
                 // the clamped playhead it reports, or the flag itself.
-                let position_moved =
-                    self.state.position_ms != position_ms.min(self.state.duration_ms);
+                let previous_position = self.state.position_ms;
                 self.state.playing = false;
                 if was_playing {
                     // Command-driven pause already stopped and persisted the
@@ -3722,13 +3804,13 @@ impl Engine {
                     // player/audio-device pause.
                     self.pause_listening();
                 }
-                self.update_position(position_ms);
+                self.update_player_position(position_ms);
                 // `Engine::pause` reports its own transition before librespot
                 // answers it, so the answer itself is worth a state event only
                 // when it says something the report did not. The anchor still
                 // moves either way: that is what the projection reads, and the
                 // position lane carries it out at the next heartbeat.
-                was_playing || position_moved
+                was_playing || self.state.position_ms != previous_position
             }
             PlayerEvent::PositionChanged {
                 play_request_id,
@@ -3751,10 +3833,9 @@ impl Engine {
                 // carries a playhead the UI has not seen. A genuinely different
                 // position is a change the state event reports, so it still
                 // emits one.
-                let position_moved =
-                    self.state.position_ms != position_ms.min(self.state.duration_ms);
-                self.update_position(position_ms);
-                position_moved
+                let previous_position = self.state.position_ms;
+                self.update_player_position(position_ms);
+                self.state.position_ms != previous_position
             }
             PlayerEvent::EndOfTrack {
                 play_request_id,
@@ -7172,15 +7253,80 @@ mod tests {
 
         assert_eq!(engine.set_playback_speed(2.0), Ok(true));
         assert_eq!(engine.loop_pass, 3);
+    }
 
-        let (mut loaded_engine, _) = test_engine();
-        loaded_engine.state =
-            edited_playback_state(100_000, Vec::new(), Some(loop_range(20_000, 40_000, 3)));
-        loaded_engine.state.position_ms = 25_000;
-        loaded_engine.loop_pass = 2;
-        loaded_engine.loop_decoder_eof = true;
-        assert!(loaded_engine.set_playback_speed(1.5).is_err());
-        assert_eq!(loaded_engine.loop_pass, 2);
+    #[test]
+    fn speed_changes_are_finite_bounded_and_do_not_restart_loaded_or_paused_audio() {
+        let (mut engine, _) = test_engine();
+        engine.state = edited_playback_state(100_000, Vec::new(),
+            Some(loop_range(20_000, 40_000, 3)));
+        engine.state.position_ms = 25_000;
+        engine.state.playing = false;
+        engine.loop_pass = 2;
+        engine.loop_decoder_eof = true;
+        engine.loop_jump_pending = true;
+        engine.history.push(0);
+        let queue = serde_json::to_value(&engine.state.queue).unwrap();
+        for speed in [0.5, 3.0, 4.0, 1.0] {
+            assert_eq!(engine.set_playback_speed(speed), Ok(true));
+            assert_eq!(engine.state.position_ms, 25_000);
+            assert!(!engine.state.playing);
+            assert_eq!(engine.loop_pass, 2);
+            assert!(engine.loop_decoder_eof);
+            assert!(engine.loop_jump_pending);
+            assert_eq!(engine.history, vec![0]);
+            assert_eq!(serde_json::to_value(&engine.state.queue).unwrap(), queue);
+        }
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.499, 4.001] {
+            assert!(engine.set_playback_speed(invalid).is_err());
+            assert_eq!(engine.state.playback_speed, 1.0);
+            assert_eq!(engine.state.position_ms, 25_000);
+        }
+        assert_eq!(engine.set_playback_speed(1.0), Ok(false));
+    }
+
+    #[test]
+    fn speed_boundary_settles_old_rate_before_projecting_new_rate() {
+        let (mut engine, _) = test_engine();
+        engine.state = playback_state(100_000);
+        engine.state.playing = true;
+        engine.current_load_produced_audio = true;
+        // No device ring in this deterministic fallback-clock scenario.
+        engine.audio_revision = u64::MAX;
+        let start = Instant::now();
+        engine.position_anchor = Some((10_000, start));
+        engine.state.playback_speed = 4.0;
+        engine.audible_speed = Some(1.0);
+        let boundary = start + Duration::from_millis(150);
+        assert!(engine.on_audio_signal(AudioSignal::SpeedBoundary {
+            speed: 4.0, revision: engine.audio_revision, at: boundary,
+        }));
+        assert_eq!(engine.state.position_ms, 10_150);
+        assert!(engine.tick_position_at(boundary + Duration::from_millis(100)));
+        assert_eq!(engine.state.position_ms, 10_550);
+        assert!(!engine.on_audio_signal(AudioSignal::SpeedBoundary {
+            speed: 0.5, revision: engine.audio_revision - 1, at: boundary,
+        }));
+        assert_eq!(engine.state.position_ms, 10_550);
+    }
+
+    #[test]
+    fn resuming_discarded_output_starts_the_consumer_clock_at_the_paused_decoder_offset() {
+        let (mut engine, _) = test_engine();
+        engine.state = edited_playback_state(100_000, Vec::new(),
+            Some(loop_range(20_000, 40_000, 3)));
+        engine.state.playing = false;
+        engine.update_position(25_000);
+        engine.loop_pass = 2;
+        engine.current_load_produced_audio = true;
+        engine.audio_revision = u64::MAX;
+        engine.audio_start_position_ms = 0;
+        engine.prepare_audio_resume();
+        assert_eq!(engine.state.position_ms, 25_000);
+        assert!(!engine.state.playing);
+        assert_eq!(engine.loop_pass, 2);
+        assert_eq!(engine.source_position_after_audio(0.0), 25_000);
+        assert_eq!(engine.source_position_after_audio(300.0), 25_300);
     }
 
     #[test]

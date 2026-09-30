@@ -47,6 +47,10 @@ enum BrowseOutcome {
         request_id: String,
         result: Result<PlaylistBrowse, String>,
     },
+    PlaylistCovers {
+        request_id: String,
+        result: Result<Vec<PlaylistRef>, String>,
+    },
     Radio {
         request_id: String,
         result: Result<RadioBrowse, String>,
@@ -440,6 +444,20 @@ async fn run(
                                     }
                                 }
                             }
+                            Command::BrowsePlaylistCovers { playlists } => {
+                                match engine.browse_session_clone() {
+                                    Ok(session) => {
+                                        let sender = browse_sender.clone();
+                                        tokio::spawn(async move {
+                                            let result = browse::playlist_covers_browse(&session, playlists).await;
+                                            let _ = sender.send(BrowseOutcome::PlaylistCovers { request_id, result });
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = browse_sender.send(BrowseOutcome::PlaylistCovers { request_id, result: Err(error) });
+                                    }
+                                }
+                            }
                             Command::BrowseRadio { id } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
@@ -499,12 +517,12 @@ async fn run(
                                     }
                                 }
                             }
-                            Command::BrowseProfile { username } => {
+                            Command::BrowseProfile { username, known_playlists } => {
                                 match engine.browse_session_clone() {
                                     Ok(session) => {
                                         let sender = browse_sender.clone();
                                         tokio::spawn(async move {
-                                            let result = browse::user_profile_browse(&session, &username).await;
+                                            let result = browse::user_profile_browse(&session, &username, &known_playlists).await;
                                             let _ = sender.send(BrowseOutcome::Profile { request_id, result });
                                         });
                                     }
@@ -865,6 +883,9 @@ async fn run(
                                 Ok(browse)
                             });
                             engine.send_browse_response(&request_id, "browse_playlist", &result)?;
+                        }
+                        BrowseOutcome::PlaylistCovers { request_id, result } => {
+                            engine.send_browse_response(&request_id, "browse_playlist_covers", &result)?;
                         }
                         BrowseOutcome::Radio { request_id, result } => {
                             engine.send_browse_response(&request_id, "browse_radio", &result)?;

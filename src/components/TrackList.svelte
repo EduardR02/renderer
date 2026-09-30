@@ -7,6 +7,7 @@
     playback,
     togglePlay,
     library,
+    libraryChanges,
     promotePlaylist,
     openCredits,
     ui,
@@ -16,6 +17,7 @@
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
   import PersonalSave from "./PersonalSave.svelte";
+  import { personal, personalApi, personalConnected, watchPersonal } from "../lib/personal.svelte.js";
   import { formatTime } from "../lib/time.js";
   import { spotifyLink, writeClipboard } from "../lib/spotify-link.js";
   import { observeStuck } from "../lib/sticky.js";
@@ -485,7 +487,7 @@
     clearTimeout(copyResetTimer);
     menu.open = true;
     menu.anchor = e.currentTarget;
-    menu.x = Math.min(r.right - 216, window.innerWidth - 224);
+    menu.x = Math.max(8, Math.min(r.right - 240, window.innerWidth - 248));
     menu.top = placed.top;
     menu.bottom = placed.bottom;
     menu.maxH = placed.maxH;
@@ -721,6 +723,43 @@
 
   const visible = $derived(disableWindowing ? tracks : tracks.slice(firstRow, lastRow));
 
+  /* One observer warms only painted rows, including short embedded lists.
+     Opening overflow never waits for a request or guesses membership. */
+  const membershipRows = new Map();
+  let membershipObserver = null;
+  function observeMembership(node, uri) {
+    membershipRows.set(node, uri);
+    membershipObserver?.observe(node);
+    return {
+      update(nextUri) {
+        membershipRows.set(node, nextUri);
+        membershipObserver?.unobserve(node);
+        membershipObserver?.observe(node);
+      },
+      destroy() {
+        membershipObserver?.unobserve(node);
+        membershipRows.delete(node);
+      },
+    };
+  }
+  $effect(() => watchPersonal());
+  $effect(() => {
+    const root = rootEl;
+    const ready = personalConnected();
+    const revision = personal.membershipRevision;
+    const libraryRevision = libraryChanges.savedTracks;
+    if (!root || !ready) return;
+    const observer = new IntersectionObserver((entries) => {
+      const uris = entries.filter((entry) => entry.isIntersecting)
+        .map((entry) => membershipRows.get(entry.target))
+        .filter((uri) => uri?.startsWith("spotify:track:"));
+      if (uris.length) personalApi.warmMemberships(uris).catch(() => {});
+    }, { root: root.closest(".scroll") });
+    membershipObserver = observer;
+    for (const node of membershipRows.keys()) observer.observe(node);
+    return () => { observer.disconnect(); membershipObserver = null; };
+  });
+
 
   function measure(scroller) {
     if (!bodyEl || !scroller) return;
@@ -873,6 +912,7 @@
       class:skipped={rowSkipped(track)}
       class:drag-source={rowIsSource(i)}
       data-i={i}
+      use:observeMembership={track.uri}
       style:transform={rowDragTransform(i)}
       role="button"
       aria-disabled={track.unavailable ? "true" : undefined}
@@ -1088,7 +1128,7 @@
   <!-- The popover is the glass and its child is the scroller, so that the
        scroller's overlay bar is laid inside the popover, in the top layer. -->
   <div
-    class="menu glass-overlay"
+    class="menu track-menu glass-overlay"
     popover="manual"
     use:topLayer
     bind:this={menuEl}
@@ -1104,7 +1144,7 @@
       <button class="menu-item" onclick={openPicker}>Add to playlist…</button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:")}
-      <PersonalSave uri={menu.track.uri} />
+      <PersonalSave uri={menu.track.uri} menu savedLabel="Remove from Liked Songs" unsavedLabel="Add to Liked Songs" onSaved={() => closeMenus(true)} />
     {/if}
     {#if menuLink}
       <!-- The confirmation lives on the item, which is why the menu does not
@@ -1263,6 +1303,7 @@
     margin: 0;
     padding: 0;
   }
+  .track-menu { width: 240px; min-width: 0; max-width: calc(100vw - 16px); }
   .menu-scroll {
     padding: var(--s1);
     overflow-y: auto;

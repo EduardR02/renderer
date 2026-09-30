@@ -1018,9 +1018,6 @@
           <button class="btn-ghost" onclick={shufflePlay} disabled={!tracks.length}>
             <Icon name="shuffle" size={14} />Shuffle
           </button>
-          {#if library.some((entry) => entry.id === pl.id)}
-            <button class="btn-ghost" onclick={() => togglePin(pl.id)}>{isPinned(pl.id) ? "Unpin" : "Pin to sidebar"}</button>
-          {/if}
           <div class="playlist-menu-wrap">
             <button
               class="btn-icon"
@@ -1043,15 +1040,17 @@
                 bind:this={menu}
                 onkeydown={onMenuKeyDown}
               >
+                {#if library.some((entry) => entry.id === pl.id)}
+                  <button class="menu-item" role="menuitem" onclick={() => { togglePin(pl.id); closeMenu(true); }}>{isPinned(pl.id) ? "Unpin from sidebar" : "Pin to sidebar"}</button>
+                {/if}
                 {#if editable}
                   <button class="menu-item" role="menuitem" onclick={startRename}>Rename playlist</button>
                   <button class="menu-item" role="menuitem" disabled={!tracks.length} onclick={() => { closeMenu(); cleanupId = pl.id; }}>Remove songs by rules…</button>
                 {/if}
                 <!-- The confirmation lives on the item, which is why the menu
                      does not close on click: a copy with no feedback is
-                     indistinguishable from a dead control. Sharing is not
-                     editing, so this item is the whole menu for a playlist
-                     that is not ours. -->
+                     indistinguishable from a dead control. Sharing does not
+                     require playlist ownership. -->
                 <button
                   class="menu-item"
                   role="menuitem"

@@ -1,5 +1,5 @@
 <script>
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import {
     playback,
     api,
@@ -12,6 +12,8 @@
     nowSaved,
     lookupSavedIn,
   } from "../lib/state.svelte.js";
+  import { library, session } from "../lib/state.svelte.js";
+  import { personal, personalApi, personalConnected, personalSaved, watchPersonal } from "../lib/personal.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
@@ -76,6 +78,7 @@
   }
 
   function changeVolume(percent, final = false) {
+    if (!Number.isFinite(percent)) return;
     const next = Math.min(100, Math.max(0, Math.round(percent)));
     volumeError = "";
     volumeDraft = next;
@@ -111,7 +114,7 @@
     let lastWheelAt = -Infinity;
     const onWheel = (event) => {
       // Leave pinch-to-zoom and horizontal navigation to the browser.
-      if (event.ctrlKey || event.metaKey || !event.deltaY
+      if (event.ctrlKey || event.metaKey || !Number.isFinite(event.deltaY) || !event.deltaY
         || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
       event.preventDefault();
       const now = performance.now();
@@ -275,18 +278,49 @@
    */
   const currentUri = $derived(current?.uri ?? null);
 
-  /* Track changes re-ask; index changes (an add while this track plays,
-     an external like picked up by reconciliation) arrive as one event. */
   $effect(() => {
-    lookupSavedIn(currentUri);
+    const uri = currentUri;
+    const account = session.username;
+    untrack(() => {
+      nowSaved.refs = [];
+      lookupSavedIn(uri);
+    });
+  });
+  $effect(() => watchPersonal());
+  $effect(() => {
+    const uri = currentUri;
+    const account = session.username;
+    const revision = personal.membershipRevision;
+    if (uri?.startsWith("spotify:track:") && personalConnected()) {
+      untrack(() => personalApi.warmMemberships([uri])).catch(() => {});
+    }
   });
   $effect(() => {
-    const event = listen("memberships_changed", () => lookupSavedIn(currentUri));
+    const event = listen("memberships_changed", () => {
+      lookupSavedIn(currentUri);
+      if (currentUri?.startsWith("spotify:track:") && personalConnected()) {
+        personalApi.warmMemberships([currentUri]).catch(() => {});
+      }
+    });
     return () => event.then((off) => off()).catch(() => {});
   });
 
-  /* Screen readers get the real container names, not a count. */
-  const savedLabel = $derived(`Saved in ${nowSaved.refs.map((ref) => ref.name).join(", ")}`);
+  const savedRefs = $derived.by(() => {
+    const owned = new Set(library.filter((item) => item.owner_id === session.username).map((item) => item.id));
+    const liked = personalSaved(currentUri);
+    const refs = nowSaved.refs.filter((ref) => ref.id === "liked" ? liked !== false : owned.has(ref.id));
+    if (liked === true && !refs.some((ref) => ref.id === "liked")) {
+      return [{ id: "liked", name: "Liked Songs" }, ...refs];
+    }
+    return refs;
+  });
+  const savedLabel = $derived(`Saved in ${savedRefs.map((ref) => ref.name).join(", ")}`);
+  let savedMark = $state(null);
+  async function focusSavedMark({ restoreFocus = false } = {}) {
+    if (!restoreFocus) return;
+    await tick();
+    savedMark?.focus();
+  }
 
   function openSaved(id) {
     if (id === "liked") navigate("liked");
@@ -319,20 +353,23 @@
    * step grid, the clamp and the equality checks plain integer work.
    */
   const SPEED_MIN = 50;
-  const SPEED_MAX = 200;
+  const SPEED_MAX = 400;
   const SPEED_STEP = 5;
-  const SPEED_PRESETS = [75, 100, 125, 150];
+  const SPEED_PRESETS = [75, 100, 150, 200];
 
   let speedDraft = $state(null);
   let speedOpen = $state(false);
   let speedButton = $state(null);
   let speedMenu = $state(null);
   let speedAnchor = $state({ left: 0, bottom: 0 });
+  const SPEED_INTERVAL_MS = 80;
   let speedTimer = null;
   let pendingSpeed = null;
-  let speedRequestActive = false;
-  let speedIntent = 0;
-
+  let activeSpeed = null;
+  let speedSentAt = -Infinity;
+  let speedUrgent = false;
+  let speedDisposed = false;
+  let speedError = $state("");
 
   const speedPercent = $derived(
     speedDraft ?? Math.round((playback.playback_speed || 1) * 100)
@@ -343,43 +380,55 @@
     return (percent / 100).toFixed(2).replace(/0$/, "");
   }
 
-  /**
-   * Wheel and slider input is first collapsed into one settled intent. If a
-   * command is already in flight, only the newest settled value waits behind
-   * it; no two speed commands overlap and intermediate values are discarded.
-   */
+  /** One in-flight command, with only the newest intent waiting behind it. */
   async function flushSpeed() {
-    if (speedRequestActive) return;
-    speedRequestActive = true;
-    while (pendingSpeed) {
-      const request = pendingSpeed;
-      pendingSpeed = null;
-      try {
-        await api.setPlaybackSpeed(request.percent / 100);
-      } catch {
-        // The API wrapper rolls back only if this is still the active command.
-      } finally {
-        if (request.intent === speedIntent && speedDraft === request.percent) {
-          speedDraft = null;
-        }
+    clearTimeout(speedTimer);
+    speedTimer = null;
+    if (speedDisposed || activeSpeed !== null || pendingSpeed === null) return;
+    const delay = SPEED_INTERVAL_MS - (performance.now() - speedSentAt);
+    if (!speedUrgent && delay > 0) {
+      speedTimer = setTimeout(flushSpeed, delay);
+      return;
+    }
+    const target = pendingSpeed;
+    pendingSpeed = null;
+    activeSpeed = target;
+    speedUrgent = false;
+    speedSentAt = performance.now();
+    try {
+      await api.setPlaybackSpeed(target / 100);
+    } catch (error) {
+      if (!speedDisposed && pendingSpeed === null) speedError = `Could not change speed: ${String(error)}`;
+    } finally {
+      activeSpeed = null;
+      if (!speedDisposed) {
+        if (pendingSpeed === null) speedDraft = null;
+        else flushSpeed();
       }
     }
-    speedRequestActive = false;
   }
 
-  function commitSpeed(percent) {
+  function commitSpeed(percent, final = false) {
+    if (!Number.isFinite(percent)) return;
     const snapped = Math.round(percent / SPEED_STEP) * SPEED_STEP;
     const next = Math.min(SPEED_MAX, Math.max(SPEED_MIN, snapped));
-    const intent = ++speedIntent;
+    speedError = "";
     speedDraft = next;
-    clearTimeout(speedTimer);
-    speedTimer = setTimeout(() => {
-      pendingSpeed = { percent: next, intent };
-      flushSpeed();
-    }, 120);
+    pendingSpeed = next === activeSpeed
+      || (activeSpeed === null && next === Math.round(playback.playback_speed * 100)) ? null : next;
+    speedUrgent = final;
+    if (pendingSpeed === null && activeSpeed === null) speedDraft = null;
+    flushSpeed();
   }
 
-  $effect(() => () => clearTimeout(speedTimer));
+  $effect(() => {
+    speedDisposed = false;
+    return () => {
+      speedDisposed = true;
+      clearTimeout(speedTimer);
+      pendingSpeed = null;
+    };
+  });
 
   function placeSpeedMenu() {
     const rect = speedButton?.getBoundingClientRect();
@@ -395,19 +444,17 @@
     if (speedOpen) placeSpeedMenu();
   }
 
-  /* Bound here rather than with onwheel so it can be non-passive: scrolling
-     the control must adjust it, not scroll whatever sits behind it. */
-  $effect(() => {
-    const node = speedButton;
-    if (!node) return;
+  /* Non-passive on both surfaces: a speed gesture must not scroll the page. */
+  function speedWheel(node) {
     const onWheel = (event) => {
+      if (event.ctrlKey || event.metaKey || !Number.isFinite(event.deltaY)
+        || !event.deltaY || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
       event.preventDefault();
-      const direction = event.deltaY < 0 ? 1 : -1;
-      commitSpeed(speedPercent + direction * SPEED_STEP);
+      untrack(() => commitSpeed(speedPercent + (event.deltaY < 0 ? SPEED_STEP : -SPEED_STEP)));
     };
     node.addEventListener("wheel", onWheel, { passive: false });
-    return () => node.removeEventListener("wheel", onWheel);
-  });
+    return { destroy: () => node.removeEventListener("wheel", onWheel) };
+  }
 
   $effect(() => {
     if (!speedOpen) return;
@@ -468,19 +515,20 @@
             />
           {/if}
         </span>
-        {#if nowSaved.refs.length}
+        {#if savedRefs.length}
           <!-- Marks live BESIDE the two-line text block, not inside its first
                line: .p-now centres its children, so the check faces the whole
                title+artists stack instead of hanging off the song name. -->
           <span class="p-saved">
-            <span class="p-saved-mark"><Icon name="check" size={10} /></span>
-            <!-- Keyboard path: tabbing into a row button opens the panel
-                 through :focus-within, so the wrapper stays non-focusable
-                 and every interactive target remains a real button. -->
+            <button class="p-saved-trigger" bind:this={savedMark} aria-label={savedLabel} title={savedLabel}>
+              <span class="p-saved-mark"><Icon name="check" size={10} /></span>
+            </button>
+            <!-- Focusing the check opens its membership panel without needing
+                 to tab into an invisible descendant. -->
             <span class="p-saved-panel glass-overlay" role="group" aria-label={savedLabel}>
               <span class="p-saved-scroll" use:scrollbar>
                 <span class="p-saved-head">Saved in</span>
-                {#each nowSaved.refs as ref (ref.id)}
+                {#each savedRefs as ref (ref.id)}
                   <button
                     class="p-saved-row"
                     title="Open {ref.name}"
@@ -490,9 +538,8 @@
               </span>
             </span>
           </span>
-        {/if}
-        {#if current.uri?.startsWith("spotify:track:")}
-          <PersonalSave uri={current.uri} compact />
+        {:else if current.uri?.startsWith("spotify:track:")}
+          <PersonalSave uri={current.uri} compact onSaved={focusSavedMark} />
         {/if}
         {#if editIndicator}
           <span
@@ -593,11 +640,12 @@
         class="p-speed"
         class:on={speedPercent !== 100}
         bind:this={speedButton}
+        use:speedWheel
         title="Playback speed — scroll to adjust, double-click to reset"
         aria-label="Playback speed"
         aria-expanded={speedOpen}
         onclick={toggleSpeedMenu}
-        ondblclick={() => commitSpeed(100)}
+        ondblclick={() => commitSpeed(100, true)}
       >
         {speedLabel}×
       </button>
@@ -612,29 +660,32 @@
           <span class="speed-value">{speedLabel}×</span>
           <span class="speed-note">pitch preserved</span>
         </div>
-        <Slider
-          min={SPEED_MIN}
-          max={SPEED_MAX}
-          value={speedPercent}
-          label="Playback speed"
-          step={SPEED_STEP}
-          kind="speed"
-          formatValue={(v) => formatSpeed(v) + "×"}
-          onDragStart={(v) => (speedDraft = v)}
-          onDragChange={(v) => (speedDraft = v)}
-          onCommit={(v) => commitSpeed(v)}
-        />
+        <div class="speed-slider" use:speedWheel>
+          <Slider
+            min={SPEED_MIN}
+            max={SPEED_MAX}
+            value={speedPercent}
+            label="Playback speed"
+            step={SPEED_STEP}
+            kind="speed"
+            formatValue={(v) => formatSpeed(Math.round(v / SPEED_STEP) * SPEED_STEP) + "×"}
+            onDragStart={(v) => commitSpeed(v)}
+            onDragChange={(v) => commitSpeed(v)}
+            onCommit={(v) => commitSpeed(v, true)}
+          />
+        </div>
         <div class="speed-presets">
           {#each SPEED_PRESETS as preset}
             <button
               class="speed-preset"
               class:on={speedPercent === preset}
-              onclick={() => commitSpeed(preset)}
+              onclick={() => commitSpeed(preset, true)}
             >
               {formatSpeed(preset)}×
             </button>
           {/each}
         </div>
+        {#if speedError}<p class="speed-error" role="status">{speedError}</p>{/if}
       </div>
       <DevicePicker />
       <button
@@ -742,11 +793,13 @@
     transform: translateX(-50%);
     margin: 0;
     padding: var(--s3) var(--s3) var(--s1);
-    width: 232px;
+    width: 280px;
     border: 0;
     border-radius: var(--r3);
     color: var(--fg-1);
   }
+  .speed-slider { display: flex; }
+  .speed-error { margin: var(--s2) 0; color: var(--rose-ink); font-size: var(--t-11); line-height: 1.4; }
   .p-title-line {
     display: flex;
     align-items: baseline;
@@ -796,6 +849,11 @@
     cursor: default;
     outline: none;
   }
+  .p-saved-trigger {
+    display: grid; place-items: center;
+    width: 32px; height: 32px;
+    border-radius: var(--rf);
+  }
   .p-saved-mark {
     display: inline-flex;
     align-items: center;
@@ -814,7 +872,7 @@
       box-shadow var(--d1) var(--ease);
   }
   .p-saved:hover .p-saved-mark,
-  .p-saved:focus-visible .p-saved-mark {
+  .p-saved:focus-within .p-saved-mark {
     background: color-mix(in srgb, var(--rose-ink) 82%, #ffffff);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--rose-ink) 22%, transparent);
   }
@@ -852,14 +910,13 @@
   .p-saved-panel::after {
     content: "";
     position: absolute;
-    top: -8px;
+    bottom: -8px;
     left: 0;
     right: 0;
     height: 8px;
   }
   .p-saved:hover .p-saved-panel,
-  .p-saved:focus-within .p-saved-panel,
-  .p-saved:focus-visible .p-saved-panel {
+  .p-saved:focus-within .p-saved-panel {
     opacity: 1;
     visibility: visible;
     transform: translateY(0);
@@ -956,7 +1013,7 @@
   }
   .speed-preset {
     flex: 1;
-    height: 32px;
+    height: 36px;
     border-radius: var(--r2);
     color: var(--fg-1);
     font-size: var(--t-12);

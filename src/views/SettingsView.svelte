@@ -4,12 +4,14 @@
     playback,
     session,
     stats,
+    ui,
     cacheStats,
     refreshCacheStats,
     clearCache,
     api,
     openAuthUrl,
     isLoggedOut,
+    navigate,
   } from "../lib/state.svelte.js";
   import Icon from "../components/Icon.svelte";
   import ConfirmDialog from "../components/ConfirmDialog.svelte";
@@ -21,6 +23,8 @@
     disconnectPersonal, setDevicesEnabled,
   } from "../lib/personal.svelte.js";
   let clientId = $state("");
+  let clientIdVisible = $state(false);
+  const compact = $derived((ui.paneWidth || 1200) < 560);
   let personalBusy = $state(false);
   let personalError = $state("");
   $effect(() => watchPersonal());
@@ -39,10 +43,6 @@
 
   const username = $derived(playback.username || session.username);
 
-
-  /* `status` waits for the engine's response (or a timeout). It checks
-     reachability now; auth and playback readiness are reported separately. */
-  let ping = $state("idle");
   let clearTarget = $state(null);
   let clearing = $state(false);
   let clearError = $state("");
@@ -96,13 +96,6 @@
     }
   }
 
-  function checkEngine() {
-    ping = "checking";
-    api
-      .status()
-      .then(() => (ping = "ok"))
-      .catch(() => (ping = "failed"));
-  }
 
   /* The cache limit is the one number in Settings with a live counterpart on
      disk, so the row shows the two against each other rather than as two
@@ -169,9 +162,6 @@
     );
   }
 
-  const pingLabel = $derived(
-    ping === "ok" ? "Reachable" : ping === "failed" ? "No answer" : ping === "checking" ? "Checking…" : "Not checked"
-  );
 
   // The command is cached server-side for a minute and this effect runs once
   // per Settings mount, so reopening the page stays fresh without a disk walk
@@ -189,7 +179,7 @@
   });
 </script>
 
-<section class="view page">
+<section class="view page settings-page" class:compact>
   <div class="settings-intro">
     <h1 class="page-title">Settings</h1>
     {#if settingErrors.load}<p class="inline-error" role="alert">{settingErrors.load}</p>{/if}
@@ -209,7 +199,6 @@
                 ? "Opens Spotify in your browser to authorise this device."
                 : "Waiting for Spotify sign-in to be ready…"}
             </div>
-            {#if session.error}<div class="inline-error" role="alert">{session.error}</div>{/if}
           </div>
           <div class="set-ctl">
             <button
@@ -226,6 +215,10 @@
           <div>
             <div class="k">{username || "Signed in"}</div>
             <div class="d">Spotify account</div>
+            <div class="account-links">
+              {#if username}<button class="link-more" onclick={() => navigate("profile", username)}>My profile</button>{/if}
+              <button class="link-more" onclick={() => navigate("podcasts")}>Saved podcasts</button>
+            </div>
           </div>
           <div class="set-ctl">
             <button class="btn-ghost" onclick={() => api.logout().catch(() => {})}>
@@ -238,30 +231,31 @@
         <div class="set-row">
           <div>
             <div class="k">Last session error</div>
-            <div class="d">{session.error}</div>
+            <div class="inline-error" role="alert">{session.error}</div>
           </div>
           <div class="set-ctl"><span class="dot warn"></span></div>
         </div>
       {/if}
     </div>
 
-    <div class="set-group">
+    <div class="set-group personal-app">
       <h2>Personal Spotify app</h2>
-      <div class="set-row">
-        <div>
-          <div class="k">Developer Client ID</div>
-          <div class="d">Optional. Create your own app in Spotify's developer dashboard and register <code>http://127.0.0.1:5589/personal-api/callback</code> as its redirect URI. Your Client ID stays on this computer; no shared app or token is used in the webview. Without a grant, likes and follows remain read-only.</div>
+      <div class="set-row client-id-row">
+        <form class="client-id-form" onsubmit={(event) => { event.preventDefault(); personalAction(() => configurePersonal(clientId)); }}>
+          <label class="k" for="spotify-client-id">Developer Client ID</label>
+          <div class="d" id="client-id-help">Optional. To enable likes and follows, create an app in Spotify's developer dashboard with this redirect URI: <code>http://127.0.0.1:5589/personal-api/callback</code>. The Client ID is a public app identifier, hidden here for privacy.</div>
+          <input id="spotify-client-id" class="client-id-input" type={clientIdVisible ? "text" : "password"} aria-describedby="client-id-help" bind:value={clientId} placeholder="Client ID" autocomplete="off" spellcheck="false" />
           {#if personalError || personal.error}<div class="inline-error" role="alert">{personalError || personal.error}</div>{/if}
-        </div>
-        <div class="set-ctl">
-          <input class="client-id-input" aria-label="Spotify developer Client ID" bind:value={clientId} placeholder="Client ID" autocomplete="off" spellcheck="false" />
-          <button class="btn-ghost" disabled={personalBusy || !clientId.trim()} onclick={() => personalAction(() => configurePersonal(clientId))}>Save</button>
-        </div>
+          <div class="set-ctl">
+            <button type="button" class="btn-ghost" aria-controls="spotify-client-id" aria-pressed={clientIdVisible} onclick={() => clientIdVisible = !clientIdVisible}>{clientIdVisible ? "Hide Client ID" : "Reveal Client ID"}</button>
+            <button type="submit" class="btn-ghost" disabled={personalBusy || !clientId.trim()}>Save</button>
+          </div>
+        </form>
       </div>
       <div class="set-row">
         <div>
           <div class="k">Personal authorization</div>
-          <div class="d">{personal.loading ? "Checking…" : personal.status?.connected && !personalConnected() ? `Personal grant belongs to ${personal.status.account_id}. Disconnect and authorize this account.` : personal.status?.connected ? `Connected as ${personal.status.account_id}` : personal.status?.authorization_pending ? "Waiting for authorization in your browser…" : personal.status?.client_id ? "Not authorized. Your Spotify playback remains available without this grant." : "Enter your own Client ID to enable library changes."}</div>
+          <div class="d">{personal.loading ? "Checking…" : personal.status?.connected && !personalConnected() ? `Authorized as ${personal.status.account_id}. Disconnect to authorize this account.` : personal.status?.connected ? `Authorized as ${personal.status.account_id}` : personal.status?.authorization_pending ? "Waiting for authorization in your browser…" : personal.status?.client_id ? "Not authorized. Playback does not need this grant." : "Save a Client ID to authorize library changes."}</div>
         </div>
         <div class="set-ctl">
           {#if personal.status?.connected}
@@ -274,7 +268,7 @@
       <div class="set-row">
         <div>
           <div class="k">Spotify Connect devices</div>
-          <div class="d">Optional remote Spotify Connect playback. Renderer keeps playing through this PC's OS default output; transferring a separate Spotify Connect session does not move Renderer audio. Off makes no device requests. Device access needs separate authorization.</div>
+          <div class="d">Control a separate Spotify Connect session. Renderer audio stays on this computer. Requires device authorization; no device requests are made while off.</div>
         </div>
         <div class="set-ctl">
           <input class="set-check" type="checkbox" aria-label="Enable Spotify Connect" checked={personal.status?.devices_enabled ?? false} disabled={personalBusy || !personalConnected()} onchange={(event) => personalAction(() => setDevicesEnabled(event.currentTarget.checked))} />
@@ -448,36 +442,17 @@
 
     <div class="set-group"><h2>Updates</h2><UpdateControl /></div>
 
-    <div class="set-group">
-      <h2>Diagnostics</h2>
-      <div class="set-row">
-        <div>
-          <div class="k">Engine</div>
-          <div class="d">Check whether the engine answers now. Reachability does not confirm Spotify sign-in or audio output.</div>
-        </div>
-        <div class="set-ctl">
-          <span class="v status" class:ok={ping === "ok"} class:bad={ping === "failed"}>
-            <span class="status-dot" aria-hidden="true"></span>{pingLabel}
-          </span>
-          <button class="btn-ghost" onclick={checkEngine} disabled={ping === "checking"}>Check</button>
+    {#if playback.error && playback.error !== session.error}
+      <div class="set-group">
+        <h2>Engine</h2>
+        <div class="set-row engine-error-row">
+          <div>
+            <div class="k">Last engine error</div>
+            <div class="inline-error" role="alert">{playback.error}</div>
+          </div>
         </div>
       </div>
-      <div class="set-row">
-        <div>
-          <div class="k">Playback session</div>
-          <div class="d">{playback.ready && playback.auth_state === "ready" ? "Spotify session reports ready. Audio output has not been tested here." : "Spotify session is not ready for playback."}</div>
-        </div>
-        <div class="set-ctl"><span class="v">{playback.ready && playback.auth_state === "ready" ? "Ready" : "Not ready"}</span></div>
-      </div>
-      <div class="set-row">
-        <div class="k">Auth state</div>
-        <div class="set-ctl">
-          <span class="v status" class:ok={playback.auth_state === "ready"}>
-            <span class="status-dot" aria-hidden="true"></span>{playback.auth_state ?? "unknown"}
-          </span>
-        </div>
-      </div>
-    </div>
+    {/if}
   </div>
 </section>
 
@@ -499,8 +474,17 @@
 {/if}
 
 <style>
+  .account-links { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); margin-top: var(--s2); }
+  .account-links .link-more { font-size: var(--t-12); }
+  .client-id-row, .engine-error-row { grid-template-columns: minmax(0, 1fr); }
+  .client-id-form { display: grid; gap: var(--s3); min-width: 0; }
+  .client-id-form .set-ctl { flex-wrap:wrap; }
+  .compact .personal-app .set-row { grid-template-columns:minmax(0, 1fr); gap:var(--s3); }
+  .compact .personal-app .set-ctl { justify-content:flex-start; flex-wrap:wrap; }
+  .client-id-form .d { margin-top: calc(-1 * var(--s2)); }
+  .client-id-form code { overflow-wrap: anywhere; }
   .client-id-input {
-    width: 180px; min-width: 0; height: 34px; padding: 0 var(--s2);
+    width: 100%; min-width: 0; height: 34px; padding: 0 var(--s2);
     border: 1px solid var(--line-2); border-radius: var(--r2);
     background: var(--raise-1); color: var(--fg);
     font-size: var(--t-12);

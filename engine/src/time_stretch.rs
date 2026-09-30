@@ -57,6 +57,7 @@ impl AudioPipeline {
             edit: config
                 .edit
                 .as_ref()
+                .filter(|edit| !edit.is_empty())
                 .map(|edit| SampleEdit::new(edit, config.position_ms, config.loop_pass)),
             stretcher: (config.speed != 1.0).then(|| Wsola::new(config.speed)),
             filtered: Vec::new(),
@@ -64,20 +65,42 @@ impl AudioPipeline {
         }
     }
 
+    /// Changes only the rate: sample-edit cursors and finite-loop state stay
+    /// attached to the decoder stream rather than restarting at a UI position.
+    pub fn set_speed(&mut self, speed: f32, pending: &mut Vec<f32>) {
+        match self.stretcher.as_mut() {
+            Some(stretcher) if speed == 1.0 => {
+                stretcher.finish_into_passthrough(pending);
+                self.stretcher = None;
+            }
+            Some(stretcher) => stretcher.set_speed(speed),
+            None if speed != 1.0 => {
+                let mut stretcher = Wsola::new(speed);
+                stretcher.continuous_start = true;
+                self.stretcher = Some(stretcher);
+            }
+            None => {}
+        }
+    }
+
+    pub fn is_passthrough(&self) -> bool {
+        self.edit.is_none() && self.stretcher.is_none()
+    }
+
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Option<u32> {
         output.clear();
         let loop_to = if let Some(edit) = &mut self.edit {
-            self.filtered.clear();
-            let loop_to = edit.process(input, &mut self.filtered);
             if let Some(stretcher) = &mut self.stretcher {
+                self.filtered.clear();
+                let loop_to = edit.process(input, &mut self.filtered);
                 stretcher.process(&self.filtered, output);
                 if loop_to.is_some() {
                     stretcher.finish(output);
                 }
+                loop_to
             } else {
-                output.extend_from_slice(&self.filtered);
+                edit.process(input, output)
             }
-            loop_to
         } else if let Some(stretcher) = &mut self.stretcher {
             stretcher.process(input, output);
             None
@@ -282,6 +305,11 @@ pub struct Wsola {
     emitted_frames: usize,
     /// Output-time position, in output frames.
     output_time: f64,
+    /// Integrated nominal source clock. Multiplying all past output by the
+    /// newest speed would move the search backwards on a live rate change.
+    source_time: f64,
+    rate_origin_input: f64,
+    rate_origin_output: f64,
     /// Absolute frame index of the next target block (natural continuation).
     target_idx: i64,
     /// Absolute frame index of the search region start.
@@ -290,6 +318,7 @@ pub struct Wsola {
     /// half of the last block awaiting its blend.
     staged: Vec<f32>,
     staged_complete: usize,
+    continuous_start: bool,
     /// Scratch blocks: target continuation, searched optimal, blended result.
     target_buf: Vec<f32>,
     opt_buf: Vec<f32>,
@@ -365,10 +394,14 @@ impl Wsola {
             input_frames: 0,
             emitted_frames: 0,
             output_time: 0.0,
+            source_time: 0.0,
+            rate_origin_input: 0.0,
+            rate_origin_output: 0.0,
             target_idx: 0,
             search_idx: -center_offset,
             staged: Vec::new(),
             staged_complete: 0,
+            continuous_start: false,
             target_buf: vec![0.0; window * CHANNELS],
             opt_buf: vec![0.0; window * CHANNELS],
             work_buf: vec![0.0; window * CHANNELS],
@@ -387,20 +420,70 @@ impl Wsola {
         self.input_frames = 0;
         self.emitted_frames = 0;
         self.output_time = 0.0;
+        self.source_time = 0.0;
+        self.rate_origin_input = 0.0;
+        self.rate_origin_output = 0.0;
         self.target_idx = 0;
         self.search_idx = -self.center_offset;
         self.staged.clear();
         self.staged_complete = 0;
+        self.continuous_start = false;
         self.search_macs = 0;
         self.search_count = 0;
         #[cfg(test)]
         self.search_audit.clear();
     }
 
+
+    pub fn set_speed(&mut self, speed: f32) {
+        let source = self.rate_origin_input
+            + (self.emitted_frames as f64 - self.rate_origin_output) * self.speed as f64;
+        self.rate_origin_input = source;
+        self.rate_origin_output = self.emitted_frames as f64;
+        self.speed = speed;
+        self.source_time = source
+            + (self.output_time - self.emitted_frames as f64) * speed as f64;
+        self.search_idx = self.source_time.round() as i64 - self.center_offset;
+    }
+
+    fn wanted_frames(&self) -> usize {
+        (self.rate_origin_output
+            + (self.input_frames as f64 - self.rate_origin_input) / self.speed as f64)
+            .round()
+            .max(0.0) as usize
+    }
+
+    /// Retire WSOLA at the already-emitted source clock, not at the decoder
+    /// head. Keep its real lookahead and blend the staged continuation into it;
+    /// after this one bounded handover exact 1x has no stretcher at all.
+    fn finish_into_passthrough(&mut self, output: &mut Vec<f32>) {
+        let source = self.rate_origin_input
+            + (self.emitted_frames as f64 - self.rate_origin_output) * self.speed as f64;
+        let start = (source.round().max(0.0) as usize).max(self.input_start);
+        let offset = (start - self.input_start) * CHANNELS;
+        let remaining = self.input_frames.saturating_sub(start);
+        let blend = self.hop.min(remaining).min(self.staged.len() / CHANNELS);
+        for frame in 0..remaining {
+            for channel in 0..CHANNELS {
+                let raw = self.input[offset + frame * CHANNELS + channel];
+                let sample = if frame < blend {
+                    let weight = self.hann[frame];
+                    self.staged[frame * CHANNELS + channel] * (1.0 - weight) + raw * weight
+                } else {
+                    raw
+                };
+                output.push(sample);
+            }
+        }
+    }
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
         debug_assert!(input.len().is_multiple_of(CHANNELS));
         self.input_frames += input.len() / CHANNELS;
         self.input.extend_from_slice(input);
+        if self.continuous_start && self.input.len() >= self.hop * CHANNELS {
+            self.staged.extend_from_slice(&self.input[..self.hop * CHANNELS]);
+            self.continuous_start = false;
+        }
         while self.can_perform() {
             self.iterate();
         }
@@ -408,7 +491,7 @@ impl Wsola {
     }
 
     pub fn finish(&mut self, output: &mut Vec<f32>) {
-        let wanted = (self.input_frames as f64 / self.speed as f64).round() as usize;
+        let wanted = self.wanted_frames();
         while self.emitted_frames + self.staged.len() / CHANNELS < wanted {
             let required_end = (self.target_idx + self.window as i64)
                 .max(self.search_idx + self.search_size() as i64)
@@ -426,11 +509,17 @@ impl Wsola {
     }
 
     fn emit_complete(&mut self, output: &mut Vec<f32>) {
-        let done = self.staged_complete * CHANNELS;
+        // At 3x/4x the first analysis hop can exceed the duration of a short
+        // packet. Retain that excess until enough real source arrives; EOF
+        // must never be longer merely because a packet happened to end early.
+        let frames = self.staged_complete.min(
+            self.wanted_frames().saturating_sub(self.emitted_frames),
+        );
+        let done = frames * CHANNELS;
         output.extend_from_slice(&self.staged[..done]);
         self.staged.drain(..done);
-        self.emitted_frames += self.staged_complete;
-        self.staged_complete = 0;
+        self.emitted_frames += frames;
+        self.staged_complete -= frames;
     }
 
     /// Chromium's `CanPerformWsola`: both blocks must end inside the buffered
@@ -525,11 +614,16 @@ impl Wsola {
         // re-centers on the nominal continuation of the output clock.
         self.target_idx = optimal_abs + hop as i64;
         self.output_time += hop as f64;
-        self.search_idx =
-            (self.output_time * self.speed as f64).round() as i64 - self.center_offset;
+        self.source_time += hop as f64 * self.speed as f64;
+        self.search_idx = self.source_time.round() as i64 - self.center_offset;
 
         // Drop input no candidate can reach again.
-        let earliest = self.target_idx.min(self.search_idx);
+        // Also retain un-emitted real lookahead for a future exact-1x
+        // handover, even when a high-rate analysis hop runs beyond it.
+        let emitted_source = self.rate_origin_input
+            + (self.emitted_frames as f64 - self.rate_origin_output) * self.speed as f64;
+        let earliest = self.target_idx.min(self.search_idx)
+            .min(emitted_source.floor() as i64);
         if earliest > self.input_start as i64 {
             let drop = ((earliest - self.input_start as i64) as usize) * CHANNELS;
             self.input.drain(..drop);
@@ -930,13 +1024,28 @@ mod tests {
 
     fn positive_crossing_frequency(samples: &[f32]) -> f32 {
         let mut crossings = 0usize;
+        let mut first = 0.0;
+        let mut last = 0.0;
         let frames = samples.len() / CHANNELS;
         for frame in 1..frames {
-            if samples[(frame - 1) * CHANNELS] <= 0.0 && samples[frame * CHANNELS] > 0.0 {
+            let before = f64::from(samples[(frame - 1) * CHANNELS]);
+            let after = f64::from(samples[frame * CHANNELS]);
+            if before <= 0.0 && after > 0.0 {
+                let crossing = (frame - 1) as f64 - before / (after - before);
+                if crossings == 0 {
+                    first = crossing;
+                }
+                last = crossing;
                 crossings += 1;
             }
         }
-        crossings as f32 * SAMPLE_RATE as f32 / frames as f32
+        if crossings < 2 {
+            return 0.0;
+        }
+        // Measure complete periods rather than counting a phase-dependent
+        // partial period at each edge. A one-second 4x output otherwise has
+        // 1 Hz count quantization even when its actual pitch is unchanged.
+        ((crossings - 1) as f64 * f64::from(SAMPLE_RATE) / (last - first)) as f32
     }
 
     #[test]
@@ -960,8 +1069,6 @@ mod tests {
         for speed in [0.7, 1.4, 2.0] {
             let output = stretch_in_packets(&input, speed, &[256, 1_152, 2_048]);
             let measured = positive_crossing_frequency(&output);
-            // Measured worst case across 0.5x..2x is ±0.11 Hz; ±0.5 Hz is
-            // roughly 4x headroom over that.
             assert!(
                 (measured - 440.0).abs() < 0.5,
                 "speed {speed} measured {measured} Hz"
@@ -1515,5 +1622,133 @@ mod tests {
                 "speed {speed} dropped or invented the WSOLA EOF tail"
             );
         }
+    }
+
+    #[test]
+    fn high_rates_keep_pitch_duration_and_packet_independence() {
+        let input = stereo_tone(SAMPLE_RATE as usize * 4, 440.0, -0.25);
+        for speed in [3.0, 4.0] {
+            let whole = stretch_in_packets(&input, speed, &[input.len() / CHANNELS]);
+            let packets = stretch_in_packets(&input, speed, &[1, 128, 576, 1_024, 333]);
+            assert_eq!(whole, packets, "speed {speed} changed at packet boundaries");
+            assert_eq!(packets.len() / CHANNELS,
+                (input.len() as f64 / CHANNELS as f64 / speed as f64).round() as usize);
+            let measured = positive_crossing_frequency(&packets);
+            assert!((measured - 440.0).abs() < 1.0,
+                "speed {speed} changed the tone's pitch: measured {measured} Hz");
+            for frame in packets.chunks_exact(CHANNELS) {
+                assert!((frame[1] + frame[0] * 0.25).abs() < 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn high_rate_short_eof_never_emits_a_full_hop_instead_of_its_duration() {
+        for frames in [1, 8, 300, 1_024, 1_632, 2_205, 4_410] {
+            let input = stereo_tone(frames, 611.0, 1.0);
+            for speed in [3.0, 4.0] {
+                let output = stretch_in_packets(&input, speed, &[127, 293]);
+                assert_eq!(output.len() / CHANNELS,
+                    (frames as f64 / speed as f64).round() as usize,
+                    "{frames} source frames at {speed}x");
+            }
+        }
+    }
+
+    #[test]
+    fn changing_rate_integrates_old_then_new_source_time_without_restarting() {
+        let frames = SAMPLE_RATE as usize * 4;
+        let input = stereo_tone(frames, 440.0, 0.5);
+        let mut stretcher = Wsola::new(1.5);
+        let mut output = Vec::new();
+        stretcher.process(&input[..SAMPLE_RATE as usize * 2 * CHANNELS], &mut output);
+        let old_frames = output.len() / CHANNELS;
+        stretcher.set_speed(4.0);
+        stretcher.process(&input[SAMPLE_RATE as usize * 2 * CHANNELS..], &mut output);
+        stretcher.finish(&mut output);
+        let expected = (old_frames as f64
+            + (frames as f64 - old_frames as f64 * 1.5) / 4.0).round() as usize;
+        assert_eq!(output.len() / CHANNELS, expected);
+        assert!((positive_crossing_frequency(&output) - 440.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn live_rate_changes_keep_edit_cursor_and_finite_loop_pass() {
+        let mut pipeline = AudioPipeline::new(&PipelineConfig {
+            edit: Some(TrackEdit {
+                cuts: vec![TimeRange { start_ms: 30, end_ms: 40 }],
+                loop_range: Some(LoopRange { start_ms: 10, end_ms: 100, play_count: 3 }),
+                ..TrackEdit::default()
+            }),
+            speed: 1.0,
+            position_ms: 0,
+            loop_pass: 2,
+        });
+        let mut output = Vec::new();
+        let before = frames_for_ms(20);
+        assert_eq!(pipeline.process(&source_ramp(0, before), &mut output), None);
+        pipeline.set_speed(4.0, &mut output);
+        let after = frames_for_ms(90);
+        assert_eq!(pipeline.process(&source_ramp(before, after), &mut output), Some(10));
+        let edit = pipeline.edit.as_ref().unwrap();
+        assert_eq!(edit.frame, ms_to_frame(100));
+        assert_eq!(edit.loop_range.unwrap().pass, 2);
+        assert_eq!(edit.cut_index, 1);
+    }
+
+    #[test]
+    fn rapid_rate_reversals_preserve_stereo_duration_and_packet_independence() {
+        let input = stereo_tone(SAMPLE_RATE as usize, 440.0, -0.25);
+        let render = |packet_frames: usize| {
+            let mut stretcher = Wsola::new(4.0);
+            let mut output = Vec::new();
+            let mut source_clock = 0.0;
+            let mut previous_frames = 0;
+            let mut previous_speed = 4.0;
+            let mut final_speed = 4.0;
+            for (index, segment) in input.chunks(1_632 * CHANNELS).enumerate() {
+                let emitted = output.len() / CHANNELS;
+                source_clock += (emitted - previous_frames) as f64 * previous_speed;
+                previous_frames = emitted;
+                final_speed = [4.0, 0.5, 3.0, 0.5, 1.37][index % 5];
+                previous_speed = f64::from(final_speed);
+                stretcher.set_speed(final_speed);
+                for packet in segment.chunks(packet_frames * CHANNELS) {
+                    stretcher.process(packet, &mut output);
+                }
+            }
+            stretcher.finish(&mut output);
+            let expected = (previous_frames as f64
+                + (input.len() as f64 / CHANNELS as f64 - source_clock)
+                    / f64::from(final_speed)).round() as usize;
+            assert_eq!(output.len() / CHANNELS, expected);
+            for frame in output.chunks_exact(CHANNELS) {
+                assert!(frame.iter().all(|sample| sample.is_finite()));
+                assert!((frame[1] + frame[0] * 0.25).abs() < 1.0e-6);
+            }
+            output
+        };
+        let whole_segments = render(1_632);
+        for packet_frames in [1, 127, 1_024] {
+            assert_eq!(render(packet_frames), whole_segments);
+        }
+    }
+
+    #[test]
+    fn returning_to_exact_one_preserves_real_lookahead_then_passes_samples_unchanged() {
+        let mut pipeline = AudioPipeline::new(&PipelineConfig {
+            edit: None, speed: 4.0, position_ms: 0, loop_pass: 1,
+        });
+        let input = stereo_tone(frames_for_ms(200), 440.0, -0.5);
+        let mut output = Vec::new();
+        pipeline.process(&input, &mut output);
+        let consumed = output.len() / CHANNELS * 4;
+        let mut pending = Vec::new();
+        pipeline.set_speed(1.0, &mut pending);
+        assert_eq!(pending.len() / CHANNELS, input.len() / CHANNELS - consumed);
+        assert!(pipeline.is_passthrough());
+        let next = source_ramp(input.len() / CHANNELS, 127);
+        pipeline.process(&next, &mut output);
+        assert_eq!(output, next);
     }
 }

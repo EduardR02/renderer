@@ -8,19 +8,17 @@
 //!    `rodio::Sink::sleep_until_end()` before pausing, which blocks the player
 //!    thread until the entire buffered queue has played out — about half a
 //!    second of audio at the default write-ahead — on every pause, stop, and
-//!    shutdown. This sink drops the buffered audio and pauses instead, so
-//!    pauses silence the output within one audio-buffer period.
+//!    shutdown. This sink pauses immediately: user pauses retain audio, while
+//!    discontinuous stops discard it. Both silence output within one buffer.
 //! 2. [`SampleRing`]/[`LiveSource`]: the stock backend appends every decoded
 //!    packet to the sink as its own `rodio::Source`. That is the cause of a
 //!    measured playback-rate error; see "Playback rate and fidelity" below.
 //!
-//! Resume semantics: librespot's player resumes by calling `start()` and
-//! immediately re-feeding decoder packets, so the dropped buffer is rebuilt
-//! from the decoder's stream position. Reported positions stay consistent
-//! because they track the decoder position, not the buffer tail; the only
-//! cost is the short refill gap on resume, bounded by the audio fetch
-//! read-ahead settings. Track changes (gapless) never stop the sink, and a
-//! fresh `write` after `stop` refills the ring automatically.
+//! Resume semantics: a user pause retains the consumer's in-flight packet,
+//! queued packets, WSOLA overlap and resampler history. Resume continues those
+//! samples before decoding ahead, and the consumer clock excludes paused wall
+//! time. Loads and seeks explicitly invalidate this retained audio; a speed
+//! change does not. Natural track boundaries remain gapless.
 //!
 //! # Playback rate and fidelity
 //!
@@ -139,7 +137,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -178,8 +176,8 @@ static LIVE_RING: Mutex<Weak<SampleRing>> = Mutex::new(Weak::new());
 const LIVE_RING_POISON_MSG: &str = "live sample ring should not be poisoned";
 static LIVE_PROCESSING: Mutex<Weak<Mutex<AudioProcessing>>> = Mutex::new(Weak::new());
 const LIVE_PROCESSING_POISON_MSG: &str = "live audio processing registry should not be poisoned";
-static CUSTOMIZATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CUSTOMIZATION_REVISION: AtomicU64 = AtomicU64::new(0);
+static CUSTOMIZATION_SPEED: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
 static CUSTOMIZATION: Mutex<Customization> = Mutex::new(Customization {
     config: None,
     discontinuous: false,
@@ -188,6 +186,13 @@ static AUDIO_SIGNAL_SENDER: Mutex<Option<mpsc::UnboundedSender<AudioSignal>>> = 
 
 #[derive(Clone, Copy, Debug)]
 pub enum AudioSignal {
+    /// Delivered at the first frame using the new rate, after old-rate queued
+    /// audio. Its callback timestamp anchors the transport, not decode-ahead.
+    SpeedBoundary {
+        speed: f32,
+        revision: u64,
+        at: Instant,
+    },
     LoopBoundary {
         position_ms: u32,
         revision: u64,
@@ -249,13 +254,8 @@ pub fn install_signal_sender(sender: mpsc::UnboundedSender<AudioSignal>) {
         .expect("audio signal sender should not be poisoned") = Some(sender);
 }
 
-pub fn configure_customization(edit: Option<TrackEdit>, speed: f32, position_ms: u32) -> u64 {
-    configure_customization_at_loop_pass(edit, speed, position_ms, 1)
-}
-
-/// Installs a discontinuous customization at a known finite-loop pass. The
-/// engine uses this only for an internal loop jump; ordinary loads and seeks
-/// always start at pass one through [`configure_customization`].
+/// Installs a discontinuous customization at a known finite-loop pass.
+/// The engine supplies the pass for loads, seeks, and internal loop jumps.
 pub fn configure_customization_at_loop_pass(
     edit: Option<TrackEdit>,
     speed: f32,
@@ -276,6 +276,22 @@ pub fn configure_customization_after_natural_boundary(
     set_customization(edit, speed, position_ms, false, 1)
 }
 
+/// Changes rate without clearing the ring, resetting edits or seeking the
+/// decoder. The player thread applies it at its next packet boundary.
+pub fn set_customization_speed(speed: f32) {
+    let mut customization = CUSTOMIZATION
+        .lock()
+        .expect("audio customization should not be poisoned");
+    let config = customization.config.get_or_insert(PipelineConfig {
+        edit: None,
+        speed,
+        position_ms: 0,
+        loop_pass: 1,
+    });
+    config.speed = speed;
+    CUSTOMIZATION_SPEED.store(speed.to_bits(), Ordering::Release);
+}
+
 fn set_customization(
     edit: Option<TrackEdit>,
     speed: f32,
@@ -294,8 +310,8 @@ fn set_customization(
         .lock()
         .expect("audio customization should not be poisoned");
     customization.config = active.then_some(config);
+    CUSTOMIZATION_SPEED.store(speed.to_bits(), Ordering::Release);
     customization.discontinuous |= discontinuous;
-    CUSTOMIZATION_ACTIVE.store(active, Ordering::Release);
     let revision = CUSTOMIZATION_REVISION
         .fetch_add(1, Ordering::Release)
         .wrapping_add(1);
@@ -331,6 +347,7 @@ pub fn finish_natural_boundary() -> Result<(), String> {
     };
 
     let mut queued = Vec::new();
+    let timing;
     {
         let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tail = Vec::new();
@@ -341,11 +358,13 @@ pub fn finish_natural_boundary() -> Result<(), String> {
             Some(resampler) => resampler.process(&tail, &mut queued),
             None => queued = tail,
         }
+        timing = (processing.pipeline_revision, processing.speed, processing.output_rate);
     }
     if queued.is_empty() {
         return Ok(());
     }
-    ring.push_marked(queued, None, 0, WRITE_DRAIN_TIMEOUT)
+    ring.push_timed_at_generation(ring.generation.load(Ordering::Acquire),
+        queued, None, 0, WRITE_DRAIN_TIMEOUT, Some(timing))
         .map_err(|()| "rodio sink stalled while flushing the natural EOF tail".to_owned())
 }
 
@@ -493,6 +512,7 @@ struct SampleRing {
     /// `stop()` silences audio already handed to the audio thread rather than
     /// letting up to a packet of stale sound trail the stop.
     generation: AtomicU64,
+    retaining_pause: AtomicBool,
 }
 
 #[derive(Default)]
@@ -504,6 +524,21 @@ struct RingPacket {
     /// delivery time would incorrectly retag stale audio as current.
     loop_revision: u64,
     boundary_id: u64,
+    timing: Option<PacketTiming>,
+}
+
+#[derive(Clone, Copy)]
+struct PacketTiming {
+    revision: u64,
+    start_ms: f64,
+    duration_ms: f64,
+    speed: f32,
+}
+
+#[derive(Clone, Copy)]
+struct AudibleClock {
+    timing: PacketTiming,
+    at: Instant,
 }
 
 struct RingState {
@@ -513,6 +548,10 @@ struct RingState {
     queued_samples: usize,
     next_boundary_id: u64,
     consumed_boundary_id: u64,
+    timeline_revision: u64,
+    timeline_ms: f64,
+    audible: Option<AudibleClock>,
+    paused_elapsed_ms: Option<f64>,
 }
 
 impl SampleRing {
@@ -524,9 +563,14 @@ impl SampleRing {
                 queued_samples: 0,
                 next_boundary_id: 0,
                 consumed_boundary_id: 0,
+                timeline_revision: 0,
+                timeline_ms: 0.0,
+                audible: None,
+                paused_elapsed_ms: None,
             }),
             space_freed: Condvar::new(),
             generation: AtomicU64::new(0),
+            retaining_pause: AtomicBool::new(false),
         })
     }
 
@@ -549,6 +593,7 @@ impl SampleRing {
         self.push_marked(packet, None, 0, timeout)
     }
 
+    #[cfg(test)]
     fn push_marked(
         &self,
         samples: Vec<f32>,
@@ -560,6 +605,7 @@ impl SampleRing {
         self.push_marked_at_generation(generation, samples, loop_to_ms, loop_revision, timeout)
     }
 
+    #[cfg(test)]
     fn push_marked_at_generation(
         &self,
         generation: u64,
@@ -568,12 +614,28 @@ impl SampleRing {
         loop_revision: u64,
         timeout: Duration,
     ) -> Result<(), ()> {
+        self.push_timed_at_generation(
+            generation, samples, loop_to_ms, loop_revision, timeout, None,
+        )
+    }
+
+    fn push_timed_at_generation(
+        &self,
+        generation: u64,
+        samples: Vec<f32>,
+        loop_to_ms: Option<u32>,
+        loop_revision: u64,
+        timeout: Duration,
+        timing: Option<(u64, f32, u32)>,
+    ) -> Result<(), ()> {
         let deadline = Instant::now() + timeout;
         let mut state = self.lock();
         if self.generation.load(Ordering::Acquire) != generation {
             return Ok(());
         }
-        while state.queued_samples >= self.capacity {
+        while state.queued_samples >= self.capacity
+            && !self.retaining_pause.load(Ordering::Acquire)
+        {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(());
             };
@@ -592,12 +654,29 @@ impl SampleRing {
         } else {
             0
         };
+        let timing = timing.filter(|_| !samples.is_empty()).map(|(revision, speed, rate)| {
+            if state.timeline_revision != revision {
+                state.timeline_revision = revision;
+                state.timeline_ms = 0.0;
+            }
+            let duration_ms = samples.len() as f64 * 1_000.0
+                / (f64::from(rate) * f64::from(NUM_CHANNELS));
+            let timing = PacketTiming {
+                revision,
+                start_ms: state.timeline_ms,
+                duration_ms,
+                speed,
+            };
+            state.timeline_ms += duration_ms * f64::from(speed);
+            timing
+        });
         state.queued_samples += samples.len();
         state.packets.push_back(RingPacket {
             samples,
             loop_to_ms,
             loop_revision,
             boundary_id,
+            timing,
         });
 
         // A loop marker is flow control, not a notification attached to an
@@ -607,6 +686,7 @@ impl SampleRing {
         while boundary_id != 0
             && state.consumed_boundary_id < boundary_id
             && self.generation.load(Ordering::Acquire) == generation
+            && !self.retaining_pause.load(Ordering::Acquire)
         {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(());
@@ -625,10 +705,26 @@ impl SampleRing {
         let mut state = self.lock();
         let packet = state.packets.pop_front()?;
         state.queued_samples -= packet.samples.len();
+        let speed_change = packet.timing.and_then(|timing| {
+            let previous = state.audible;
+            let at = Instant::now();
+            state.audible = Some(AudibleClock { timing, at });
+            previous.is_none_or(|previous| previous.timing.revision != timing.revision
+                || previous.timing.speed != timing.speed)
+                .then_some(AudioSignal::SpeedBoundary {
+                    speed: timing.speed,
+                    revision: timing.revision,
+                    at,
+                })
+        });
         drop(state);
+        if let Some(change) = speed_change {
+            signal(change);
+        }
         self.space_freed.notify_one();
         Some(packet)
     }
+
 
     fn acknowledge_boundary(&self, boundary_id: u64) {
         if boundary_id == 0 {
@@ -640,6 +736,57 @@ impl SampleRing {
         self.space_freed.notify_all();
     }
 
+    fn audible_elapsed_ms(&self, revision: u64) -> Option<f64> {
+        self.audible_elapsed_at(revision, Instant::now())
+    }
+
+    fn audible_elapsed_at(&self, revision: u64, at: Instant) -> Option<f64> {
+        let state = self.lock();
+        let Some(clock) = state.audible.filter(|clock| clock.timing.revision == revision) else {
+            // Before the first callback, queued audio is still at its initial
+            // source offset; a decoder-head event is not audible progress.
+            return state.packets.iter().find_map(|packet|
+                packet.timing.filter(|timing| timing.revision == revision)
+                    .map(|timing| timing.start_ms));
+        };
+        Some(clock.timing.start_ms
+            + state.paused_elapsed_ms.unwrap_or_else(||
+                (at.saturating_duration_since(clock.at).as_secs_f64() * 1_000.0)
+                    .min(clock.timing.duration_ms)) * f64::from(clock.timing.speed))
+    }
+
+    fn pause_at(&self, at: Instant) {
+        let mut state = self.lock();
+        if state.paused_elapsed_ms.is_none() {
+            state.paused_elapsed_ms = Some(state.audible.map_or(0.0, |clock|
+                (at.saturating_duration_since(clock.at).as_secs_f64() * 1_000.0)
+                    .min(clock.timing.duration_ms)));
+        }
+        self.retaining_pause.store(true, Ordering::Release);
+        drop(state);
+        // A producer may be inside write() when pause arrives. Admit that one
+        // in-flight packet so librespot can poll the pause command instead of
+        // waiting on a device we have deliberately stopped.
+        self.space_freed.notify_all();
+    }
+
+    fn resume_at(&self, at: Instant) {
+        let mut state = self.lock();
+        if let Some(elapsed) = state.paused_elapsed_ms.take() {
+            if let Some(clock) = &mut state.audible {
+                clock.at = at - Duration::from_secs_f64(elapsed / 1_000.0);
+            }
+        }
+        self.retaining_pause.store(false, Ordering::Release);
+    }
+
+    fn stop_processing(&self, processing: &Mutex<AudioProcessing>) {
+        if !self.retaining_pause.load(Ordering::Acquire) {
+            self.clear();
+            processing.lock().unwrap_or_else(PoisonError::into_inner).reset();
+        }
+    }
+
     /// Drops every queued packet and tells [`LiveSource`] to drop the one it
     /// holds. Non-blocking: this is what makes `stop()` instant.
     fn clear(&self) {
@@ -647,9 +794,42 @@ impl SampleRing {
         state.packets.clear();
         state.queued_samples = 0;
         state.consumed_boundary_id = state.next_boundary_id;
+        state.audible = None;
+        state.paused_elapsed_ms = None;
+        self.retaining_pause.store(false, Ordering::Release);
+        state.timeline_ms = 0.0;
+        state.timeline_revision = 0;
         self.generation.fetch_add(1, Ordering::Release);
         drop(state);
         self.space_freed.notify_all();
+    }
+}
+
+/// Source-time elapsed on the packet actually feeding the device, excluding
+/// startup/underrun silence and decode-ahead. Cuts map through Engine's timeline.
+pub fn audible_elapsed_ms(revision: u64) -> Option<f64> {
+    LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade()?
+        .audible_elapsed_ms(revision)
+}
+
+pub fn audible_speed(revision: u64) -> Option<f32> {
+    let ring = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade()?;
+    let state = ring.lock();
+    state.audible.filter(|clock| clock.timing.revision == revision)
+        .map(|clock| clock.timing.speed)
+        .or_else(|| state.packets.iter().find_map(|packet|
+            packet.timing.filter(|timing| timing.revision == revision)
+                .map(|timing| timing.speed)))
+}
+
+/// A user pause retains the audible packet, queued audio and processing
+/// lookahead. Seeks/loads still clear all three through customization.
+pub fn pause_output() {
+    if let Some(ring) = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade() {
+        ring.pause_at(Instant::now());
+    }
+    if let Some(sink) = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG).upgrade() {
+        sink.pause();
     }
 }
 
@@ -811,6 +991,8 @@ struct AudioProcessing {
     resampler: Option<Resampler>,
     pipeline_revision: u64,
     pipeline: Option<AudioPipeline>,
+    speed: f32,
+    output_rate: u32,
 }
 
 impl AudioProcessing {
@@ -827,11 +1009,65 @@ impl AudioProcessing {
             (config, discontinuous)
         };
         self.pipeline = config.as_ref().map(AudioPipeline::new);
+        self.speed = config.as_ref().map_or(1.0, |config| config.speed);
         self.pipeline_revision = revision;
         if discontinuous {
             if let Some(resampler) = &mut self.resampler {
                 resampler.reset();
             }
+        }
+    }
+
+    fn synchronize_speed(&mut self, pending: &mut Vec<f32>) -> Option<f32> {
+        let speed = f32::from_bits(CUSTOMIZATION_SPEED.load(Ordering::Acquire));
+        if self.speed == speed {
+            return None;
+        }
+        if let Some(pipeline) = &mut self.pipeline {
+            pipeline.set_speed(speed, pending);
+        } else if speed != 1.0 {
+            let mut pipeline = AudioPipeline::new(&PipelineConfig {
+                edit: None,
+                speed: 1.0,
+                position_ms: 0,
+                loop_pass: 1,
+            });
+            pipeline.set_speed(speed, pending);
+            self.pipeline = Some(pipeline);
+        }
+        if speed == 1.0 && self.pipeline.as_ref().is_some_and(AudioPipeline::is_passthrough) {
+            self.pipeline = None;
+        }
+        self.speed = speed;
+        Some(speed)
+    }
+
+    /// Shared by the real sink and device-free audio regression tests. Exact
+    /// 1x/no edit returns the converter's allocation untouched.
+    fn render_packet(
+        &mut self,
+        samples: Vec<f32>,
+        pipeline_scratch: &mut Vec<f32>,
+        resampler_scratch: &mut Vec<f32>,
+    ) -> (Vec<f32>, Option<u32>) {
+        if self.pipeline.is_none() && self.resampler.is_none() {
+            return (samples, None);
+        }
+        pipeline_scratch.clear();
+        resampler_scratch.clear();
+        let (filtered, loop_to) = match &mut self.pipeline {
+            Some(pipeline) => {
+                let loop_to = pipeline.process(&samples, pipeline_scratch);
+                (&pipeline_scratch[..], loop_to)
+            }
+            None => (&samples[..], None),
+        };
+        match &mut self.resampler {
+            Some(resampler) => {
+                resampler.process(filtered, resampler_scratch);
+                (resampler_scratch.clone(), loop_to)
+            }
+            None => (pipeline_scratch.clone(), loop_to),
         }
     }
 
@@ -850,12 +1086,11 @@ pub struct RodioSink {
     ring: Arc<SampleRing>,
     output_rate: rodio::SampleRate,
     processing: Arc<Mutex<AudioProcessing>>,
-    /// Per-packet staging reused across writes so edited/resampled packets
-    /// allocate only the ring's own packet copy, not a fresh intermediate Vec
-    /// per stage. Only `write` (the player thread) touches them; they live on
-    /// the sink rather than in `AudioProcessing` because the finished packet
-    /// has to outlive the processing lock while the ring's backpressure wait
-    /// runs.
+    /// Per-packet staging reused across writes. The final clone deliberately
+    /// gives the ring a tight allocation: its budget counts audible samples,
+    /// not capacity, so moving decoder-sized scratch would inflate retained
+    /// memory at high rates or with sparse cuts. Backpressure never holds
+    /// processing; only the player thread touches these buffers.
     pipeline_scratch: Vec<f32>,
     resampler_scratch: Vec<f32>,
     /// The customization revision [`AudioSignal::Output`] was last sent for.
@@ -1065,6 +1300,8 @@ pub fn open(host: cpal::Host, format: AudioFormat) -> Result<RodioSink, RodioErr
             .load(Ordering::Acquire)
             .wrapping_sub(1),
         pipeline: None,
+        speed: 1.0,
+        output_rate,
     }));
 
     // The one fact that decides output fidelity, and the one that is otherwise
@@ -1136,6 +1373,7 @@ impl Sink for RodioSink {
             self.rodio_sink = Some(sink);
         }
 
+        self.ring.resume_at(Instant::now());
         self.rodio_sink
             .as_ref()
             .expect("rodio sink was connected above")
@@ -1143,10 +1381,9 @@ impl Sink for RodioSink {
         Ok(())
     }
 
-    /// Stops without draining: the buffered audio is dropped immediately and
-    /// the sink pauses, so the player thread never blocks on remaining audio
-    /// (the stock backend's `sleep_until_end` costs ~0.5 s per pause). The
-    /// next `write` refills the ring and `start` resumes it.
+    /// Stops without draining. A requested user pause retains samples and
+    /// processing state; seek/load/stop discontinuities discard them instead.
+    /// Both pause the device immediately without waiting on queued audio.
     ///
     /// This deliberately does not call `rodio::Sink::stop`, which the previous
     /// per-packet version used: `Sink::stop` ends the current source for good,
@@ -1158,11 +1395,7 @@ impl Sink for RodioSink {
     /// (`Pausable` emits silence without polling its input), so the refilled
     /// ring is not consumed while stopped.
     fn stop(&mut self) -> SinkResult<()> {
-        self.ring.clear();
-        self.processing
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .reset();
+        self.ring.stop_processing(&self.processing);
         if let Some(sink) = &self.rodio_sink {
             sink.pause();
         }
@@ -1196,44 +1429,30 @@ impl Sink for RodioSink {
         let processing = Arc::clone(&self.processing);
         let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
         processing.synchronize_pipeline(revision);
-
-        if processing.pipeline.is_none() && processing.resampler.is_none() {
-            // Load-bearing bypass: the ordinary 1.0/no-edit path hands
-            // converter output directly to the ring flow, still move-based.
-            drop(processing);
-            return self.queue(ring_generation, revision, samples_f32, None);
+        self.pipeline_scratch.clear();
+        if let Some(speed) = processing.synchronize_speed(&mut self.pipeline_scratch) {
+            // The retiring stretcher hands its lookahead to exact 1x, so these
+            // samples follow the marker. Never wait with processing locked.
+            self.resampler_scratch.clear();
+            match &mut processing.resampler {
+                Some(resampler) => {
+                    resampler.process(&self.pipeline_scratch, &mut self.resampler_scratch);
+                }
+                None => std::mem::swap(&mut self.pipeline_scratch, &mut self.resampler_scratch),
+            }
+            if !self.resampler_scratch.is_empty() {
+                let tail = self.resampler_scratch.clone();
+                drop(processing);
+                self.queue(ring_generation, revision, tail, None, speed)?;
+                processing = self.processing.lock().unwrap_or_else(PoisonError::into_inner);
+            }
         }
 
-        // Edited or rate-converted packets render into the reusable scratch
-        // buffers; only the ring's own packet copy allocates.
-        self.pipeline_scratch.clear();
-        self.resampler_scratch.clear();
-        let (final_in_pipeline_scratch, loop_to_ms) = match processing.pipeline.as_mut() {
-            Some(pipeline) => {
-                let loop_to_ms = pipeline.process(&samples_f32, &mut self.pipeline_scratch);
-                match processing.resampler.as_mut() {
-                    Some(resampler) => {
-                        resampler.process(&self.pipeline_scratch, &mut self.resampler_scratch);
-                        (false, loop_to_ms)
-                    }
-                    None => (true, loop_to_ms),
-                }
-            }
-            None => {
-                processing
-                    .resampler
-                    .as_mut()
-                    .expect("bypass case returned above")
-                    .process(&samples_f32, &mut self.resampler_scratch);
-                (false, None)
-            }
-        };
+        let (queued, loop_to_ms) = processing.render_packet(
+            samples_f32, &mut self.pipeline_scratch, &mut self.resampler_scratch,
+        );
+        let speed = processing.speed;
         drop(processing);
-        let queued = if final_in_pipeline_scratch {
-            &self.pipeline_scratch[..]
-        } else {
-            &self.resampler_scratch[..]
-        };
 
         // Do not pace an empty customized packet. The ring's queued audible
         // samples already provide normal backpressure; sleeping for removed
@@ -1243,7 +1462,7 @@ impl Sink for RodioSink {
             return Ok(());
         }
 
-        self.queue(ring_generation, revision, queued.to_vec(), loop_to_ms)
+        self.queue(ring_generation, revision, queued, loop_to_ms, speed)
     }
 }
 
@@ -1260,13 +1479,15 @@ impl RodioSink {
         revision: u64,
         samples: Vec<f32>,
         loop_to_ms: Option<u32>,
+        speed: f32,
     ) -> SinkResult<()> {
-        let queued = self.ring.push_marked_at_generation(
+        let queued = self.ring.push_timed_at_generation(
             ring_generation,
             samples,
             loop_to_ms,
             loop_to_ms.map_or(0, |_| revision),
             WRITE_DRAIN_TIMEOUT,
+            Some((revision, speed, self.output_rate)),
         );
         if queued.is_err() {
             // The only way this wait expires is that nothing consumed the ring
@@ -1747,33 +1968,130 @@ mod tests {
         release_live(&LIVE_RING, &playing, LIVE_RING_POISON_MSG);
     }
 
-    /// The load-bearing bypass gate: at the ordinary transport setting
-    /// `RodioSink::write` must hand the converter's own `Vec` straight to the
-    /// resampler, and it takes that branch whenever no pipeline was built. So
-    /// the property that keeps the -116 dB path untouched is precisely "no
-    /// speed and no edit an unedited 1x listener can produce arms one".
-    /// `speed != 1.0` is a float comparison, which is only safe because every
-    /// value the UI offers is a binary fraction — pin that here rather than
-    /// trusting it.
+
     #[test]
-    fn nothing_arms_the_sample_pipeline_at_1x_without_an_edit() {
+    fn exact_one_customization_returns_the_converter_packet_without_stretcher_or_copy() {
         let _guard = customization_guard();
-        // Mirrors SPEEDS in src/components/PlayerBar.svelte.
-        for speed in [0.5f32, 0.75, 1.0, 1.25, 1.5, 2.0] {
-            configure_customization(None, speed, 0);
-            assert_eq!(
-                CUSTOMIZATION_ACTIVE.load(Ordering::Acquire),
-                speed != 1.0,
-                "speed {speed} (bits {:08x}) armed the pipeline wrongly",
-                speed.to_bits()
-            );
-        }
-        configure_customization(Some(TrackEdit::default()), 1.0, 0);
-        assert!(
-            !CUSTOMIZATION_ACTIVE.load(Ordering::Acquire),
-            "an edit record with no cuts and no loop must stay bypassed"
+        let revision = configure_customization_at_loop_pass(Some(TrackEdit::default()), 1.0, 0, 1);
+        let mut processing = AudioProcessing {
+            resampler: None,
+            pipeline_revision: revision.wrapping_sub(1),
+            pipeline: None,
+            speed: 1.0,
+            output_rate: SAMPLE_RATE,
+        };
+        processing.synchronize_pipeline(revision);
+        let samples = vec![0.0, -0.0, f32::MIN_POSITIVE, -0.125, 0.75, -1.0];
+        let allocation = samples.as_ptr();
+        let bits: Vec<_> = samples.iter().map(|sample| sample.to_bits()).collect();
+        let mut pipeline_scratch = Vec::new();
+        let mut resampler_scratch = Vec::new();
+        let (output, loop_to) = processing.render_packet(
+            samples, &mut pipeline_scratch, &mut resampler_scratch,
         );
-        configure_customization(None, 1.0, 0);
+        assert_eq!(output.as_ptr(), allocation);
+        assert_eq!(output.iter().map(|sample| sample.to_bits()).collect::<Vec<_>>(), bits);
+        assert_eq!(loop_to, None);
+        assert!(processing.pipeline.is_none());
+        assert_eq!(pipeline_scratch.capacity(), 0);
+        assert_eq!(resampler_scratch.capacity(), 0);
+    }
+
+    #[test]
+    fn queued_audio_keeps_old_rate_until_the_new_packet_is_audible() {
+        let ring = test_ring();
+        let revision = 19;
+        let generation = ring.generation.load(Ordering::Acquire);
+        let frames = OUT_RATE as usize / 10;
+        for speed in [1.0, 4.0] {
+            ring.push_timed_at_generation(generation, packet(frames * NUM_CHANNELS as usize),
+                None, 0, Duration::from_millis(50), Some((revision, speed, OUT_RATE))).unwrap();
+        }
+        let first = ring.lock().packets.pop_front().unwrap();
+        let second = ring.lock().packets.pop_front().unwrap();
+        let at = Instant::now();
+        ring.lock().audible = Some(AudibleClock { timing: first.timing.unwrap(), at });
+        assert_eq!(ring.audible_elapsed_at(revision, at + Duration::from_millis(50)), Some(50.0));
+        assert_eq!(ring.audible_elapsed_at(revision, at + Duration::from_millis(150)), Some(100.0));
+        ring.lock().audible = Some(AudibleClock {
+            timing: second.timing.unwrap(), at: at + Duration::from_millis(100),
+        });
+        assert_eq!(ring.audible_elapsed_at(revision, at + Duration::from_millis(100)), Some(100.0));
+        assert_eq!(ring.audible_elapsed_at(revision, at + Duration::from_millis(150)), Some(300.0));
+        assert_eq!(ring.audible_elapsed_at(revision, at + Duration::from_millis(250)), Some(500.0));
+        assert_eq!(ring.audible_elapsed_at(revision + 1, at), None);
+        ring.clear();
+        assert_eq!(ring.audible_elapsed_at(revision, at), None);
+    }
+
+    #[test]
+    fn pause_retains_inflight_audio_and_freezes_source_time_until_resume() {
+        let ring = test_ring();
+        let samples = vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0];
+        ring.push(samples.clone(), Duration::from_millis(50)).unwrap();
+        ring.push(vec![4.0, -4.0], Duration::from_millis(50)).unwrap();
+        let mut source = LiveSource::new(ring.clone(), OUT_RATE);
+        source.silence_remaining = 0;
+        assert_eq!(source.next(), Some(1.0));
+        assert_eq!(source.next(), Some(-1.0));
+        let at = Instant::now();
+        let revision = 31;
+        ring.lock().audible = Some(AudibleClock {
+            timing: PacketTiming { revision, start_ms: 13_000.0, duration_ms: 100.0, speed: 1.0 },
+            at,
+        });
+        let processing = Mutex::new(AudioProcessing {
+            resampler: None, pipeline_revision: revision,
+            pipeline: Some(AudioPipeline::new(&PipelineConfig {
+                edit: None, speed: 4.0, position_ms: 0, loop_pass: 1,
+            })),
+            speed: 4.0, output_rate: SAMPLE_RATE,
+        });
+        let mut pipeline_scratch = Vec::new();
+        let mut resampler_scratch = Vec::new();
+        let prefix = SAMPLE_RATE as usize / 50;
+        let suffix = SAMPLE_RATE as usize * 2 / 25;
+        let (first, _) = processing.lock().unwrap_or_else(PoisonError::into_inner).render_packet(
+            vec![0.25; prefix * NUM_CHANNELS as usize],
+            &mut pipeline_scratch, &mut resampler_scratch,
+        );
+        ring.pause_at(at + Duration::from_millis(50));
+        ring.stop_processing(&processing);
+        assert_eq!(ring.audible_elapsed_at(revision, at + Duration::from_secs(5)), Some(13_050.0));
+        ring.resume_at(at + Duration::from_secs(5));
+        assert_eq!(ring.audible_elapsed_at(revision, at + Duration::from_secs(5)), Some(13_050.0));
+        assert_eq!(ring.audible_elapsed_at(revision,
+            at + Duration::from_secs(5) + Duration::from_millis(25)), Some(13_075.0));
+        assert_eq!((0..6).map(|_| source.next().unwrap()).collect::<Vec<_>>(),
+            vec![2.0, -2.0, 3.0, -3.0, 4.0, -4.0]);
+        let (last, _) = processing.lock().unwrap_or_else(PoisonError::into_inner).render_packet(
+            vec![0.25; suffix * NUM_CHANNELS as usize],
+            &mut pipeline_scratch, &mut resampler_scratch,
+        );
+        let mut tail = Vec::new();
+        processing.lock().unwrap_or_else(PoisonError::into_inner)
+            .pipeline.as_mut().unwrap().finish(&mut tail);
+        assert_eq!((first.len() + last.len() + tail.len()) / NUM_CHANNELS as usize,
+            ((prefix + suffix) as f64 / 4.0).round() as usize,
+            "pause must not lose the stretcher's un-emitted source lookahead");
+        ring.clear();
+        assert_eq!(ring.audible_elapsed_at(revision, at), None);
+    }
+
+    #[test]
+    fn pause_releases_a_capacity_wait_without_losing_the_inflight_packet() {
+        let ring = SampleRing::new(2);
+        ring.push(vec![1.0, -1.0], Duration::from_millis(50)).unwrap();
+        let producer = ring.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            done.send(producer.push(vec![2.0, -2.0], Duration::from_secs(1))).unwrap();
+        });
+        ring.pause_at(Instant::now());
+        assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
+        writer.join().unwrap();
+        assert_eq!(ring.pop().unwrap().samples, vec![1.0, -1.0]);
+        assert_eq!(ring.pop().unwrap().samples, vec![2.0, -2.0]);
     }
 
     /// Natural gapless setup must preserve the outgoing queue, while every
@@ -1792,11 +2110,11 @@ mod tests {
             "a natural track boundary must leave the audible tail queued"
         );
 
-        configure_customization(None, 1.25, 0);
+        configure_customization_at_loop_pass(None, 1.25, 0, 1);
         assert_eq!(
             ring.queued_samples(),
             0,
-            "a speed/config discontinuity must discard stale queued samples"
+            "a configuration discontinuity must discard stale queued samples"
         );
     }
 
@@ -1819,6 +2137,8 @@ mod tests {
             resampler: None,
             pipeline_revision: CUSTOMIZATION_REVISION.load(Ordering::Acquire),
             pipeline: Some(pipeline),
+            speed,
+            output_rate: SAMPLE_RATE,
         }));
         *LIVE_RING.lock().expect(LIVE_RING_POISON_MSG) = Arc::downgrade(&ring);
         *LIVE_PROCESSING.lock().expect(LIVE_PROCESSING_POISON_MSG) = Arc::downgrade(&processing);

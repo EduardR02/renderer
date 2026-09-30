@@ -1,10 +1,13 @@
 <script>
+  import { untrack } from "svelte";
   import {
     route,
     navigate,
     navigateArtist,
     library,
     libraryState,
+    libraryRailEntries,
+    hydrateLibraryCovers,
     followed,
     loadFollowedArtists,
     insertPlaylist,
@@ -18,7 +21,7 @@
   import LikedMark from "./LikedMark.svelte";
   import { scrollbar } from "../lib/scrollbar.js";
   import PlaylistRailRow from "./PlaylistRailRow.svelte";
-  import { loadPins, isPinned, togglePin } from "../lib/pins.svelte.js";
+  import { pins, loadPins, isPinned, togglePin } from "../lib/pins.svelte.js";
   import { session } from "../lib/state.svelte.js";
   import { watchPersonal } from "../lib/personal.svelte.js";
   import { frost } from "../lib/ambient.svelte.js";
@@ -32,6 +35,37 @@
   let filtering = $state(false);
   let filterQuery = $state("");
   let filterInput = $state(null);
+
+  const coverRows = new Map();
+  let coverObserver = null;
+  function observeCover(node, id) {
+    coverRows.set(node, id);
+    coverObserver?.observe(node);
+    return {
+      update(nextId) {
+        coverRows.set(node, nextId);
+        coverObserver?.unobserve(node);
+        coverObserver?.observe(node);
+      },
+      destroy() {
+        coverObserver?.unobserve(node);
+        coverRows.delete(node);
+      },
+    };
+  }
+  $effect(() => {
+    const root = libList;
+    const account = session.username;
+    if (!root || !account) return;
+    const observer = new IntersectionObserver((entries) => {
+      const ids = entries.filter((entry) => entry.isIntersecting)
+        .map((entry) => coverRows.get(entry.target)).filter(Boolean);
+      if (ids.length) hydrateLibraryCovers(ids).catch(() => {});
+    }, { root });
+    coverObserver = observer;
+    for (const node of coverRows.keys()) observer.observe(node);
+    return () => { observer.disconnect(); coverObserver = null; };
+  });
 
   /**
    * Which collection the one library list is showing.
@@ -62,33 +96,87 @@
       .catch((error) => { if (active) treeError = String(error); });
     return () => { active = false; };
   });
-  const filteredLibrary = $derived.by(() => {
-    const query = filterQuery.trim().toLocaleLowerCase();
-    const byId = new Map(library.map((playlist) => [playlist.id, playlist]));
-    const entries = [];
-    const seen = new Set();
-    function visit(nodes, depth) {
-      for (const node of nodes) {
-        if (node.kind === "folder") {
-          entries.push({ kind: "folder", id: node.id, name: node.name, depth });
-          visit(node.children ?? [], depth + 1);
-        } else if (node.kind === "playlist") {
-          const id = node.playlist?.id;
-          if (id && !seen.has(id)) {
-            seen.add(id);
-            entries.push({ kind: "playlist", playlist: byId.get(id) ?? node.playlist, depth });
-          }
-        }
-      }
+  const filteredLibrary = $derived(libraryRailEntries(library, tree, pins.ids, filterQuery));
+  const showLiked = $derived(!filterQuery.trim() || "liked songs".includes(filterQuery.trim().toLocaleLowerCase()));
+
+  let libraryMenu = $state(null);
+  let menu = $state(null);
+  let menuX = $state(0);
+  let menuY = $state(0);
+
+  function closeLibraryMenu(returnFocus = false) {
+    const trigger = libraryMenu?.trigger;
+    const hadFocus = menu?.contains(document.activeElement);
+    menu?.hidePopover();
+    libraryMenu = null;
+    if (returnFocus && hadFocus) queueMicrotask(() => trigger?.focus());
+  }
+
+  function openLibraryMenu(event, id, name) {
+    const keyboard = event.type === "keydown";
+    if (keyboard && event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+    event.preventDefault();
+    if (trackDrag.active || !session.username) return;
+    const trigger = event.currentTarget;
+    const bounds = trigger.getBoundingClientRect();
+    libraryMenu = {
+      id, name, trigger,
+      x: keyboard ? bounds.left + 8 : event.clientX,
+      y: keyboard ? bounds.bottom : event.clientY,
+    };
+  }
+
+  $effect(() => {
+    const target = libraryMenu;
+    const element = menu;
+    if (!target || !element) return;
+    element.showPopover();
+    const bounds = element.getBoundingClientRect();
+    menuX = Math.max(8, Math.min(target.x, window.innerWidth - bounds.width - 8));
+    menuY = Math.max(8, Math.min(target.y, window.innerHeight - bounds.height - 8));
+    queueMicrotask(() => element.querySelector('[role="menuitem"]')?.focus());
+    function dismiss(event) {
+      if (!element.contains(event.target)) closeLibraryMenu();
     }
-    if (Array.isArray(tree)) visit(tree, 0);
-    for (const playlist of library) {
-      if (!seen.has(playlist.id)) entries.push({ kind: "playlist", playlist, depth: 0 });
-    }
-    if (query) return entries.filter((entry) => entry.kind === "playlist" && entry.playlist.name?.toLocaleLowerCase().includes(query));
-    const pinned = entries.filter((entry) => entry.kind === "playlist" && isPinned(entry.playlist.id));
-    return [...pinned.map((entry) => ({ ...entry, depth: 0 })), ...entries.filter((entry) => entry.kind === "folder" || !isPinned(entry.playlist.id))];
+    function onResize() { closeLibraryMenu(); }
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("scroll", dismiss, true);
+    window.addEventListener("resize", onResize);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("scroll", dismiss, true);
+      window.removeEventListener("resize", onResize);
+    };
   });
+
+  $effect(() => {
+    session.username;
+    route.name;
+    route.id;
+    showingArtists;
+    filterQuery;
+    untrack(() => closeLibraryMenu());
+  });
+
+  function onLibraryMenuKeyDown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeLibraryMenu(true);
+    } else if (event.key === "Tab") {
+      const trigger = libraryMenu?.trigger;
+      closeLibraryMenu();
+      trigger?.focus();
+    } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      menu?.querySelector('[role="menuitem"]')?.focus();
+    }
+  }
+
+  function pinFromMenu() {
+    const id = libraryMenu?.id;
+    closeLibraryMenu(true);
+    if (id) togglePin(id);
+  }
 
   const filteredArtists = $derived.by(() => {
     const query = filterQuery.trim().toLocaleLowerCase();
@@ -288,15 +376,6 @@
     <button class="nav-item" class:active={route.name === "history"} onclick={() => navigate("history")}>
       <Icon name="clock" size={17} /><span>History</span>
     </button>
-    <button class="nav-item" class:active={route.name === "podcasts"} onclick={() => navigate("podcasts")}>
-      <Icon name="note" size={17} /><span>Podcasts</span>
-    </button>
-    {#if session.username}
-      <button class="nav-item" class:active={route.name === "profile" && route.id === session.username}
-        onclick={() => navigate("profile", session.username)}>
-        <Icon name="library" size={17} /><span>My profile</span>
-      </button>
-    {/if}
   </nav>
 
   <div class="lib">
@@ -351,11 +430,8 @@
           >
             <Icon name="search" size={13} />
           </button>
-          <!-- Only over playlists. There is nothing to create in the artist
-               list — this app cannot follow an artist at all, and Spotify's
-               own write for it is an internal protobuf service — so the slot
-               goes back to the head rather than holding a control that would
-               have to explain itself. -->
+          <!-- Creation belongs to playlists; Following keeps the same header
+               geometry without advertising an unrelated playlist action. -->
           {#if !showingArtists}
             <button class="btn-icon" title="New playlist" onclick={startCreate}>
               <Icon name="plus" size={14} />
@@ -423,25 +499,29 @@
           <p class="lib-filter-empty">You are not following any artists yet</p>
         {/if}
       {:else}
-        {#if isPinned("liked")}
-          <div class="lib-row liked-row" class:active={route.name === "liked"}>
-            <button class="pin-liked-open" onclick={() => navigate("liked")}><LikedMark size={32} /><span class="lib-name">Liked Songs</span></button>
-            <button class="pin-liked-toggle" title="Unpin Liked Songs" aria-label="Unpin Liked Songs" onclick={() => togglePin("liked")}>◆</button>
-          </div>
+        {#if showLiked && isPinned("liked")}
+          <button class="lib-row liked-row" class:active={route.name === "liked"} aria-haspopup="menu"
+            onclick={() => navigate("liked")}
+            oncontextmenu={(event) => openLibraryMenu(event, "liked", "Liked Songs")}
+            onkeydown={(event) => openLibraryMenu(event, "liked", "Liked Songs")}>
+            <LikedMark size={32} /><span class="lib-name">Liked Songs</span>
+          </button>
         {/if}
         {#each filteredLibrary as entry (entry.kind === "folder" ? `folder:${entry.id}` : `playlist:${entry.playlist.id}`)}
           {#if entry.kind === "folder"}
-            <div class="lib-folder" style:padding-left={`${12 + entry.depth * 16}px`}>▾ {entry.name}</div>
+            <div class="lib-folder" style:padding-left={`${12 + entry.depth * 16}px`}><Icon name="chevron-down" size={12} /><span>{entry.name}</span></div>
           {:else}
-            <PlaylistRailRow playlist={entry.playlist} depth={entry.depth}
-              active={route.name === "playlist" && route.id === entry.playlist.id} playing={playingId === entry.playlist.id} />
+            <PlaylistRailRow playlist={entry.playlist} depth={entry.depth} {observeCover}
+              active={route.name === "playlist" && route.id === entry.playlist.id} playing={playingId === entry.playlist.id} onmenu={openLibraryMenu} />
           {/if}
         {/each}
-        {#if !isPinned("liked")}
-          <div class="lib-row liked-row" class:active={route.name === "liked"}>
-            <button class="pin-liked-open" onclick={() => navigate("liked")}><LikedMark size={32} /><span class="lib-name">Liked Songs</span></button>
-            <button class="pin-liked-toggle" title="Pin Liked Songs" aria-label="Pin Liked Songs" onclick={() => togglePin("liked")}>◇</button>
-          </div>
+        {#if showLiked && !isPinned("liked")}
+          <button class="lib-row liked-row" class:active={route.name === "liked"} aria-haspopup="menu"
+            onclick={() => navigate("liked")}
+            oncontextmenu={(event) => openLibraryMenu(event, "liked", "Liked Songs")}
+            onkeydown={(event) => openLibraryMenu(event, "liked", "Liked Songs")}>
+            <LikedMark size={32} /><span class="lib-name">Liked Songs</span>
+          </button>
         {/if}
         {#if treeError}<p class="lib-filter-empty">Folders unavailable: {treeError} <button class="link-more" onclick={() => treeGeneration++}>Retry</button></p>{/if}
         {#if !libraryState.loaded && !library.length}
@@ -455,7 +535,7 @@
               <span class="skeleton line" style="width:{78 - ((i * 13) % 34)}%;height:11px;margin:0"></span>
             </div>
           {/each}
-        {:else if filterQuery.trim() && !filteredLibrary.length}
+        {:else if filterQuery.trim() && !filteredLibrary.length && !showLiked}
           <p class="lib-filter-empty">No matching playlists</p>
         {:else if libraryState.loaded && !library.length}
           <p class="lib-filter-empty">No playlists in your library yet</p>
@@ -468,3 +548,26 @@
     <Icon name="settings" size={17} /><span>Settings</span>
   </button>
 </aside>
+
+{#if libraryMenu}
+  <div class="menu library-context-menu glass-overlay" popover="manual" role="menu"
+    aria-label={`${libraryMenu.name} actions`} tabindex="-1" bind:this={menu}
+    style:left={`${menuX}px`} style:top={`${menuY}px`} onkeydown={onLibraryMenuKeyDown}>
+    <button class="menu-item" role="menuitem" onclick={pinFromMenu}>
+      {isPinned(libraryMenu.id) ? "Unpin from library" : "Pin to top of library"}
+    </button>
+  </div>
+{/if}
+
+<style>
+  .lib-row.liked-row { grid-template-columns: 32px minmax(0, 1fr); }
+  .lib-folder { gap: var(--s2); }
+  .lib-folder span { overflow: hidden; text-overflow: ellipsis; }
+  .library-context-menu {
+    position: fixed;
+    inset: auto;
+    margin: 0;
+    max-width: calc(100vw - 16px);
+    min-width: min(216px, calc(100vw - 16px));
+  }
+</style>
