@@ -7,6 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { normalizeCanonicalPlaylistDescription } from "./artist.js";
 import { parseSpotifyLink } from "./spotify-link.js";
+import { applyCacheMarks } from "./cache-marks.js";
 
 /* ---------------- Navigation ---------------- */
 
@@ -616,7 +617,7 @@ export function applyPlayback(payload) {
      null check, and no caller has to remember the `buffering` term. */
   syncPlayheadTicker();
   if (!queueHeld) {
-    propagateCachedMarks(playback.queue, incomingQueue);
+    // Queue rows remain authoritative when a new generation is adopted.
     playback.queue = incomingQueue;
     /* Only a generation the payload actually named is remembered. One that
        named none is a payload from before this contract (or from a harness):
@@ -629,64 +630,32 @@ export function applyPlayback(payload) {
     playback.upcoming = incomingOrder;
     orderRevision = incomingOrderRevision;
   }
+  let cachedIds = Array.isArray(payload.cached_ids) && payload.cached_ids.length
+    ? new Set(payload.cached_ids) : null;
+  if (!queueHeld) {
+    for (const track of incomingQueue) {
+      if (track.cached && track.id) (cachedIds ??= new Set()).add(track.id);
+    }
+  }
+  if (cachedIds) propagateCacheMarks(cachedIds);
   maybeStartDeferredSearch();
 }
 
-/**
- * Carries download marks from the queue into whatever list is on screen.
- *
- * The engine re-checks the playing track as it finishes caching (see
- * `refresh_cached_marks`) and that reaches us on the queue. But a playlist view
- * renders `detail.playlist.tracks`, a different array holding different objects
- * for the same songs, so without this the mark would appear in the queue and
- * nowhere the reader is looking.
- *
- * The rows a payload carries are the authority on their own marks, so the diff
- * below only ever skips a row it can show is the row the previous payload held
- * at that index: the same id, with a mark that did not move. An index holding a
- * different row is an insertion or a removal that shifted everything after it,
- * and then no index-wise reading is trustworthy — the pass reads the whole
- * incoming queue instead. That fallback is what covers the case the optimised
- * walk would otherwise miss: a replacement of the same length whose rows are
- * both marked, where the flags on their own say "nothing moved".
- *
- * One-way and set-only: a track that has become cached stays marked for as long
- * as the list is open. Un-marking would mean re-deriving the whole list from a
- * payload that only speaks about two tracks, and inferring "not cached" from
- * "not mentioned" is exactly the wrong reading.
- */
-function propagateCachedMarks(previous, incoming) {
-  const rows = incoming ?? [];
-  let marked = [];
-  let aligned = Array.isArray(previous) && previous.length === rows.length;
-  if (aligned) {
-    for (let index = 0; index < rows.length; index += 1) {
-      const from = previous[index];
-      const into = rows[index];
-      if (from?.id !== into?.id) {
-        aligned = false;
-        break;
-      }
-      if (from?.cached || !into?.cached) continue;
-      marked.push(into.id);
-    }
-  }
-  if (!aligned) {
-    marked = [];
-    for (const row of rows) {
-      if (row?.cached && row.id) marked.push(row.id);
-    }
-  }
-  if (!marked.length) return;
-  const cachedIds = new Set(marked);
+/** Download IDs are additive metadata, independent of queue/order revisions. */
+const cacheMarkListeners = new Set();
+
+export function watchCacheMarks(listener) {
+  cacheMarkListeners.add(listener);
+  return () => cacheMarkListeners.delete(listener);
+}
+
+function propagateCacheMarks(ids) {
+  applyCacheMarks(playback.queue, ids);
   for (const view of [detail.playlist, detail.album, detail.artist, detail.radio]) {
-    for (const track of view?.tracks ?? []) {
-      if (!track.cached && cachedIds.has(track.id)) track.cached = true;
-    }
-    for (const track of view?.top_tracks ?? []) {
-      if (!track.cached && cachedIds.has(track.id)) track.cached = true;
-    }
+    applyCacheMarks(view?.tracks, ids);
+    applyCacheMarks(view?.top_tracks, ids);
   }
+  for (const listener of cacheMarkListeners) listener(ids);
 }
 
 export function applySession(payload) {
@@ -2058,11 +2027,9 @@ function browseLikedFirstPage() {
  * Drops the cached page and the walk in flight, so the next reader pays for a
  * fresh one from the account that is current now.
  *
- * Called for the two things that can move the collection under us: the shell
- * reporting that its membership index changed (a like added or removed, here or
- * in another client), and a change of account, where the previous account's
- * saved tracks are not this one's. A stale page would draw and play the wrong
- * list.
+ * Membership and account changes invalidate the collection; an explicit
+ * audio-cache clear invalidates its downloaded marks. The next browse must
+ * answer from the current account and cache, not a stale first page.
  */
 function invalidateLikedFirstPage() {
   likedFirstPage = null;
@@ -2143,6 +2110,12 @@ export function refreshCacheStats() {
 
 export async function clearCache(kind) {
   const payload = await api.clearCache(kind);
+  // A successful explicit wipe is the only cache message that unsets marks.
+  if (kind === "audio") {
+    propagateCacheMarks(null);
+    invalidateLikedFirstPage();
+    cataloguePageCache.clear();
+  }
   cacheStats.audio = payload?.audio ?? null;
   cacheStats.covers = payload?.covers ?? null;
   cacheStats.updatedAt = Date.now();

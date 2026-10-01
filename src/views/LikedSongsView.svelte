@@ -1,12 +1,13 @@
 <script>
   import { untrack } from "svelte";
-  import { api, ui, session, sessionEpoch, watchSavedTracks } from "../lib/state.svelte.js";
+  import { api, ui, session, sessionEpoch, watchSavedTracks, watchCacheMarks, playback, isPlayingSource, togglePlay } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Icon from "../components/Icon.svelte";
   import LikedMark from "../components/LikedMark.svelte";
   import { paletteFor } from "../lib/covertone.svelte.js";
   import { detailArtSize } from "../lib/layout.js";
   import { mergeLikedRows, reconcileLikedRows, mergeLikedPage, applyLikedDelta } from "../lib/liked-songs.js";
+  import { applyCacheMarks } from "../lib/cache-marks.js";
 
   /* Rose's own hue, rebuilt at the header's fixed dark. Every other detail
      page takes its colour from artwork; this collection has none, and does not
@@ -20,6 +21,7 @@
   const collection = $state({ tracks: [], nextCursor: null, loadedPages: 0, removed: new Set() });
   const tracks = $derived(collection.tracks);
   const nextCursor = $derived(collection.nextCursor);
+  const playingThis = $derived(isPlayingSource("liked"));
   let loading = $state(false);
   let error = $state("");
   let loadGeneration = 0;
@@ -110,8 +112,15 @@
       });
   }));
 
+  $effect(() => watchCacheMarks((ids) => applyCacheMarks(tracks, ids)));
+
   function playFrom(index) {
     if (tracks.length) api.playQueue(tracks, index, "liked").catch(() => {});
+  }
+
+  function playOrToggle() {
+    if (playingThis) togglePlay();
+    else playFrom(0);
   }
 </script>
 
@@ -142,11 +151,11 @@
          area, not ink. -->
     <button
       class="play-lg saved"
-      title="Play Liked Songs"
-      disabled={!tracks.length}
-      onclick={() => playFrom(0)}
+      title={playingThis ? (playback.playing ? "Pause" : "Resume") : "Play Liked Songs"}
+      disabled={!tracks.length && !playingThis}
+      onclick={playOrToggle}
     >
-      <Icon name="play" size={22} />
+      <Icon name={playingThis && playback.playing ? "pause" : "play"} size={22} />
     </button>
   </div>
 

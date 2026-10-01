@@ -36,17 +36,45 @@ enum Update {
     State {
         playing: bool,
         position_ms: u32,
-        duration_ms: u32,
-        uri: String,
-        title: String,
-        artist: String,
-        album: String,
-        cover: String,
+        metadata: Metadata,
     },
     /// A scalar heartbeat: only the playhead moved.
     Position(u32),
     /// Nothing playable (logged out, empty queue).
     Stopped,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Metadata {
+    duration_ms: u32,
+    title: String,
+    artist: String,
+    album: String,
+    cover: String,
+}
+
+impl Metadata {
+    fn as_media(&self) -> MediaMetadata<'_> {
+        MediaMetadata {
+            title: Some(&self.title),
+            artist: Some(&self.artist),
+            album: Some(&self.album),
+            cover_url: (!self.cover.is_empty()).then_some(self.cover.as_str()),
+            duration: Some(Duration::from_millis(self.duration_ms as u64)),
+        }
+    }
+}
+
+fn publish_metadata<E>(
+    previous: &mut Option<Metadata>,
+    next: Metadata,
+    publish: impl FnOnce(MediaMetadata<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    if previous.as_ref() != Some(&next) {
+        publish(next.as_media())?;
+        *previous = Some(next);
+    }
+    Ok(())
 }
 
 /// Attaches system media controls. Failures are warnings, never fatal: a
@@ -109,34 +137,20 @@ fn run_controls(
         let _ = refresh.request("status", serde_json::Value::Null).await;
     });
 
-    // Metadata only changes with the track; resending it on every heartbeat
-    // makes Windows repaint the flyout for nothing. Transport status and the
-    // playhead position are cheap and sent every time.
-    let mut last_uri = String::new();
+    // Deduplicate the actual OS metadata tuple, not the URI: preview edits,
+    // restores and refreshed titles/artwork can change it for the same song.
+    // Position heartbeats stay on the scalar transport-only lane.
+    let mut last_metadata = None;
     for update in receiver {
         let result = match update {
             Update::State {
                 playing,
                 position_ms,
-                duration_ms,
-                uri,
-                title,
-                artist,
-                album,
-                cover,
+                metadata,
             } => {
-                if uri != last_uri {
-                    let metadata = MediaMetadata {
-                        title: Some(&title),
-                        artist: Some(&artist),
-                        album: Some(&album),
-                        cover_url: (!cover.is_empty()).then_some(cover.as_str()),
-                        duration: Some(Duration::from_millis(duration_ms as u64)),
-                    };
-                    if let Err(error) = controls.set_metadata(metadata) {
-                        log::warn(&format!("could not update media metadata: {error:?}"));
-                    }
-                    last_uri = uri;
+                if let Err(error) = publish_metadata(&mut last_metadata, metadata,
+                    |metadata| controls.set_metadata(metadata)) {
+                    log::warn(&format!("could not update media metadata: {error:?}"));
                 }
                 controls.set_playback(transport(playing, position_ms))
             }
@@ -145,7 +159,7 @@ fn run_controls(
             }
             Update::Stopped => {
                 PLAYING.store(false, Ordering::Relaxed);
-                last_uri.clear();
+                last_metadata = None;
                 #[cfg(windows)]
                 if let Some(hwnd) = hwnd {
                     if let Err(error) = clear_windows_metadata(hwnd) {
@@ -298,12 +312,13 @@ pub fn update_state(state: &PlaybackState) {
     let _ = sender.send(Update::State {
         playing: state.playing,
         position_ms: state.position_ms,
-        duration_ms,
-        uri: state.current_uri.clone(),
-        title: track.name.clone(),
-        artist: track.artist_names.join(", "),
-        album: track.album_name.clone(),
-        cover: track.cover_url.clone(),
+        metadata: Metadata {
+            duration_ms,
+            title: track.name.clone(),
+            artist: track.artist_names.join(", "),
+            album: track.album_name.clone(),
+            cover: track.cover_url.clone(),
+        },
     });
 }
 
@@ -329,10 +344,41 @@ pub fn update_disconnected() {
     }
 }
 
+
 fn track_duration(compiled_ms: u32, source_ms: u32) -> u32 {
-    if compiled_ms > 0 {
-        compiled_ms
-    } else {
-        source_ms
+    if compiled_ms > 0 { compiled_ms } else { source_ms }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_metadata_publishes_preview_duration_restore_and_same_song_refresh_only_when_changed() {
+        let song = |duration_ms, title: &str| Metadata { duration_ms, title: title.into(),
+            artist: "Artist".into(), album: "Album".into(), cover: "cover".into() };
+        let mut previous = None;
+        let mut published = Vec::new();
+        for next in [song(180_000, "Song"), song(180_000, "Song"),
+            song(30_000, "Song"), song(180_000, "Song"), song(180_000, "Corrected title")] {
+            publish_metadata(&mut previous, next, |metadata| {
+                published.push((metadata.duration.unwrap().as_millis(), metadata.title.unwrap().to_owned()));
+                Ok::<_, ()>(())
+            }).unwrap();
+        }
+        assert_eq!(published, [(180_000, "Song".into()), (30_000, "Song".into()),
+            (180_000, "Song".into()), (180_000, "Corrected title".into())]);
+    }
+
+    #[test]
+    fn failed_os_metadata_publication_is_retried_on_next_full_state() {
+        let song = || Metadata { duration_ms: 10, title: "Song".into(),
+            artist: String::new(), album: String::new(), cover: String::new() };
+        let mut previous = None;
+        assert_eq!(publish_metadata(&mut previous, song(), |_| Err("OS unavailable")), Err("OS unavailable"));
+        let mut calls = 0;
+        publish_metadata(&mut previous, song(), |_| { calls += 1; Ok::<_, ()>(()) }).unwrap();
+        publish_metadata(&mut previous, song(), |_| { calls += 1; Ok::<_, ()>(()) }).unwrap();
+        assert_eq!(calls, 1);
     }
 }

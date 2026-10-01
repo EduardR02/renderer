@@ -234,6 +234,9 @@ pub struct AppState {
     /// carry this ephemeral generation across launches.
     #[serde(skip)]
     pub library_generation: u64,
+    /// Fences full Liked Songs walks against confirmed personal-API writes.
+    #[serde(skip)]
+    pub liked_generation: u64,
     /// Last computed cache sizes and the unix second they were computed at,
     /// so reopening Settings does not re-walk thousands of files. See
     /// [`CACHE_STATS_TTL_SECS`].
@@ -270,11 +273,34 @@ impl AppState {
             library_fetching: false,
             library_refresh_queued: false,
             library_generation: 0,
+            liked_generation: 0,
             cache_stats: None,
             memberships: Vec::new(),
             membership_fetching: false,
             membership_refresh_queued: false,
         }
+    }
+
+    pub(crate) fn record_liked_write(&mut self, uris: &[String], saved: bool) -> bool {
+        if !uris.iter().any(|uri| uri.starts_with("spotify:track:")) {
+            return false;
+        }
+        self.liked_generation = self.liked_generation.wrapping_add(1);
+        apply_liked_write(&mut self.memberships, uris, saved)
+    }
+
+    /// Returns no result for a read overtaken by a landed like/unlike, and
+    /// coalesces a fresh walk into the running reconciliation chain.
+    pub(crate) fn commit_liked_read(&mut self, generation: u64, uris: HashSet<String>) -> Option<bool> {
+        if self.liked_generation != generation {
+            self.membership_refresh_queued = true;
+            return None;
+        }
+        Some(upsert_membership(&mut self.memberships, MembershipEntry {
+            id: LIKED_MEMBERSHIP_ID.to_owned(),
+            revision: String::new(),
+            uris,
+        }))
     }
 
     pub(crate) fn start_playlist_refresh(&mut self, id: &str, cause: RefreshCause) -> bool {
@@ -849,10 +875,9 @@ pub fn is_followed_playlist(playlists: &[Playlist], id: &str) -> bool {
     playlists.iter().any(|playlist| playlist.id == id)
 }
 
-/// Copies fields the rootlist cannot reliably produce — the name, the
-/// description, previously browsed cover candidates, a missing cover URL,
-/// revision, and local activity timestamps — from the previous library
-/// snapshot onto a freshly fetched one.
+/// Copies sparse display metadata and local activity timestamps from the
+/// previous library snapshot. A missing source revision remains unknown:
+/// a previously browsed version is not evidence that today's rootlist is fresh.
 ///
 /// The rootlist is intentionally sparse, so a plain replacement would blank
 /// these fields on every library refresh. For the candidates that is not
@@ -885,7 +910,6 @@ pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
                 playlist.cover_url = old.cover_url.clone();
             }
             if playlist.cover_urls.is_empty() { playlist.cover_urls = old.cover_urls.clone(); }
-            if playlist.snapshot_id.is_empty() { playlist.snapshot_id = old.snapshot_id.clone(); }
             playlist.last_played = old.last_played;
             playlist.last_activity = old.last_activity;
             if playlist.description.is_empty() {
@@ -1128,20 +1152,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_rootlist_revision_wins_but_sparse_rows_keep_browsed_metadata() {
-        let mut old = playlist("p");
-        old.snapshot_id = "before".into();
-        old.cover_urls = vec!["old-cover".into()];
-        let mut fresh = vec![Playlist { snapshot_id: "after".into(), cover_urls: vec!["new-cover".into()],
-            ..playlist("p") }];
+    fn sparse_rootlist_keeps_display_metadata_without_claiming_old_revision_is_current() {
+        let old = Playlist { snapshot_id: "before".into(), cover_urls: vec!["old-cover".into()],
+            ..playlist("p") };
+        let mut fresh = vec![Playlist { snapshot_id: "after".into(), ..playlist("p") }];
         carry_local_fields(&[old.clone()], &mut fresh);
         assert_eq!(fresh[0].snapshot_id, "after");
-        assert_eq!(fresh[0].cover_urls, ["new-cover"]);
         let mut sparse = vec![playlist("p")];
         carry_local_fields(&[old], &mut sparse);
-        assert_eq!(sparse[0].snapshot_id, "before");
+        assert!(sparse[0].snapshot_id.is_empty());
         assert_eq!(sparse[0].cover_urls, ["old-cover"]);
     }
+
+    #[test]
+    fn landed_likes_and_unlikes_fence_older_full_collection_reads() {
+        let mut state = AppState::new(PathBuf::new());
+        let a = "spotify:track:a".to_owned();
+        let b = "spotify:track:b".to_owned();
+        state.commit_liked_read(0, HashSet::from([a.clone()]));
+        let read_generation = state.liked_generation;
+        assert!(state.record_liked_write(&[a.clone()], false));
+        assert!(state.record_liked_write(&[b.clone()], true));
+        assert_eq!(state.commit_liked_read(read_generation, HashSet::from([a])), None);
+        assert!(state.membership_refresh_queued);
+        assert_eq!(state.memberships[0].uris, HashSet::from([b.clone()]));
+        assert_eq!(state.commit_liked_read(state.liked_generation, HashSet::from([b.clone()])), Some(false));
+        assert_eq!(state.memberships[0].uris, HashSet::from([b]));
+    }
+
 
     #[test]
     fn folder_tree_survives_cache_replacement_and_deleted_playlists_stay_deleted() {
@@ -1803,7 +1841,6 @@ mod tests {
         let previous = vec![Playlist {
             description: "<p>Road&nbsp;music</p>".into(),
             cover_urls: vec!["cover-a".into(), "cover-b".into()],
-            snapshot_id: "rev-a".into(),
             last_played: Some(1_000),
             last_activity: Some(2_000),
             ..playlist("p1")
@@ -1812,7 +1849,6 @@ mod tests {
         carry_local_fields(&previous, &mut fresh);
         assert_eq!(fresh[0].description, "Road music");
         assert_eq!(fresh[0].cover_urls, vec!["cover-a", "cover-b"]);
-        assert_eq!(fresh[0].snapshot_id, "rev-a");
         assert_eq!(fresh[0].last_played, Some(1_000));
         assert_eq!(fresh[0].last_activity, Some(2_000));
         // A playlist the previous snapshot never had stays empty — it has

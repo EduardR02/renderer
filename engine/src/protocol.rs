@@ -774,6 +774,9 @@ pub struct PlaylistRef {
     pub id: String,
     pub uri: String,
     pub name: String,
+    /// Playlist4 revision hex, when the source supplied an actual version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     /// Plain-text description from search/playlist metadata, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -803,6 +806,7 @@ impl Default for SongwriterPlaylist {
                 id: String::new(),
                 uri: String::new(),
                 name: String::new(),
+                revision: None,
                 description: None,
                 owner_id: String::new(),
                 owner_name: String::new(),
@@ -2127,6 +2131,7 @@ mod tests {
             id: "0123456789ABCDEFGHIJKL".to_owned(),
             uri: "spotify:playlist:0123456789ABCDEFGHIJKL".to_owned(),
             name: "Road Trip".to_owned(),
+            revision: None,
             description: Some("A road trip playlist.".to_owned()),
             owner_id: "alice".to_owned(),
             owner_name: String::new(),
@@ -2475,6 +2480,7 @@ mod tests {
                 id: "writers".to_owned(),
                 uri: "spotify:playlist:writers".to_owned(),
                 name: "Written by Artist".to_owned(),
+                revision: None,
                 description: Some("Official".to_owned()),
                 owner_id: "spotify".to_owned(),
                 owner_name: "Spotify".to_owned(),

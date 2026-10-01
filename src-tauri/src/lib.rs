@@ -58,6 +58,13 @@ fn reconcile_autostart_preference(app: &tauri::AppHandle, settings: &mut app::Ap
     }
 }
 
+/// Shared by normal RunEvent::Exit and the Windows updater's direct exit.
+pub(crate) fn shutdown_for_exit(app: &tauri::AppHandle) {
+    if let Some(client) = app.try_state::<Arc<EngineClient>>() {
+        client.shutdown_engine();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     log::init(app::logs_dir());
@@ -75,6 +82,7 @@ pub fn run() {
             None,
         ))
         .invoke_handler(tauri::generate_handler![
+            commands::check_for_update,
             commands::play,
             commands::pause,
             commands::next,
@@ -221,9 +229,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                if let Some(client) = app_handle.try_state::<Arc<EngineClient>>() {
-                    client.shutdown_engine();
-                }
+                shutdown_for_exit(app_handle);
             }
         });
 }

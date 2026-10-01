@@ -1,7 +1,8 @@
 <script>
   import { onMount } from "svelte";
   import { getVersion } from "@tauri-apps/api/app";
-  import { check } from "@tauri-apps/plugin-updater";
+  import { invoke } from "@tauri-apps/api/core";
+  import { Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
 
   /**
@@ -62,7 +63,10 @@
       }
     }
     try {
-      const result = await check();
+      // The shell's Update resource includes the final engine flush before
+      // Windows launches its installer and exits; keep official install APIs.
+      const metadata = await invoke("check_for_update");
+      const result = metadata ? new Update(metadata) : null;
       if (!active) {
         if (result) await result.close();
         return;

@@ -355,6 +355,11 @@ pub async fn create_playlist(session: &Session, name: &str) -> Result<PlaylistRe
         id,
         uri,
         name: name.to_owned(),
+        revision: reply
+            .revision
+            .as_deref()
+            .filter(|bytes| !bytes.is_empty())
+            .map(crate::browse::hex),
         description: None,
         owner_id: session.username(),
         owner_name: String::new(),

@@ -701,13 +701,6 @@ pub fn pause_output() {
     }
 }
 
-/// A native failure may race librespot's unsolicited Paused event. The engine
-/// uses this sink-owned fact to leave user playback intent for recovery.
-pub fn output_has_failed(revision: u64) -> bool {
-    LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade()
-        .is_some_and(|output| output.status.revision.load(Ordering::Acquire) == revision
-            && output.status.failed.load(Ordering::Acquire))
-}
 
 /// Callback proof remains valid after pause, even if no later write reports it.
 pub fn output_is_ready(revision: u64) -> bool {
@@ -995,6 +988,12 @@ impl AudioProcessing {
         match &mut self.resampler {
             Some(resampler) => {
                 resampler.process(filtered, resampler_scratch);
+                // An intentional loop jump resets the filter on the next
+                // revision. Emit its lookahead before the audible marker;
+                // ordinary gapless packets keep their rational phase/history.
+                if loop_to.is_some() {
+                    resampler.finish(resampler_scratch);
+                }
                 (resampler_scratch.clone(), loop_to)
             }
             None => (pipeline_scratch.clone(), loop_to),
@@ -2108,6 +2107,86 @@ mod tests {
         assert!(processing.pipeline.is_none());
         assert_eq!(pipeline_scratch.capacity(), 0);
         assert_eq!(resampler_scratch.capacity(), 0);
+    }
+
+    #[test]
+    fn resampled_loop_emits_the_complete_pass_before_its_audible_marker() {
+        let _guard = customization_guard();
+        let revision = 37;
+        let config = PipelineConfig {
+            edit: Some(TrackEdit {
+                cuts: Vec::new(),
+                loop_range: Some(renderer_engine::protocol::LoopRange {
+                    start_ms: 0, end_ms: 100, play_count: 2,
+                }),
+            }),
+            speed: 1.0, position_ms: 0, loop_pass: 1,
+        };
+        let mut processing = AudioProcessing {
+            resampler: Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16),
+            pipeline_revision: revision, pipeline: Some(AudioPipeline::new(&config)),
+            speed: 1.0, output_rate: OUT_RATE,
+        };
+        let samples = vec![0.25; 4_410 * NUM_CHANNELS as usize];
+        let mut reference = Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16).unwrap();
+        let mut expected = Vec::new();
+        reference.process(&samples, &mut expected);
+        reference.finish(&mut expected);
+        let (output, marker) = processing.render_packet(samples, &mut Vec::new(), &mut Vec::new());
+        assert_eq!(output.len(), 4_800 * NUM_CHANNELS as usize,
+            "the 34 lookahead frames cannot be discarded at the loop reset");
+        assert_eq!(output, expected);
+        assert_eq!(marker, Some(0));
+        let ring = test_ring();
+        let producer_ring = Arc::clone(&ring);
+        let producer = std::thread::spawn(move || {
+            producer_ring.push_marked(output, marker, revision, Duration::from_secs(1)).unwrap();
+        });
+        while ring.lock().next_boundary_id == 0 {
+            std::thread::yield_now();
+        }
+        let mut source = LiveSource::new(Arc::clone(&ring));
+        for sample in expected {
+            assert_eq!(source.next(), Some(sample));
+            assert_eq!(ring.lock().consumed_boundary_id, 0,
+                "loop marker preceded the resampler tail");
+        }
+        source.next();
+        assert_eq!(ring.lock().consumed_boundary_id, 1);
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn ordinary_gapless_tracks_keep_resampler_history_and_rational_phase() {
+        let _guard = customization_guard();
+        let revision = configure_customization_at_loop_pass(None, 1.0, 0, 1);
+        let mut processing = AudioProcessing {
+            resampler: Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16),
+            pipeline_revision: revision.wrapping_sub(1), pipeline: None,
+            speed: 1.0, output_rate: OUT_RATE,
+        };
+        processing.synchronize_pipeline(revision);
+        let samples: Vec<_> = (0..6_617 * NUM_CHANNELS as usize)
+            .map(|index| (index as f32 * 0.03).sin()).collect();
+        let mut reference = Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16).unwrap();
+        let mut expected = Vec::new();
+        reference.process(&samples, &mut expected);
+        reference.finish(&mut expected);
+        let split = 4_411 * NUM_CHANNELS as usize;
+        let mut pipeline_scratch = Vec::new();
+        let mut resampler_scratch = Vec::new();
+        let (mut output, marker) = processing.render_packet(samples[..split].to_vec(),
+            &mut pipeline_scratch, &mut resampler_scratch);
+        assert_eq!(marker, None);
+        let revision = configure_customization_after_natural_boundary(None, 1.0, 0);
+        processing.synchronize_pipeline(revision);
+        let (tail, marker) = processing.render_packet(samples[split..].to_vec(),
+            &mut pipeline_scratch, &mut resampler_scratch);
+        assert_eq!(marker, None);
+        output.extend(tail);
+        processing.resampler.as_mut().unwrap().finish(&mut output);
+        assert_eq!(output, expected,
+            "a natural boundary must sound exactly like one uninterrupted resampled stream");
     }
 
     #[test]

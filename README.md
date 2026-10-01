@@ -64,6 +64,10 @@ temporary seekable files instead. The sound-device stream opens on Play, stops
 when paused or finished, and follows system output changes. It can launch at
 login, minimized if you want.
 
+An idle-session reconnect keeps the latest selected track; Pause cancels automatic
+resumption. Audio-device and normalization handovers capture the current playhead
+and preserve an ongoing finite loop, rather than starting its repeat count again.
+
 Playlists can be created, renamed, deleted and reordered, and tracks added or
 removed by drag and drop or in bulk by rules (artist, album, title, length),
 with a preview of exactly which entries go. Playlists can be pinned to the top
@@ -107,11 +111,15 @@ or Spotify app. The engine queue remains canonical: Spotify plays bounded
 windows in its order, including the device's own Next button. Queue edits keep
 the current song and position, but replacing or extending a window can rebuffer;
 Spotify offers no atomic queue replacement or gapless guarantee for those
-requests. Remote changes are checked at track boundaries or once a minute,
-backing off to two minutes when paused. **This computer** pauses the remote
-output and returns to the same local queue, order and cursor, paused. If another
-Spotify client started its own queue, Renderer shows it without replacing the
-local queue.
+requests. Controls write immediately; background reconciliation checks a selected
+device every four seconds while playing and every twenty seconds while paused,
+with earlier track-boundary checks and fast command confirmation. No remote poll
+runs for **This computer**. Failed queue replacements retain the requested queue
+for retry without interpreting old Spotify rows as its new occurrences. Removing
+the paused current row stages its replacement until Play or a device-side resume.
+**This computer** pauses the remote output and returns to the same local queue,
+order and cursor, paused. If another Spotify client started its own queue, Renderer
+shows it without replacing the local queue.
 
 Spotify devices play Spotify's original audio: Renderer's playback speed and
 track-editor previews require **This computer**. Device availability, Spotify
@@ -187,6 +195,8 @@ is deadline-driven, with system notifications for output-device changes. Queue
 rows and upcoming order cross process boundaries only when their independent
 revisions change; omission retains the existing arrays, an empty array clears
 them. Cover URLs fetch missing artwork directly into a rebuildable disk cache.
+Download marks are additive ID deltas independent of those revisions, including
+songs visible outside the queue; only an explicit audio-cache clear removes them.
 Card glow colours are measured on hover or focus; the artist pick waits until
 visible.
 
@@ -199,6 +209,11 @@ and handles everything to do with sound. The Tauri shell in `src-tauri/`
 supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
 Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
+
+The shell waits for its final playback-state flush on normal exit and before a
+Windows updater launches its installer and exits the process. Library refreshes
+use supplied playlist revisions, revalidating bare membership IDs when the
+revision is unknown. A successful Like or Unlike fences older Liked Songs reads.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.

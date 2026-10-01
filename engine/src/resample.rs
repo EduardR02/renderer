@@ -126,8 +126,8 @@ impl Resampler {
         Some(resampler)
     }
 
-    /// Discards filter state, so audio from before a seek or a track change
-    /// cannot bleed into what follows, and restarts the phase at zero.
+    /// Discards filter state at a discontinuity (seek or explicit selection),
+    /// so old audio cannot bleed into what follows, and restarts phase at zero.
     pub fn reset(&mut self) {
         self.history.clear();
         // A track begins from silence, so zero-filling the left context is not

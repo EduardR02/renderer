@@ -1,6 +1,6 @@
 <script>
   import { tick, untrack } from "svelte";
-  import { api, route, session, navigate, ui, playback, isPlayingSource, togglePlay, setPageTitle } from "../lib/state.svelte.js";
+  import { api, route, session, navigate, ui, playback, isPlayingSource, togglePlay, setPageTitle, watchCacheMarks } from "../lib/state.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { detailArtSize } from "../lib/layout.js";
   import { spotifyLink } from "../lib/spotify-link.js";
@@ -11,6 +11,7 @@
   import Menu from "../components/Menu.svelte";
   import { rowWindow } from "../lib/virtual.js";
   import { filterEpisodes, orderEpisodes, indexEpisodeSearch } from "../lib/episodes.js";
+  import { applyCacheMarks } from "../lib/cache-marks.js";
 
   /**
    * A show and its episodes, or one episode — audio only, in the app's own
@@ -201,20 +202,29 @@
   const source = $derived(isShow ? `show:${data?.id ?? ""}` : `episode:${data?.track?.id ?? ""}`);
   const playingHere = $derived(isShow ? isPlayingSource(source) : !!record?.uri && record.uri === playingUri);
 
-  async function play(episode) {
+  $effect(() => watchCacheMarks((ids) => {
+    if (isShow) {
+      for (const episode of allEpisodes) {
+        if (episode.track) applyCacheMarks([episode.track], ids);
+      }
+    } else if (record) applyCacheMarks([record], ids);
+  }));
+
+  async function startEpisodeQueue(episode) {
     if (unavailable(episode)) return;
-    if (episode.track?.uri === playingUri) {
-      togglePlay();
-      return;
-    }
     const started = generation;
     playError = "";
     try {
       const available = isShow ? playableEpisodes : [episode];
-      await api.playQueue(available.map((item) => item.track), available.findIndex((item) => item.track.id === episode.track.id), source);
+      await api.playQueue(available.map((item) => item.track), available.indexOf(episode), source);
     } catch (reason) {
       if (started === generation) playError = String(reason);
     }
+  }
+  function play(episode) {
+    if (unavailable(episode)) return;
+    if (episode.track?.uri === playingUri) togglePlay();
+    else startEpisodeQueue(episode);
   }
   async function enqueue(episode) {
     if (unavailable(episode)) return;
@@ -233,7 +243,7 @@
       return;
     }
     const first = playableEpisodes[0];
-    if (first) play(first);
+    if (first) startEpisodeQueue(first);
   }
 
   /* One row menu for the whole list, hung off the row's "…". */
@@ -307,7 +317,7 @@
             <button
               class="play-lg"
               title={playingHere ? (playback.playing ? "Pause" : "Resume") : "Play episodes in displayed order"}
-              disabled={!playableEpisodes.length}
+              disabled={!playableEpisodes.length && !playingHere}
               onclick={playShow}
             >
               <Icon name={playingHere && playback.playing ? "pause" : "play"} size={22} />
@@ -444,7 +454,7 @@
                     <button
                       class="ep-play"
                       title={current ? (playback.playing ? "Pause" : "Resume") : "Play"}
-                      aria-label={`${current && playback.playing ? "Pause" : "Play"} ${episode.track.name}`}
+                      aria-label={`${current ? (playback.playing ? "Pause" : "Resume") : "Play"} ${episode.track.name}`}
                       onclick={() => play(episode)}
                     >
                       <span class="ep-play-disc"><Icon name={current && playback.playing ? "pause" : "play"} size={14} /></span>

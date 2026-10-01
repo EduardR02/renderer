@@ -295,6 +295,7 @@ impl Playlist {
             id: self.id.clone(),
             uri: self.uri.clone(),
             name: self.name.clone(),
+            revision: (!self.snapshot_id.is_empty()).then(|| self.snapshot_id.clone()),
             owner_id: self.owner_id.clone(),
             owner_name: self.owner.clone(),
             description: (!self.description.is_empty()).then(|| self.description.clone()),
@@ -336,12 +337,12 @@ impl From<&PlaylistRef> for Playlist {
             },
             owner_id: reference.owner_id.clone(),
             cover_url: reference.cover_url.clone().unwrap_or_default(),
-            // Rootlist metadata has no revision; profile artwork samples can
-            // carry genuine mosaic candidates without a full playlist browse.
+            // Profile artwork samples carry genuine mosaic candidates without
+            // a full playlist browse; unknown revisions remain unknown.
             collaborative: false,
             tracks_total: reference.track_count.unwrap_or(0),
             cover_urls: reference.cover_urls.clone(),
-            snapshot_id: String::new(),
+            snapshot_id: reference.revision.clone().unwrap_or_default(),
             last_played: None,
             last_activity: None,
         }
@@ -1131,6 +1132,17 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn cache_ids_or_none<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if !value.is_array() {
+        return Ok(None);
+    }
+    serde_json::from_value(value).map(Some).map_err(serde::de::Error::custom)
+}
+
 /// Mirror of the engine's `state` line, with a locally projected playhead
 /// between its scalar transport updates.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1177,6 +1189,10 @@ pub struct PlaybackState {
     /// is never restored or persisted — only forwarded. It may be omitted
     /// independently of `queue` when `order_revision` is unchanged.
     pub upcoming: Vec<usize>,
+    /// Additive cache marks, independent of queue/order revisions. Omission
+    /// retains known marks; these IDs can refer to visible off-queue rows.
+    #[serde(deserialize_with = "cache_ids_or_none", skip_serializing_if = "Option::is_none")]
+    pub cached_ids: Option<Vec<String>>,
     #[serde(deserialize_with = "string_or_default")]
     pub error: String,
 }
@@ -1209,6 +1225,7 @@ impl Default for PlaybackState {
             queue_revision: 0,
             order_revision: 0,
             upcoming: Vec::new(),
+            cached_ids: None,
             error: String::new(),
         }
     }
@@ -1247,6 +1264,9 @@ impl Serialize for PlaybackEvent<'_> {
         }
         if self.include_order {
             map.serialize_entry("upcoming", &state.upcoming)?;
+        }
+        if let Some(ids) = &state.cached_ids {
+            map.serialize_entry("cached_ids", ids)?;
         }
         map.end()
     }
@@ -1331,6 +1351,7 @@ mod tests {
     fn artwork_hydration_preserves_existing_covers_and_local_ordering_facts() {
         let metadata = PlaylistRef {
             id: "p1".into(), uri: "spotify:playlist:p1".into(), name: "Old title".into(),
+            revision: None,
             description: None, owner_id: "owner".into(), owner_name: String::new(),
             cover_url: Some("remote-custom".into()), cover_urls: vec!["sample".into()],
             track_count: Some(400),
@@ -1435,6 +1456,7 @@ mod tests {
             id: "mix".into(),
             uri: "spotify:playlist:mix".into(),
             name: "Mixtape".into(),
+            revision: None,
             description: Some("<p>Mixed&nbsp;tapes</p>".into()),
             owner_id: "dj".into(),
             owner_name: "DJ Name".into(),
@@ -1682,6 +1704,7 @@ mod tests {
                 id: "0123456789ABCDEFGHIJKL".into(),
                 uri: "spotify:playlist:0123456789ABCDEFGHIJKL".into(),
                 name: "Public Mix".into(),
+                revision: None,
                 description: Some("A public playlist.".into()),
                 owner_id: "alice".into(),
                 owner_name: "Alice Example".into(),
@@ -1717,6 +1740,7 @@ mod tests {
             id: "p1".into(),
             uri: "spotify:playlist:p1".into(),
             name: "Literal tags".into(),
+            revision: None,
             description: Some("&lt;b&gt;".into()),
             owner_id: String::new(),
             owner_name: String::new(),
@@ -1733,6 +1757,7 @@ mod tests {
             id: "p1".into(),
             uri: "spotify:playlist:p1".into(),
             name: "Short songs".into(),
+            revision: None,
             description: Some("Songs under < 3 min > classics".into()),
             owner_id: String::new(),
             owner_name: String::new(),
@@ -1860,6 +1885,7 @@ mod tests {
                 id: "writers".into(),
                 uri: "spotify:playlist:writers".into(),
                 name: "Written by Artist".into(),
+                revision: None,
                 description: Some("Official writers playlist".into()),
                 owner_id: "spotify".into(),
                 owner_name: "Spotify".into(),

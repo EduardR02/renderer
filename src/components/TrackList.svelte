@@ -345,9 +345,7 @@
 
   function onRowDblClick(i) {
     if (justDragged()) return; // the release click of a drag is not play intent
-    if (tracks[i]?.unavailable) return;
-    if (i === currentRow && playback.playing) togglePlay();
-    else playFrom(i);
+    onPlayIconClick(i);
   }
 
   function onPlayIconClick(i) {

@@ -9,7 +9,6 @@ use crate::app::{
     carry_local_fields, clear_cache_directory, compute_cache_stats, data_dir, engine_state_dir,
     insert_created_playlist, is_followed_playlist, load_app_settings, load_playlist_list, now_secs,
     order_by_last_activity, playlist_detail_from_cache, playlist_qualifies, remove_membership,
-    apply_liked_write,
     update_app_settings, save_membership, save_playlist_list, save_tracks_cache,
     touch_playlist_activity as stamp_playlist_activity, touch_playlist_played, tracks_cache_bytes,
     upsert_membership, upsert_playlist, upsert_tracks_cache, write_tracks_cache_bytes, AppSettings,
@@ -36,6 +35,34 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
+
+/// Creates the same updater resource as the plugin's check command, with the
+/// engine's durable shutdown included in Windows' pre-process-exit hook.
+#[tauri::command]
+pub async fn check_for_update(webview: tauri::Webview) -> Result<Option<Value>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let app = webview.app_handle().clone();
+    let updater = webview.updater_builder()
+        .on_before_exit(move || {
+            crate::shutdown_for_exit(&app);
+            app.cleanup_before_exit();
+        })
+        .build().map_err(|error| error.to_string())?;
+    let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    // The plugin already parsed/validated pub_date as RFC3339. Retain that
+    // spelling for JS instead of adding a second date formatter dependency.
+    let mut metadata = json!({
+        "currentVersion": update.current_version,
+        "version": update.version,
+        "date": update.raw_json.get("pub_date").and_then(Value::as_str),
+        "body": update.body,
+        "rawJson": update.raw_json,
+    });
+    metadata["rid"] = json!(webview.resources_table().add(update));
+    Ok(Some(metadata))
+}
 // ---------------------------------------------------------------------------
 // Playback commands
 // ---------------------------------------------------------------------------
@@ -269,14 +296,15 @@ pub async fn set_playlist_track_edit_enabled(
 
 #[tauri::command]
 pub async fn set_playlist_track_excluded(
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
     client: State<'_, Arc<EngineClient>>,
     playlist_id: String,
     track_id: String,
     excluded: bool,
 ) -> Result<(), String> {
-    client
-        .set_playlist_track_excluded(&playlist_id, &track_id, excluded)
-        .await
+    client.set_playlist_track_excluded(&playlist_id, &track_id, excluded).await?;
+    router.eligibility_changed(&app).await
 }
 
 // ---------------------------------------------------------------------------
@@ -824,7 +852,7 @@ pub async fn personal_api_set_saved(
     let _serialize = persistence.lock();
     let written = {
         let mut guard = state.lock();
-        apply_liked_write(&mut guard.memberships, &uris, saved)
+        guard.record_liked_write(&uris, saved)
             .then(|| (guard.data_dir.clone(), guard.memberships.clone()))
     };
     if let Some((dir, entries)) = written {
@@ -1108,6 +1136,19 @@ pub async fn clear_cache(
     tauri::async_runtime::spawn_blocking(move || clear_cache_directory(&root, keep))
         .await
         .map_err(|error| format!("could not clear the {kind} cache: {error}"))??;
+    if kind == "audio" {
+        client.clear_cache_marks();
+        let mut guard = state.lock();
+        guard.playback.cached_ids = None;
+        for track in &mut guard.playback.queue {
+            track.cached = false;
+        }
+        for entry in &mut guard.tracks_cache {
+            for track in &mut entry.tracks {
+                track.cached = false;
+            }
+        }
+    }
 
     let stats = tauri::async_runtime::spawn_blocking(compute_cache_stats)
         .await
@@ -1119,6 +1160,21 @@ pub async fn clear_cache(
 // ---------------------------------------------------------------------------
 // Background tasks
 // ---------------------------------------------------------------------------
+
+fn apply_cached_ids(snapshot: &mut AppState, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    for track in &mut snapshot.playback.queue {
+        track.cached |= ids.contains(track.id.as_str());
+    }
+    for entry in &mut snapshot.tracks_cache {
+        for track in &mut entry.tracks {
+            track.cached |= ids.contains(track.id.as_str());
+        }
+    }
+}
 
 /// Applies a scalar position heartbeat to the shared snapshot: only the two
 /// playhead scalars change, in place. The engine already distinguishes
@@ -1289,6 +1345,12 @@ pub async fn consume_states(app: AppHandle) {
             }
         } {
             Ok(StateLine::State(state)) => state,
+            Ok(StateLine::CachedIds(ids)) => {
+                let state = app.state::<Mutex<AppState>>();
+                apply_cached_ids(&mut state.lock(), &ids);
+                let _ = app.emit("state", json!({"cached_ids": ids}));
+                continue;
+            }
             Ok(StateLine::Position(heartbeat)) => {
                 // A heartbeat only moved the playhead: freshen the snapshot
                 // scalars in place and forward the existing scalar `position`
@@ -1365,6 +1427,15 @@ pub async fn consume_states(app: AppHandle) {
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
+        if let Some(ids) = &state.cached_ids {
+            let managed = app.state::<Mutex<AppState>>();
+            apply_cached_ids(&mut managed.lock(), ids);
+            if client.restore_is_pending() || app.state::<Arc<PlaybackRouter>>().is_remote() {
+                // Suppressing a local transport frame must not suppress a
+                // cache addition for a visible row outside that queue.
+                let _ = app.emit("state", json!({"cached_ids": ids}));
+            }
+        }
 
         // A fresh child reports an authenticated but empty state before its
         // queue/settings are restored. Start restoration once and suppress
@@ -1636,7 +1707,7 @@ fn spawn_membership_reconcile(app: AppHandle) {
 fn membership_refresh_work(qualifying: Vec<(String, String)>, memberships: &[MembershipEntry]) -> Vec<String> {
     qualifying.into_iter().filter(|(id, revision)| {
         memberships.iter().find(|entry| &entry.id == id)
-            .is_none_or(|entry| !revision.is_empty() && entry.revision != *revision)
+            .is_none_or(|entry| revision.is_empty() || entry.revision != *revision)
     }).map(|(id, _)| id).collect()
 }
 
@@ -1668,9 +1739,8 @@ async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client:
             save_membership(&guard.data_dir, &guard.memberships);
             let _ = app.emit("memberships_changed", json!({"saved_tracks": false}));
         }
-        // Rootlist may omit revisions. An unknown revision must not turn a
-        // refresh into a reread of every playlist; details and confirmed writes
-        // update existing memberships, and new containers fill in here.
+        // Unknown is not unchanged. Revalidate source URI membership only,
+        // sequentially paced below; never resolve full playlist track metadata.
         let work = membership_refresh_work(qualifying, &guard.memberships);
         (guard.data_dir.clone(), work, guard.library_generation)
     };
@@ -1718,6 +1788,7 @@ async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client:
     if !library_generation_is_current(&state.lock(), generation) {
         return;
     }
+    let liked_generation = state.lock().liked_generation;
     match browse_all_liked_uris(client).await {
         Ok(uris) => {
             let persistence = state.lock().playlist_persistence.clone();
@@ -1727,14 +1798,7 @@ async fn reconcile_memberships(app: &AppHandle, state: &Mutex<AppState>, client:
                 if !library_generation_is_current(&guard, generation) {
                     return;
                 }
-                let changed = upsert_membership(
-                    &mut guard.memberships,
-                    MembershipEntry {
-                        id: LIKED_MEMBERSHIP_ID.to_owned(),
-                        revision: String::new(),
-                        uris,
-                    },
-                );
+                let changed = guard.commit_liked_read(liked_generation, uris).unwrap_or(false);
                 (changed, changed.then(|| guard.memberships.clone()))
             };
             if let Some(entries) = entries {
@@ -2046,7 +2110,7 @@ mod tests {
     use crate::types::PlaybackState;
 
     #[test]
-    fn library_refresh_fetches_only_missing_or_known_changed_memberships() {
+    fn membership_refresh_revalidates_unknown_versions_and_skips_only_proven_unchanged_rows() {
         let memberships = vec![
             MembershipEntry { id: "unchanged".into(), revision: "r1".into(), uris: HashSet::new() },
             MembershipEntry { id: "unknown".into(), revision: "r2".into(), uris: HashSet::new() },
@@ -2054,8 +2118,9 @@ mod tests {
         ];
         let rows = [("unchanged", "r1"), ("unknown", ""), ("changed", "r4"), ("new", "")]
             .into_iter().map(|(id, revision)| (id.into(), revision.into())).collect();
-        assert_eq!(membership_refresh_work(rows, &memberships), ["changed", "new"]);
+        assert_eq!(membership_refresh_work(rows, &memberships), ["unknown", "changed", "new"]);
     }
+
 
     #[test]
     fn rootlist_tree_replacement_flattens_all_folders_without_resurrecting_deleted_rows() {

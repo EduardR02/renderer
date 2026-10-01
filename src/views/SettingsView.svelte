@@ -1,5 +1,5 @@
 <script>
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import {
     playback,
     session,
@@ -67,6 +67,7 @@
   let clearing = $state(false);
   let clearError = $state("");
   let settingBusy = $state("");
+  const requestedSettings = $state({});
   const settingErrors = $state({
     audioCacheLimit: "",
     normalisation: "",
@@ -126,15 +127,20 @@
       : null,
   );
 
-  async function updateSetting(key, update, fallbackMessage) {
+  async function updateSetting(key, requested, update, fallbackMessage) {
     if (!settingsState.loaded || settingBusy) return;
     settingBusy = key;
+    requestedSettings[key] = requested;
     settingErrors[key] = "";
     try {
+      // Render the requested value even if the command rejects synchronously.
+      // Clearing it then necessarily restores the saved value in the DOM.
+      await tick();
       await update();
     } catch (error) {
       settingErrors[key] = String(error || fallbackMessage);
     } finally {
+      delete requestedSettings[key];
       if (settingBusy === key) settingBusy = "";
     }
   }
@@ -143,6 +149,7 @@
     if (!Number.isFinite(mb)) return;
     return updateSetting(
       "audioCacheLimit",
+      mb,
       () => api.setAudioCacheLimit(mb),
       "Could not save the cache limit.",
     );
@@ -151,6 +158,7 @@
   function updateLaunchAtLogin(enabled) {
     return updateSetting(
       "launchAtLogin",
+      enabled,
       () => api.setLaunchAtLogin(enabled),
       "Could not update launch at login.",
     );
@@ -159,6 +167,7 @@
   function updateStartMinimized(enabled) {
     return updateSetting(
       "startMinimized",
+      enabled,
       () => api.setStartMinimized(enabled),
       "Could not update start minimized.",
     );
@@ -167,6 +176,7 @@
   function updateAnimatedCanvas(enabled) {
     return updateSetting(
       "animatedCanvas",
+      enabled,
       () => api.setAnimatedCanvas(enabled),
       "Could not update animated Canvas.",
     );
@@ -175,6 +185,7 @@
   function updateNormalisation(enabled) {
     return updateSetting(
       "normalisation",
+      enabled,
       () => api.setNormalisation(enabled),
       "Could not update volume normalization.",
     );
@@ -355,7 +366,7 @@
             class="set-check"
             type="checkbox"
             aria-label="Volume normalization"
-            checked={appSettings?.normalisation ?? false}
+            checked={requestedSettings.normalisation ?? appSettings?.normalisation ?? false}
             disabled={!settingsState.loaded || !!settingBusy}
             onchange={(event) => updateNormalisation(event.currentTarget.checked)}
           />
@@ -372,7 +383,7 @@
             class="set-check"
             type="checkbox"
             aria-label="Launch at login"
-            checked={appSettings?.launch_at_login ?? false}
+            checked={requestedSettings.launchAtLogin ?? appSettings?.launch_at_login ?? false}
             disabled={!settingsState.loaded || !!settingBusy}
             onchange={(event) => updateLaunchAtLogin(event.currentTarget.checked)}
           />
@@ -389,7 +400,7 @@
             class="set-check"
             type="checkbox"
             aria-label="Start minimized"
-            checked={appSettings?.start_minimized ?? false}
+            checked={requestedSettings.startMinimized ?? appSettings?.start_minimized ?? false}
             disabled={!settingsState.loaded || !!settingBusy}
             onchange={(event) => updateStartMinimized(event.currentTarget.checked)}
           />
@@ -410,7 +421,7 @@
             class="set-check"
             type="checkbox"
             aria-label="Animated Canvas"
-            checked={appSettings?.animated_canvas ?? false}
+            checked={requestedSettings.animatedCanvas ?? appSettings?.animated_canvas ?? false}
             disabled={!settingsState.loaded || !!settingBusy}
             onchange={(event) => updateAnimatedCanvas(event.currentTarget.checked)}
           />
@@ -460,7 +471,7 @@
           <Select
             label="Audio cache limit"
             options={CACHE_LIMITS}
-            value={cacheLimitMb}
+            value={requestedSettings.audioCacheLimit ?? cacheLimitMb}
             disabled={!settingsState.loaded || !!settingBusy}
             onchange={updateAudioCacheLimit}
           />

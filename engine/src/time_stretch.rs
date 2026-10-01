@@ -32,9 +32,9 @@ pub struct PipelineConfig {
     pub edit: Option<TrackEdit>,
     pub speed: f32,
     pub position_ms: u32,
-    /// One-based audible pass through a finite loop. Fresh loads and user
-    /// seeks use pass one before the loop end and the final pass at or after
-    /// it; an internal loop jump increments it.
+    /// One-based audible pass through a finite loop. Explicit selections and
+    /// user seeks derive it from position; non-seek player handovers preserve
+    /// the current pass and an internal loop jump increments it.
     pub loop_pass: u32,
 }
 

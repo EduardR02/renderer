@@ -1296,6 +1296,7 @@ fn parse_profile_playlists(payload: &[u8], username: &str, name: &str) -> Result
             id: id.to_base62().ok()?,
             uri: item.uri,
             name: item.name,
+            revision: None,
             owner_id,
             owner_name,
             description: None,
@@ -1442,6 +1443,8 @@ fn enrich_profile_playlist(playlist: &mut PlaylistRef, metadata: &PlaylistRef) {
 struct PlaylistHeaderJson {
     attributes: PlaylistHeaderAttributesJson,
     #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
     length: Option<u32>,
     #[serde(default, rename = "ownerUsername")]
     owner_username: String,
@@ -1462,6 +1465,7 @@ fn parse_profile_playlist_header(payload: &[u8], reference: &PlaylistRef) -> Res
         id: reference.id.clone(),
         uri: reference.uri.clone(),
         name: reference.name.clone(),
+        revision: header.revision.as_deref().and_then(protobuf_revision),
         owner_name: if header.owner_username.is_empty() || header.owner_username == reference.owner_id {
             reference.owner_name.clone()
         } else { String::new() },
@@ -1998,6 +2002,9 @@ struct RootlistItemJson {
 
 #[derive(Default, Deserialize)]
 struct RootlistMetaItemJson {
+    /// playlist4_external.proto MetaItem.revision uses protobuf-JSON bytes.
+    #[serde(default)]
+    revision: Option<String>,
     #[serde(default)]
     length: Option<i64>,
     #[serde(default, rename = "ownerUsername")]
@@ -2023,13 +2030,20 @@ struct PictureSizeJson {
     url: Option<String>,
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+fn protobuf_revision(encoded: &str) -> Option<String> {
+    base64::engine::general_purpose::STANDARD.decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(encoded))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded))
+        .ok().filter(|bytes| !bytes.is_empty()).map(|bytes| hex(&bytes))
 }
 
 /// Cover for a rootlist playlist: the raw `picture` file id (base64 bytes)
@@ -2078,6 +2092,7 @@ fn playlist_ref_from_rootlist(
         id: id.to_base62().unwrap_or_default(),
         uri: raw_uri.to_owned(),
         name: attributes.and_then(|a| a.name.clone()).unwrap_or_default(),
+        revision: meta.revision.as_deref().and_then(protobuf_revision),
         owner_id: meta
             .owner_username
             .clone()
@@ -2392,6 +2407,7 @@ pub async fn playlist_browse(
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
         name: playlist.name().to_owned(),
+        revision: (!revision.is_empty()).then(|| revision.clone()),
         owner_id: owner_id.clone(),
         owner_name: owner_name.clone(),
         description: playlist_description(&playlist.attributes.description),
@@ -2403,7 +2419,7 @@ pub async fn playlist_browse(
         id: id_of(&playlist.id),
         uri: uri_of(&playlist.id),
         name: playlist.name().to_owned(),
-        revision: Some(revision),
+        revision: (!revision.is_empty()).then_some(revision),
         owner_id,
         description: playlist_description(&playlist.attributes.description),
         owner_name,
@@ -3114,6 +3130,7 @@ fn official_songwriter_playlist_ref(
         id,
         uri,
         name: playlist.name().to_owned(),
+        revision: (!playlist.revision.is_empty()).then(|| hex(&playlist.revision)),
         description: playlist_description(&playlist.attributes.description),
         owner_id,
         owner_name: search_reference.owner_name.clone(),
@@ -4691,6 +4708,7 @@ fn playlist_ref_from_hit(hit: &SearchPlaylistHitJson) -> PlaylistRef {
         id: hit_id(hit.uri.as_deref()),
         uri: hit.uri.clone().unwrap_or_default(),
         name: hit.name.clone().unwrap_or_default(),
+        revision: None,
         description: hit.description.as_deref().and_then(playlist_description),
         owner_id,
         owner_name: owner
@@ -6328,6 +6346,7 @@ mod tests {
             id: "public-id".into(), uri: "spotify:playlist:public-id".into(),
             name: "Published title".into(), owner_id: "listener".into(),
             owner_name: "Listener".into(), description: None,
+            revision: None,
             cover_url: None, cover_urls: Vec::new(), track_count: None,
         };
         let header = parse_profile_playlist_header(br#"{
@@ -6772,6 +6791,26 @@ mod tests {
         assert_eq!(converted.name, "Test Album");
         assert_eq!(converted.artist_names, vec!["Test Artist".to_owned()]);
         assert_eq!(converted.cover_url, None);
+    }
+
+    #[test]
+    fn rootlist_item_versions_decode_bytes_and_missing_versions_do_not_inherit_the_root_version() {
+        for (source_revision, expected) in [
+            (serde_json::json!("AAECAw=="), Some("00010203")),
+            (serde_json::Value::Null, None),
+            (serde_json::json!(""), None),
+            (serde_json::json!("not valid base64!"), None),
+        ] {
+            let contents = serde_json::json!({
+                "revision": "////",
+                "items": [{"uri": "spotify:playlist:0123456789ABCDEFGHIJKL"}],
+                "metaItems": [{"revision": source_revision, "ownerUsername": "alice",
+                    "attributes": {"name": "Playlist"}}],
+            });
+            let nodes = rootlist_nodes(&contents).unwrap();
+            let LibraryNode::Playlist { playlist } = &nodes[0] else { panic!("missing playlist") };
+            assert_eq!(playlist.revision.as_deref(), expected);
+        }
     }
 
     #[test]
@@ -7433,6 +7472,7 @@ mod tests {
             id: String::new(),
             uri: uri.to_owned(),
             name: name.to_owned(),
+            revision: None,
             description: None,
             owner_id: owner_id.to_owned(),
             owner_name: String::new(),
@@ -7568,6 +7608,7 @@ mod tests {
             id: "0123456789ABCDEFGHIJKL".to_owned(),
             uri: "spotify:user:spotify:playlist:0123456789ABCDEFGHIJKL".to_owned(),
             name: "Written by Artist".to_owned(),
+            revision: None,
             description: None,
             owner_id: "spotify".to_owned(),
             owner_name: "Spotify".to_owned(),

@@ -7,7 +7,7 @@
 //! pipe closes and re-requests `status` so the session re-syncs after a
 //! restart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -116,6 +116,8 @@ pub enum StateLine {
     /// at 50 ms), and a full state would re-parse the whole queue to say one
     /// number.
     Volume(u8),
+    /// Cache additions still publish when a queue/order delta cannot resolve.
+    CachedIds(Vec<String>),
     Disconnected,
 }
 
@@ -553,6 +555,8 @@ struct DeltaBase {
     order_revision: Option<u64>,
     queue: Vec<Track>,
     upcoming: Vec<usize>,
+    /// Positive file marks survive omitted arrays and queue replacement.
+    cached_ids: HashSet<String>,
     /// The revision whose missing rows the engine was already asked to
     /// re-send, so one shed payload costs at most one request.
     resynced: Option<u64>,
@@ -563,6 +567,20 @@ impl DeltaBase {
     fn adopt(&mut self, state: &PlaybackState, rows: PayloadRows) -> DeltaAdoption {
         let sent_queue = matches!(rows, PayloadRows::Sent | PayloadRows::QueueOnly);
         let sent_order = matches!(rows, PayloadRows::Sent | PayloadRows::OrderOnly);
+        let mut new_marks = false;
+        if let Some(ids) = &state.cached_ids {
+            for id in ids {
+                if !self.cached_ids.contains(id) {
+                    self.cached_ids.insert(id.clone());
+                    new_marks = true;
+                }
+            }
+        }
+        if !sent_queue && new_marks {
+            for track in &mut self.queue {
+                track.cached |= self.cached_ids.contains(&track.id);
+            }
+        }
         if !sent_queue && (state.queue_revision == 0 || self.revision != Some(state.queue_revision)) {
             return DeltaAdoption::Unresolvable { revision: state.queue_revision };
         }
@@ -572,13 +590,27 @@ impl DeltaBase {
         if sent_queue {
             self.revision = (state.queue_revision != 0).then_some(state.queue_revision);
             self.queue.clone_from(&state.queue);
+            for track in &state.queue {
+                if track.cached && !self.cached_ids.contains(&track.id) {
+                    self.cached_ids.insert(track.id.clone());
+                }
+            }
         }
         if sent_order {
             self.order_revision = (state.order_revision != 0).then_some(state.order_revision);
             self.upcoming.clone_from(&state.upcoming);
         }
+        let mut marked_rows = false;
+        if sent_queue {
+            for track in &mut self.queue {
+                if !track.cached && self.cached_ids.contains(&track.id) {
+                    track.cached = true;
+                    marked_rows = true;
+                }
+            }
+        }
         self.resynced = None;
-        if sent_queue && sent_order { DeltaAdoption::AsSent }
+        if sent_queue && sent_order && !marked_rows { DeltaAdoption::AsSent }
         else { DeltaAdoption::Fill { queue: self.queue.clone(), upcoming: self.upcoming.clone() } }
     }
 
@@ -626,6 +658,8 @@ pub struct EngineClient {
     persist_thread: Mutex<Option<JoinHandle<()>>>,
     next_request_id: AtomicU64,
     shutting_down: AtomicBool,
+    /// Serializes duplicate exit paths; every caller waits for the final flush.
+    shutdown_lock: Mutex<()>,
 }
 
 impl EngineClient {
@@ -660,6 +694,7 @@ impl EngineClient {
             persist_thread: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
+            shutdown_lock: Mutex::new(()),
         });
         *client.persist_thread.lock() = Some(spawn_persistence_writer(&client, persist_rx));
         if let Err(error) = client.spawn_engine() {
@@ -1669,8 +1704,11 @@ impl EngineClient {
     /// sole persistence writer. Once shutdown starts, reader callbacks freeze
     /// state publication so the final finite generation is stable.
     pub fn shutdown_engine(&self) {
+        let _shutdown = self.shutdown_lock.lock();
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
         log::info("engine shutdown requested");
-        self.shutting_down.store(true, Ordering::SeqCst);
 
         let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
         let _ = self.write_line(&line);
@@ -1706,6 +1744,22 @@ impl EngineClient {
         }
         if let Some(writer) = self.persist_thread.lock().take() {
             let _ = writer.join();
+        }
+    }
+
+    /// The explicit successful Settings clear is the only negative cache
+    /// update; empty or omitted cached_ids are never a reset.
+    pub fn clear_cache_marks(&self) {
+        let mut base = self.delta_base.lock();
+        base.cached_ids.clear();
+        for track in &mut base.queue {
+            track.cached = false;
+        }
+        if let Some(state) = self.last_state.lock().as_mut() {
+            state.cached_ids = None;
+            for track in &mut state.queue {
+                track.cached = false;
+            }
         }
     }
 
@@ -1816,6 +1870,9 @@ impl EngineClient {
                 &merged
             }
             DeltaAdoption::Unresolvable { revision } => {
+                if let Some(ids) = &state.cached_ids {
+                    let _ = self.state_tx.send(StateLine::CachedIds(ids.clone()));
+                }
                 // The engine hands the rows of a revision over exactly once,
                 // and that payload never made it here, so there is no base to
                 // merge from and no honest queue to publish: filling the gap
@@ -2309,6 +2366,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exit_waits_for_final_flush_and_freezes_the_snapshot_before_writer_acknowledgement() {
+        let initial = PlaybackState { auth_state: "ready".into(), position_ms: 12_345,
+            current_index: Some(0), current_uri: "spotify:track:a".into(),
+            queue: vec![Track { id: "a".into(), uri: "spotify:track:a".into(), ..Track::default() }],
+            ..PlaybackState::default() };
+        let mut client = client_with_last_state(initial);
+        let (persist_tx, persist_rx) = mpsc::sync_channel(1);
+        Arc::get_mut(&mut client).unwrap().persist_tx = persist_tx;
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let (flush_tx, flush_rx) = mpsc::channel();
+        let weak = Arc::downgrade(&client);
+        let writer = std::thread::spawn(move || {
+            let PersistCommand::Shutdown { result_tx, .. } = persist_rx.recv().unwrap()
+                else { panic!("exit must request the unthrottled final flush") };
+            let client = weak.upgrade().unwrap();
+            client.on_position(PositionHeartbeat { position_ms: 99_999, duration_ms: 180_000 });
+            snapshot_tx.send(client.playback_snapshot_for_shutdown().unwrap()).unwrap();
+            flush_rx.recv().unwrap();
+            result_tx.send(Ok(())).unwrap();
+        });
+        *client.persist_thread.lock() = Some(writer);
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let shutdown = client.clone();
+        let exit = std::thread::spawn(move || {
+            shutdown.shutdown_engine();
+            returned_tx.send(()).unwrap();
+        });
+        let snapshot = snapshot_rx.recv().unwrap();
+        assert_eq!(snapshot.position_ms, 12_345);
+        assert_eq!(snapshot.queue[0].id, "a");
+        assert!(matches!(returned_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        flush_tx.send(()).unwrap();
+        returned_rx.recv().unwrap();
+        exit.join().unwrap();
+        // The normal Exit event may follow the updater hook. It must be a
+        // completed no-op rather than requesting a second writer shutdown.
+        client.shutdown_engine();
+        assert!(client.persist_thread.lock().is_none());
+    }
+
+
+    #[test]
+    fn cached_deltas_mark_retained_and_later_rows_without_replacing_queue_identity() {
+        let initial = PlaybackState { auth_state: "ready".into(), queue_revision: 11, order_revision: 21,
+            queue: vec![Track { id: "a".into(), ..Track::default() }], ..PlaybackState::default() };
+        let client = client_with_last_state(initial.clone());
+        let Some(Line::State { state: delta, rows }) = parse_line(json!({
+            "type": "state", "auth_state": "ready", "queue_revision": 11, "order_revision": 21,
+            "cached_ids": ["a", "detail-only"]
+        })) else { panic!("cache delta did not parse") };
+        client.on_state(&delta, rows);
+        let marked = client.current_state().unwrap();
+        assert!(marked.queue[0].cached);
+        let event = serde_json::to_value(crate::types::PlaybackEvent::new(&marked, false, false)).unwrap();
+        assert!(event.get("queue").is_none());
+        assert_eq!(event["cached_ids"], json!(["a", "detail-only"]));
+        client.on_state(&PlaybackState { cached_ids: Some(Vec::new()), queue: Vec::new(), ..initial.clone() },
+            PayloadRows::Omitted);
+        assert!(client.current_state().unwrap().queue[0].cached);
+        for raw in [Value::Null, json!(false), json!({})] {
+            let Some(Line::State { state, rows }) = parse_line(json!({
+                "type": "state", "auth_state": "ready", "queue_revision": 11,
+                "order_revision": 21, "cached_ids": raw
+            })) else { panic!("non-array marks must behave as omission") };
+            client.on_state(&state, rows);
+            assert!(client.current_state().unwrap().queue[0].cached);
+        }
+        client.on_state(&PlaybackState { queue_revision: 12, order_revision: 22,
+            queue: vec![Track { id: "detail-only".into(), ..Track::default() }], ..initial.clone() },
+            PayloadRows::Sent);
+        assert!(client.current_state().unwrap().queue[0].cached);
+        client.clear_cache_marks();
+        client.on_state(&PlaybackState { queue: Vec::new(), queue_revision: 12, order_revision: 22, ..initial },
+            PayloadRows::Omitted);
+        assert!(!client.current_state().unwrap().queue[0].cached);
+    }
+
+    #[test]
+    fn unresolved_queue_delta_still_delivers_off_queue_cache_additions() {
+        let initial = PlaybackState { auth_state: "ready".into(), queue_revision: 1, order_revision: 1,
+            queue: vec![Track { id: "a".into(), ..Track::default() }], ..PlaybackState::default() };
+        let client = client_with_last_state(initial.clone());
+        let mut events = client.subscribe_lines();
+        client.on_state(&PlaybackState { queue_revision: 2, cached_ids: Some(vec!["detail-only".into()]),
+            queue: Vec::new(), ..initial.clone() }, PayloadRows::Omitted);
+        assert_eq!(client.current_state().unwrap().queue, initial.queue);
+        let StateLine::CachedIds(ids) = events.try_recv().unwrap() else { panic!("cache marks were held behind queue") };
+        assert_eq!(ids, ["detail-only"]);
+        client.on_state(&PlaybackState { queue_revision: 2, order_revision: 2,
+            queue: vec![Track { id: "detail-only".into(), ..Track::default() }], ..initial },
+            PayloadRows::Sent);
+        assert!(client.current_state().unwrap().queue[0].cached);
+    }
+    #[test]
     fn order_only_deltas_advance_duplicate_occurrences_without_erasing_rows() {
         let rows = vec![
             Track { id: "same".into(), uri: "spotify:track:same".into(), ..Track::default() },
@@ -2362,6 +2513,7 @@ mod tests {
             persist_thread: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
+            shutdown_lock: Mutex::new(()),
         })
     }
 
@@ -2716,6 +2868,7 @@ mod tests {
             StateLine::State(fanned) => assert_eq!(fanned.queue, state.queue),
             StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
             StateLine::Volume(_) => panic!("nor the volume lane"),
+            StateLine::CachedIds(_) => panic!("the full state carries its cache marks"),
             StateLine::Disconnected => panic!("the reader stays connected"),
         }
 
@@ -2805,6 +2958,7 @@ mod tests {
             }
             StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
             StateLine::Volume(_) => panic!("nor the volume lane"),
+            StateLine::CachedIds(_) => panic!("the full state carries its cache marks"),
             StateLine::Disconnected => panic!("the reader stays connected"),
         }
     }
@@ -2859,6 +3013,7 @@ mod tests {
             }
             StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
             StateLine::Volume(_) => panic!("nor the volume lane"),
+            StateLine::CachedIds(_) => panic!("the full state carries its cache marks"),
             StateLine::Disconnected => panic!("the reader stays connected"),
         }
         assert_eq!(
@@ -3236,17 +3391,14 @@ mod tests {
             }
             StateLine::State(_) => panic!("heartbeat must not arrive as a full state"),
             StateLine::Volume(_) => panic!("nor as a volume step"),
+            StateLine::CachedIds(_) => panic!("nor as cache marks"),
             StateLine::Disconnected => panic!("heartbeat path must stay connected"),
         }
     }
 
-    /// The volume lane: the engine answers a volume step with a scalar line
-    /// instead of a full state, so the shell has to parse it, keep the cached
-    /// volume right (that snapshot is what `status`/`get_state` and the durable
-    /// playback snapshot are built from) and fan it out as its own line — never
-    /// as a full state, which would defeat the point of the lane.
+    /// Volume changes preserve the cached playhead and held queue allocation.
     #[test]
-    fn volume_lines_freshen_the_last_state_volume_and_fan_out_as_scalars() {
+    fn volume_lines_update_volume_without_changing_playhead_or_queue_identity() {
         let mut state = PlaybackState::default();
         state.auth_state = "ready".to_owned();
         state.volume = 50;
@@ -3255,10 +3407,6 @@ mod tests {
         let client = client_with_last_state(state);
         let queue_ptr = client.last_state.lock().as_ref().unwrap().queue.as_ptr();
 
-        // Subscribe before the send: broadcast messages sent with no active
-        // receiver are dropped, exactly like the production flow where
-        // consume_states subscribes before the engine produces lines.
-        let mut receiver = client.subscribe_lines();
         let Some(Line::Volume(volume)) = parse_line(serde_json::json!({
             "type": "volume",
             "volume": 31,
@@ -3279,14 +3427,6 @@ mod tests {
             queue_ptr,
             "a volume step must never clone the queue"
         );
-        match receiver.try_recv().expect("volume fanned out") {
-            StateLine::Volume(fanned) => assert_eq!(fanned, 31),
-            StateLine::State(_) => {
-                panic!("a volume step must not arrive as a full state")
-            }
-            StateLine::Position(_) => panic!("nor as a position heartbeat"),
-            StateLine::Disconnected => panic!("the volume path must stay connected"),
-        }
     }
 
     #[test]
@@ -3743,6 +3883,7 @@ mod tests {
             StateLine::State(state) => state,
             StateLine::Position(_) => panic!("the initial line is a full state, not a heartbeat"),
             StateLine::Volume(_) => panic!("nor a volume step"),
+            StateLine::CachedIds(_) => panic!("nor cache marks"),
             StateLine::Disconnected => panic!("engine disconnected before its initial state"),
         };
         assert!(!first.auth_state.is_empty());
@@ -3761,6 +3902,7 @@ mod tests {
             StateLine::State(state) => state,
             StateLine::Position(_) => panic!("status re-emits a full state"),
             StateLine::Volume(_) => panic!("status re-emits a full state, not a volume step"),
+            StateLine::CachedIds(_) => panic!("nor cache marks"),
             StateLine::Disconnected => panic!("engine disconnected before the status state"),
         };
         assert_eq!(after_status.auth_state, first.auth_state);

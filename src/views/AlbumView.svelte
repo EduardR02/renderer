@@ -1,5 +1,5 @@
 <script>
-  import { detail, api, ui, navigate, retryDetail } from "../lib/state.svelte.js";
+  import { detail, api, ui, navigate, retryDetail, playback, isPlayingSource, togglePlay } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -15,6 +15,8 @@
   /* The sleeve gives way before the title does when the pane is narrow. */
   const artSize = $derived(detailArtSize(ui.paneWidth));
   const tracks = $derived(album?.tracks ?? []);
+  const source = $derived(`album:${album?.id ?? ""}`);
+  const playingThis = $derived(isPlayingSource(source));
   const artistIds = $derived(album?.artist_ids ?? []);
   // Keep old/partial payloads useful: the primary track id can still link the
   // first header artist, while missing parallel ids leave other names plain.
@@ -33,10 +35,13 @@
     shuffleBusy = false;
   });
 
-
-
   function playFrom(i) {
-    if (tracks.length) api.playQueue(tracks, i, `album:${album?.id ?? ""}`).catch(() => {});
+    if (tracks.length) api.playQueue(tracks, i, source).catch(() => {});
+  }
+
+  function playOrToggle() {
+    if (playingThis) togglePlay();
+    else playFrom(0);
   }
 
   async function shufflePlay() {
@@ -132,8 +137,8 @@
           {/if}
         </p>
         <div class="actions">
-          <button class="play-lg" title="Play" onclick={() => playFrom(0)} disabled={!tracks.length}>
-            <Icon name="play" size={22} />
+          <button class="play-lg" title={playingThis ? (playback.playing ? "Pause" : "Resume") : "Play"} onclick={playOrToggle} disabled={!tracks.length && !playingThis}>
+            <Icon name={playingThis && playback.playing ? "pause" : "play"} size={22} />
           </button>
           <button class="btn-round lg" title="Shuffle" aria-label="Shuffle" aria-busy={shuffleBusy} onclick={shufflePlay} disabled={!tracks.length || shuffleBusy}>
             <Icon name="shuffle" size={20} />
@@ -152,7 +157,7 @@
       <!-- No album column and no per-row thumbnail: the art is already the
            largest thing on the page, and every row would repeat it. -->
       <div style="margin-top:var(--s6)">
-        <TrackList {tracks} {playFrom} showAlbum={false} showArt={false} showPlays queueContext={`album:${album?.id ?? ""}`} />
+        <TrackList {tracks} {playFrom} showAlbum={false} showArt={false} showPlays queueContext={source} />
       </div>
     {:else}
       <div class="empty">

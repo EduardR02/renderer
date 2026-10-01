@@ -337,6 +337,34 @@ pub(crate) fn player_path(device_id: &str, endpoint: &str, query: &[(&str, Strin
     Ok(format!("me/player/{}?{}", endpoint, url.query().unwrap_or_default()))
 }
 
+async fn request_token(http: &Client, endpoint: &str, params: &[(&str, &str)]) -> Result<TokenResponse, String> {
+    let response = http.post(endpoint).form(params).send().await
+        .map_err(|_| UNREACHABLE.to_owned())?;
+    let status = response.status();
+    if !status.is_success() && status != StatusCode::BAD_REQUEST {
+        return Err(spotify_error(status));
+    }
+    let bytes = response.bytes().await.map_err(|_| UNREACHABLE.to_owned())?;
+    if status == StatusCode::BAD_REQUEST {
+        let failure = serde_json::from_slice::<TokenFailure>(&bytes).ok();
+        return Err(if failure.and_then(|failure| failure.error).as_deref() == Some("invalid_grant") {
+            "Spotify authorization expired; reconnect the developer app"
+        } else {
+            "Spotify rejected the developer authorization request"
+        }.to_owned());
+    }
+    let token: TokenResponse = serde_json::from_slice(&bytes)
+        .map_err(|_| "Spotify returned an invalid token response".to_owned())?;
+    if !token.token_type.eq_ignore_ascii_case("Bearer")
+        || token.access_token.is_empty()
+        || token.expires_in == 0
+        || token.refresh_token.as_deref() == Some("")
+    {
+        return Err("Spotify returned an invalid token response".to_owned());
+    }
+    Ok(token)
+}
+
 impl PersonalApi {
     pub fn new() -> Result<Arc<Self>, String> {
         let http = Client::builder().timeout(Duration::from_secs(15)).build()
@@ -458,28 +486,7 @@ impl PersonalApi {
     }
 
     async fn token(&self, params: &[(&str, &str)]) -> Result<TokenResponse, String> {
-        let response = self.http.post("https://accounts.spotify.com/api/token")
-            .form(params).send().await.map_err(|_| "Spotify token service is unreachable".to_owned())?;
-        if !response.status().is_success() {
-            if response.status() == StatusCode::BAD_REQUEST {
-                let failure: Option<TokenFailure> = response.json().await.ok();
-                if failure.and_then(|failure| failure.error).as_deref() == Some("invalid_grant") {
-                    return Err("Spotify authorization expired; reconnect the developer app".to_owned());
-                }
-                return Err("Spotify rejected the developer authorization request".to_owned());
-            }
-            return Err(spotify_error(response.status()));
-        }
-        let token: TokenResponse = response.json().await
-            .map_err(|_| "Spotify returned an invalid token response".to_owned())?;
-        if !token.token_type.eq_ignore_ascii_case("Bearer")
-            || token.access_token.is_empty()
-            || token.expires_in == 0
-            || token.refresh_token.as_deref() == Some("")
-        {
-            return Err("Spotify returned an invalid token response".to_owned());
-        }
-        Ok(token)
+        request_token(&self.http, "https://accounts.spotify.com/api/token", params).await
     }
 
     async fn complete_authorization(&self, app: &AppHandle, client_id: &str, playback_account: &str, verifier: &str, code: &str, enable_devices: bool) -> Result<(), String> {
@@ -707,6 +714,68 @@ async fn await_callback(listener: TcpListener, expected_state: &str) -> Result<R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn token_transport_and_server_failures_retry_but_rejected_grants_do_not() {
+        let http = Client::builder().no_proxy().build().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let disconnected = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let error = request_token(&http, &endpoint, &[("grant_type", "refresh_token")]).await.err().unwrap();
+        assert_eq!(error, UNREACHABLE);
+        assert!(is_transient(&error));
+        disconnected.await.unwrap();
+
+        for (status, body, transient) in [
+            (502, "", Some(true)),
+            (429, "", Some(true)),
+            (400, r#"{"error":"invalid_grant"}"#, Some(false)),
+            (400, r#"{"error":"invalid_client"}"#, Some(false)),
+            (200, r#"{"access_token":"","token_type":"Bearer","expires_in":3600}"#, Some(false)),
+            (200, r#"{"access_token":"renewed","token_type":"Bearer","expires_in":3600}"#, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let end = loop {
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") { break end + 4; }
+                };
+                let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length = head.lines().find_map(|line| line.strip_prefix("content-length:")
+                    .map(|value| value.trim().parse::<usize>().unwrap())).unwrap();
+                while bytes.len() - end < length {
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                stream.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let result = request_token(&http, &endpoint, &[("grant_type", "refresh_token")]).await;
+            match transient {
+                Some(transient) => {
+                    let error = result.err().unwrap();
+                    assert_eq!(is_transient(&error), transient, "{status}: {error}");
+                    if body.contains("invalid_grant") { assert!(error.contains("authorization expired")); }
+                }
+                None => {
+                    let token = result.ok().unwrap();
+                    assert_eq!(token.access_token, "renewed");
+                    assert_eq!(token.expires_in, 3600);
+                }
+            }
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn player_controls_target_and_encode_the_selected_device() {

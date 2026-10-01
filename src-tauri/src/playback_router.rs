@@ -32,7 +32,9 @@ const LOW_WATER: usize = 10;
 /// Spotify can keep reporting the previous item for a few seconds after a
 /// command; until then a disagreeing reading is retried, not believed.
 const GRACE: Duration = Duration::from_secs(8);
-const HEARTBEAT: Duration = Duration::from_secs(60);
+const ACTIVE_POLL: Duration = Duration::from_secs(4);
+const PAUSED_POLL: Duration = Duration::from_secs(20);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// The last window entry counts as finished this close to its projected end.
 const END_SLACK_MS: u32 = 1500;
 /// Revisions cross the JavaScript bridge as exactly representable integers.
@@ -119,6 +121,13 @@ struct Pending {
     retries: u32,
 }
 
+/// Desired start, retained until Spotify accepts its window. It is never an
+/// occurrence mapping for the previously applied window.
+struct StartIntent {
+    current: usize,
+    position_ms: u32,
+}
+
 struct Remote {
     /// What the window shows. While the engine's order plays, `queue` is the
     /// engine's rows, `current_index` the device's row and `upcoming` the
@@ -138,7 +147,7 @@ struct Remote {
     published_order: Option<u64>,
     polling: bool,
     pending: Option<Pending>,
-    paused_checks: u32,
+    start_intent: Option<StartIntent>,
     failures: u32,
     repeat_dirty: bool,
     pause_dirty: bool,
@@ -180,7 +189,7 @@ impl Remote {
             published_order: None,
             polling: false,
             pending: None,
-            paused_checks: 0,
+            start_intent: None,
             failures: 0,
             repeat_dirty: false,
             pause_dirty: false,
@@ -208,7 +217,6 @@ impl Remote {
     fn expect(&mut self, uri: Option<String>, playing: Option<bool>) {
         self.pending = Some(Pending { since: Instant::now(), uri, playing, position_ms: None, retries: 0 });
         self.polling = true;
-        self.paused_checks = 0;
     }
 
     /// Points the view at row `row` of the rows it shows.
@@ -268,7 +276,6 @@ impl Remote {
         self.state.error.clear();
         self.supports_volume = player.device.supports_volume;
         self.anchored = Instant::now();
-        self.paused_checks = if player.is_playing { 0 } else { self.paused_checks.saturating_add(1) };
     }
 
     /// Shows the device's item followed by Spotify's own queue.
@@ -336,6 +343,11 @@ impl PlaybackRouter {
 
     pub async fn run(&self, app: &AppHandle, action: Action) -> Result<(), String> {
         self.core.run(&self.host(app), action).await
+    }
+
+    /// Re-read the engine's authoritative order after eligibility metadata changes.
+    pub async fn eligibility_changed(&self, app: &AppHandle) -> Result<(), String> {
+        self.core.eligibility_changed(&self.host(app)).await
     }
 
     pub async fn watch(self: Arc<Self>, app: AppHandle) {
@@ -476,7 +488,7 @@ impl Core {
     async fn return_local<H: Host>(&self, host: &H) -> Result<(), String> {
         let Some(kind) = self.remote.lock().as_ref().map(Remote::kind) else { return Ok(()); };
         // Returning is deliberately paused, never an automatic local fallback.
-        let needs_pause = kind != Kind::Prepared || self.remote.lock().as_ref().is_some_and(|remote| remote.pause_dirty);
+        let needs_pause = kind != Kind::Prepared || self.remote.lock().as_ref().is_some_and(|remote| remote.pause_dirty || remote.start_intent.is_some());
         let stopped = if needs_pause { self.command(host, Method::PUT, "pause", &[], None).await } else { Ok(()) };
         let Some(remote) = self.remote.lock().take() else { return Ok(()); };
         self.changed.notify_one();
@@ -511,7 +523,9 @@ impl Core {
         if let Err(error) = &result { self.report_error(host, error); }
         else if kind.is_some() {
             let recovered = self.remote.lock().as_mut().is_some_and(|remote| {
-                if remote.state.error.is_empty() { return false; }
+                let unapplied = remote.start_intent.is_some() || remote.repeat_dirty || remote.pause_dirty
+                    || matches!(&remote.mode, Mode::Owned(window) if window.stale);
+                if remote.state.error.is_empty() || unapplied { return false; }
                 remote.state.error.clear();
                 true
             });
@@ -565,14 +579,15 @@ impl Core {
     async fn seek<H: Host>(&self, host: &H, kind: Kind, position_ms: u32) -> Result<(), String> {
         let duration = self.remote.lock().as_ref().map_or(0, |remote| remote.state.duration_ms);
         let position_ms = if duration == 0 { position_ms } else { position_ms.min(duration) };
-        // A staged queue starts from the sought position when Play sends it.
-        if kind != Kind::Prepared {
+        let staged = kind == Kind::Prepared || self.remote.lock().as_ref().is_some_and(|remote| remote.start_intent.is_some());
+        if !staged {
             self.command(host, Method::PUT, "seek", &[("position_ms", position_ms.to_string())], None).await?;
         }
         if let Some(remote) = self.remote.lock().as_mut() {
             remote.state.position_ms = position_ms;
             remote.anchored = Instant::now();
-            if kind != Kind::Prepared {
+            if let Some(intent) = remote.start_intent.as_mut() { intent.position_ms = position_ms; }
+            if !staged {
                 remote.expect(Some(remote.state.current_uri.clone()), None);
                 if let Some(pending) = remote.pending.as_mut() { pending.position_ms = Some(position_ms); }
             }
@@ -582,8 +597,10 @@ impl Core {
     }
 
     async fn pause<H: Host>(&self, host: &H, kind: Kind) -> Result<(), String> {
-        if kind != Kind::Prepared { self.command(host, Method::PUT, "pause", &[], None).await?; }
+        let needs_pause = kind != Kind::Prepared || self.remote.lock().as_ref().is_some_and(|remote| remote.start_intent.is_some());
+        if needs_pause { self.command(host, Method::PUT, "pause", &[], None).await?; }
         if let Some(remote) = self.remote.lock().as_mut() {
+            remote.start_intent = None;
             remote.rebase();
             remote.state.playing = false;
             if kind != Kind::Prepared { remote.expect(None, Some(false)); }
@@ -725,6 +742,7 @@ impl Core {
         {
             let mut guard = self.remote.lock();
             let remote = guard.as_mut().ok_or(RELEASED)?;
+            remote.start_intent = None;
             remote.state.playing = false;
             remote.state.position_ms = 0;
             remote.anchored = Instant::now();
@@ -751,7 +769,7 @@ impl Core {
             {
                 let mut guard = self.remote.lock();
                 let remote = guard.as_mut().ok_or(RELEASED)?;
-                let playing = remote.state.playing;
+                let needs_pause = remote.kind() != Kind::Prepared || remote.pause_dirty || remote.start_intent.is_some();
                 remote.adopt_engine(view);
                 remote.show_row(None);
                 remote.set_order(Vec::new());
@@ -759,8 +777,9 @@ impl Core {
                 remote.state.playing = false;
                 remote.mode = Mode::Prepared;
                 remote.pending = None;
-                remote.pause_dirty = playing;
-                remote.polling = playing;
+                remote.start_intent = None;
+                remote.pause_dirty = needs_pause;
+                remote.polling = needs_pause;
             }
             self.publish(host);
             self.apply_pause(host).await?;
@@ -780,6 +799,18 @@ impl Core {
             let remote = guard.as_mut().ok_or(RELEASED)?;
             remote.adopt_engine(view);
             remote.consumed.clear();
+            // Old URIs remain on the device until the write succeeds, but they
+            // no longer name any occurrence in this replacement queue.
+            if let Mode::Owned(window) = &mut remote.mode {
+                window.rows.fill(None);
+                window.stale = true;
+            }
+            remote.pending = None;
+            remote.show_row(remote.anchor);
+            remote.state.position_ms = 0;
+            remote.state.playing = false;
+            remote.anchored = Instant::now();
+            remote.set_order(remote.plan.clone());
             remote.anchor
         };
         self.publish(host);
@@ -821,6 +852,20 @@ impl Core {
     /// shuffle and repeat go out of the way first unless the router already
     /// owns the device.
     async fn start<H: Host>(&self, host: &H, current: usize, position_ms: u32) -> Result<(), String> {
+        {
+            let mut guard = self.remote.lock();
+            let remote = guard.as_mut().ok_or(RELEASED)?;
+            validate_remote_track(remote.state.queue.get(current).ok_or("queue index is out of range")?)?;
+            remote.start_intent = Some(StartIntent { current, position_ms });
+            remote.pending = None;
+            remote.show_row(Some(current));
+            remote.state.position_ms = position_ms;
+            remote.state.playing = false;
+            remote.anchored = Instant::now();
+            remote.polling = true;
+            if let Mode::Owned(window) = &mut remote.mode { window.stale = true; }
+        }
+        self.publish(host);
         if self.remote.lock().as_ref().is_some_and(|remote| remote.anchor != Some(current)) {
             self.reanchor(host, current, position_ms).await?;
         }
@@ -833,14 +878,16 @@ impl Core {
                 remote.device_path("shuffle", &[("state", "false".into())]),
                 remote.device_path("repeat", &[("state", remote.spotify_repeat().into())]),
             ));
-            (configure, window_tail(&remote.state.queue, &order))
+            let tail = window_tail(&remote.state.queue, &order);
+            remote.set_order(order);
+            (configure, tail)
         };
+        self.publish(host);
         if let Some((shuffle, repeat)) = configure {
             host.spotify(Method::PUT, shuffle?, None).await?;
             host.spotify(Method::PUT, repeat?, None).await?;
         }
         self.send_window(host, current, tail, position_ms).await?;
-        if let Some(remote) = self.remote.lock().as_mut() { remote.set_order(order); }
         self.publish(host);
         Ok(())
     }
@@ -870,9 +917,11 @@ impl Core {
         remote.state.playing = true;
         remote.state.position_ms = position_ms;
         remote.state.error.clear();
+        remote.failures = 0;
         remote.pause_dirty = false;
         remote.anchored = Instant::now();
         remote.expect(Some(uri), Some(true));
+        remote.start_intent = None;
         Ok(())
     }
 
@@ -893,6 +942,16 @@ impl Core {
             let mut guard = self.remote.lock();
             let remote = guard.as_mut().ok_or(RELEASED)?;
             remote.adopt_engine(view);
+            if let Some(mut intent) = remote.start_intent.take() {
+                if let Some(current) = remap.apply(intent.current) {
+                    intent.current = current;
+                    remote.start_intent = Some(intent);
+                } else if let Some(current) = remote.anchor {
+                    intent.current = current;
+                    intent.position_ms = 0;
+                    remote.start_intent = Some(intent);
+                }
+            }
             if kind == Kind::Prepared {
                 // Nothing plays there yet: the view is the engine's own. Its
                 // replacement for a removed current row starts from 0.
@@ -945,6 +1004,29 @@ impl Core {
         };
         let order = self.order(host, Some(current), current).await?;
         self.settle(host, current, order).await
+    }
+
+    async fn eligibility_changed<H: Host>(&self, host: &H) -> Result<(), String> {
+        let _operation = self.operation.lock().await;
+        let kind = self.remote.lock().as_ref().map(Remote::kind);
+        if !matches!(kind, Some(Kind::Prepared | Kind::Owned)) { return Ok(()); }
+        let result: Result<(), String> = async {
+            let view = host.engine(None).await?;
+            let current = {
+                let mut guard = self.remote.lock();
+                let remote = guard.as_mut().ok_or(RELEASED)?;
+                remote.adopt_engine(view);
+                remote.state.current_index
+            };
+            if let Some(current) = current {
+                let order = self.order(host, Some(current), current).await?;
+                self.settle(host, current, order).await?;
+            }
+            Ok(())
+        }.await;
+        if let Err(error) = &result { self.report_error(host, error); }
+        self.changed.notify_one();
+        result
     }
 
     /// Publish canonical edits even if the Spotify write fails. A stale window
@@ -1063,8 +1145,13 @@ impl Core {
     async fn sync<H: Host>(&self, host: &H) -> Result<(), String> {
         let Some(device) = self.remote.lock().as_ref().map(|remote| remote.state.output_device_id.clone()) else { return Ok(()); };
         self.apply_pause(host).await?;
-        if self.remote.lock().as_ref().is_some_and(|remote| remote.kind() == Kind::Prepared) { return Ok(()); }
         self.apply_repeat(host).await?;
+        let intent = self.remote.lock().as_ref().and_then(|remote| remote.start_intent.as_ref()
+            .map(|intent| (intent.current, intent.position_ms)));
+        if let Some((current, position_ms)) = intent {
+            return self.start(host, current, position_ms).await;
+        }
+        if self.remote.lock().as_ref().is_some_and(|remote| remote.kind() == Kind::Prepared) { return Ok(()); }
         let player = host.spotify(Method::GET, "me/player?additional_types=track,episode".into(), None).await?
             .map(serde_json::from_value::<PlayerState>).transpose()
             .map_err(|_| "Spotify returned an invalid playback state".to_owned())?;
@@ -1108,6 +1195,11 @@ impl Core {
             /// autoplay past the last entry): the order goes on after this row.
             Resume(Option<usize>),
             Elsewhere,
+            /// A paused old occurrence must not replace a newly staged selection.
+            Staged,
+            /// The phone resumed an obsolete removed row: play the staged row,
+            /// not the row after it.
+            Start(usize),
         }
         let Some(player) = player else {
             // The device dropped its session: show it stopped, keep watching slowly.
@@ -1115,7 +1207,6 @@ impl Core {
                 remote.rebase();
                 remote.state.playing = false;
                 remote.state.error.clear();
-                remote.paused_checks = remote.paused_checks.saturating_add(1);
             }
             self.publish_transport(host);
             return Ok(());
@@ -1142,6 +1233,12 @@ impl Core {
                 // Spotify's own shuffle or repeat reorders what it holds: that is
                 // the phone taking over, not the window playing.
                 Some(_) if !plan_kept => Seen::Elsewhere,
+                Some(j) if !player.is_playing && window.stale
+                    && (window.rows[j].is_none() || window.rows[j] != remote.state.current_index) => {
+                    remote.state.volume = player.device.volume_percent.unwrap_or(remote.state.volume);
+                    remote.supports_volume = player.device.supports_volume;
+                    Seen::Staged
+                }
                 Some(j) => {
                     if j > window.at {
                         remote.consumed.extend(window.rows[window.at + 1..=j].iter().flatten());
@@ -1160,8 +1257,11 @@ impl Core {
                             }
                             Seen::Row(row)
                         }
-                        // A paused edit removed this entry, then the phone played on.
-                        None => Seen::Resume(before),
+                        None if player.is_playing => match remote.state.current_index {
+                            Some(current) => Seen::Start(current),
+                            None => Seen::Resume(before),
+                        },
+                        None => Seen::Staged,
                     }
                 }
                 // Past the last entry Spotify's autoplay takes over: the order
@@ -1171,6 +1271,8 @@ impl Core {
             }
         };
         match seen {
+            Seen::Staged => { self.publish_transport(host); Ok(()) }
+            Seen::Start(current) => self.start(host, current, 0).await,
             Seen::Row(row) => {
                 if self.remote.lock().as_ref().is_some_and(|remote| remote.anchor != Some(row)) {
                     self.reanchor(host, row, player.progress_ms.unwrap_or(0)).await?;
@@ -1219,7 +1321,6 @@ impl Core {
                     remote.rebase();
                     remote.state.playing = false;
                     remote.state.error.clear();
-                    remote.paused_checks = remote.paused_checks.saturating_add(1);
                 }
             }
             remote.show_foreign(player.as_ref(), &queue);
@@ -1259,16 +1360,16 @@ impl Core {
     }
 }
 
-/// Retries after the router's own command, at the expected end of the item
-/// (Spotify moves on by itself), or after a slow heartbeat. A paused device is
-/// checked at 30, 60, then every 120 seconds; failures back off to a minute.
+/// Confirm commands quickly with bounded retries, observe healthy selected
+/// devices regularly, and check earlier at the projected track boundary.
 fn reconcile_delay(remote: &Remote) -> Duration {
-    if remote.failures > 0 { return Duration::from_secs(1 << remote.failures.min(6)).min(HEARTBEAT); }
+    if remote.failures > 0 { return Duration::from_secs(1 << remote.failures.min(6)).min(MAX_BACKOFF); }
     if let Some(pending) = &remote.pending { return Duration::from_millis(750 << pending.retries.min(3)); }
-    if !remote.state.playing { return Duration::from_secs(30 << remote.paused_checks.min(2)); }
-    if remote.state.duration_ms == 0 { return HEARTBEAT; }
+    if remote.start_intent.is_some() || remote.repeat_dirty || remote.pause_dirty { return Duration::from_millis(750); }
+    if !remote.state.playing { return PAUSED_POLL; }
+    if remote.state.duration_ms == 0 { return ACTIVE_POLL; }
     let remaining = remote.state.duration_ms.saturating_sub(remote.position());
-    Duration::from_millis(u64::from(remaining) + 750).min(HEARTBEAT)
+    Duration::from_millis(u64::from(remaining) + 750).min(ACTIVE_POLL)
 }
 
 /// The engine's order from the device's row `current`, derived from the
@@ -1553,13 +1654,15 @@ mod tests {
         playing: bool,
         position_ms: u32,
         ops: Vec<String>,
+        excluded: HashSet<String>,
     }
 
     impl FakeEngine {
         fn upcoming(&self) -> Vec<usize> {
-            let Some(current) = self.current else { return (0..self.rows.len()).collect(); };
-            let mut upcoming: Vec<usize> = (current + 1..self.rows.len()).filter(|row| !self.rows[*row].unavailable).collect();
-            if self.repeat == "context" { upcoming.extend((0..=current).filter(|row| !self.rows[*row].unavailable)); }
+            let eligible = |row: &usize| !self.rows[*row].unavailable && !self.excluded.contains(&self.rows[*row].id);
+            let Some(current) = self.current else { return (0..self.rows.len()).filter(eligible).collect(); };
+            let mut upcoming: Vec<usize> = (current + 1..self.rows.len()).filter(eligible).collect();
+            if self.repeat == "context" { upcoming.extend((0..=current).filter(eligible)); }
             upcoming
         }
         fn state(&self) -> PlaybackState {
@@ -1624,7 +1727,7 @@ mod tests {
             personal_api::read_player_response(response).await
         }
         async fn engine(&self, op: Option<EngineOp<'_>>) -> Result<EngineView, String> { Ok(self.engine.lock().apply(op)) }
-        async fn exclusions(&self, _context: &str) -> Result<Vec<String>, String> { Ok(Vec::new()) }
+        async fn exclusions(&self, _context: &str) -> Result<Vec<String>, String> { Ok(self.engine.lock().excluded.iter().cloned().collect()) }
         async fn pause_engine(&self) -> Result<(), String> { self.engine.lock().playing = false; Ok(()) }
         async fn local(&self, _action: Action) -> Result<(), String> { Ok(()) }
         fn local_state(&self) -> PlaybackState { self.engine.lock().state() }
@@ -1639,10 +1742,174 @@ mod tests {
         let spotify = Arc::new(Mutex::new(Spotify::default()));
         let base = serve(spotify.clone()).await;
         let engine = FakeEngine { rows: (0..rows).map(|row| track(&format!("t{row}"))).collect(), current: Some(0), repeat: "off".into(),
-            revision: 1, playing, position_ms: 0, ops: Vec::new() };
+            revision: 1, playing, position_ms: 0, ops: Vec::new(), excluded: HashSet::new() };
         let host = TestHost { base, http: reqwest::Client::builder().no_proxy().build().unwrap(), spotify, engine: Mutex::new(engine),
             local_shown: Mutex::new(0), events: Mutex::new(Vec::new()) };
         (Core::default(), host)
+    }
+
+    #[tokio::test]
+    async fn removing_a_paused_current_row_stays_staged_until_explicit_or_device_resume() {
+        for device_resume in [false, true] {
+            let (core, host) = owned(3).await;
+            core.run(&host, Action::Pause).await.unwrap();
+            host.spotify.lock().player = Some(reading("spotify:track:t0", false, 1000));
+            core.sync(&host).await.unwrap();
+            host.spotify.lock().log.clear();
+            core.run(&host, Action::Remove(0)).await.unwrap();
+            for _ in 0..3 { core.sync(&host).await.unwrap(); }
+            let state = core.snapshot().unwrap();
+            assert!(!state.playing);
+            assert_eq!(state.current_uri, "spotify:track:t1");
+            assert_eq!(state.current_index, Some(0));
+            assert_eq!(state.position_ms, 0);
+            assert!(host.spotify.lock().writes().is_empty());
+            if device_resume {
+                host.spotify.lock().player = Some(reading("spotify:track:t0", true, 1000));
+                core.sync(&host).await.unwrap();
+            } else {
+                core.run(&host, Action::Play).await.unwrap();
+            }
+            assert_eq!(uris(&host.spotify.lock().last_play().unwrap()), ["spotify:track:t1", "spotify:track:t2"]);
+            assert_eq!(core.snapshot().unwrap().current_uri, "spotify:track:t1");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_replacement_retains_intent_without_relabeling_the_old_window() {
+        let (core, host) = owned(2).await;
+        host.spotify.lock().write_failures.extend([502, 502]);
+        assert!(core.run(&host, Action::Queue(vec![track("new0"), track("new1")], 0, String::new(), false)).await.is_err());
+        core.reconcile(&host).await;
+        let state = core.snapshot().unwrap();
+        assert_eq!(state.current_uri, "spotify:track:new0");
+        assert!(!state.playing);
+        assert!(!state.error.is_empty());
+        remote(&core, |remote| {
+            assert!(remote.start_intent.is_some());
+            assert!(remote.polling);
+            let Mode::Owned(window) = &remote.mode else { panic!("lost applied window"); };
+            assert_eq!(window.uris, ["spotify:track:t0", "spotify:track:t1"]);
+            assert_eq!(window.rows, [None, None]);
+        });
+        assert_eq!(host.spotify.lock().reads_of("me/player"), 0);
+        core.reconcile(&host).await;
+        assert_eq!(uris(&host.spotify.lock().last_play().unwrap()), ["spotify:track:new0", "spotify:track:new1"]);
+        host.spotify.lock().player = Some(reading("spotify:track:new0", true, 200));
+        core.sync(&host).await.unwrap();
+        assert!(core.snapshot().unwrap().playing);
+        assert!(core.snapshot().unwrap().error.is_empty());
+        assert!(!remote(&core, |remote| remote.start_intent.is_some()));
+        assert_eq!(remote(&core, |remote| remote.failures), 0);
+    }
+
+    #[tokio::test]
+    async fn clearing_a_failed_replacement_stops_the_old_session_and_cancels_retry() {
+        let (core, host) = owned(2).await;
+        host.spotify.lock().write_failures.push_back(502);
+        assert!(core.run(&host, Action::Queue(vec![track("new")], 0, String::new(), false)).await.is_err());
+        assert!(!core.snapshot().unwrap().playing);
+        host.spotify.lock().log.clear();
+        core.run(&host, Action::Queue(Vec::new(), 0, String::new(), false)).await.unwrap();
+        core.reconcile(&host).await;
+        assert_eq!(host.spotify.lock().writes(), ["PUT me/player/pause?device_id=phone"]);
+        assert!(core.snapshot().unwrap().queue.is_empty());
+        assert!(!remote(&core, |remote| remote.polling || remote.start_intent.is_some()));
+        assert!(host.engine.lock().rows.is_empty());
+        assert!(!host.engine.lock().playing);
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_follows_occurrences_through_edits_and_seek_but_pause_cancels_it() {
+        let (core, host) = owned(3).await;
+        host.spotify.lock().write_failures.push_back(502);
+        assert!(core.run(&host, Action::Index(1)).await.is_err());
+        core.run(&host, Action::Move(1, 2)).await.unwrap();
+        core.run(&host, Action::Seek(4321)).await.unwrap();
+        core.reconcile(&host).await;
+        let play = host.spotify.lock().last_play().unwrap();
+        assert_eq!(uris(&play), ["spotify:track:t1"]);
+        assert_eq!(play["position_ms"], 4321);
+
+        host.spotify.lock().write_failures.push_back(502);
+        assert!(core.run(&host, Action::Index(0)).await.is_err());
+        core.run(&host, Action::Pause).await.unwrap();
+        host.spotify.lock().player = Some(reading("spotify:track:t1", false, 4321));
+        host.spotify.lock().log.clear();
+        core.sync(&host).await.unwrap();
+        assert!(!core.snapshot().unwrap().playing);
+        assert_eq!(core.snapshot().unwrap().current_uri, "spotify:track:t0");
+        assert!(host.spotify.lock().writes().is_empty());
+        assert!(!remote(&core, |remote| remote.start_intent.is_some()));
+    }
+
+    #[tokio::test]
+    async fn eligibility_changes_replace_playing_order_but_stage_paused_order() {
+        for paused in [false, true] {
+            let (core, host) = owned(3).await;
+            if paused {
+                core.run(&host, Action::Pause).await.unwrap();
+                host.spotify.lock().player = Some(reading("spotify:track:t0", false, 4321));
+                core.sync(&host).await.unwrap();
+            } else {
+                remote(&core, |remote| remote.state.position_ms = 4321);
+            }
+            host.spotify.lock().log.clear();
+            host.engine.lock().excluded.insert("t1".into());
+            core.eligibility_changed(&host).await.unwrap();
+            let state = core.snapshot().unwrap();
+            assert_eq!(state.current_uri, "spotify:track:t0");
+            assert_eq!(state.playing, !paused);
+            assert_eq!(state.upcoming, [2]);
+            if paused {
+                assert_eq!(state.position_ms, 4321);
+                assert!(host.spotify.lock().writes().is_empty());
+                core.run(&host, Action::Play).await.unwrap();
+            }
+            let play = host.spotify.lock().last_play().unwrap();
+            assert_eq!(uris(&play), ["spotify:track:t0", "spotify:track:t2"]);
+            assert!((4321..5321).contains(&play["position_ms"].as_u64().unwrap()));
+            host.spotify.lock().log.clear();
+            core.run(&host, Action::Next).await.unwrap();
+            assert_eq!(host.spotify.lock().writes(), ["POST me/player/next?device_id=phone"]);
+            assert_eq!(core.snapshot().unwrap().current_uri, "spotify:track:t2");
+        }
+    }
+
+    #[tokio::test]
+    async fn volume_and_native_previous_do_not_replace_the_window_and_local_return_is_paused() {
+        let (core, host) = owned(3).await;
+        core.run(&host, Action::Volume(73)).await.unwrap();
+        assert_eq!(core.snapshot().unwrap().volume, 73);
+        assert_eq!(host.spotify.lock().writes(), ["PUT me/player/volume?device_id=phone&volume_percent=73"]);
+        core.run(&host, Action::Next).await.unwrap();
+        host.spotify.lock().player = Some(reading("spotify:track:t1", true, 100));
+        core.sync(&host).await.unwrap();
+        host.spotify.lock().log.clear();
+        core.run(&host, Action::Previous).await.unwrap();
+        assert_eq!(host.spotify.lock().writes(), ["POST me/player/previous?device_id=phone"]);
+        assert_eq!(core.snapshot().unwrap().current_index, Some(0));
+        core.select(&host, None).await.unwrap();
+        assert!(!host.engine.lock().playing);
+        assert_eq!(host.engine.lock().current, Some(0));
+        assert!(core.snapshot().is_none());
+    }
+
+    #[test]
+    fn selected_device_observation_latency_remains_bounded_while_playing_or_paused() {
+        let mut remote = Remote::new(PlaybackState { playing: true, position_ms: 20000, duration_ms: 100000, ..PlaybackState::default() }, true);
+        assert!(reconcile_delay(&remote) <= Duration::from_secs(4));
+        remote.state.position_ms = 99000;
+        assert!(reconcile_delay(&remote) <= Duration::from_millis(1750));
+        remote.state.playing = false;
+        for _ in 0..20 {
+            assert!(reconcile_delay(&remote) <= Duration::from_secs(20));
+            remote.adopt_transport(&serde_json::from_value(reading("spotify:track:t0", false, 1000)).unwrap());
+        }
+        remote.expect(None, Some(true));
+        assert!(reconcile_delay(&remote) <= Duration::from_millis(750));
+        remote.pending.as_mut().unwrap().retries = 100;
+        assert!(reconcile_delay(&remote) <= Duration::from_secs(6));
     }
 
     #[tokio::test]
@@ -1846,7 +2113,6 @@ mod tests {
             assert_eq!(remote.kind(), Kind::Owned);
             assert_eq!(remote.state.current_index, Some(1));
             assert_eq!(remote.pending.as_ref().unwrap().retries, 1);
-            assert_eq!(reconcile_delay(remote), Duration::from_millis(1500));
         });
         assert_eq!(host.spotify.lock().reads_of("me/player/queue"), 0, "a stale reading is not an outside change");
         host.spotify.lock().player = Some(reading("spotify:track:t1", true, 400));
@@ -1941,7 +2207,6 @@ mod tests {
         remote(&core, |remote| {
             assert!(!remote.state.playing);
             assert_eq!(remote.kind(), Kind::Owned);
-            assert_eq!(reconcile_delay(remote), Duration::from_secs(60));
         });
 
         // With autoplay on, a song after the last entry is stopped, not adopted.
@@ -2086,18 +2351,6 @@ mod tests {
         assert_eq!(projected_position(&state, Duration::from_secs(2)), 92000);
     }
 
-    #[test]
-    fn paused_devices_are_checked_less_and_less_often() {
-        let mut remote = Remote::new(PlaybackState { playing: true, position_ms: 20000, duration_ms: 100000, ..PlaybackState::default() }, true);
-        assert_eq!(reconcile_delay(&remote), HEARTBEAT);
-        remote.state.position_ms = 99000;
-        assert!(reconcile_delay(&remote) <= Duration::from_millis(1750));
-        remote.state.playing = false;
-        for (checks, seconds) in [(0, 30), (1, 60), (2, 120), (20, 120)] {
-            remote.paused_checks = checks;
-            assert_eq!(reconcile_delay(&remote), Duration::from_secs(seconds));
-        }
-    }
 
     #[test]
     fn the_phones_own_items_are_shown_with_their_details_and_duplicates() {

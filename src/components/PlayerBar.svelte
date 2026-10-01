@@ -251,7 +251,8 @@
     playback.current_index >= 0 ? (playback.queue[playback.current_index] ?? null) : null
   );
 
-  const effectiveEdit = $derived(current?.effective_edit ?? null);
+  const localOutput = $derived(!playback.output_device_id);
+  const effectiveEdit = $derived(localOutput ? current?.effective_edit ?? null : null);
   const editTimeline = $derived.by(() => makeEditTimeline(
     effectiveEdit,
     current?.duration_ms,
@@ -269,11 +270,8 @@
    * The track the bar is looking at, as the one thing the saved-in lookup
    * depends on.
    *
-   * `current` is a fresh row object whenever the queue array is replaced — a
-   * cached mark landing, a queue edit, a state event that carries rows — so an
-   * effect reading the row would re-ask the index for a track that never
-   * stopped playing. The URI is that row's identity, and it is equal across
-   * all of those replacements.
+   * `current` can be a fresh row object after a queue edit. The URI is that
+   * row's identity, so metadata updates never restart the lookup.
    */
   const currentUri = $derived(current?.uri ?? null);
 
@@ -376,7 +374,7 @@
   let speedError = $state("");
 
   const speedPercent = $derived(
-    speedDraft ?? Math.round((playback.playback_speed || 1) * 100)
+    localOutput ? speedDraft ?? Math.round((playback.playback_speed || 1) * 100) : 100
   );
   const speedLabel = $derived(formatSpeed(speedPercent));
 
@@ -388,7 +386,7 @@
   async function flushSpeed() {
     clearTimeout(speedTimer);
     speedTimer = null;
-    if (speedDisposed || activeSpeed !== null || pendingSpeed === null) return;
+    if (speedDisposed || !localOutput || activeSpeed !== null || pendingSpeed === null) return;
     const delay = SPEED_INTERVAL_MS - (performance.now() - speedSentAt);
     if (!speedUrgent && delay > 0) {
       speedTimer = setTimeout(flushSpeed, delay);
@@ -413,7 +411,7 @@
   }
 
   function commitSpeed(percent, final = false) {
-    if (!Number.isFinite(percent)) return;
+    if (!localOutput || !Number.isFinite(percent)) return;
     const snapped = Math.round(percent / SPEED_STEP) * SPEED_STEP;
     const next = Math.min(SPEED_MAX, Math.max(SPEED_MIN, snapped));
     speedError = "";
@@ -434,6 +432,14 @@
     };
   });
 
+  $effect(() => {
+    if (localOutput) return;
+    speedOpen = false;
+    speedDraft = null;
+    pendingSpeed = null;
+    clearTimeout(speedTimer);
+  });
+
   function placeSpeedMenu() {
     const rect = speedButton?.getBoundingClientRect();
     if (!rect) return;
@@ -444,6 +450,7 @@
   }
 
   function toggleSpeedMenu() {
+    if (!localOutput) return;
     speedOpen = !speedOpen;
     if (speedOpen) placeSpeedMenu();
   }
@@ -451,7 +458,7 @@
   /* Non-passive on both surfaces: a speed gesture must not scroll the page. */
   function speedWheel(node) {
     const onWheel = (event) => {
-      if (event.ctrlKey || event.metaKey || !Number.isFinite(event.deltaY)
+      if (!localOutput || event.ctrlKey || event.metaKey || !Number.isFinite(event.deltaY)
         || !event.deltaY || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
       event.preventDefault();
       untrack(() => commitSpeed(speedPercent + (event.deltaY < 0 ? SPEED_STEP : -SPEED_STEP)));
@@ -686,7 +693,8 @@
         class:on={speedPercent !== 100}
         bind:this={speedButton}
         use:speedWheel
-        title="Playback speed — scroll to adjust, double-click to reset"
+        disabled={!localOutput}
+        title={localOutput ? "Playback speed — scroll to adjust, double-click to reset" : "Spotify devices play original audio at normal speed"}
         aria-label="Playback speed"
         aria-expanded={speedOpen}
         onclick={toggleSpeedMenu}

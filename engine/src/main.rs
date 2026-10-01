@@ -246,8 +246,9 @@ async fn run(
             input = input_receiver.recv() => {
                 match input.unwrap_or(Input::Eof) {
                     Input::Request(request) => {
-                        // Idle sessions are observed on demand, not polled; a
-                        // dead one starts reconnecting before this command.
+                        // Observe idle sessions on demand. Queue selection is
+                        // accepted immediately into authoritative engine state;
+                        // a dead session reconnects before loading that target.
                         if !matches!(&request.command, Command::Shutdown)
                             && engine.tick_session_health(&auth_sender)
                         {
