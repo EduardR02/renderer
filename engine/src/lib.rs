@@ -7,27 +7,29 @@
 
 pub mod protocol;
 
-/// Atomic single-file replacement shared by every durable writer in the
-/// engine and by the Tauri shell.
-///
-/// Windows has no atomic `rename` over an existing target (`fs::rename` fails
-/// with "already exists"), so durable writers go through `MoveFileExW` with
-/// `MOVEFILE_REPLACE_EXISTING` (the commit) and `MOVEFILE_WRITE_THROUGH`
-/// (the metadata reaches disk before the call returns). Elsewhere a rename is
-/// already atomic and durably ordered.
+/// Atomic single-file replacement shared by engine and shell writers.
+/// Standard rename replaces existing files on Windows too. Only durable
+/// user-state commits need the additional Windows write-through flag.
 pub mod atomic {
-    #[cfg(not(windows))]
-    use std::fs;
     use std::io;
     use std::path::Path;
 
-    #[cfg(not(windows))]
-    pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
-        fs::rename(source, destination)
+    pub fn replace_file_atomically(
+        source: &Path,
+        destination: &Path,
+        durable: bool,
+    ) -> io::Result<()> {
+        #[cfg(windows)]
+        if durable {
+            return replace_durably(source, destination);
+        }
+        #[cfg(not(windows))]
+        let _ = durable;
+        std::fs::rename(source, destination)
     }
 
     #[cfg(windows)]
-    pub fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    fn replace_durably(source: &Path, destination: &Path) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
 
         #[link(name = "Kernel32")]
@@ -57,6 +59,29 @@ pub mod atomic {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn atomic_replacement_overwrites_existing_destination_for_both_durability_modes() {
+            let directory = std::env::temp_dir().join(format!(
+                "renderer-atomic-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let destination = directory.join("destination");
+            let source = directory.join("source");
+            std::fs::write(&destination, b"old").unwrap();
+            for (durable, bytes) in [(false, b"cache".as_slice()), (true, b"durable".as_slice())] {
+                std::fs::write(&source, bytes).unwrap();
+                super::replace_file_atomically(&source, &destination, durable).unwrap();
+                assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+                assert!(!source.exists());
+            }
+            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 }

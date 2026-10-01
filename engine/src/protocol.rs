@@ -105,8 +105,8 @@ pub struct TrackRef {
     /// Answered where the track's metadata is parsed, because that is the one
     /// place the file ids are already in hand: knowing this anywhere else would
     /// mean a second metadata fetch per track. It is a snapshot taken at browse
-    /// time, not a subscription — a track that finishes caching while a list is
-    /// on screen is marked on the next browse of that list.
+    /// time; a track that finishes caching while it plays reaches lists on
+    /// screen through the state's `cached_ids` at the next track change.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cached: bool,
     /// Compact source context carried with a queue item into listening history
@@ -206,6 +206,12 @@ pub enum Command {
     PlayQueueIndex {
         index: usize,
     },
+    /// Aligns the existing canonical queue to a remote occurrence, paused.
+    /// Position uses the compiled transport timeline; rows are never replaced.
+    SetQueueCursor {
+        index: usize,
+        position_ms: u32,
+    },
     Play,
     Pause,
     Next,
@@ -298,15 +304,17 @@ pub enum Command {
     /// Removes all finalized and in-progress local listening history rows.
     ClearHistory,
     Shutdown,
-    /// User playlist library via the spclient rootlist (first `length`
-    /// entries). Responded to with a `browse_playlists` message.
-    BrowsePlaylists {
-        length: usize,
-    },
     /// Playlist metadata and tracks via `/playlist/v2/playlist/{id}`.
     /// Responded to with a `browse_playlist` message.
     BrowsePlaylist {
         id: String,
+    },
+    /// Ordered song membership only, without resolving track metadata.
+    BrowsePlaylistMembership { id: String },
+    /// Local exclusions for a source context and the live automatic queue plan.
+    QueueMetadata {
+        #[serde(default)]
+        context: Option<String>,
     },
     /// Bounded header/artwork hydration; never fetches full playlist tracks.
     BrowsePlaylistCovers { playlists: Vec<PlaylistRef> },
@@ -1169,17 +1177,11 @@ pub struct ShowRef {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EpisodeRef {
-    pub id: String,
-    pub uri: String,
-    pub name: String,
+    /// Playback identity, title, artwork and availability live only in `track`.
     pub show_id: String,
     pub show_name: String,
     pub description: String,
-    pub cover_url: Option<String>,
-    pub duration_ms: u32,
     pub published_at: Option<i64>,
-    pub unavailable: bool,
-    pub unavailable_reason: Option<String>,
     /// Audio-only queue representation. No episode is a song edit target.
     pub track: TrackRef,
 }
@@ -1195,6 +1197,19 @@ pub struct ShowBrowse {
     pub cover_url: Option<String>,
     pub episodes: Vec<EpisodeRef>,
 }
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PlaylistMembership {
+    pub id: String,
+    pub revision: String,
+    pub uris: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct QueueMetadata {
+    pub excluded_track_ids: Vec<String>,
+    pub upcoming: Vec<usize>,
+}
+
 
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1238,7 +1253,8 @@ pub enum SearchTopRef {
     Artist(ArtistRef),
     Playlist(PlaylistRef),
     Show(ShowRef),
-    Episode(EpisodeRef),
+    /// Canonical episode lives in `SearchBrowse::episodes`, never repeated here.
+    Episode { uri: String },
 }
 
 /// Payload of a successful [`Command::BrowseSearch`] response.
@@ -1309,6 +1325,8 @@ pub struct StateEvent<'a> {
     pub audible_playback_speed: f32,
     pub current_index: Option<usize>,
     pub current_uri: Option<&'a str>,
+    /// Exact source of the current row; empty when no source is known.
+    pub context: &'a str,
     /// The queue rows this state describes. Present whenever [`Self::queue_revision`]
     /// names a generation the receiver has not been given, and omitted when it
     /// is the generation it already holds — the shell keeps the rows it has
@@ -1316,7 +1334,7 @@ pub struct StateEvent<'a> {
     /// row identity survives the several states of one track change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue: Option<&'a [TrackRef]>,
-    /// The generation of the queue rows and of the plan derived from them.
+    /// The generation of the queue rows.
     ///
     /// Always sent, because it is the only thing that tells an omitted `queue`
     /// from an empty one. Monotonic within a process and seeded so it cannot
@@ -1329,15 +1347,28 @@ pub struct StateEvent<'a> {
     /// nanoseconds would sit where representable numbers are 256 apart, and one
     /// bump would leave the number unchanged.
     pub queue_revision: u64,
+    /// The generation of the play order: the current row, the shuffle bag,
+    /// the modes, what counts as eligible — and the rows, which every rows
+    /// change moves too. Always sent, on the same terms as `queue_revision`,
+    /// because it is what tells an omitted `upcoming` from an empty one.
+    pub order_revision: u64,
     /// Queue indexes in the order automatic playback will actually reach them,
     /// current row excluded: shuffle's live bag when shuffle is on, the
     /// sequential walk when it is off, exclusions and unavailable rows already
     /// removed. Derived state, never restored or persisted — the UI would
-    /// otherwise have to guess at a plan only the engine holds. Travels with
-    /// `queue` and is omitted with it: the plan is derived from the rows and
-    /// from the current row, and the revision covers both.
+    /// otherwise have to guess at a plan only the engine holds. Present when
+    /// [`Self::order_revision`] is new to the receiver, so a track change
+    /// carries this list and not the rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upcoming: Option<Vec<usize>>,
+    /// Track ids the engine found in the audio cache since it last sent
+    /// `queue` — at track changes, never on a clock. Present when the list
+    /// grew; the rows the next `queue` carries are marked themselves. An id
+    /// may name a track the current rows no longer hold (the one just left
+    /// behind by a queue replacement), whose mark still belongs on any list
+    /// showing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_ids: Option<&'a [String]>,
     pub error: Option<&'a str>,
 }
 
@@ -1579,6 +1610,7 @@ mod tests {
             ..TrackRef::default()
         };
         let queue = [track];
+        let cached = ["track-id".to_owned()];
         let state = serde_json::to_value(StateEvent {
             kind: "state",
             ready: true,
@@ -1597,9 +1629,12 @@ mod tests {
             audible_playback_speed: 1.0,
             current_index: Some(0),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
+            context: "playlist:source",
             queue: Some(&queue),
             queue_revision: 7,
+            order_revision: 9,
             upcoming: Some(vec![2, 1]),
+            cached_ids: Some(&cached),
             error: None,
         })
         .unwrap();
@@ -1612,8 +1647,10 @@ mod tests {
         assert_eq!(state["queue"][0]["artist_names"], json!(["Artist"]));
         assert_eq!(state["queue"][0]["duration_ms"], 123_456);
         assert_eq!(state["queue_revision"], 7);
+        assert_eq!(state["order_revision"], 9);
         // The plan is queue indexes in play order, not a second copy of rows.
         assert_eq!(state["upcoming"], json!([2, 1]));
+        assert_eq!(state["cached_ids"], json!(["track-id"]));
         assert!(state["error"].is_null());
         // The authorize URL is only present while a login attempt is pending.
         assert!(state["auth_url"].is_null());
@@ -1643,16 +1680,21 @@ mod tests {
             audible_playback_speed: 1.0,
             current_index: Some(3),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
+            context: "playlist:source",
             queue: None,
             queue_revision: 7,
+            order_revision: 9,
             upcoming: None,
+            cached_ids: None,
             error: None,
         })
         .unwrap();
 
         assert!(!state.as_object().unwrap().contains_key("queue"));
         assert!(!state.as_object().unwrap().contains_key("upcoming"));
+        assert!(!state.as_object().unwrap().contains_key("cached_ids"));
         assert_eq!(state["queue_revision"], 7);
+        assert_eq!(state["order_revision"], 9);
         assert_eq!(state["current_index"], 3);
     }
 
@@ -1676,9 +1718,12 @@ mod tests {
             audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,
+            context: "",
             queue: Some(&[]),
             queue_revision: 1,
+            order_revision: 1,
             upcoming: Some(Vec::new()),
+            cached_ids: None,
             error: None,
         })
         .unwrap();
@@ -1940,17 +1985,6 @@ mod tests {
 
     #[test]
     fn browse_commands_deserialize_from_the_line_protocol() {
-        let playlists: Request = serde_json::from_value(json!({
-            "request_id": "request-11",
-            "type": "browse_playlists",
-            "length": 50,
-        }))
-        .unwrap();
-        assert!(matches!(
-            playlists.command,
-            Command::BrowsePlaylists { length: 50 }
-        ));
-
         let playlist: Request = serde_json::from_value(json!({
             "request_id": "request-12",
             "type": "browse_playlist",
@@ -2186,9 +2220,9 @@ mod tests {
         );
         assert!(failure.get("data").is_none());
 
-        // browse_playlists carries its payload as a bare array in `data`.
+        // browse_playlist_covers carries its payload as a bare array in `data`.
         let lists = serde_json::to_value(BrowseResponse {
-            kind: "browse_playlists",
+            kind: "browse_playlist_covers",
             request_id: "request-11",
             ok: true,
             error: None,
@@ -2230,9 +2264,12 @@ mod tests {
             audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,
+            context: "",
             queue: Some(&[]),
             queue_revision: 1,
+            order_revision: 1,
             upcoming: Some(Vec::new()),
+            cached_ids: None,
             error: None,
         })
         .unwrap();
@@ -2255,9 +2292,12 @@ mod tests {
             audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,
+            context: "",
             queue: Some(&[]),
             queue_revision: 2,
+            order_revision: 2,
             upcoming: Some(Vec::new()),
+            cached_ids: None,
             error: None,
         })
         .unwrap();

@@ -4,7 +4,7 @@ const titleOrder = new Intl.Collator(undefined, { sensitivity: "base", numeric: 
 export function orderEpisodes(episodes, sort = "recent") {
   const ordered = [...episodes];
   if (sort === "title") {
-    return ordered.sort((a, b) => titleOrder.compare(a.name ?? "", b.name ?? ""));
+    return ordered.sort((a, b) => titleOrder.compare(a.track.name ?? "", b.track.name ?? ""));
   }
   const direction = sort === "oldest" ? 1 : -1;
   return ordered.sort((a, b) => {
@@ -15,12 +15,20 @@ export function orderEpisodes(episodes, sort = "recent") {
   });
 }
 
+/** Normalize once per browse result; sorting keeps these episode identities. */
+export function indexEpisodeSearch(episodes) {
+  return new Map(episodes.map((episode) => [
+    episode,
+    [String(episode.track.name ?? "").toLowerCase(), String(episode.description ?? "").toLowerCase()],
+  ]));
+}
+
 /** Literal, case-insensitive title/description search; keep the chosen order. */
-export function filterEpisodes(episodes, query) {
+export function filterEpisodes(episodes, query, index) {
   const wanted = query.trim().toLowerCase();
   if (!wanted) return episodes;
-  return episodes.filter((episode) =>
-    String(episode.name ?? "").toLowerCase().includes(wanted)
-    || String(episode.description ?? "").toLowerCase().includes(wanted),
-  );
+  return episodes.filter((episode) => {
+    const [name, description] = index.get(episode);
+    return name.includes(wanted) || description.includes(wanted);
+  });
 }

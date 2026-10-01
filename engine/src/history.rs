@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,14 +16,6 @@ const JOURNAL_FILE: &str = "listening_history.jsonl";
 /// The in-progress row, alone, so that keeping it durable costs one small
 /// atomic replace per playback event instead of rewriting the archive.
 const ACTIVE_FILE: &str = "listening_history_active.json";
-/// The single-snapshot format this replaced. Imported once, then deleted —
-/// but only once the merged archive is on disk. See [`commit_migration`].
-const LEGACY_SNAPSHOT_FILE: &str = "listening_history.json";
-/// The track-metadata sidecar of an abandoned prototype that wrote its own
-/// rows to [`JOURNAL_FILE`] before this journal existed. Nothing in the engine
-/// reads it, and the journal it belonged to is not read as an archive any
-/// more, so the one-time migration deletes it.
-const PROTOTYPE_TRACKS_FILE: &str = "listening_history_tracks.json";
 
 /// The archive ceiling.
 ///
@@ -79,7 +71,65 @@ struct PersistedActive {
 
 struct ActivePlay {
     persisted: PersistedActive,
+    keys: SearchKeys,
     playing_since: Option<Instant>,
+}
+
+impl ActivePlay {
+    fn new(persisted: PersistedActive, playing_since: Option<Instant>) -> Self {
+        let keys = SearchKeys::of(&persisted.item);
+        Self { persisted, keys, playing_since }
+    }
+}
+
+/// A row's title and artists, case-folded once when the row enters memory.
+///
+/// Search and the name orders compare these, so a query re-folds nothing: a
+/// keystroke in the history filter used to lowercase every title (and every
+/// artist the title did not match) in a fifty-thousand-row archive.
+struct SearchKeys {
+    title: Box<str>,
+    /// The artist names, folded and joined by [`ARTIST_SEPARATOR`] — a
+    /// character no typed query contains, so a match never spans two names.
+    artists: Box<str>,
+}
+
+const ARTIST_SEPARATOR: char = '\u{1f}';
+
+impl SearchKeys {
+    fn of(item: &HistoryItem) -> Self {
+        let mut artists = String::new();
+        for (index, artist) in item.track.artist_names.iter().enumerate() {
+            if index > 0 {
+                artists.push(ARTIST_SEPARATOR);
+            }
+            artists.push_str(&artist.to_lowercase());
+        }
+        Self {
+            title: item.track.name.to_lowercase().into_boxed_str(),
+            artists: artists.into_boxed_str(),
+        }
+    }
+
+    /// Whether the row answers an already-folded query.
+    fn matches(&self, needle: &str) -> bool {
+        needle.is_empty()
+            || self.title.contains(needle)
+            || self.artists.split(ARTIST_SEPARATOR).any(|artist| artist.contains(needle))
+    }
+}
+
+/// A finalized row together with its folded search keys.
+struct ArchivedRow {
+    item: HistoryItem,
+    keys: SearchKeys,
+}
+
+impl ArchivedRow {
+    fn new(item: HistoryItem) -> Self {
+        let keys = SearchKeys::of(&item);
+        Self { item, keys }
+    }
 }
 
 /// A position in the archive as an ordering sees it. The in-progress play is
@@ -123,21 +173,30 @@ pub struct ListeningHistory {
     core: Arc<Mutex<HistoryCore>>,
 }
 
+/// Pages the archive from any thread. The command loop hands one to a
+/// blocking task per request, so a filtered or name-ordered page over the
+/// whole archive never holds up transport or browse replies.
+#[derive(Clone)]
+pub struct HistoryReader {
+    load_error: Option<String>,
+    core: Arc<Mutex<HistoryCore>>,
+}
+
 /// Playback state, the ordering cache, and the generation bookkeeping that
 /// keeps exactly one background writer draining to disk.
 struct HistoryCore {
-    finalized: VecDeque<HistoryItem>,
+    finalized: VecDeque<ArchivedRow>,
     active: Option<ActivePlay>,
     /// Rows already in `finalized` that the journal has not accepted yet.
     /// They stay here until a write succeeds, which is what makes a failed
     /// append retry rather than lose a play.
     pending: VecDeque<HistoryItem>,
-    /// Bumped when rows left the front of `finalized`, or when a legacy
-    /// import seeded it: the journal no longer matches memory and must be
-    /// rewritten whole rather than appended to. A counter rather than a flag
-    /// because a rewrite is serialized under the lock and written outside it,
-    /// and a trim landing in that gap must not be marked done by the write it
-    /// arrived too late for.
+    /// Bumped when rows left the front of `finalized`, or when the loaded
+    /// journal had to be replaced: the journal no longer matches memory and
+    /// must be rewritten whole rather than appended to. A counter rather than
+    /// a flag because a rewrite is serialized under the lock and written
+    /// outside it, and a trim landing in that gap must not be marked done by
+    /// the write it arrived too late for.
     rewrite_requested: u64,
     /// The highest trim generation a rewrite has actually put on disk.
     rewrite_written: u64,
@@ -225,8 +284,8 @@ impl HistoryCore {
             // cannot have been in an ordering built from it.
             return;
         }
-        self.finalized.push_back(item.clone());
-        self.pending.push_back(item);
+        self.pending.push_back(item.clone());
+        self.finalized.push_back(ArchivedRow { item, keys: active.keys });
         self.enforce_bound();
         self.invalidate();
     }
@@ -289,7 +348,7 @@ impl ListeningHistory {
 
     fn from_parts(
         root: PathBuf,
-        finalized: VecDeque<HistoryItem>,
+        finalized: VecDeque<ArchivedRow>,
         active: Option<ActivePlay>,
         needs_rewrite: bool,
         load_error: Option<String>,
@@ -311,7 +370,7 @@ impl ListeningHistory {
                 ordering: None,
             })),
         };
-        // A trimmed or imported archive is only in memory until this lands.
+        // A trimmed or replaced archive is only in memory until this lands.
         if needs_rewrite {
             store.persist();
         }
@@ -329,8 +388,8 @@ impl ListeningHistory {
         {
             let mut core = self.lock_core();
             core.retire_active(false);
-            core.active = Some(ActivePlay {
-                persisted: PersistedActive {
+            core.active = Some(ActivePlay::new(
+                PersistedActive {
                     item: HistoryItem {
                         row: HistoryRow {
                             track_id: track.id.clone(),
@@ -343,8 +402,8 @@ impl ListeningHistory {
                     },
                     duration_ms: track.duration_ms,
                 },
-                playing_since: Some(Instant::now()),
-            });
+                Some(Instant::now()),
+            ));
         }
         // A failed background write leaves the store dirty; pause, finalize,
         // or the next transition queues a fresh generation and retries.
@@ -428,13 +487,41 @@ impl ListeningHistory {
         self.persist();
     }
 
+    /// A handle that pages this archive from another thread.
+    pub fn reader(&self) -> HistoryReader {
+        HistoryReader {
+            load_error: self.load_error.clone(),
+            core: Arc::clone(&self.core),
+        }
+    }
+
+    pub fn clear(&mut self) -> Result<(), String> {
+        self.ensure_writable()?;
+        if self.root.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut core = self.lock_core();
+            core.finalized.clear();
+            core.pending.clear();
+            core.active = None;
+            core.rewrite_requested = core.rewrite_requested.wrapping_add(1);
+            core.invalidate();
+        }
+        self.persist();
+        Ok(())
+    }
+}
+
+impl HistoryReader {
     /// One filtered, ordered window of the archive.
     pub fn page(&self, request: &HistoryQuery) -> Result<HistoryPage, String> {
         if let Some(error) = &self.load_error {
             return Err(format!("listening history is read-only: {error}"));
         }
 
-        let mut core = self.lock_core();
+        let mut core = lock_history_core(&self.core);
         let active_qualified = core.active_qualified();
         let recorded = core.finalized.len() + usize::from(active_qualified);
         let needle = request.query.trim().to_lowercase();
@@ -468,7 +555,9 @@ impl ListeningHistory {
             .iter()
             .filter_map(|slot| match slot {
                 Slot::Active => live_active.clone(),
-                Slot::Finalized(index) => core.finalized.get(*index as usize).cloned(),
+                Slot::Finalized(index) => {
+                    core.finalized.get(*index as usize).map(|row| row.item.clone())
+                }
             })
             .collect::<Vec<_>>();
         let next = request.offset.saturating_add(items.len());
@@ -480,25 +569,9 @@ impl ListeningHistory {
             next_offset: (next < total).then_some(next),
         })
     }
+}
 
-    pub fn clear(&mut self) -> Result<(), String> {
-        self.ensure_writable()?;
-        if self.root.as_os_str().is_empty() {
-            return Ok(());
-        }
-
-        {
-            let mut core = self.lock_core();
-            core.finalized.clear();
-            core.pending.clear();
-            core.active = None;
-            core.rewrite_requested = core.rewrite_requested.wrapping_add(1);
-            core.invalidate();
-        }
-        self.persist();
-        Ok(())
-    }
-
+impl ListeningHistory {
     fn writable(&self) -> bool {
         if let Some(error) = &self.load_error {
             eprintln!("listening history mutation rejected: {error}");
@@ -604,74 +677,53 @@ fn ensure_ordering(
         return;
     }
 
-    let live_active = core.live_active();
-    // Folded once per row here, not once per comparison. The comparator this
-    // replaces asked `artist_key` for both sides (a join plus a lowercase
-    // each) and folded both titles on every comparison, so a name sort over
-    // the whole archive was ~2n·log n allocations — tens of millions at the
-    // ceiling — and it runs inline on the engine's command loop, where every
-    // transport and browse reply waits behind it. The filter reads the same
-    // folded title rather than folding the row a second time.
-    //
-    // `page` only builds a projection when there is a needle or the order is
-    // a name order, so the title fold always has a reader; the artist join is
-    // asked for by the artist order alone.
-    let name_sort = matches!(sort, HistorySort::Title | HistorySort::Artist);
-    let mut slots = Vec::new();
-    let mut keys = Vec::new();
-    let mut consider = |item: &HistoryItem, slot: Slot| {
-        let title = item.track.name.to_lowercase();
-        if !matches_folded(&title, item, needle) {
-            return;
-        }
-        if !name_sort {
-            slots.push(slot);
-            return;
-        }
-        keys.push(NameKey {
-            slot,
-            title,
-            artists: matches!(sort, HistorySort::Artist).then(|| artist_key(item)),
-            started_at: item.row.started_at,
+    // Every row carries its folded keys (see [`SearchKeys`]), so a rebuild
+    // allocates nothing per row: the filter and the comparator only read
+    // strings folded when the row entered memory.
+    let slots = {
+        let core = &*core;
+        let active = core
+            .active
+            .as_ref()
+            .filter(|_| active_qualified)
+            .map(|active| (Slot::Active, &active.keys, active.persisted.item.row.started_at));
+        let rows = core.finalized.iter().enumerate().map(|(index, row)| {
+            (Slot::Finalized(index as u32), &row.keys, row.item.row.started_at)
         });
-    };
-    if active_qualified {
-        if let Some(item) = &live_active {
-            consider(item, Slot::Active);
-        }
-    }
-    for (index, item) in core.finalized.iter().enumerate() {
-        consider(item, Slot::Finalized(index as u32));
-    }
-
-    match sort {
-        // The scan above walks oldest-first with the in-progress row ahead of
-        // it, so newest-first is that walk read backwards.
-        HistorySort::Recent => {
-            let head = usize::from(active_qualified && slots.first() == Some(&Slot::Active));
-            slots[head..].reverse();
-        }
-        HistorySort::Oldest => {
-            if slots.first() == Some(&Slot::Active) {
-                slots.rotate_left(1);
+        // The scan walks oldest-first with the in-progress row ahead of it.
+        let matching = active
+            .into_iter()
+            .chain(rows)
+            .filter(|(_, keys, _)| keys.matches(needle));
+        match sort {
+            HistorySort::Recent | HistorySort::Oldest => {
+                let mut slots: Vec<Slot> = matching.map(|(slot, ..)| slot).collect();
+                let active_first = slots.first() == Some(&Slot::Active);
+                if sort == HistorySort::Recent {
+                    // Newest-first is the walk read backwards, behind the
+                    // in-progress row.
+                    slots[usize::from(active_first)..].reverse();
+                } else if active_first {
+                    slots.rotate_left(1);
+                }
+                slots
+            }
+            HistorySort::Title | HistorySort::Artist => {
+                let mut keyed: Vec<_> = matching.collect();
+                keyed.sort_by(|(_, left, left_started), (_, right, right_started)| {
+                    let primary = if sort == HistorySort::Artist {
+                        left.artists.cmp(&right.artists)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    };
+                    primary
+                        .then_with(|| left.title.cmp(&right.title))
+                        .then_with(|| right_started.cmp(left_started))
+                });
+                keyed.into_iter().map(|(slot, ..)| slot).collect()
             }
         }
-        HistorySort::Title | HistorySort::Artist => {
-            keys.sort_by(|left, right| {
-                let primary = match sort {
-                    HistorySort::Artist => left.artists.cmp(&right.artists),
-                    _ => std::cmp::Ordering::Equal,
-                };
-                primary
-                    .then_with(|| left.title.cmp(&right.title))
-                    .then_with(|| right.started_at.cmp(&left.started_at))
-            });
-            // The folded keys are dropped with the rebuild that made them:
-            // paging reads slots, and the next query is what pays for the next
-            // projection.
-            slots = keys.into_iter().map(|key| key.slot).collect();
-        }
-    }
+    };
 
     core.ordering = Some(CachedOrdering {
         query: needle.to_owned(),
@@ -680,46 +732,6 @@ fn ensure_ordering(
         active_qualified,
         slots,
     });
-}
-
-/// One row's place in a name order, with its folded sort values.
-///
-/// The values are folded once per rebuild so the comparator allocates nothing:
-/// it only compares what is already here, which is what turns a name sort from
-/// a fold per comparison into a fold per row.
-struct NameKey {
-    slot: Slot,
-    /// `track.name`, lowercased — the filter's haystack and the title
-    /// tie-break.
-    title: String,
-    /// `artist_names` joined and lowercased, the artist order's primary
-    /// comparison. `None` in the title order, whose comparator never reads it:
-    /// folding it there would be one allocation per row for nothing.
-    artists: Option<String>,
-    started_at: i64,
-}
-
-fn artist_key(item: &HistoryItem) -> String {
-    item.track.artist_names.join(", ").to_lowercase()
-}
-
-/// Whether a row answers the query, against a title that has already been
-/// folded.
-///
-/// The artists are folded here, one at a time and short-circuiting, because
-/// the artist order's single joined key is not what the filter compares:
-/// `any` over the individual names and `contains` over their join disagree
-/// across a comma, so the join cannot be reused for this.
-fn matches_folded(folded_title: &str, item: &HistoryItem, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    folded_title.contains(needle)
-        || item
-            .track
-            .artist_names
-            .iter()
-            .any(|artist| artist.to_lowercase().contains(needle))
 }
 
 /// Lock recovery: every history field update is one uninterruptible step
@@ -798,8 +810,8 @@ fn drain_persistence(core: Arc<Mutex<HistoryCore>>, root: PathBuf) {
 fn serialize_task(core: &HistoryCore) -> Result<WriteTask, String> {
     let (journal, rewrite) = if core.rewrite_requested != core.rewrite_written {
         let mut bytes = Vec::new();
-        for item in &core.finalized {
-            write_line(&mut bytes, item)?;
+        for row in &core.finalized {
+            write_line(&mut bytes, &row.item)?;
         }
         // The rewrite covers `finalized`, which already contains every queued
         // row, so the queue is cleared by it too.
@@ -845,17 +857,15 @@ fn serialize_task(core: &HistoryCore) -> Result<WriteTask, String> {
 /// [`JOURNAL_FILE`], and `HistoryItem` is deliberately lenient — every field
 /// defaults — so those rows *parse*, arrive with an empty track, and fail
 /// validation on line one. A file this code never wrote was therefore fatal:
-/// the store went read-only and took the archive being imported alongside it
-/// down with it. The tag turns "was this ever ours?" into a question the file
-/// answers itself, rather than one inferred from whether foreign bytes happen
-/// to fit our shape.
+/// the store went read-only. The tag turns "was this ever ours?" into a
+/// question the file answers itself, rather than one inferred from whether
+/// foreign bytes happen to fit our shape.
 ///
 /// The alternative was to move the journal to a filename the prototype could
 /// not have taken. Rejected: it dodges the one name that collided and leaves
-/// the next collision just as fatal, and it would not even settle this case,
-/// because the file at the old name still has to be judged — deleting it
-/// unread is the same class of mistake as deleting the snapshot unwritten.
-/// Judging it means recognising our own format, which is this code either way.
+/// the next collision just as fatal, and the file at the old name would still
+/// have to be judged rather than deleted unread. Judging it means recognising
+/// our own format, which is this code either way.
 /// The cost is about thirty bytes a line, paid to make the archive
 /// self-describing.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -939,17 +949,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-    replace_file_atomically(&temporary, path)
+    replace_file_atomically(&temporary, path, true)
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
 }
 
 struct LoadedArchive {
-    finalized: VecDeque<HistoryItem>,
+    finalized: VecDeque<ArchivedRow>,
     active: Option<ActivePlay>,
     /// Whether what was loaded differs from what is on disk — a discarded
     /// foreign journal or an over-ceiling trim — and so must be written back
-    /// whole. An import does its own writing, synchronously, so it does not
-    /// use this.
+    /// whole.
     needs_rewrite: bool,
 }
 
@@ -980,33 +989,7 @@ fn load_archive(root: &Path) -> Result<LoadedArchive, String> {
         }
     };
 
-    // One-time import of the single-snapshot format. The owner's existing
-    // record is worth one function; a silent discard is not.
-    let legacy_path = root.join(LEGACY_SNAPSHOT_FILE);
-    let active_path = root.join(ACTIVE_FILE);
-    let mut active = None;
-    if let Some(legacy) = read_legacy_snapshot(&legacy_path)? {
-        merge_imported(&mut finalized, legacy.finalized);
-        commit_migration(&journal_path, &active_path, &finalized, legacy.active.as_ref())?;
-        // Everything the snapshot held is on disk in the new format now, and
-        // only now, so it can go. A failed unlink is not fatal: the merged
-        // archive is durable and the import is idempotent, so the next start
-        // simply does it again — going read-only over a stuck delete would
-        // cost the owner their history for something that costs them nothing.
-        if let Err(error) = fs::remove_file(&legacy_path) {
-            eprintln!("could not remove {}: {error}", legacy_path.display());
-        }
-        needs_rewrite = false;
-        active = legacy.active.map(|persisted| ActivePlay {
-            persisted,
-            playing_since: None,
-        });
-    }
-    remove_abandoned_prototype_files(root);
-
-    if active.is_none() {
-        active = read_active_sidecar(&active_path, &finalized)?;
-    }
+    let active = read_active_sidecar(&root.join(ACTIVE_FILE), &finalized)?;
 
     if finalized.len() > MAX_HISTORY_ITEMS {
         while finalized.len() > MAX_HISTORY_ITEMS {
@@ -1016,7 +999,7 @@ fn load_archive(root: &Path) -> Result<LoadedArchive, String> {
     }
 
     Ok(LoadedArchive {
-        finalized,
+        finalized: finalized.into_iter().map(ArchivedRow::new).collect(),
         active,
         needs_rewrite,
     })
@@ -1043,10 +1026,7 @@ fn read_active_sidecar(
         last.row.track_id == persisted.item.row.track_id
             && last.row.started_at == persisted.item.row.started_at
     });
-    Ok((!duplicated).then_some(ActivePlay {
-        persisted,
-        playing_since: None,
-    }))
+    Ok((!duplicated).then(|| ActivePlay::new(persisted, None)))
 }
 
 /// What the file at [`JOURNAL_FILE`] turned out to be.
@@ -1138,126 +1118,6 @@ fn parse_line(line: &[u8]) -> Result<HistoryItem, serde_json::Error> {
         // caller is what still rejects a row no build of ours wrote.
         Err(_) => serde_json::from_slice::<HistoryItem>(line),
     }
-}
-
-/// Folds imported rows in front of the journal's, dropping any the journal
-/// already holds.
-///
-/// The dedupe is what makes an import safe to run twice, and so what lets the
-/// snapshot be deleted last: an interruption between committing the merged
-/// archive and removing the snapshot leaves both on disk, and the next start
-/// imports the same rows again. Identity is the track plus the millisecond it
-/// started — the key the sidecar is deduped on, which no two plays share.
-fn merge_imported(finalized: &mut VecDeque<HistoryItem>, imported: Vec<HistoryItem>) {
-    let fresh: Vec<HistoryItem> = {
-        let existing: HashSet<(&str, i64)> = finalized
-            .iter()
-            .map(|item| (item.row.track_id.as_str(), item.row.started_at))
-            .collect();
-        imported
-            .into_iter()
-            .filter(|item| !existing.contains(&(item.row.track_id.as_str(), item.row.started_at)))
-            .collect()
-    };
-    // Imported rows predate anything a journal of ours could hold, so they go
-    // in front.
-    for item in fresh.into_iter().rev() {
-        finalized.push_front(item);
-    }
-}
-
-/// Puts the merged archive on disk, whole and fsynced, before the import
-/// deletes anything.
-///
-/// This ordering is the fix. Deleting the snapshot on the way *out* of reading
-/// it left 1,084 rows living only in memory, one fallible step ahead of a
-/// loader that could still fail — and when it did, the archive went with it.
-/// Written in this order, a crash at any point leaves the snapshot readable
-/// until its rows are durable somewhere else, so the worst case is that the
-/// import runs again and produces the same archive.
-fn commit_migration(
-    journal_path: &Path,
-    active_path: &Path,
-    finalized: &VecDeque<HistoryItem>,
-    active: Option<&PersistedActive>,
-) -> Result<(), String> {
-    if let Some(parent) = journal_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    }
-    let mut bytes = Vec::new();
-    for item in finalized {
-        write_line(&mut bytes, item)?;
-    }
-    write_atomic(journal_path, &bytes)?;
-    // The snapshot's in-progress play has nowhere else to live either, so it
-    // is part of what has to be durable before the snapshot goes.
-    if let Some(active) = active {
-        let bytes = serde_json::to_vec(active)
-            .map_err(|error| format!("could not serialize the in-progress play: {error}"))?;
-        write_atomic(active_path, &bytes)?;
-    }
-    Ok(())
-}
-
-/// Removes what the abandoned prototype left behind. Its journal is no longer
-/// read as one — replaced by the merged archive, or refused as foreign — and
-/// its track-metadata sidecar is read by nothing here, so this is the last
-/// file of that design still on disk.
-///
-/// Never fatal: a leftover nobody can delete is clutter, and turning clutter
-/// into a read-only archive is the whole mistake being corrected here.
-fn remove_abandoned_prototype_files(root: &Path) {
-    let path = root.join(PROTOTYPE_TRACKS_FILE);
-    if let Err(error) = fs::remove_file(&path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("could not remove {}: {error}", path.display());
-        }
-    }
-}
-
-struct LegacySnapshot {
-    finalized: Vec<HistoryItem>,
-    active: Option<PersistedActive>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredHistory {
-    version: u32,
-    finalized: Vec<HistoryItem>,
-    active: Option<PersistedActive>,
-}
-
-/// Reads the single-snapshot format. It is deliberately left on disk: a file
-/// whose contents exist only in memory, ahead of code that can still fail, is
-/// what cost this archive once already. [`commit_migration`] and the caller
-/// delete it, in that order.
-fn read_legacy_snapshot(path: &Path) -> Result<Option<LegacySnapshot>, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
-    };
-    let stored: StoredHistory = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-    if stored.version != 1 {
-        return Err(format!(
-            "unsupported listening history version {}",
-            stored.version
-        ));
-    }
-    for item in stored
-        .finalized
-        .iter()
-        .chain(stored.active.iter().map(|active| &active.item))
-    {
-        validate_item(item)?;
-    }
-    Ok(Some(LegacySnapshot {
-        finalized: stored.finalized,
-        active: stored.active,
-    }))
 }
 
 fn validate_item(item: &HistoryItem) -> Result<(), String> {
@@ -1361,7 +1221,7 @@ mod tests {
     /// the view pages.
     fn everything(history: &ListeningHistory) -> Vec<HistoryItem> {
         history
-            .page(&HistoryQuery {
+            .reader().page(&HistoryQuery {
                 limit: usize::MAX,
                 ..HistoryQuery::default()
             })
@@ -1491,7 +1351,7 @@ mod tests {
         let root = scratch();
         let mut history = ListeningHistory::new(root.clone());
         history.start(&track("listening"));
-        assert_eq!(history.page(&HistoryQuery::default()).unwrap().recorded, 0);
+        assert_eq!(history.reader().page(&HistoryQuery::default()).unwrap().recorded, 0);
 
         {
             let mut core = history.lock_core();
@@ -1499,13 +1359,13 @@ mod tests {
             active.playing_since = None;
             active.persisted.item.row.ms_played = QUALIFYING_MS;
         }
-        let page = history.page(&HistoryQuery::default()).unwrap();
+        let page = history.reader().page(&HistoryQuery::default()).unwrap();
         assert_eq!(page.recorded, 1);
         assert_eq!(page.items[0].row.track_id, "listening");
 
         // Finalizing keeps it in the same place rather than moving it.
         history.finalize(false);
-        let page = history.page(&HistoryQuery::default()).unwrap();
+        let page = history.reader().page(&HistoryQuery::default()).unwrap();
         assert_eq!(page.recorded, 1);
         assert_eq!(page.items[0].row.track_id, "listening");
 
@@ -1526,7 +1386,7 @@ mod tests {
 
         let page = |offset: usize| {
             history
-                .page(&HistoryQuery {
+                .reader().page(&HistoryQuery {
                     offset,
                     limit: 50,
                     ..HistoryQuery::default()
@@ -1567,7 +1427,7 @@ mod tests {
             record(&mut history, &format!("track-{index:02}"));
         }
         let page = history
-            .page(&HistoryQuery {
+            .reader().page(&HistoryQuery {
                 offset: 0,
                 limit: 3,
                 sort: HistorySort::Oldest,
@@ -1590,7 +1450,7 @@ mod tests {
         }
 
         let filtered = history
-            .page(&HistoryQuery {
+            .reader().page(&HistoryQuery {
                 query: "  ALP  ".trim().to_owned(),
                 ..HistoryQuery::default()
             })
@@ -1599,7 +1459,7 @@ mod tests {
         assert_eq!(filtered.recorded, 4, "the archive size is reported whole");
 
         let by_title = history
-            .page(&HistoryQuery {
+            .reader().page(&HistoryQuery {
                 sort: HistorySort::Title,
                 ..HistoryQuery::default()
             })
@@ -1633,20 +1493,20 @@ mod tests {
                 let mut track = track(id);
                 track.name = title.to_owned();
                 track.artist_names = vec![artist.to_owned()];
-                core.finalized.push_back(HistoryItem {
+                core.finalized.push_back(ArchivedRow::new(HistoryItem {
                     row: HistoryRow {
                         track_id: id.to_owned(),
                         started_at,
                         ..HistoryRow::default()
                     },
                     track: sanitize_track(&track),
-                });
+                }));
             }
         }
 
         let ids = |sort: HistorySort| -> Vec<String> {
             history
-                .page(&HistoryQuery {
+                .reader().page(&HistoryQuery {
                     limit: usize::MAX,
                     sort,
                     ..HistoryQuery::default()
@@ -1664,6 +1524,42 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// The filter reads keys folded when the row entered memory, one artist at
+    /// a time, so a query never matches across two names.
+    #[test]
+    fn the_filter_matches_each_artist_from_folded_keys() {
+        let history = ListeningHistory::new(PathBuf::new());
+        {
+            let mut core = history.lock_core();
+            let mut duet = track("duet");
+            duet.name = "Duet".to_owned();
+            duet.artist_names = vec!["Alpha".to_owned(), "Beta Band".to_owned()];
+            core.finalized.push_back(ArchivedRow::new(HistoryItem {
+                row: HistoryRow {
+                    track_id: "duet".to_owned(),
+                    started_at: 1,
+                    ..HistoryRow::default()
+                },
+                track: sanitize_track(&duet),
+            }));
+        }
+        let reader = history.reader();
+        let total = |query: &str| {
+            reader
+                .page(&HistoryQuery {
+                    query: query.to_owned(),
+                    ..HistoryQuery::default()
+                })
+                .unwrap()
+                .total
+        };
+        assert_eq!(total("DUET"), 1);
+        assert_eq!(total("band"), 1);
+        assert_eq!(total("alpha"), 1);
+        assert_eq!(total("alphabeta"), 0);
+        assert_eq!(total("alpha, beta"), 0, "a match never spans two artists");
     }
 
     /* =====================================================================
@@ -1696,32 +1592,32 @@ mod tests {
             let mut core = history.lock_core();
             for index in 0..MAX_HISTORY_ITEMS + COMPACT_SLACK {
                 let track = track(&format!("track-{index}"));
-                core.finalized.push_back(HistoryItem {
+                core.finalized.push_back(ArchivedRow::new(HistoryItem {
                     row: HistoryRow {
                         track_id: track.id.clone(),
                         started_at: index as i64,
                         ..HistoryRow::default()
                     },
                     track: sanitize_track(&track),
-                });
+                }));
             }
             // At the ceiling plus the slack, nothing has been dropped yet.
             core.enforce_bound();
             assert_eq!(core.finalized.len(), MAX_HISTORY_ITEMS + COMPACT_SLACK);
             assert_eq!(core.rewrite_requested, core.rewrite_written);
 
-            core.finalized.push_back(HistoryItem {
+            core.finalized.push_back(ArchivedRow::new(HistoryItem {
                 row: HistoryRow {
                     track_id: "overflow".to_owned(),
                     ..HistoryRow::default()
                 },
                 track: sanitize_track(&track("overflow")),
-            });
+            }));
             core.enforce_bound();
         }
         let core = history.lock_core();
         assert_eq!(core.finalized.len(), MAX_HISTORY_ITEMS);
-        assert_eq!(core.finalized.front().unwrap().row.track_id, "track-1001");
+        assert_eq!(core.finalized.front().unwrap().item.row.track_id, "track-1001");
         assert_ne!(
             core.rewrite_requested, core.rewrite_written,
             "a trim can only reach disk as a rewrite"
@@ -1792,7 +1688,7 @@ mod tests {
         fs::write(&path, lines.join("\n")).unwrap();
 
         let mut broken = ListeningHistory::new(root.clone());
-        assert!(broken.page(&HistoryQuery::default()).unwrap_err().contains("read-only"));
+        assert!(broken.reader().page(&HistoryQuery::default()).unwrap_err().contains("read-only"));
         broken.start(&track("new"));
         assert!(!broken.finalize(true));
         assert!(broken.clear().unwrap_err().contains("read-only"));
@@ -1823,41 +1719,6 @@ mod tests {
         let recovered = ListeningHistory::new(root.clone());
         assert_eq!(everything(&recovered).len(), 1);
         assert!(recovered.lock_core().active.is_none());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn the_single_snapshot_format_is_imported_once_and_then_gone() {
-        let root = scratch();
-        fs::create_dir_all(&root).unwrap();
-        let legacy = serde_json::json!({
-            "version": 1,
-            "finalized": [
-                { "track_id": "old-1", "started_at": 1, "ms_played": 120_000,
-                  "completed": true, "context": "", "track": sanitize_track(&track("old-1")) },
-                { "track_id": "old-2", "started_at": 2, "ms_played": 120_000,
-                  "completed": true, "context": "", "track": sanitize_track(&track("old-2")) },
-            ],
-            "active": null,
-        });
-        fs::write(
-            root.join(LEGACY_SNAPSHOT_FILE),
-            serde_json::to_vec(&legacy).unwrap(),
-        )
-        .unwrap();
-
-        let mut history = ListeningHistory::new(root.clone());
-        record(&mut history, "new");
-        let items = everything(&history);
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].row.track_id, "new");
-        assert_eq!(items[2].row.track_id, "old-1");
-        assert!(!root.join(LEGACY_SNAPSHOT_FILE).exists());
-
-        // And the merged archive is on disk in the new format.
-        let reopened = ListeningHistory::new(root.clone());
-        assert_eq!(everything(&reopened).len(), 3);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1947,212 +1808,30 @@ mod tests {
     }
 
     /* =====================================================================
-       MIGRATION, AND FILES THAT WERE NEVER OURS
-
-       These are the owner's real files. The bug they cover destroyed 1,084
-       rows on a machine where every test above was green: the import deleted
-       the snapshot as it read it, and a stale file at the journal's path then
-       failed the load that was carrying the rows.
+       FILES THAT WERE NEVER OURS
        ===================================================================== */
 
-    /// Two rows copied verbatim out of the owner's own `listening_history.json`
-    /// so the fixture is the shape that actually exists on disk, not one
-    /// imagined from the struct definitions.
-    const REAL_LEGACY_ROWS: [&str; 2] = [
-        r#"{"track_id":"4lB6tf7G0L9YRdRI0ic675","started_at":1787545290419,"ms_played":3599,"completed":false,"context":"album:1pDVIIFTcs3lVzSyvkuk71","track":{"id":"4lB6tf7G0L9YRdRI0ic675","uri":"spotify:track:4lB6tf7G0L9YRdRI0ic675","name":"lost my head","artist_names":["Conrad.","remy"],"artist_ids":["788qKGMEh4hfYUTy8yANRC","4DsVKs4W72RTKOfD3CtTaw"],"artist_id":"788qKGMEh4hfYUTy8yANRC","album_id":"1pDVIIFTcs3lVzSyvkuk71","album_name":"color theory","cover_url":"https://i.scdn.co/image/ab67616d00001e027c9ead3c30e44da793192e50","duration_ms":133760}}"#,
-        r#"{"track_id":"1k3J7o5b0tDUzbllLycVUJ","started_at":1787546364915,"ms_played":1517,"completed":false,"context":"playlist:1UVLhex5G3Ckkj9hc4gWw4","track":{"id":"1k3J7o5b0tDUzbllLycVUJ","uri":"spotify:track:1k3J7o5b0tDUzbllLycVUJ","name":"Honest","artist_names":["San Holo","BROODS"],"artist_ids":["0jNDKefhfSbLR9sFvcPLHo","5r5Va4lVQ1zjEfbJSrmCsS"],"artist_id":"0jNDKefhfSbLR9sFvcPLHo","album_id":"7t6TgWkJUkrtbMtcpk7sh0","album_name":"Honest","cover_url":"https://i.scdn.co/image/ab67616d00001e0234b3f7d6bfcd836a3bfa4b8f","duration_ms":228000}}"#,
-    ];
-
-    /// Lines copied verbatim out of the file the abandoned prototype left at
-    /// the journal's path: our field names, no `track` at all, its metadata in
-    /// a separate `listening_history_tracks.json`.
+    /// Lines copied verbatim out of the file an abandoned prototype left at
+    /// the journal's path: our field names, no `track` at all.
     const REAL_PROTOTYPE_ROWS: [&str; 3] = [
         r#"{"track_id":"3TxKtkCNR1yQARsvHxvNnP","started_at":1787416619638,"ms_played":189103,"completed":false,"context":"playlist:7jL0XCEu7RG0DXlr7JpgRI"}"#,
         r#"{"track_id":"4N8svBAsJvG0LW15icoiuW","started_at":1787416808832,"ms_played":19456,"completed":false,"context":"playlist:5evgTEnTDxEnEjr4eoGess"}"#,
         r#"{"track_id":"0BAQjCC9gfqOebxpmonHKz","started_at":1787417090001,"ms_played":116849,"completed":false,"context":"playlist:5evgTEnTDxEnEjr4eoGess"}"#,
     ];
 
-    fn write_legacy_snapshot(root: &Path, active: &str) {
-        fs::create_dir_all(root).unwrap();
-        fs::write(
-            root.join(LEGACY_SNAPSHOT_FILE),
-            format!(
-                r#"{{"version":1,"finalized":[{},{}],"active":{active}}}"#,
-                REAL_LEGACY_ROWS[0], REAL_LEGACY_ROWS[1]
-            ),
-        )
-        .unwrap();
-    }
-
-    fn write_prototype_leftovers(root: &Path) {
+    fn write_prototype_journal(root: &Path) {
         fs::create_dir_all(root).unwrap();
         fs::write(
             root.join(JOURNAL_FILE),
             format!("{}\n", REAL_PROTOTYPE_ROWS.join("\n")),
         )
         .unwrap();
-        fs::write(
-            root.join(PROTOTYPE_TRACKS_FILE),
-            r#"{"74cZEzPwU4qBhO1TTCUDEQ":{"id":"74cZEzPwU4qBhO1TTCUDEQ","name":"Wildfire"}}"#,
-        )
-        .unwrap();
-    }
-
-    /// A snapshot `active` whose play is nowhere in `finalized`, so its
-    /// survival can be told apart from the rows'.
-    fn legacy_active() -> String {
-        let item = HistoryItem {
-            row: HistoryRow {
-                track_id: "in-progress".to_owned(),
-                started_at: 1_787_546_400_000,
-                ..HistoryRow::default()
-            },
-            track: sanitize_track(&track("in-progress")),
-        };
-        format!(
-            r#"{{"item":{},"duration_ms":180000}}"#,
-            serde_json::to_string(&item).unwrap()
-        )
-    }
-
-    #[test]
-    fn the_owners_stale_prototype_journal_costs_the_import_nothing() {
-        let root = scratch();
-        write_legacy_snapshot(&root, "null");
-        write_prototype_leftovers(&root);
-
-        let mut history = ListeningHistory::new(root.clone());
-        let items = everything(&history);
-        assert_eq!(items.len(), 2, "every legacy row has to survive");
-        assert_eq!(items[0].row.track_id, "1k3J7o5b0tDUzbllLycVUJ");
-        assert_eq!(items[0].track.name, "Honest");
-        assert_eq!(items[1].row.track_id, "4lB6tf7G0L9YRdRI0ic675");
-
-        // Writable: a stranger's file must not reach the read-only state that
-        // exists for damage to an archive of ours.
-        record(&mut history, "after-the-migration");
-        assert_eq!(everything(&history).len(), 3);
-
-        assert!(!root.join(LEGACY_SNAPSHOT_FILE).exists());
-        assert!(
-            !root.join(PROTOTYPE_TRACKS_FILE).exists(),
-            "the prototype's metadata sidecar is dead and goes with it"
-        );
-        let journal = fs::read_to_string(root.join(JOURNAL_FILE)).unwrap();
-        assert!(!journal.contains("3TxKtkCNR1yQARsvHxvNnP"));
-
-        let reopened = ListeningHistory::new(root.clone());
-        assert_eq!(everything(&reopened).len(), 3);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn an_import_interrupted_mid_commit_keeps_the_snapshot_and_never_doubles_it() {
-        let root = scratch();
-        write_legacy_snapshot(&root, &legacy_active());
-        write_prototype_leftovers(&root);
-
-        // Interrupt the commit between the journal and the in-progress row: a
-        // directory where the sidecar belongs fails that replace the way a
-        // crash at the same instant would.
-        let blocked = root.join(ACTIVE_FILE);
-        fs::create_dir(&blocked).unwrap();
-        let stalled = ListeningHistory::new(root.clone());
-        assert!(stalled
-            .page(&HistoryQuery::default())
-            .unwrap_err()
-            .contains("read-only"));
-        assert!(
-            root.join(LEGACY_SNAPSHOT_FILE).exists(),
-            "the snapshot is the only readable copy until the commit finishes"
-        );
-        let journal = fs::read_to_string(root.join(JOURNAL_FILE)).unwrap();
-        assert_eq!(
-            journal.lines().filter(|line| !line.is_empty()).count(),
-            2,
-            "the merged archive reaches disk before anything is deleted"
-        );
-
-        fs::remove_dir(&blocked).unwrap();
-        let resumed = ListeningHistory::new(root.clone());
-        let items = everything(&resumed);
-        assert_eq!(
-            items.len(),
-            2,
-            "the retried import must not append the rows a second time"
-        );
-        assert_eq!(
-            resumed
-                .lock_core()
-                .active
-                .as_ref()
-                .map(|active| active.persisted.item.row.track_id.clone()),
-            Some("in-progress".to_owned()),
-            "the snapshot's in-progress play is durable before the snapshot goes"
-        );
-        assert!(!root.join(LEGACY_SNAPSHOT_FILE).exists());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn every_stage_of_the_import_loads_the_whole_archive() {
-        // A finished migration, to take the committed bytes from.
-        let source = scratch();
-        write_legacy_snapshot(&source, &legacy_active());
-        write_prototype_leftovers(&source);
-        drop(ListeningHistory::new(source.clone()));
-        let committed_journal = fs::read(source.join(JOURNAL_FILE)).unwrap();
-        let committed_active = fs::read(source.join(ACTIVE_FILE)).unwrap();
-
-        // Every state the import passes through, each rebuilt from scratch and
-        // opened as a cold start would open it.
-        let stages: Vec<(&str, Vec<(&str, Vec<u8>)>)> = vec![
-            ("nothing written yet", vec![]),
-            (
-                "the journal is committed, the sidecar is not",
-                vec![(JOURNAL_FILE, committed_journal.clone())],
-            ),
-            (
-                "both files are committed, the snapshot is not deleted yet",
-                vec![
-                    (JOURNAL_FILE, committed_journal.clone()),
-                    (ACTIVE_FILE, committed_active.clone()),
-                ],
-            ),
-        ];
-        for (stage, files) in stages {
-            let root = scratch();
-            write_legacy_snapshot(&root, &legacy_active());
-            write_prototype_leftovers(&root);
-            for (name, bytes) in files {
-                fs::write(root.join(name), bytes).unwrap();
-            }
-            let history = ListeningHistory::new(root.clone());
-            assert_eq!(everything(&history).len(), 2, "{stage}");
-            assert!(history.lock_core().active.is_some(), "{stage}");
-            assert!(!root.join(LEGACY_SNAPSHOT_FILE).exists(), "{stage}");
-            let _ = fs::remove_dir_all(root);
-        }
-
-        // And the state after the delete, which is every start from then on.
-        let root = scratch();
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(JOURNAL_FILE), &committed_journal).unwrap();
-        fs::write(root.join(ACTIVE_FILE), &committed_active).unwrap();
-        let history = ListeningHistory::new(root.clone());
-        assert_eq!(everything(&history).len(), 2);
-        assert!(history.lock_core().active.is_some());
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(source);
     }
 
     #[test]
     fn a_journal_that_was_never_ours_is_replaced_rather_than_fatal() {
         let root = scratch();
-        write_prototype_leftovers(&root);
+        write_prototype_journal(&root);
 
         let mut history = ListeningHistory::new(root.clone());
         assert!(
@@ -2165,7 +1844,6 @@ mod tests {
         let items = everything(&reopened);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].row.track_id, "the-first-real-play");
-        assert!(!root.join(PROTOTYPE_TRACKS_FILE).exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2211,7 +1889,7 @@ mod tests {
 
         let damaged = ListeningHistory::new(root.clone());
         assert!(damaged
-            .page(&HistoryQuery::default())
+            .reader().page(&HistoryQuery::default())
             .unwrap_err()
             .contains("read-only"));
         assert!(fs::read_to_string(root.join(JOURNAL_FILE))

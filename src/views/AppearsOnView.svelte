@@ -6,7 +6,7 @@
   } from "../lib/state.svelte.js";
   import { createCataloguePaging, sentinelLoader } from "../lib/discography.svelte.js";
   import { playAlbumById, cardPlay } from "../lib/play.js";
-  import { coverTone } from "../lib/covertone.svelte.js";
+  import { coverTone, cardTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   const artist = $derived(detail.artist);
@@ -86,8 +86,7 @@
     {#if paging.releases.length}
       <div class="grid appears-grid">
         {#each paging.releases as release (release.id)}
-          {@const tone = coverTone(release.cover_url, release.id)}
-          <div class="card" style:--tone-glow={tone.glow}>
+          <div class="card" use:cardTone={[release.cover_url, release.id]}>
             <div class="card-art">
               <Cover src={release.cover_url} id={release.id} name={release.name} fill lg />
               <button

@@ -7,7 +7,6 @@ mod media_keys;
 mod personal_api;
 mod playback_router;
 mod types;
-mod updater;
 
 use std::sync::Arc;
 
@@ -15,7 +14,7 @@ use parking_lot::Mutex;
 use tauri::Manager;
 
 use app::{
-    data_dir, load_app_settings, load_membership, load_tracks_cache, save_app_settings, AppState,
+    data_dir, load_app_settings, load_membership, load_tracks_cache, update_app_settings, AppState,
 };
 use engine_client::EngineClient;
 
@@ -52,7 +51,7 @@ fn reconcile_autostart_preference(app: &tauri::AppHandle, settings: &mut app::Ap
         return;
     }
     settings.launch_at_login = actual;
-    if let Err(error) = save_app_settings(settings) {
+    if let Err(error) = update_app_settings(|settings| settings.launch_at_login = actual) {
         log::warn(&format!(
             "could not persist launch-at-login registration state: {error}"
         ));
@@ -103,7 +102,6 @@ pub fn run() {
             commands::set_playlist_track_edit_enabled,
             commands::set_playlist_track_excluded,
             commands::search,
-            commands::browse_playlists,
             commands::browse_playlist,
             commands::hydrate_library_covers,
             commands::browse_radio,
@@ -117,7 +115,6 @@ pub fn run() {
             commands::browse_show,
             commands::browse_episode,
             commands::browse_profile,
-            commands::browse_playlist_tree,
             commands::browse_track_credits,
             commands::browse_canvas,
             commands::browse_followed_artists,
@@ -140,12 +137,9 @@ pub fn run() {
             commands::personal_api_saved_shows,
             commands::personal_api_devices,
             commands::select_output,
-            updater::check_update,
             commands::get_state,
-            commands::get_cover,
             commands::get_cache_stats,
             commands::clear_cache,
-            commands::get_app_settings,
             commands::set_audio_cache_limit,
             commands::set_launch_at_login,
             commands::set_start_minimized,
@@ -212,43 +206,16 @@ pub fn run() {
             } else {
                 log::warn("could not find the main window for media keys");
             }
-            // Re-request status shortly after startup so a state line always
-            // lands after the event consumer has subscribed, even if the
-            // engine's very first line beat it.
-            let status_client = client.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let _ = status_client
-                    .request("status", serde_json::Value::Null)
-                    .await;
-            });
 
             // Mirror engine state into AppState and the frontend.
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(commands::consume_states(app_handle));
             Ok(())
         })
-        // cover://<sha1hex> serves cached cover art bytes to <img> tags.
-        .register_uri_scheme_protocol("cover", |_context, request| {
-            // Windows serves custom schemes as `http://cover.localhost/<hex>`,
-            // where the hash is the path; elsewhere it stays `cover://<hex>`,
-            // where the hash is the host. Concatenating the two produced
-            // "cover.localhost<hex>" here, which matched no cached file — so
-            // cover art had never once resolved on Windows.
-            let uri = request.uri();
-            let path = uri.path().trim_start_matches('/');
-            let hex = if path.is_empty() {
-                uri.host().unwrap_or_default()
-            } else {
-                path
-            };
-            // A revalidation of a cover the webview already holds; the handler
-            // answers it with the tag alone rather than the picture.
-            let if_none_match = request
-                .headers()
-                .get("If-None-Match")
-                .and_then(|value| value.to_str().ok());
-            covers::serve_cover(hex, if_none_match)
+        .register_asynchronous_uri_scheme_protocol("cover", |_context, request, responder| {
+            tauri::async_runtime::spawn(async move {
+                responder.respond(covers::serve_cover(request).await);
+            });
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

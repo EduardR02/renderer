@@ -276,8 +276,6 @@ class AppDisk {
         return this.trackPlaylists(String(args.uri ?? "").trim());
       case "get_history":
         return this.history(args);
-      case "get_app_settings":
-        return this.settings();
       default:
         return null;
     }
@@ -292,11 +290,12 @@ class AppDisk {
     const saved = this.load("playback_state.json");
     if (!saved) return null;
     const list = this.library();
+    const settings = this.settings();
     const { queue = [], current_index: index = null } = saved.data;
     const current = index == null ? null : queue[index];
     const meId = list?.data.me_id ?? "";
     return {
-      savedAt: Math.max(saved.mtimeMs, list?.mtimeMs ?? 0),
+      savedAt: Math.max(saved.mtimeMs, list?.mtimeMs ?? 0, settings?.savedAt ?? 0),
       value: {
         playback: {
           ready: true,
@@ -314,12 +313,16 @@ class AppDisk {
           playback_speed: saved.data.playback_speed ?? 1,
           current_index: index,
           current_uri: current?.uri ?? "",
+          context: current?.context ?? "",
           queue,
           queue_revision: 0,
+          order_revision: 0,
           upcoming: [],
           error: "",
         },
         playlists: list?.data.playlists ?? [],
+        playlist_tree: list?.data.playlist_tree ?? [],
+        settings: settings?.value ?? {},
         me_id: meId,
       },
     };

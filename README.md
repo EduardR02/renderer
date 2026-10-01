@@ -57,16 +57,19 @@ The interface is frosted glass lit by whatever is playing: a still haze taken
 from the song's Canvas or cover. It changes with the song and costs nothing
 while the song plays.
 
-Audio is 320 kbps and gapless. Media keys work when the app isn't focused, and
-it shows up in Windows Quick Settings and on the lock screen. Played songs are
-cached, so replaying them uses no network. Podcast episodes are streamed through
-temporary seekable files, not kept in the offline audio cache. When the system's
-audio output changes, local playback follows it. It can launch at login, minimized if you want.
+Local audio is 320 kbps and gapless. Media keys work when the app isn't focused,
+and it shows up in Windows Quick Settings and on the lock screen. Played songs
+are cached, so replaying them uses no network; podcast episodes stream through
+temporary seekable files instead. The sound-device stream opens on Play, stops
+when paused or finished, and follows system output changes. It can launch at
+login, minimized if you want.
+
 Playlists can be created, renamed, deleted and reordered, and tracks added or
 removed by drag and drop or in bulk by rules (artist, album, title, length),
 with a preview of exactly which entries go. Playlists can be pinned to the top
-of the library, and folders are kept. Settings has an audio cache size limit
-and volume normalisation.
+of the library, and their folder tree restores from disk before refreshing.
+Likes update the open Liked Songs list without losing loaded pages or scroll
+position. Settings has an audio cache size limit and volume normalisation.
 
 Some extra things I added because we control playback here:
 
@@ -82,18 +85,8 @@ Canvas works, but only if you have it enabled in the real Spotify app. It's
 an account setting on their servers, not a local one, and their backend returns
 nothing at all while it's off. You still get the album cover, of course.
 
-Show pages load all resolved episode metadata before displaying the list, but
-render only the visible rows. Search matches episode titles and descriptions
-across that complete result. Episodes default to newest first; oldest first and
-title sorting are also available. Play follows the filtered, sorted order and
-skips unavailable episodes.
-
-Podcast streaming does not synchronously cache the whole episode on Play. Its
-temporary file can reserve the full logical size before those bytes arrive,
-and streaming prefetch can still download ahead, even a whole episode during
-preload or while paused. Episode files left by older versions are ignored, not
-specially deleted; they can occupy cache space until normal pruning or you
-clear the audio cache.
+Podcast lists are virtualized, with title and description search across the
+loaded show. Play follows the displayed order and skips unavailable episodes.
 
 ### Likes, follows and devices (optional)
 
@@ -110,11 +103,15 @@ developer app. It's a second authorization for the same account, not another acc
 
 Allow Spotify Connect access in Settings, then choose an output from the player
 bar. Renderer pauses local audio before starting the selected phone, speaker
-or Spotify app. New queues and playback controls use that selected output,
-and its playback state is synchronized only while it is selected. Choosing
-**This computer** pauses the remote output and restores the current queue and
-position locally, paused; press Play to resume here. No local Connect device
-ID is required.
+or Spotify app. The engine queue remains canonical: Spotify plays bounded
+windows in its order, including the device's own Next button. Queue edits keep
+the current song and position, but replacing or extending a window can rebuffer;
+Spotify offers no atomic queue replacement or gapless guarantee for those
+requests. Remote changes are checked at track boundaries or once a minute,
+backing off to two minutes when paused. **This computer** pauses the remote
+output and returns to the same local queue, order and cursor, paused. If another
+Spotify client started its own queue, Renderer shows it without replacing the
+local queue.
 
 Spotify devices play Spotify's original audio: Renderer's playback speed and
 track-editor previews require **This computer**. Device availability, Spotify
@@ -185,8 +182,13 @@ can use to control it, so close it when you're done.
 
 It has to be cheap to run while sitting open all day, so a few things follow
 from that. The playhead is animated with a transform instead of a width, so it
-doesn't force layout on every tick. Long lists are virtualized. The engine sends
-a small position update on each heartbeat rather than the whole state.
+doesn't force layout on every tick. Long lists are virtualized. Idle engine work
+is deadline-driven, with system notifications for output-device changes. Queue
+rows and upcoming order cross process boundaries only when their independent
+revisions change; omission retains the existing arrays, an empty array clears
+them. Cover URLs fetch missing artwork directly into a rebuildable disk cache.
+Card glow colours are measured on hover or focus; the artist pick waits until
+visible.
 
 The glass doesn't re-blur the window as things move. The haze is rendered once
 per song on the GPU, in a worker, and the panes show a pre-frosted copy of it,

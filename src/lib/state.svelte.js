@@ -217,8 +217,9 @@ export function setNowPlayingOpen(open) {
   }
 }
 
-/** Live preference bits used by mounted surfaces without polling Settings. */
+/** The single settings snapshot, hydrated by bootstrap and mutation replies. */
 export const appSettings = $state({ animated_canvas: true });
+export const settingsState = $state({ loaded: false });
 
 /**
  * The name the sticky top bar shows for a page that loads its own record —
@@ -259,37 +260,19 @@ export function openTrackEditor(track, playlistId = null) {
 }
 
 function applyAppSettings(value) {
-  if (value && typeof value === "object" && "animated_canvas" in value) {
-    appSettings.animated_canvas = !!value.animated_canvas;
-  }
+  if (!value || typeof value !== "object") return;
+  Object.assign(appSettings, value);
+  settingsState.loaded = true;
 }
 
-/* A panel-mount read must never overwrite a newer Settings mutation. Reads
-   begun while a write is in flight are ignored as snapshots of an undefined
-   intermediate state; the mutation reply remains authoritative. */
 let appSettingsRevision = 0;
-let appSettingsMutations = 0;
-
-function readAppSettings() {
-  const revision = appSettingsRevision;
-  const stableAtStart = appSettingsMutations === 0;
-  return invoke("get_app_settings").then((value) => {
-    if (stableAtStart && revision === appSettingsRevision) applyAppSettings(value);
-    return value;
-  });
-}
 
 function mutateAppSettings(command, args) {
   const revision = ++appSettingsRevision;
-  appSettingsMutations += 1;
-  return invoke(command, args)
-    .then((value) => {
-      if (revision === appSettingsRevision) applyAppSettings(value);
-      return value;
-    })
-    .finally(() => {
-      appSettingsMutations -= 1;
-    });
+  return invoke(command, args).then((value) => {
+    if (revision === appSettingsRevision) applyAppSettings(value);
+    return value;
+  });
 }
 
 export function focusSearch() {
@@ -317,13 +300,21 @@ export const playback = $state({
   audible_playback_speed: 1,
   current_index: -1,
   current_uri: null,
+  context: "",
   queue: [],
+  queue_revision: 0,
+  order_revision: 0,
   /* Queue indexes in the order automatic playback will actually reach them,
      current row excluded. Only the engine knows this: it holds the live
      shuffle bag and the per-playlist exclusions, so index order is a guess. */
   upcoming: [],
   error: null,
 });
+
+/** Source identity comes from the engine's active row, never queue contents. */
+export function isPlayingSource(context) {
+  return Boolean(context && playback.current_uri && playback.context === context);
+}
 let playingRequestGeneration = 0;
 let playingAuthorityGeneration = 0;
 let volumeRequestGeneration = 0;
@@ -549,6 +540,7 @@ export function positionMs() {
  * change" instead of "the queue is empty".
  */
 let queueRevision = null;
+let orderRevision = null;
 
 /**
  * The generation a payload names, or null when it names none.
@@ -565,7 +557,7 @@ let queueRevision = null;
  */
 function namedQueueRevision(value) {
   const revision = Number(value);
-  return Number.isFinite(revision) && revision !== 0 ? revision : null;
+  return Number.isSafeInteger(revision) && revision > 0 ? revision : null;
 }
 
 export function applyPlayback(payload) {
@@ -590,13 +582,21 @@ export function applyPlayback(payload) {
      consumer of a queue row — the player bar's container lookup, the plan
      derived from it, the queue view's rows — is keyed on the row object, and a
      fresh array of equal rows is a fresh set of objects to all of them. */
+  if ("output_device_id" in payload && payload.output_device_id !== playback.output_device_id) {
+    queueRevision = null;
+    orderRevision = null;
+  }
   const incomingQueue = "queue" in payload ? payload.queue : null;
   const incomingRevision = namedQueueRevision(payload.queue_revision);
   const queueHeld =
     incomingQueue === null ||
     (queueRevision !== null && incomingRevision === queueRevision);
+  const incomingOrder = "upcoming" in payload ? payload.upcoming : null;
+  const incomingOrderRevision = namedQueueRevision(payload.order_revision);
+  const orderHeld = incomingOrder === null ||
+    (orderRevision !== null && incomingOrderRevision === orderRevision);
   for (const key of Object.keys(playback)) {
-    if (key === "queue") continue;
+    if (key === "queue" || key === "upcoming") continue;
     // A full state for an older drag position must not undo the live intent.
     if (key === "volume" && volumePendingGeneration !== null) continue;
     if (key in payload) playback[key] = payload[key];
@@ -624,6 +624,10 @@ export function applyPlayback(payload) {
        a generation starts the comparison afresh rather than matching against a
        number that stands for nothing. */
     queueRevision = incomingRevision;
+  }
+  if (!orderHeld) {
+    playback.upcoming = incomingOrder;
+    orderRevision = incomingOrderRevision;
   }
   maybeStartDeferredSearch();
 }
@@ -733,7 +737,7 @@ export const library = $state([]);
  * Home's provisional shelves wait on `fresh`, so a stale snapshot can never
  * mount listening-history rows that the fresh answer immediately reshuffles.
  */
-export const libraryState = $state({ loaded: false, fresh: false });
+export const libraryState = $state({ loaded: false, fresh: false, tree: [] });
 
 // Only missing, visible rows enter this queue. Headers reuse the engine's
 // account-scoped profile metadata; the library remains the sole row store.
@@ -1111,6 +1115,7 @@ function observeSearchSession(payload) {
       // The previous account's recency must not leak into the next session's
       // Home: shelves stay hidden until the new account's own `library` event.
       libraryState.fresh = false;
+      libraryState.tree = [];
     }
   }
 
@@ -1787,7 +1792,8 @@ function activityValue(playlist) {
   return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY;
 }
 
-export function setLibrary(playlists, { fresh = false } = {}) {
+export function setLibrary(playlists, { fresh = false, tree } = {}) {
+  if (tree !== undefined) libraryState.tree = tree;
   const ordered = [...(playlists ?? [])];
   ordered.sort((left, right) => {
     const a = activityValue(left);
@@ -2065,15 +2071,17 @@ function invalidateLikedFirstPage() {
 
 export const libraryChanges = $state({ savedTracks: 0 });
 
-/**
- * The shell's membership index says Liked Songs changed — a like made here
- * (the personal app's write lands in the index at once), in another client, or
- * a change of account. The cached first page is stale, and whatever shows the
- * collection reloads on the revision.
- */
-export function savedTracksChanged() {
+const savedTracksListeners = new Set();
+export function watchSavedTracks(listener) {
+  savedTracksListeners.add(listener);
+  return () => savedTracksListeners.delete(listener);
+}
+
+/** Invalidate future first-page reads and notify mounted collections in place. */
+export function savedTracksChanged(change = null) {
   invalidateLikedFirstPage();
   libraryChanges.savedTracks++;
+  for (const listener of savedTracksListeners) listener(change);
 }
 
 /**
@@ -2094,11 +2102,6 @@ export function artistFollowChanged(artist, following) {
 
 /* ---------------- Cover resolution ---------------- */
 
-const coverCache = new Map(); // remote url -> cover:// url
-const coverPending = new Map(); // remote url -> Promise<string|null>
-
-/** Reactive counters for Settings; the Maps above are not observable. */
-export const stats = $state({ coversResolved: 0 });
 
 /**
  * Disk-backed cache usage returned by `get_cache_stats`. The backend memoises
@@ -2144,48 +2147,12 @@ export async function clearCache(kind) {
   cacheStats.covers = payload?.covers ?? null;
   cacheStats.updatedAt = Date.now();
   cacheStats.error = null;
-  if (kind === "covers") {
-    coverCache.clear();
-    coverPending.clear();
-    stats.coversResolved = 0;
-  }
   return payload;
 }
 
-/**
- * Turns the engine's `cover://<sha1>` into a URL the webview will actually
- * fetch. A bare custom scheme is not one of them: Tauri exposes custom
- * protocols as `http://<scheme>.localhost/<path>` on Windows and
- * `<scheme>://localhost/<path>` elsewhere, and `convertFileSrc` is what picks
- * the right shape. Handing `<img>` the raw `cover://` url fails silently on
- * every platform, which is why cover art had never rendered.
- */
-function toLocalUrl(coverUrl) {
-  if (!coverUrl) return null;
-  if (coverUrl.startsWith("http")) return coverUrl;
-  return convertFileSrc(coverUrl.replace(/^cover:\/\//, ""), "cover");
-}
-
-export async function resolveCoverUrl(url) {
-  if (!url) return null;
-  if (url.startsWith("cover://") || url.startsWith("http://cover.")) return toLocalUrl(url);
-  const hit = coverCache.get(url);
-  if (hit) return hit;
-  const inflight = coverPending.get(url);
-  if (inflight) return inflight;
-  const p = invoke("get_cover", { url })
-    .then((u) => {
-      const local = toLocalUrl(u);
-      if (local) {
-        coverCache.set(url, local);
-        stats.coversResolved = coverCache.size;
-      }
-      return local;
-    })
-    .catch(() => null)
-    .finally(() => coverPending.delete(url));
-  coverPending.set(url, p);
-  return p;
+/** The image request itself fetches and caches missing artwork. */
+export function coverUrl(url) {
+  return url ? convertFileSrc(url, "cover") : "";
 }
 
 /* ---------------- Commands (exact contract names) ---------------- */
@@ -2416,21 +2383,18 @@ export const api = {
   browseTrackCredits: (id) => invoke("browse_track_credits", { id }),
   browseCanvas: (id) => invoke("browse_canvas", { id }),
   getCacheStats: () => invoke("get_cache_stats"),
-  getAppSettings: readAppSettings,
   /** Explicit Settings-only cache wipe; returns fresh audio/covers stats. */
   clearCache: (kind) => invoke("clear_cache", { kind }),
-  setAudioCacheLimit: (mb) => invoke("set_audio_cache_limit", { mb }),
+  setAudioCacheLimit: (mb) => mutateAppSettings("set_audio_cache_limit", { mb }),
   setNormalisation: (enabled) =>
     mutateAppSettings("set_normalisation", { enabled: !!enabled }),
-  setLaunchAtLogin: (enabled) => invoke("set_launch_at_login", { enabled: !!enabled }),
-  setStartMinimized: (enabled) => invoke("set_start_minimized", { enabled: !!enabled }),
+  setLaunchAtLogin: (enabled) => mutateAppSettings("set_launch_at_login", { enabled: !!enabled }),
+  setStartMinimized: (enabled) => mutateAppSettings("set_start_minimized", { enabled: !!enabled }),
   setAnimatedCanvas: (enabled) =>
     mutateAppSettings("set_animated_canvas", { enabled: !!enabled }),
-  browsePlaylists: () => invoke("browse_playlists"),
   browseShow: (id) => invoke("browse_show", { id }),
   browseEpisode: (id) => invoke("browse_episode", { id }),
   browseProfile: (username) => invoke("browse_profile", { username }),
-  browsePlaylistTree: (length = 1000) => invoke("browse_playlist_tree", { length }),
   /**
    * The collection is walked by cursor; only the first page is deduplicated and
    * kept for a moment (see [`browseLikedFirstPage`]). Later pages belong to the
@@ -2455,7 +2419,6 @@ export const api = {
     invoke("remove_playlist_tracks", { id, uris, expectedSnapshotId }),
   reorderPlaylistTracks: (id, from, to) =>
     invoke("reorder_playlist_tracks", { id, from, to }),
-  status: () => invoke("status"),
   login: () => invoke("login"),
   logout: () => invoke("logout"),
   getState: () => invoke("get_state"),
@@ -2726,7 +2689,7 @@ export async function initEvents() {
     // Owned-playlist index updates repaint the saved check but cannot change
     // personal Liked membership or invalidate its cached first page.
     ["memberships_changed", (e) => {
-      if (e.payload?.saved_tracks) savedTracksChanged();
+      if (e.payload?.saved_tracks) savedTracksChanged(e.payload);
     }],
     // Disk hydration is useful for the sidebar and detail routes, but must
     // never promote Home past its fresh-rootlist loading frame. If a cache
@@ -2734,13 +2697,13 @@ export async function initEvents() {
     ["library_cached", (e) => {
       if (libraryState.fresh) return;
       libraryEvents += 1;
-      setLibrary(e.payload);
+      setLibrary(e.payload.playlists, { tree: e.payload.playlist_tree });
     }],
     // The one authoritative rootlist answer; the only writer that promotes
     // `libraryState.fresh` (a completed play may also, via promotePlaylist).
     ["library", (e) => {
       libraryEvents += 1;
-      setLibrary(e.payload, { fresh: true });
+      setLibrary(e.payload.playlists, { fresh: true, tree: e.payload.playlist_tree });
     }],
     // A mutation's refreshed summary patches the one library row it names;
     // full rootlist answers still arrive as `library`.
@@ -2770,9 +2733,11 @@ export async function initEvents() {
   const positionAtPull = positionEvents;
   const sessionAtPull = sessionEvents;
   const libraryAtPull = libraryEvents;
+  const settingsAtPull = appSettingsRevision;
   api
     .getState()
     .then((payload) => {
+      if (settingsAtPull === appSettingsRevision) applyAppSettings(payload.settings);
       if (stateEvents === stateAtPull) {
         let snapshot = payload?.playback ?? payload;
         if (snapshot && (
@@ -2797,7 +2762,7 @@ export async function initEvents() {
         // A cached event may arrive during the pull even though the rootlist
         // already completed before subscriptions. Do not let that event keep
         // Home in the loading frame; a newer fresh event wins on its own.
-        setLibrary(payload.playlists, { fresh: payload.library_fresh === true });
+        setLibrary(payload.playlists, { fresh: payload.library_fresh === true, tree: payload.playlist_tree });
       }
     })
     .catch(() => {});

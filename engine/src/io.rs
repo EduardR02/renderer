@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use renderer_engine::protocol::Request;
+use renderer_engine::protocol::{BrowseResponse, Request};
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
@@ -40,6 +40,38 @@ impl ProtocolWriter {
             .write_all(b"\n")
             .and_then(|_| output.flush())
             .map_err(|error| format!("could not write protocol message: {error}"))
+    }
+
+    /// Sends a typed `browse_*` response: `data` carries the payload on
+    /// success, error text only on failure. `kind` must match the command
+    /// name so the UI can route the response.
+    pub fn send_browse<T: Serialize>(
+        &self,
+        request_id: &str,
+        kind: &'static str,
+        result: &Result<T, String>,
+    ) -> Result<(), String> {
+        let (ok, error, data) = match result {
+            Ok(data) => (true, None, Some(data)),
+            Err(error) => (false, Some(error.as_str()), None),
+        };
+        self.send(&BrowseResponse { kind, request_id, ok, error, data })
+    }
+
+    /// Sends an `edit_*` response for a void edit: `ok`/`error` only, with no
+    /// `data` payload on success (the UI routes these like browse responses
+    /// but has nothing to parse).
+    pub fn send_edit(
+        &self,
+        request_id: &str,
+        kind: &'static str,
+        result: &Result<(), String>,
+    ) -> Result<(), String> {
+        let (ok, error) = match result {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error.as_str())),
+        };
+        self.send(&BrowseResponse::<()> { kind, request_id, ok, error, data: None })
     }
 }
 

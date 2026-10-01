@@ -516,16 +516,13 @@ fn retry_restore_plan(pending: &mut Option<RestorePlan>) -> Option<Duration> {
     Some(restore_retry_delay(plan.attempts))
 }
 
-/// Whether a payload carried its queue rows.
-///
-/// A fact about the wire, not about the parsed fields: the engine sends
-/// `queue` and `upcoming` only for a generation it has not handed over yet,
-/// and an omitted pair deserializes to the same two empty vectors an empty
-/// queue does. Losing the bit turns "the engine is still playing the rows you
-/// hold" into "the queue is empty".
+/// Which independent array lanes were present on the wire. Empty is data;
+/// omission is a delta referring to the named revision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PayloadRows {
     Sent,
+    QueueOnly,
+    OrderOnly,
     Omitted,
 }
 
@@ -544,28 +541,16 @@ enum DeltaAdoption {
     Unresolvable { revision: u64 },
 }
 
-/// The wire delta base: the rows of the newest payload that carried a queue,
-/// keyed by the revision it named.
+/// Independent wire bases for queue rows and upcoming order.
 ///
-/// Deliberately not the same thing as the client's `last_state`, which is the
-/// *durability* half of those payloads. Preview states and crash-restore
-/// intermediates are never installed there — a draft must not overwrite the
-/// crash snapshot, and a state the restore gate has not matched yet is not
-/// what the next process should resume — yet their rows are exactly what the
-/// payloads after them lean on. The sharp case is a crash resume: the engine
-/// restores the queue paused (a full state that cannot match `resume_playing`,
-/// so it is not adopted either), then the `Play` that follows changes no
-/// revision and therefore travels without rows. A base that dropped the
-/// restored rows turns that `Play` into an emptied queue: the restore gate
-/// never matches again, the window loses the rows, media keys read Stopped and
-/// the writer is handed the emptiness as the live queue. Following the wire
-/// instead of the durability policy is what makes [`DeltaAdoption::Fill`]
-/// total.
+/// Kept apart from `last_state`: previews and crash-restore intermediates are
+/// not durable state, but subsequent deltas still refer to their arrays.
 #[derive(Debug, Default)]
 struct DeltaBase {
     /// The revision the retained rows belong to, or `None` before a payload
     /// has carried any.
     revision: Option<u64>,
+    order_revision: Option<u64>,
     queue: Vec<Track>,
     upcoming: Vec<usize>,
     /// The revision whose missing rows the engine was already asked to
@@ -576,41 +561,25 @@ struct DeltaBase {
 impl DeltaBase {
     /// Decides how `state` gets its queue, and records the base it leaves.
     fn adopt(&mut self, state: &PlaybackState, rows: PayloadRows) -> DeltaAdoption {
-        match rows {
-            PayloadRows::Sent => {
-                self.retain(state);
-                DeltaAdoption::AsSent
-            }
-            PayloadRows::Omitted => {
-                if state.queue_revision != 0 && self.revision == Some(state.queue_revision) {
-                    DeltaAdoption::Fill {
-                        queue: self.queue.clone(),
-                        upcoming: self.upcoming.clone(),
-                    }
-                } else {
-                    DeltaAdoption::Unresolvable {
-                        revision: state.queue_revision,
-                    }
-                }
-            }
+        let sent_queue = matches!(rows, PayloadRows::Sent | PayloadRows::QueueOnly);
+        let sent_order = matches!(rows, PayloadRows::Sent | PayloadRows::OrderOnly);
+        if !sent_queue && (state.queue_revision == 0 || self.revision != Some(state.queue_revision)) {
+            return DeltaAdoption::Unresolvable { revision: state.queue_revision };
         }
-    }
-
-    /// Retains the rows a payload carried as the base for its revision.
-    ///
-    /// Revision `0` is the pre-revision payload — "assume changed", see
-    /// `PlaybackState::queue_revision` — and is never retained: a base keyed
-    /// on it would replace the second of two explicit revision-0 queues with
-    /// the first, and a revision-0 engine sends its rows with every state
-    /// anyway, which is what "assume changed" means.
-    fn retain(&mut self, state: &PlaybackState) {
-        if state.queue_revision == 0 {
-            return;
+        if !sent_order && (state.order_revision == 0 || self.order_revision != Some(state.order_revision)) {
+            return DeltaAdoption::Unresolvable { revision: state.order_revision };
         }
-        self.revision = Some(state.queue_revision);
-        self.queue = state.queue.clone();
-        self.upcoming = state.upcoming.clone();
+        if sent_queue {
+            self.revision = (state.queue_revision != 0).then_some(state.queue_revision);
+            self.queue.clone_from(&state.queue);
+        }
+        if sent_order {
+            self.order_revision = (state.order_revision != 0).then_some(state.order_revision);
+            self.upcoming.clone_from(&state.upcoming);
+        }
         self.resynced = None;
+        if sent_queue && sent_order { DeltaAdoption::AsSent }
+        else { DeltaAdoption::Fill { queue: self.queue.clone(), upcoming: self.upcoming.clone() } }
     }
 
     /// Records that the missing rows of `revision` are being re-requested,
@@ -704,6 +673,9 @@ impl EngineClient {
     pub fn subscribe_lines(&self) -> tokio::sync::broadcast::Receiver<StateLine> {
         self.state_tx.subscribe()
     }
+
+    /// The reader's canonical snapshot, fresher than the UI's asynchronous copy.
+    pub fn current_state(&self) -> Option<PlaybackState> { self.last_state.lock().clone() }
 
     /// Starts the pending startup/crash restore exactly once, after a fresh
     /// engine reports that authentication is ready. Preview leases are kept
@@ -1206,6 +1178,12 @@ impl EngineClient {
         result
     }
 
+    /// Align a paused canonical occurrence without replacing its rows or order.
+    pub async fn set_queue_cursor(&self, index: usize, position_ms: u32) -> Result<(), String> {
+        self.request("set_queue_cursor", json!({ "index": index, "position_ms": position_ms }))
+            .await.map(|_| ())
+    }
+
     pub async fn play_queue_index(&self, index: usize) -> Result<(), String> {
         let result = self
             .request("play_queue_index", json!({"index": index}))
@@ -1354,15 +1332,6 @@ impl EngineClient {
     // Browse / edit requests (typed payloads from `data`)
     // ------------------------------------------------------------------
 
-    pub async fn browse_playlists(
-        &self,
-        length: usize,
-    ) -> Result<Vec<renderer_engine::protocol::PlaylistRef>, String> {
-        let reply = self
-            .request("browse_playlists", json!({"length": length}))
-            .await?;
-        parse_data(reply, "browse_playlists")
-    }
 
     pub async fn browse_playlist_tree(
         &self,
@@ -1415,6 +1384,20 @@ impl EngineClient {
     ) -> Result<renderer_engine::protocol::PlaylistBrowse, String> {
         let reply = self.request("browse_playlist", json!({"id": id})).await?;
         parse_data(reply, "browse_playlist")
+    }
+
+    pub async fn browse_playlist_membership(
+        &self,
+        id: &str,
+    ) -> Result<renderer_engine::protocol::PlaylistMembership, String> {
+        parse_data(self.request("browse_playlist_membership", json!({"id": id})).await?, "browse_playlist_membership")
+    }
+
+    pub async fn queue_metadata(
+        &self,
+        context: Option<&str>,
+    ) -> Result<renderer_engine::protocol::QueueMetadata, String> {
+        parse_data(self.request("queue_metadata", json!({"context": context})).await?, "queue_metadata")
     }
 
     pub async fn browse_radio(
@@ -1691,10 +1674,15 @@ impl EngineClient {
 
         let line = build_line(&self.next_request_id(), "shutdown", Value::Null);
         let _ = self.write_line(&line);
-        std::thread::sleep(Duration::from_millis(400));
         if let Some(mut child) = self.process.lock().take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                    _ => { let _ = child.kill(); let _ = child.wait(); break; }
+                }
+            }
         }
         *self.stdin.lock() = None;
 
@@ -1813,17 +1801,8 @@ impl EngineClient {
         // observed the engine in preview mode. An unrelated false state
         // arriving before activation must not clear a freshly claimed lease.
         let was_preview = self.preview_active.swap(state.preview, Ordering::AcqRel);
-        // A state line carries the queue only when the queue it describes has
-        // changed: the engine drops `queue` and `upcoming` and leaves the
-        // revision behind. Merge the retained rows back in before anything
-        // compares, stores or forwards this state — the restore gate, the
-        // durable snapshot and the window all describe one queue, and an
-        // omitted queue must never read as an emptied one. (The persistence
-        // comparison would call that a queue edit, and write it to disk.)
-        //
-        // The rows come from the wire base, which every payload carrying rows
-        // installs whatever the durability filter below decides about the
-        // state as a whole.
+        // Fill independently omitted arrays before restoring, persisting or
+        // publishing the state. Explicit empty arrays are never filled.
         let adoption = self.delta_base.lock().adopt(state, rows);
         let merged;
         let state = match adoption {
@@ -2202,14 +2181,11 @@ struct VolumeLine {
 fn parse_line(value: Value) -> Option<Line> {
     match value.get("type").and_then(Value::as_str) {
         Some("state") => {
-            // Whether the rows are on the wire has to be read off the raw
-            // object: once parsed, an omitted `queue` and an empty one are the
-            // same two empty vectors. The engine omits the pair exactly when
-            // the revision is one it has already handed over.
-            let rows = if value.get("queue").is_some() {
-                PayloadRows::Sent
-            } else {
-                PayloadRows::Omitted
+            let rows = match (value.get("queue").is_some(), value.get("upcoming").is_some()) {
+                (true, true) => PayloadRows::Sent,
+                (true, false) => PayloadRows::QueueOnly,
+                (false, true) => PayloadRows::OrderOnly,
+                (false, false) => PayloadRows::Omitted,
             };
             match serde_json::from_value::<PlaybackState>(value) {
                 Ok(state) => Some(Line::State { state, rows }),
@@ -2331,6 +2307,30 @@ fn locate_engine() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_only_deltas_advance_duplicate_occurrences_without_erasing_rows() {
+        let rows = vec![
+            Track { id: "same".into(), uri: "spotify:track:same".into(), ..Track::default() },
+            Track { id: "same".into(), uri: "spotify:track:same".into(), ..Track::default() },
+        ];
+        let initial = PlaybackState { auth_state: "ready".into(), queue: rows.clone(),
+            queue_revision: 11, order_revision: 21, upcoming: vec![1], current_index: Some(0), ..PlaybackState::default() };
+        let client = client_with_last_state(initial.clone());
+        let update = PlaybackState { queue: Vec::new(), upcoming: Vec::new(), order_revision: 22,
+            current_index: Some(1), position_ms: 500, ..initial };
+        client.on_state(&update, PayloadRows::OrderOnly);
+        let state = client.current_state().unwrap();
+        assert_eq!(state.queue, rows);
+        assert_eq!(state.current_index, Some(1));
+        assert!(state.upcoming.is_empty());
+        let heartbeat = PlaybackState { queue: Vec::new(), position_ms: 1000, ..state };
+        client.on_state(&heartbeat, PayloadRows::Omitted);
+        let state = client.current_state().unwrap();
+        assert_eq!(state.queue, rows);
+        assert!(state.upcoming.is_empty());
+        assert_eq!(state.position_ms, 1000);
+    }
 
     /// An `EngineClient` with no live engine process, for unit tests of the
     /// reader-side callbacks.
@@ -2688,6 +2688,7 @@ mod tests {
         state.ready = true;
         state.auth_state = "ready".to_owned();
         state.queue_revision = 41;
+        state.order_revision = 41;
         state.queue = vec![Track {
             id: "kept".to_owned(),
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
@@ -2702,6 +2703,7 @@ mod tests {
         resumed.ready = true;
         resumed.auth_state = "ready".to_owned();
         resumed.queue_revision = 41;
+        resumed.order_revision = 41;
         resumed.playing = true;
         resumed.position_ms = 12_000;
         client.on_state(&resumed, PayloadRows::Omitted);
@@ -2722,6 +2724,7 @@ mod tests {
         // empty array is authoritative rather than an omission.
         let mut emptied = state.clone();
         emptied.queue_revision = 42;
+        emptied.order_revision = 42;
         emptied.queue = Vec::new();
         emptied.current_index = None;
         emptied.upcoming = Vec::new();
@@ -2748,6 +2751,7 @@ mod tests {
         previous.auth_state = "ready".to_owned();
         previous.playing = true;
         previous.queue_revision = 7;
+        previous.order_revision = 7;
         previous.queue = vec![Track {
             id: "restored".to_owned(),
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
@@ -2769,6 +2773,7 @@ mod tests {
         // `restore_queue` landed: the restored queue is published paused.
         let mut restored = previous.clone();
         restored.queue_revision = 8;
+        restored.order_revision = 8;
         restored.playing = false;
         client.on_state(&restored, PayloadRows::Sent);
         assert!(
@@ -2815,6 +2820,7 @@ mod tests {
         real.auth_state = "ready".to_owned();
         real.playing = true;
         real.queue_revision = 12;
+        real.order_revision = 12;
         real.queue = vec![Track {
             id: "real".to_owned(),
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
@@ -2828,6 +2834,7 @@ mod tests {
         let mut preview = real.clone();
         preview.preview = true;
         preview.queue_revision = 13;
+        preview.order_revision = 13;
         preview.queue = vec![Track {
             id: "draft".to_owned(),
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
@@ -3148,7 +3155,7 @@ mod tests {
         assert!(matches!(
             state,
             Some(Line::State {
-                rows: PayloadRows::Sent,
+                rows: PayloadRows::QueueOnly,
                 ..
             })
         ));
@@ -3759,7 +3766,7 @@ mod tests {
         assert_eq!(after_status.auth_state, first.auth_state);
 
         // Browse without a session fails cleanly through the reply channel.
-        let error = client.browse_playlists(10).await;
+        let error = client.browse_playlist_tree(10).await;
         assert!(error.is_err(), "browse without a session must fail cleanly");
 
         client.shutdown_engine();

@@ -6,7 +6,7 @@ import { expect, test } from "bun:test";
    module is evaluated. */
 globalThis.$state = (value) => value;
 
-const { applyPlayback, detail, playback } = await import("./state.svelte.js");
+const { applyPlayback, detail, playback, isPlayingSource } = await import("./state.svelte.js");
 
 function track(id, cached = false) {
   return { id, uri: `spotify:track:${id}`, name: `Track ${id}`, duration_ms: 180_000, cached };
@@ -91,4 +91,55 @@ test("revision 0 names no generation, so it is never matched", () => {
   applyPlayback({ queue: [track("a")], queue_revision: 0, current_index: 0 });
   applyPlayback({ queue: [track("b")], queue_revision: 0, current_index: 0 });
   expect(playback.queue.map((row) => row.id)).toEqual(["b"]);
+});
+
+test("shared songs and equal queues never substitute for exact playback source identity", () => {
+  applyPlayback({ queue: [track("shared")], current_uri: "spotify:track:shared", context: "playlist:one" });
+  expect(isPlayingSource("playlist:one")).toBe(true);
+  expect(isPlayingSource("playlist:two")).toBe(false);
+  expect(isPlayingSource("album:one")).toBe(false);
+  applyPlayback({ context: "playlist:two" });
+  expect(isPlayingSource("playlist:one")).toBe(false);
+  expect(isPlayingSource("playlist:two")).toBe(true);
+  applyPlayback({ current_uri: null, context: "" });
+  expect(isPlayingSource("playlist:two")).toBe(false);
+  expect(isPlayingSource("")).toBe(false);
+});
+
+test("device authority changes adopt their queue even when revision numbers coincide", () => {
+  applyPlayback({ output_device_id: "local", queue: [track("local")], queue_revision: 71 });
+  const local = playback.queue;
+  applyPlayback({ output_device_id: "remote", queue: [track("remote")], queue_revision: 71 });
+  expect(playback.queue).not.toBe(local);
+  expect(playback.queue.map((row) => row.id)).toEqual(["remote"]);
+  applyPlayback({ output_device_id: "local", queue: [track("local")], queue_revision: 71 });
+  expect(playback.queue.map((row) => row.id)).toEqual(["local"]);
+});
+
+test("transport omissions retain both arrays while order-only changes keep row identity", () => {
+  applyPlayback({ output_device_id: "", queue: [track("a"), track("b"), track("a")],
+    queue_revision: 100, upcoming: [1, 2], order_revision: 50, current_index: 0 });
+  const rows = playback.queue;
+  const order = playback.upcoming;
+  applyPlayback({ queue_revision: 100, order_revision: 50, position_ms: 1234 });
+  expect(playback.queue).toBe(rows);
+  expect(playback.upcoming).toBe(order);
+  applyPlayback({ queue_revision: 100, upcoming: [2], order_revision: 51, current_index: 1 });
+  expect(playback.queue).toBe(rows);
+  expect(playback.upcoming).toEqual([2]);
+  expect(playback.current_index).toBe(1);
+  applyPlayback({ upcoming: [], order_revision: 52 });
+  expect(playback.upcoming).toEqual([]);
+  expect(playback.queue).toBe(rows);
+});
+
+test("foreign adjacent revisions stay exact and update their duplicate occurrences", () => {
+  const first = 2 ** 53 - 3;
+  applyPlayback({ output_device_id: "phone", queue: [track("a"), track("a")], queue_revision: first,
+    upcoming: [1], order_revision: first, current_index: 0 });
+  applyPlayback({ queue: [track("a"), track("b")], queue_revision: first + 1,
+    upcoming: [], order_revision: first + 1, current_index: 1 });
+  expect(playback.queue.map((row) => row.id)).toEqual(["a", "b"]);
+  expect(playback.upcoming).toEqual([]);
+  expect(playback.current_index).toBe(1);
 });

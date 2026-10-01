@@ -1,5 +1,5 @@
-import { expect, setSystemTime, test } from "bun:test";
-import { boundedMisses, boundedReads } from "./cover-work.js";
+import { expect, test } from "bun:test";
+import { boundedReads } from "./cover-work.js";
 
 const step = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -76,69 +76,3 @@ test("a reader that throws still lets the queue drain", async () => {
   expect(await read("good", "good")).toBe("good");
 });
 
-test("one empty answer does not condemn a url, two in a row do", () => {
-  const misses = boundedMisses(4);
-  expect(misses.dead("a")).toBe(false);
-
-  misses.miss("a");
-  // A momentary failure must not hide the cover for the rest of the session:
-  // the next tile to show this url still asks for it.
-  expect(misses.dead("a")).toBe(false);
-  expect(misses.dead("b")).toBe(false);
-
-  misses.miss("a");
-  // The same answer twice in a row is the url's, not the network's.
-  expect(misses.dead("a")).toBe(true);
-  expect(misses.dead("b")).toBe(false);
-});
-
-test("an answer that carried a url wipes the empty ones before it", () => {
-  const misses = boundedMisses(4);
-  misses.miss("a");
-  misses.miss("a");
-  expect(misses.dead("a")).toBe(true);
-
-  misses.resolved("a");
-  expect(misses.dead("a")).toBe(false);
-  // ...so the next empty answer is measured on its own again.
-  misses.miss("a");
-  expect(misses.dead("a")).toBe(false);
-});
-
-test("the miss memory drops its oldest urls", () => {
-  const misses = boundedMisses(2);
-  misses.miss("a");
-  misses.miss("a");
-  misses.miss("b");
-  misses.miss("b");
-  expect(misses.dead("a")).toBe(true);
-
-  misses.miss("c");
-  misses.miss("c");
-  expect(misses.dead("a")).toBe(false);
-  expect(misses.dead("b")).toBe(true);
-  expect(misses.dead("c")).toBe(true);
-});
-
-test("empty answers stop standing once they are old", () => {
-  setSystemTime(new Date("2026-01-01T00:00:00Z"));
-  try {
-    const misses = boundedMisses(4);
-    misses.miss("a");
-    misses.miss("a");
-    expect(misses.dead("a")).toBe(true);
-
-    // An outage long enough to answer empty twice is still an outage: half a
-    // minute later the url is asked for again instead of being hidden for the
-    // rest of the session.
-    setSystemTime(new Date("2026-01-01T00:00:31Z"));
-    expect(misses.dead("a")).toBe(false);
-
-    // A fresh pair of empty answers starts the silence over.
-    misses.miss("a");
-    misses.miss("a");
-    expect(misses.dead("a")).toBe(true);
-  } finally {
-    setSystemTime();
-  }
-});

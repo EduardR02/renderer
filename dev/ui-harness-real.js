@@ -81,6 +81,7 @@ export async function createRealMode(h) {
   const bootSource = available ? boot.source : "none";
   const real = available ? boot.value : { playback: {}, playlists: [], me_id: "" };
   const library = real.playlists ?? [];
+  const tree = real.playlist_tree ?? [];
   const meId = real.me_id ?? "";
   /** Where each command's last answer came from: live, cache, disk or mock. */
   const sources = {};
@@ -119,7 +120,7 @@ export async function createRealMode(h) {
   if (playback.shuffle && seeded.upcoming?.length) h.shuffleBag.set([...seeded.upcoming].reverse());
   else h.redrawShuffleBag();
 
-  Object.assign(settings, (await bridge("get_app_settings")).value ?? {});
+  Object.assign(settings, real.settings ?? {});
 
   function current() {
     return playback.queue[playback.current_index] ?? null;
@@ -174,16 +175,7 @@ export async function createRealMode(h) {
   async function invoke(cmd, args = {}) {
     switch (cmd) {
       case "get_state":
-        return { playback: h.snapshot(), playlists: clone(library), me_id: meId };
-      case "browse_playlists":
-        return clone(library);
-      // Read once at boot; local writes (the canvas toggle) must win after.
-      case "get_app_settings":
-        return clone(settings);
-      case "get_cover": {
-        const url = String(args.url ?? "");
-        return /^https?:/.test(url) ? url : null;
-      }
+        return { playback: h.snapshot(), playlists: clone(library), playlist_tree: clone(tree), settings: clone(settings), me_id: meId };
       case "play_queue": {
         playback.queue = Array.isArray(args.queue)
           ? args.queue.map((track) => ({ ...clone(track), context: track.context || args.context || "" }))
@@ -365,5 +357,5 @@ export async function createRealMode(h) {
     emit,
   };
 
-  return { invoke, library, openScene, helpers };
+  return { invoke, library, tree, openScene, helpers };
 }

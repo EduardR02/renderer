@@ -80,12 +80,6 @@
     };
   });
 
-  /* Settings is loaded on panel mount, not polled. `api` mirrors the result
-     into the shared preference bit, so turning Canvas off in Settings takes
-     the video away at once. */
-  $effect(() => {
-    api.getAppSettings().catch(() => {});
-  });
 
   /** No Canvas for this record: the cover is the picture. */
   function dropCanvas() {

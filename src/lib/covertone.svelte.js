@@ -27,7 +27,7 @@
    fixed dark lightness and a real chroma never does that.
    ===================================================================== */
 
-import { resolveCoverUrl } from "./state.svelte.js";
+import { coverUrl } from "./state.svelte.js";
 import { boundedReads } from "./cover-work.js";
 import { warpHue, clayOf } from "./haze.js";
 
@@ -364,11 +364,7 @@ export function coverTone(covers, seed = "") {
   if (pool.length && !inflight.has(key)) {
     inflight.add(key);
     Promise.all(
-      pool.map((url) =>
-        resolveCoverUrl(url)
-          .then((local) => (local ? readHueOnce(url, local) : null))
-          .catch(() => null),
-      ),
+      pool.map((url) => readHueOnce(url, coverUrl(url)).catch(() => null)),
     )
       .then((found) => {
         /* `null` never got looked at, `"mono"` was looked at and had no colour
@@ -391,4 +387,33 @@ export function coverTone(covers, seed = "") {
       .finally(() => inflight.delete(key));
   }
   return identityTone(seed || key);
+}
+
+/** Lazy card colour: pointer/focus, or visibility for an always-coloured pick. */
+export function cardTone(node, initial) {
+  let source = $state(initial);
+  let active = $state(false);
+  const activate = () => { active = true; };
+  node.addEventListener("pointerenter", activate, { once: true });
+  node.addEventListener("focusin", activate, { once: true });
+  const observer = initial[2] ? new IntersectionObserver(([entry]) => {
+    if (!entry.isIntersecting) return;
+    activate();
+    observer.disconnect();
+  }, { rootMargin: "120px" }) : null;
+  observer?.observe(node);
+  $effect(() => {
+    if (!active) return;
+    const tone = coverTone(source[0], source[1]);
+    node.style.setProperty("--tone-glow", tone.glow);
+    node.style.setProperty("--tone-wash", tone.wash);
+  });
+  return {
+    update(value) { source = value; },
+    destroy() {
+      node.removeEventListener("pointerenter", activate);
+      observer?.disconnect();
+      node.removeEventListener("focusin", activate);
+    },
+  };
 }

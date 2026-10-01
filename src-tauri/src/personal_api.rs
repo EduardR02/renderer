@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use url::Url;
 
-use crate::app::{load_app_settings, save_app_settings, AppSettings, AppState};
+use crate::app::{load_app_settings, update_app_settings, AppSettings, AppState};
 
 const REDIRECT: &str = "http://127.0.0.1:5589/personal-api/callback";
 const VAULT_SERVICE: &str = "SpotifyRenderer.PersonalApi";
@@ -279,29 +279,52 @@ fn validate_uris(uris: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn spotify_error(status: StatusCode) -> String {
+const RATE_LIMITED: &str = "Spotify rate limited this operation; try again later";
+const UNAVAILABLE: &str = "Spotify is temporarily unavailable; try again later";
+pub(crate) const UNREACHABLE: &str = "Spotify Web API is unreachable";
+
+pub(crate) fn spotify_error(status: StatusCode) -> String {
     match status.as_u16() {
         401 => "Spotify authorization expired; reconnect the developer app".to_owned(),
         403 => "Spotify denied this operation (permission, subscription, or Developer Mode restriction)".to_owned(),
-        429 => "Spotify rate limited this operation; try again later".to_owned(),
-        500..=599 => "Spotify is temporarily unavailable; try again later".to_owned(),
+        429 => RATE_LIMITED.to_owned(),
+        500..=599 => UNAVAILABLE.to_owned(),
         code => format!("Spotify request failed (HTTP {code})"),
     }
 }
 
-fn api_request(http: &Client, token: &str, method: Method, url: Url, body: Option<serde_json::Value>) -> reqwest::RequestBuilder {
-    let needs_length = method == Method::PUT;
+/// A failure that says nothing about the request itself: retrying it later
+/// can succeed.
+pub(crate) fn is_transient(error: &str) -> bool {
+    matches!(error, RATE_LIMITED | UNAVAILABLE | UNREACHABLE)
+}
+
+/// A player answer: `None` for an empty body (204 means nothing is playing).
+pub(crate) async fn read_player_response(response: reqwest::Response) -> Result<Option<serde_json::Value>, String> {
+    if response.status() == StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    let bytes = response.bytes().await.map_err(|_| UNREACHABLE.to_owned())?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| "Spotify returned an invalid player response".to_owned())
+}
+
+pub(crate) fn api_request(http: &Client, token: &str, method: Method, url: Url, body: Option<serde_json::Value>) -> reqwest::RequestBuilder {
+    let needs_length = method == Method::PUT || method == Method::POST;
     let mut request = http.request(method, url).bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
     } else if needs_length {
-        // Query-only library writes still need explicit empty-body framing.
+        // Query-only writes (library, player next/queue) still need explicit
+        // empty-body framing.
         request = request.header(reqwest::header::CONTENT_LENGTH, 0);
     }
     request
 }
 
-fn player_path(device_id: &str, endpoint: &str, query: &[(&str, String)]) -> Result<String, String> {
+pub(crate) fn player_path(device_id: &str, endpoint: &str, query: &[(&str, String)]) -> Result<String, String> {
     if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
         return Err("invalid Spotify device ID".to_owned());
     }
@@ -366,8 +389,7 @@ impl PersonalApi {
         let mut settings = load_app_settings();
         if settings.personal_client_id != client_id {
             self.disconnect_locked(app)?;
-            settings.personal_client_id = client_id.to_owned();
-            save_app_settings(&settings)?;
+            settings = update_app_settings(|settings| settings.personal_client_id = client_id.to_owned())?;
             emit(app, &self.session.lock());
         }
         Ok(app_status(app, &self.session.lock(), &settings))
@@ -549,7 +571,7 @@ impl PersonalApi {
         }
         self.check_active_grant(app)?;
         let response = api_request(&self.http, &token, method, url, body).send().await
-            .map_err(|_| "Spotify Web API is unreachable".to_owned())?;
+            .map_err(|_| UNREACHABLE.to_owned())?;
         if !response.status().is_success() {
             return Err(spotify_error(response.status()));
         }
@@ -599,38 +621,13 @@ impl PersonalApi {
         Ok(devices.devices)
     }
 
-    pub async fn transfer(&self, app: &AppHandle, device_id: String, play: bool) -> Result<(), String> {
-        if device_id.is_empty() || device_id.len() > 256 || device_id.chars().any(char::is_control) {
-            return Err("invalid Spotify device ID".to_owned());
-        }
+    /// One Spotify Connect request under the device grant. The playback router
+    /// builds the path: transport writes name the selected device (see
+    /// [`player_path`]), never Spotify's account-wide active session.
+    pub async fn player(&self, app: &AppHandle, method: Method, path: &str, body: Option<serde_json::Value>) -> Result<Option<serde_json::Value>, String> {
         let _operation = self.operation.lock().await;
-        self.request(app, true, Method::PUT, "me/player", None, Some(serde_json::json!({"device_ids": [device_id], "play": play}))).await?;
-        Ok(())
-    }
-
-    /// Every transport write names the selected device, never Spotify's
-    /// unrelated account-wide active session.
-    pub async fn player_command(&self, app: &AppHandle, device_id: &str, method: Method, endpoint: &str, query: &[(&str, String)], body: Option<serde_json::Value>) -> Result<(), String> {
-        let path = player_path(device_id, endpoint, query)?;
-        let _operation = self.operation.lock().await;
-        self.request(app, true, method, &path, None, body).await?;
-        Ok(())
-    }
-
-    pub async fn player_state(&self, app: &AppHandle) -> Result<Option<PlayerState>, String> {
-        let _operation = self.operation.lock().await;
-        let response = self.request(app, true, Method::GET, "me/player?additional_types=track,episode", None, None).await?;
-        if response.status() == StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-        response.json().await.map(Some).map_err(|_| "Spotify returned an invalid playback state".to_owned())
-    }
-
-    pub async fn player_queue(&self, app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
-        let _operation = self.operation.lock().await;
-        let value: serde_json::Value = self.request(app, true, Method::GET, "me/player/queue", None, None).await?
-            .json().await.map_err(|_| "Spotify returned an invalid playback queue".to_owned())?;
-        value["queue"].as_array().cloned().ok_or_else(|| "Spotify returned no playback queue".to_owned())
+        let response = self.request(app, true, method, path, None, body).await?;
+        read_player_response(response).await
     }
 
     pub async fn account_changed(&self, app: &AppHandle, username: &str) {

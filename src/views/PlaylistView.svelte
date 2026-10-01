@@ -20,6 +20,7 @@
     library,
     api,
     playback,
+    isPlayingSource,
     navigate,
     route,
     promotePlaylist,
@@ -653,21 +654,7 @@
     playQueue(queue, i).catch(() => {});
   }
 
-  /**
-   * Whether what is playing came from this playlist.
-   *
-   * Judged by the queue's contents rather than by a "current context" the
-   * engine does not report: if the playing track is one of ours *and* the
-   * queue is the same length, this playlist is what is on. Cheap, and wrong
-   * only for the case of two identical-length playlists sharing the current
-   * track — where either answer is defensible.
-   */
-  const playingThis = $derived.by(() => {
-    const uri = playback.current_uri;
-    if (!uri || !tracks.length) return false;
-    if (playback.queue.length !== tracks.length) return false;
-    return tracks.some((track) => track.uri === uri);
-  });
+  const playingThis = $derived(isPlayingSource(`playlist:${pl?.id ?? ""}`));
 
   /* ---------------- Skips ----------------
      The playlist's local skip preference arrives on the browse payload as

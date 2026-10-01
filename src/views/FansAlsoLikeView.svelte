@@ -1,6 +1,6 @@
 <script>
   import { detail, navigateArtist } from "../lib/state.svelte.js";
-  import { coverTone } from "../lib/covertone.svelte.js";
+  import { coverTone, cardTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
 
@@ -30,10 +30,9 @@
     {#if relatedArtists.length}
       <div class="grid aux-grid">
         {#each relatedArtists as related (related.id)}
-          {@const tone = coverTone(related.cover_url, related.id)}
           <button
             class="card artist-card"
-            style:--tone-glow={tone.glow}
+            use:cardTone={[related.cover_url, related.id]}
             onclick={() => navigateArtist(related.id, related.name)}
           >
             <span class="card-art">

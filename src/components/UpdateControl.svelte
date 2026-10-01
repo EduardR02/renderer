@@ -1,6 +1,8 @@
 <script>
   import { onMount } from "svelte";
-  import { checkForUpdate, getCurrentVersion, downloadAndInstall, restartApp } from "../lib/update.js";
+  import { getVersion } from "@tauri-apps/api/app";
+  import { check } from "@tauri-apps/plugin-updater";
+  import { relaunch } from "@tauri-apps/plugin-process";
 
   /**
    * Updates, as one row: the version and where it stands, and the one thing
@@ -17,7 +19,7 @@
   let active = true;
 
   onMount(() => {
-    getCurrentVersion()
+    getVersion()
       .then((version) => {
         if (active) currentVersion = version;
       })
@@ -60,7 +62,7 @@
       }
     }
     try {
-      const result = await checkForUpdate();
+      const result = await check();
       if (!active) {
         if (result) await result.close();
         return;
@@ -77,7 +79,7 @@
 
   async function restart() {
     try {
-      await restartApp();
+      await relaunch();
     } catch (error) {
       if (active) errorMessage = `The update is installed, but restart failed: ${String(error)}`;
     }
@@ -91,7 +93,7 @@
     total = 0;
     const selected = update;
     try {
-      await downloadAndInstall(selected, (event) => {
+      await selected.downloadAndInstall((event) => {
         if (!active) return;
         if (event.event === "Started") {
           total = event.data.contentLength ?? 0;

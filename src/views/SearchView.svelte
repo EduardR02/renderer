@@ -1,8 +1,8 @@
 <script>
   import { untrack } from "svelte";
-  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch, playback } from "../lib/state.svelte.js";
+  import { search, api, navigate, navigateArtist, focusSearch, queueSearch, retrySearch, playback, togglePlay } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById, cardPlay } from "../lib/play.js";
-  import { coverTone } from "../lib/covertone.svelte.js";
+  import { coverTone, cardTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -34,8 +34,14 @@
      line already says everything a portrait and a name do not. */
   const TOP_LABEL = { track: "Song", album: "Album", artist: "Artist", playlist: "Playlist", show: "Podcast", episode: "Episode" };
   const top = $derived.by(() => {
-    const hit = search.results?.top;
-    if (!hit) return null;
+    const ranked = search.results?.top;
+    if (!ranked) return null;
+    let hit = ranked;
+    if (ranked.kind === "episode") {
+      const episode = episodes.find((item) => item.track.uri === ranked.uri);
+      if (!episode) return null;
+      hit = { ...episode.track, kind: "episode", show_name: episode.show_name };
+    }
     /* A playlist names its OWNER here, not its description. Everywhere else a
        playlist's own words are the most useful second line, but this line is
        one line in a 320px column: "Dein tägliches Update zu den aktuell am…"
@@ -67,7 +73,11 @@
   /** An episode from the results plays alone: its show is one click away. */
   function playEpisode(episode) {
     playError = "";
-    api.playQueue([episode.track], 0, `show:${episode.show_id}`).catch((error) => { playError = String(error); });
+    if (episode.track.uri === playback.current_uri) {
+      togglePlay();
+      return;
+    }
+    api.playQueue([episode.track], 0, `episode:${episode.track.id}`).catch((error) => { playError = String(error); });
   }
 
   function playTrack(i) {
@@ -366,8 +376,7 @@
         <div class="section-head"><h2 class="section-title">Playlists</h2></div>
         <div class="grid">
           {#each playlists as pl (pl.id)}
-            {@const tone = coverTone(pl.cover_url || pl.cover_urls, pl.id)}
-            <div class="card" style:--tone-glow={tone.glow}>
+            <div class="card" use:cardTone={[pl.cover_url || pl.cover_urls, pl.id]}>
               <div class="card-art">
                 <Cover
                   src={pl.cover_url}
@@ -407,8 +416,7 @@
         <div class="section-head"><h2 class="section-title">Albums</h2></div>
         <div class="grid">
           {#each albums as al (al.id)}
-            {@const tone = coverTone(al.cover_url, al.id)}
-            <div class="card" style:--tone-glow={tone.glow}>
+            <div class="card" use:cardTone={[al.cover_url, al.id]}>
               <div class="card-art">
                 <Cover src={al.cover_url} id={al.id} name={al.name} fill lg />
                 <button
@@ -448,8 +456,7 @@
         <div class="section-head"><h2 class="section-title">Podcasts</h2></div>
         <div class="grid">
           {#each shows as show (show.id)}
-            {@const tone = coverTone(show.cover_url, show.id)}
-            <div class="card" style:--tone-glow={tone.glow}>
+            <div class="card" use:cardTone={[show.cover_url, show.id]}>
               <div class="card-art">
                 <Cover src={show.cover_url} id={show.id} name={show.name} fill lg />
                 <button class="card-open" aria-label={`Open ${show.name}`} onclick={() => navigate("show", show.id)}></button>
@@ -467,25 +474,24 @@
       <div class="section">
         <div class="section-head"><h2 class="section-title">Episodes <span class="section-note">audio only</span></h2></div>
         <div class="grid">
-          {#each episodes as episode (episode.id)}
-            {@const tone = coverTone(episode.cover_url, episode.id)}
-            <div class="card" style:--tone-glow={tone.glow}>
+          {#each episodes as episode (episode.track.id)}
+            <div class="card" use:cardTone={[episode.track.cover_url, episode.track.id]}>
               <div class="card-art">
-                <Cover src={episode.cover_url} id={episode.id} name={episode.name} fill lg />
-                <button class="card-open" aria-label={`Open ${episode.name}`} onclick={() => navigate("episode", episode.id)}></button>
-                {#if episode.track && !episode.unavailable && !episode.track.unavailable}
+                <Cover src={episode.track.cover_url} id={episode.track.id} name={episode.track.name} fill lg />
+                <button class="card-open" aria-label={`Open ${episode.track.name}`} onclick={() => navigate("episode", episode.track.id)}></button>
+                {#if !episode.track.unavailable}
                   <button
                     class="card-play"
-                    aria-label={`Play ${episode.name}`}
-                    title={`Play ${episode.name}`}
+                    aria-label={`${episode.track.uri === playback.current_uri && playback.playing ? "Pause" : "Play"} ${episode.track.name}`}
+                    title={`${episode.track.uri === playback.current_uri && playback.playing ? "Pause" : "Play"} ${episode.track.name}`}
                     onclick={() => playEpisode(episode)}
                   >
-                    <Icon name="play" size={15} />
+                    <Icon name={episode.track.uri === playback.current_uri && playback.playing ? "pause" : "play"} size={15} />
                   </button>
                 {/if}
               </div>
-              <button class="card-copy" onclick={() => navigate("episode", episode.id)}>
-                <span class="card-name">{episode.name}</span>
+              <button class="card-copy" onclick={() => navigate("episode", episode.track.id)}>
+                <span class="card-name">{episode.track.name}</span>
                 <span class="card-sub">{episode.show_name}</span>
               </button>
             </div>
@@ -498,11 +504,10 @@
         <div class="section-head"><h2 class="section-title">Artists</h2></div>
         <div class="grid">
           {#each artists as ar (ar.id)}
-            {@const tone = coverTone(ar.cover_url, ar.id)}
             <!-- No play button here, and that is not an omission: an artist is
                  not a record. The whole card opens, which is the same rule the
                  others follow with the exception removed. -->
-            <button class="card" style:--tone-glow={tone.glow} onclick={() => navigateArtist(ar.id, ar.name)}>
+            <button class="card" use:cardTone={[ar.cover_url, ar.id]} onclick={() => navigateArtist(ar.id, ar.name)}>
               <span class="card-art">
                 <Cover src={ar.cover_url} id={ar.id} name={ar.name} fill circle />
               </span>

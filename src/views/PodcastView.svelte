@@ -1,6 +1,6 @@
 <script>
   import { tick, untrack } from "svelte";
-  import { api, route, session, navigate, ui, playback, togglePlay, setPageTitle } from "../lib/state.svelte.js";
+  import { api, route, session, navigate, ui, playback, isPlayingSource, togglePlay, setPageTitle } from "../lib/state.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { detailArtSize } from "../lib/layout.js";
   import { spotifyLink } from "../lib/spotify-link.js";
@@ -10,7 +10,7 @@
   import CopyLinkItem from "../components/CopyLinkItem.svelte";
   import Menu from "../components/Menu.svelte";
   import { rowWindow } from "../lib/virtual.js";
-  import { filterEpisodes, orderEpisodes } from "../lib/episodes.js";
+  import { filterEpisodes, orderEpisodes, indexEpisodeSearch } from "../lib/episodes.js";
 
   /**
    * A show and its episodes, or one episode — audio only, in the app's own
@@ -21,6 +21,7 @@
   let response = $state(null);
   const data = $derived(response?.kind === route.name && response.id === route.id ? response.value : null);
   const isShow = $derived(route.name === "show");
+  const record = $derived(isShow ? data : data?.track);
   let error = $state("");
   let busy = $state(false);
   let playError = $state("");
@@ -30,7 +31,7 @@
   let clipped = $state(false);
   let generation = 0;
   const publishedDate = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
-  const tone = $derived(coverTone(data?.cover_url, data?.id || "podcast"));
+  const tone = $derived(coverTone(record?.cover_url, record?.id || "podcast"));
   const artSize = $derived(detailArtSize(ui.paneWidth));
   let query = $state("");
   let sort = $state("recent");
@@ -44,8 +45,9 @@
   // browseShow eagerly resolves the show's metadata-listed episodes. Only the
   // DOM is windowed below; search, ordering and playback use the whole result.
   const allEpisodes = $derived(isShow ? data?.episodes ?? [] : []);
+  const episodeSearch = $derived(indexEpisodeSearch(allEpisodes));
   const orderedEpisodes = $derived(orderEpisodes(allEpisodes, sort));
-  const episodes = $derived(filterEpisodes(orderedEpisodes, query));
+  const episodes = $derived(filterEpisodes(orderedEpisodes, query, episodeSearch));
   const filtering = $derived(query.trim().length > 0);
 
   /* ---------------- Windowed episode rows ----------------
@@ -58,7 +60,7 @@
   let firstRow = $state(0);
   let lastRow = $state(12);
   let focusedEpisode = $state("");
-  const focusedRow = $derived(focusedEpisode ? episodes.findIndex((episode) => episode.id === focusedEpisode) : -1);
+  const focusedRow = $derived(focusedEpisode ? episodes.findIndex((episode) => episode.track.id === focusedEpisode) : -1);
   let currentFirst = 0;
   let currentLast = 12;
   const renderedRows = $derived.by(() => {
@@ -141,7 +143,7 @@
     return h ? (m ? `${h} hr ${m} min` : `${h} hr`) : `${m} min`;
   }
   function unavailable(episode) {
-    return episode.unavailable || !episode.track || episode.track.unavailable;
+    return !episode.track || episode.track.unavailable;
   }
   /** The description's own paragraphs; single line breaks survive inside them. */
   const paragraphs = $derived(
@@ -182,7 +184,7 @@
     busy = true;
     const load = kind === "show" ? api.browseShow(id) : api.browseEpisode(id);
     load.then((value) => {
-      if (!value?.id || (kind === "show" && !Array.isArray(value.episodes))) throw new Error("Spotify returned incomplete podcast details.");
+      if (!(kind === "show" ? value?.id && Array.isArray(value.episodes) : value?.track?.id)) throw new Error("Spotify returned incomplete podcast details.");
       if (active) response = { kind, id, value };
     })
       .catch((reason) => { if (active) error = String(reason); })
@@ -190,24 +192,18 @@
     return () => { active = false; };
   });
   $effect(() => {
-    if (data?.name) untrack(() => setPageTitle(data.name));
+    if (record?.name) untrack(() => setPageTitle(record.name));
   });
 
   /* ---------------- Playback ---------------- */
   const playingUri = $derived(playback.current_uri);
   const playableEpisodes = $derived(episodes.filter((episode) => !unavailable(episode)));
-  const queueFollowsDisplay = $derived(
-    !isShow || (playback.queue.length === playableEpisodes.length
-      && playableEpisodes.every((episode, index) => episode.track.uri === playback.queue[index]?.uri)),
-  );
-  const playingHere = $derived(
-    isShow ? queueFollowsDisplay && episodes.some((episode) => episode.track?.uri && episode.track.uri === playingUri)
-      : !!data?.track?.uri && data.track.uri === playingUri,
-  );
+  const source = $derived(isShow ? `show:${data?.id ?? ""}` : `episode:${data?.track?.id ?? ""}`);
+  const playingHere = $derived(isShow ? isPlayingSource(source) : !!record?.uri && record.uri === playingUri);
 
   async function play(episode) {
     if (unavailable(episode)) return;
-    if (episode.track?.uri === playingUri && queueFollowsDisplay) {
+    if (episode.track?.uri === playingUri) {
       togglePlay();
       return;
     }
@@ -215,7 +211,7 @@
     playError = "";
     try {
       const available = isShow ? playableEpisodes : [episode];
-      await api.playQueue(available.map((item) => item.track), available.findIndex((item) => item.id === episode.id), `show:${episode.show_id}`);
+      await api.playQueue(available.map((item) => item.track), available.findIndex((item) => item.track.id === episode.track.id), source);
     } catch (reason) {
       if (started === generation) playError = String(reason);
     }
@@ -289,10 +285,10 @@
     </div>
   {:else if data}
     <header class="detail-head">
-      <Cover src={data.cover_url || ""} id={data.id} name={data.name} size={artSize} lg raised />
+      <Cover src={record.cover_url || ""} id={record.id} name={record.name} size={artSize} lg raised />
       <div>
         <span class="tag">{isShow ? "Podcast" : "Episode"}</span>
-        <h1 class="detail-title podcast-title" class:long={data.name.length > 44}>{data.name}</h1>
+        <h1 class="detail-title podcast-title" class:long={record.name.length > 44}>{record.name}</h1>
         <p class="detail-meta">
           {#if isShow}
             {#if data.publisher}<span class="who">{data.publisher}</span><span class="sep">/</span>{/if}
@@ -303,7 +299,7 @@
               <span class="sep">/</span>
             {/if}
             {#if publication(data.published_at)}<span class="num">{publication(data.published_at)}</span><span class="sep">/</span>{/if}
-            <span class="num">{length(data.duration_ms)}</span>
+            <span class="num">{length(record.duration_ms)}</span>
           {/if}
         </p>
         <div class="actions">
@@ -338,13 +334,13 @@
                 {#if data.show_id}
                   <button class="menu-item" role="menuitem" onclick={() => { close(); navigate("show", data.show_id); }}>Go to podcast</button>
                 {/if}
-                <CopyLinkItem link={spotifyLink("episode", data.id)} {close} />
+                <CopyLinkItem link={spotifyLink("episode", record.id)} {close} />
               {/snippet}
             </HeaderMenu>
           {/if}
         </div>
         {#if !isShow && unavailable(data)}
-          <p class="start-blocked">{data.unavailable_reason || "Audio is unavailable for this episode."}</p>
+          <p class="start-blocked">{record.unavailable_reason || "Audio is unavailable for this episode."}</p>
         {/if}
         {#if playError}<p class="inline-error" role="alert">{playError}</p>{/if}
       </div>
@@ -430,7 +426,7 @@
             onfocusin={retainFocus}
             onfocusout={releaseFocus}
           >
-            {#each renderedRows as index (episodes[index].id)}
+            {#each renderedRows as index (episodes[index].track.id)}
               {@const episode = episodes[index]}
               {@const date = publication(episode.published_at)}
               {@const current = !!episode.track?.uri && episode.track.uri === playingUri}
@@ -439,44 +435,44 @@
                 class:current
                 class:unavailable={unavailable(episode)}
                 data-episode-index={index}
-                data-episode-id={episode.id}
+                data-episode-id={episode.track.id}
                 style:top={`${index * ROW_H}px`}
               >
                 <span class="ep-art">
-                  <Cover src={episode.cover_url || data.cover_url || ""} id={episode.id} name={episode.name} size={60} />
+                  <Cover src={episode.track.cover_url || data.cover_url || ""} id={episode.track.id} name={episode.track.name} size={60} />
                   {#if !unavailable(episode)}
                     <button
                       class="ep-play"
-                      title={current && queueFollowsDisplay ? (playback.playing ? "Pause" : "Resume") : "Play"}
-                      aria-label={`${current && queueFollowsDisplay && playback.playing ? "Pause" : "Play"} ${episode.name}`}
+                      title={current ? (playback.playing ? "Pause" : "Resume") : "Play"}
+                      aria-label={`${current && playback.playing ? "Pause" : "Play"} ${episode.track.name}`}
                       onclick={() => play(episode)}
                     >
-                      <span class="ep-play-disc"><Icon name={current && queueFollowsDisplay && playback.playing ? "pause" : "play"} size={14} /></span>
+                      <span class="ep-play-disc"><Icon name={current && playback.playing ? "pause" : "play"} size={14} /></span>
                     </button>
                   {/if}
                 </span>
                 <div class="ep-copy">
-                  <button class="ep-title" title={episode.name} onclick={() => navigate("episode", episode.id)}>{episode.name}</button>
+                  <button class="ep-title" title={episode.track.name} onclick={() => navigate("episode", episode.track.id)}>{episode.track.name}</button>
                   <p class="ep-meta">
                     {#if date}<span>{date}</span><span class="ep-dot" aria-hidden="true"></span>{/if}
-                    <span>{length(episode.duration_ms)}</span>
+                    <span>{length(episode.track.duration_ms)}</span>
                     {#if episode.track?.cached}
                       <span class="t-cached" title="Downloaded — this plays from the local cache"><Icon name="cached" size={13} /><span class="sr-only">Downloaded</span></span>
                     {/if}
                     {#if unavailable(episode)}
-                      <span class="ep-dot" aria-hidden="true"></span><span class="ep-why">{episode.unavailable_reason || "Audio unavailable"}</span>
+                      <span class="ep-dot" aria-hidden="true"></span><span class="ep-why">{episode.track.unavailable_reason || "Audio unavailable"}</span>
                     {/if}
                   </p>
                   {#if episode.description}<p class="ep-desc">{episode.description}</p>{/if}
                 </div>
                 <div class="ep-actions">
-                  <button class="btn-round" title="Add to queue" aria-label={`Add ${episode.name} to queue`} disabled={unavailable(episode)} onclick={() => enqueue(episode)}>
+                  <button class="btn-round" title="Add to queue" aria-label={`Add ${episode.track.name} to queue`} disabled={unavailable(episode)} onclick={() => enqueue(episode)}>
                     <Icon name="queue-add" size={17} />
                   </button>
                   <button
                     class="btn-round"
                     title="More"
-                    aria-label={`More for ${episode.name}`}
+                    aria-label={`More for ${episode.track.name}`}
                     aria-haspopup="menu"
                     aria-expanded={rowMenu?.episode === episode}
                     onclick={(event) => (rowMenu = rowMenu?.episode === episode ? null : { episode, anchor: event.currentTarget })}
@@ -503,8 +499,8 @@
 {#if rowMenu}
   <Menu anchor={rowMenu.anchor} align="end" label="Episode actions" onclose={() => (rowMenu = null)}>
     {#snippet children(close)}
-      <button class="menu-item" role="menuitem" onclick={() => { const id = rowMenu.episode.id; close(); navigate("episode", id); }}>Open episode</button>
-      <CopyLinkItem link={spotifyLink("episode", rowMenu.episode.id)} {close} />
+      <button class="menu-item" role="menuitem" onclick={() => { const id = rowMenu.episode.track.id; close(); navigate("episode", id); }}>Open episode</button>
+      <CopyLinkItem link={spotifyLink("episode", rowMenu.episode.track.id)} {close} />
     {/snippet}
   </Menu>
 {/if}

@@ -34,7 +34,6 @@ test("real mode never substitutes fixture profiles or accepts personal writes", 
       ["browse_profile", { username: "listener" }],
       ["browse_show", { id: "show" }],
       ["browse_episode", { id: "episode" }],
-      ["browse_playlist_tree", { length: 1000 }],
       ["personal_api_status", {}],
     ]) {
       await expect(mode.invoke(cmd, args)).rejects.toThrow("no fixture data");

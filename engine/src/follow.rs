@@ -58,14 +58,6 @@ use serde::Deserialize;
 
 use renderer_engine::protocol::ArtistRef;
 
-use crate::browse::{backoff_sequence, browse_error_is_transient, http_status_of};
-
-/// Retries mirror the browse schedule ([`crate::browse`]): the same spclient
-/// front door sits in front of this endpoint and answers the same transient
-/// 5xx, so a bounded retry absorbs one before it reaches the rail.
-const FOLLOWED_RETRY_ATTEMPTS: usize = 5;
-const FOLLOWED_BACKOFF_BASE_MS: u64 = 500;
-const FOLLOWED_BACKOFF_MAX_MS: u64 = 4_000;
 
 const ARTIST_URI_PREFIX: &str = "spotify:artist:";
 
@@ -137,35 +129,10 @@ pub async fn followed_artists(session: &Session) -> Result<Vec<ArtistRef>, Strin
         "/user-profile-view/v3/profile/{user}/following",
         user = session.username(),
     );
-    let backoffs = backoff_sequence(
-        FOLLOWED_RETRY_ATTEMPTS,
-        FOLLOWED_BACKOFF_BASE_MS,
-        FOLLOWED_BACKOFF_MAX_MS,
-    );
-    let mut attempt = 0usize;
-    let payload = loop {
-        match session
-            .spclient()
-            .request(&Method::GET, &endpoint, None, None)
-            .await
-        {
-            Ok(bytes) => break bytes,
-            Err(error) => {
-                let status = http_status_of(&error);
-                if !browse_error_is_transient(error.kind, status) || attempt >= backoffs.len() {
-                    return Err(format!("followed-artists request failed: {error}"));
-                }
-                let backoff = backoffs[attempt];
-                eprintln!(
-                    "followed artists failed ({error}); retrying in {backoff} ms (attempt {}/{})",
-                    attempt + 1,
-                    backoffs.len() + 1,
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-                attempt += 1;
-            }
-        }
-    };
+    let payload = crate::browse::spclient_read(|| async {
+        session.spclient().request(&Method::GET, &endpoint, None, None).await
+    }).await
+        .map_err(|error| format!("followed-artists request failed: {error}"))?;
     parse_following(&payload)
 }
 

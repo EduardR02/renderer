@@ -1,7 +1,7 @@
 <script>
   import { detail, navigate, navigateArtist, route } from "../lib/state.svelte.js";
   import { playPlaylistById, cardPlay } from "../lib/play.js";
-  import { coverTone } from "../lib/covertone.svelte.js";
+  import { coverTone, cardTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
   import { artistPlaylistCollections, playlistSubtitle } from "../lib/artist.js";
@@ -55,8 +55,7 @@
   style:--tone-glow={tone.glow}
 >
   {#snippet playlistCard(playlist)}
-  {@const tone = coverTone(playlist.cover_url || playlist.cover_urls, playlist.id)}
-  <div class="card" style:--tone-glow={tone.glow}>
+  <div class="card" use:cardTone={[playlist.cover_url || playlist.cover_urls, playlist.id]}>
     <div class="card-art">
       <Cover
         src={playlist.cover_url}

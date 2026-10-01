@@ -20,9 +20,8 @@ env_logger = { version = "0.11", default-features = false, features = ["auto-col
 librespot-audio = { version = "=0.8.0", default-features = false }
 librespot-core = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
 librespot-metadata = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
-librespot-playback = { version = "=0.8.0", default-features = false, features = ["native-tls", "rodio-backend"] }
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
 librespot-protocol = { version = "=0.8.0", default-features = false }
-rodio = { version = "0.21", default-features = false, features = ["playback"] }
 # The OAuth authorize URL must be known before the flow runs (the UI presents
 # it), so the engine drives the authorization-code + PKCE flow directly
 # instead of going through librespot-oauth (which hides the URL inside
@@ -36,6 +35,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis", "flac"] }
 url = "2.5"
 bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.44", features = ["implement", "Win32_Media_Audio", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem"] }

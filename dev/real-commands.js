@@ -7,14 +7,6 @@
  * of them touches playback, the queue, the Spotify account, or a setting. The
  * worst any of them does is refresh a local cache, noted per entry.
  *
- * Deliberately NOT here, although they read:
- *   browse_playlists       replaces the app's in-memory library and persists it;
- *                          on failure it starts a retry chain that re-emits the
- *                          library and walks every owned playlist. Nothing in
- *                          src/ calls it; the harness answers it from get_state.
- *   get_cover              downloads into the app's cover cache and returns a
- *                          cover:// path this browser cannot load; the harness
- *                          hands the remote https URL straight to <img>.
  *   status                 makes the engine re-broadcast state to the real window.
  *   cancel_track_waveform  cancels engine work.
  * Personal grant configuration/authorization/library writes/output selection
@@ -26,8 +18,6 @@ export const READ_COMMANDS = new Set([
   "get_state",
   // Native application metadata; no I/O or mutations.
   "plugin:app|version",
-  // Reads settings.json.
-  "get_app_settings",
   // In-memory membership lookup. No I/O.
   "get_track_playlists",
   // Engine: one window of the listening archive. No writes.
@@ -58,7 +48,6 @@ export const READ_COMMANDS = new Set([
   "browse_show",
   "browse_episode",
   "browse_profile",
-  "browse_playlist_tree",
   // Native-bound personal reads only, never prewarmed. Contains answers only
   // whether a profile's user is followed, once when the profile opens; the
   // UI asks for devices only when the device menu is opened.

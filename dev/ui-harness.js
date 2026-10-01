@@ -96,14 +96,13 @@ const fixtures = {
   ],
 };
 fixtures.episode = {
-  id: "ep1", uri: "spotify:episode:ep1", name: "A Walk Through the Night",
   show_id: "show1", show_name: "Listening Notes", description: "A short audio-only journey through city sounds.",
-  cover_url: "", duration_ms: 1820000, published_at: Date.UTC(2026, 8, 20),
-  unavailable: false, unavailable_reason: null,
+  published_at: Date.UTC(2026, 8, 20),
   track: {
     id: "ep1", uri: "spotify:episode:ep1", name: "A Walk Through the Night",
     artist_names: ["Listening Notes"], artist_ids: [], album_id: "show1",
-    album_name: "Listening Notes", duration_ms: 1820000, unavailable: false,
+    album_name: "Listening Notes", cover_url: "", duration_ms: 1820000,
+    unavailable: false, unavailable_reason: null,
   },
 };
 fixtures.show = {
@@ -111,8 +110,7 @@ fixtures.show = {
   publisher: "Renderer Radio", description: "Stories told entirely in sound.",
   cover_url: "", episodes: [
     fixtures.episode,
-    { ...fixtures.episode, id: "ep2", uri: "spotify:episode:ep2",
-      name: "A Quiet Morning", published_at: Date.UTC(2026, 8, 21),
+    { ...fixtures.episode, published_at: Date.UTC(2026, 8, 21),
       track: { ...fixtures.episode.track, id: "ep2", uri: "spotify:episode:ep2", name: "A Quiet Morning" } },
   ],
 };
@@ -407,8 +405,8 @@ function findTrack(value) {
   return null;
 }
 
-function contextTracks(tracks) {
-  return tracks.map((track) => ({ ...track, context: "playlist:p1" }));
+function contextTracks(tracks, context) {
+  return tracks.map((track) => ({ ...track, context: track.context || context }));
 }
 
 const playlistTracks = new Map([
@@ -482,9 +480,9 @@ function effectiveEdit(track, playlistId = "p1") {
   return saved && saved.enabled ? saved.definition : null;
 }
 
-function queueWithEdits(tracks) {
-  return contextTracks(tracks).map((entry) => {
-    const edit = effectiveEdit(entry);
+function queueWithEdits(tracks, context = "playlist:p1") {
+  return contextTracks(tracks, context).map((entry) => {
+    const edit = effectiveEdit(entry, entry.context?.startsWith("playlist:") ? entry.context.slice("playlist:".length) : "");
     return edit ? { ...entry, effective_edit: clone(edit) } : entry;
   });
 }
@@ -520,18 +518,16 @@ function emitPlaylistSummary(id) {
   if (summary) emit("playlist_summary", clone(summary));
 }
 
-/* The queue's revision, mirroring the engine's. Rows and the plan are published
-   when it moves and omitted when the receiver already holds that generation, so
-   a harness that shipped them on every event would never exercise the identity
-   path the real protocol depends on — the surface under test would not be the
-   surface. Every helper that can change a row, the current index, the order or
-   the plan bumps it. */
+/* Independent array revisions mirror the engine wire contract. Comparing
+   fixture values here keeps mutations, including browser-driven ones, honest. */
 let queueRevision = 1;
+let orderRevision = 1;
 let emittedQueueRevision = 0;
-function touchQueue() { queueRevision += 1; }
+let emittedOrderRevision = 0;
+let queueIdentity = "";
+let heldOrder = [];
 
 function refreshQueueEdits() {
-  touchQueue();
   playback.queue = playback.queue.map((entry) => {
     const track = findTrack(entry.uri);
     const edit = track && effectiveEdit(track);
@@ -596,7 +592,6 @@ function trackFromQueueItem(item) {
 }
 
 function setCurrent(index, resetPosition = true) {
-  touchQueue();
   if (!playback.queue.length) {
     playback.current_index = 0;
     playback.current_uri = null;
@@ -668,7 +663,6 @@ function queueRowEligible(index) {
 }
 
 function redrawShuffleBag() {
-  touchQueue();
   shuffleBag = [];
   if (!playback.shuffle) return;
   for (let index = 0; index < playback.queue.length; index++) {
@@ -684,7 +678,6 @@ function redrawShuffleBag() {
     pops from the back, so an append would pin it to "always next" or
     "always last". Mirrors `Engine::splice_into_shuffle_pool`. */
 function spliceIntoShuffleBag(index) {
-  touchQueue();
   if (!playback.shuffle || index === playback.current_index) return;
   if (!queueRowEligible(index) || shuffleBag.includes(index)) return;
   shuffleBag.splice(bagRandom() % (shuffleBag.length + 1), 0, index);
@@ -693,7 +686,6 @@ function spliceIntoShuffleBag(index) {
 /** Drops a removed row and shifts the rows above it down, keeping the drawn
     order of every survivor. Mirrors `Engine::repair_shuffle_pool`. */
 function repairShuffleBagAfterRemoval(index) {
-  touchQueue();
   shuffleBag = shuffleBag
     .filter((pooled) => pooled !== index)
     .map((pooled) => (pooled > index ? pooled - 1 : pooled))
@@ -718,18 +710,27 @@ function upcomingIndices() {
   return out;
 }
 
-function emitState() {
-  /* Rows and the plan ride out only when the revision moved; every scalar rides
-     every event. This is the engine's contract (`queue_revision`), and the
-     frontend's identity rule is written against it. */
-  const rows = queueRevision !== emittedQueueRevision;
-  emittedQueueRevision = queueRevision;
-  const state = { ...clone(playback), queue_revision: queueRevision };
-  if (rows) state.upcoming = upcomingIndices();
-  else {
-    delete state.queue;
-    delete state.upcoming;
+function snapshot() {
+  const identity = JSON.stringify(playback.queue);
+  if (identity !== queueIdentity) {
+    queueIdentity = identity;
+    queueRevision += 1;
   }
+  const upcoming = upcomingIndices();
+  if (upcoming.length !== heldOrder.length || upcoming.some((row, index) => row !== heldOrder[index])) {
+    heldOrder = upcoming;
+    orderRevision += 1;
+  }
+  return { ...clone(playback), context: playback.queue[playback.current_index]?.context ?? "",
+    queue_revision: queueRevision, order_revision: orderRevision, upcoming };
+}
+
+function emitState() {
+  const state = snapshot();
+  if (queueRevision === emittedQueueRevision) delete state.queue;
+  if (orderRevision === emittedOrderRevision) delete state.upcoming;
+  emittedQueueRevision = queueRevision;
+  emittedOrderRevision = orderRevision;
   emit("state", state);
 }
 
@@ -823,8 +824,6 @@ let outputFailure = "";
 const personalFollows = new Set(["spotify:artist:ar1"]);
 
 window.__fixtures = fixtures;
-/** How long `get_cover` pretends the network takes. See the command below. */
-let coverDelayMs = 0;
 /**
  * The fixture backend: every command answered from the fixtures above. In real
  * mode (`?real`, dev/ui-harness-real.js) the owner's app answers the reads and
@@ -846,7 +845,7 @@ const mock = {
       case "plugin:event|remove_listener":
         return unregisterListener(args.event, args.eventId, args.handler ?? args.handlerId);
       case "get_state":
-        return { playback: clone(playback), playlists: clone(fixtures.playlists), me_id: "eduard" };
+        return { playback: snapshot(), playlists: clone(fixtures.playlists), playlist_tree: clone(fixtures.playlistTree), settings: clone(settings), me_id: "eduard" };
       case "get_track_playlists": {
         const track = findTrack(args.uri ?? args.trackId);
         const ids = track ? [...(memberships.get(track.id) || [])] : [];
@@ -865,14 +864,12 @@ const mock = {
       case "browse_show":
         return clone(fixtures.show);
       case "browse_episode":
-        return clone(fixtures.show.episodes.find((episode) => episode.id === args.id) ?? fixtures.episode);
+        return clone(fixtures.show.episodes.find((episode) => episode.track.id === args.id) ?? fixtures.episode);
       case "browse_profile":
         return clone(args.username === "eduard" ? fixtures.profile : {
           username: args.username, name: "Another Listener", image_url: "",
           playlists: [fixtures.playlists[1]],
         });
-      case "browse_playlist_tree":
-        return clone(fixtures.playlistTree);
       case "personal_api_status":
         return clone(personalStatus);
       case "personal_api_configure":
@@ -909,7 +906,7 @@ const mock = {
           } else if (args.saved) personalFollows.add(uri);
           else personalFollows.delete(uri);
         }
-        if (liked) emit("memberships_changed", { saved_tracks: true });
+        if (liked) emit("memberships_changed", { saved_tracks: true, uris: args.uris, saved: args.saved });
         return null;
       }
       case "personal_api_devices":
@@ -982,9 +979,6 @@ const mock = {
         return {
           url: "https://res.cloudinary.com/demo/video/upload/ar_9:16,c_fill,w_720/samples/sea-turtle.mp4",
         };
-      case "get_app_settings":
-      case "get_settings":
-        return clone(settings);
       case "set_app_settings":
       case "set_settings":
         Object.assign(settings, args.settings ?? args);
@@ -1149,7 +1143,7 @@ const mock = {
         return null;
       case "play_queue": {
         const input = args.queue ?? args.tracks ?? args.uris;
-        if (Array.isArray(input)) playback.queue = queueWithEdits(input.map(trackFromQueueItem));
+        if (Array.isArray(input)) playback.queue = queueWithEdits(input.map(trackFromQueueItem), args.context ?? "");
         const automaticStart = Boolean(args.automaticStart ?? args.automatic_start);
         const requestedIndex = Number(args.index ?? args.startIndex ?? 0);
         const startedIndex = automaticStart
@@ -1174,7 +1168,7 @@ const mock = {
       case "add_queue":
       case "add_queue_item": {
         const item = args.uri ?? args.trackUri ?? args.track_uri ?? args.track;
-        playback.queue.push(...queueWithEdits([trackFromQueueItem(item)]));
+        playback.queue.push(...queueWithEdits([trackFromQueueItem(item)], args.context ?? ""));
         spliceIntoShuffleBag(playback.queue.length - 1);
         emitState();
         return null;
@@ -1238,26 +1232,6 @@ const mock = {
         return clone(trackCreditsPayload(args.id ?? args.trackId ?? "t0"));
       case "get_cache_stats":
         return { entries: 0, bytes: 0 };
-      // Artwork the browser can already fetch for itself. The real command
-      // downloads a remote cover and hands back a local path; a fixture that
-      // ships its own picture inline has nothing to download, and returning
-      // null for it would draw the "lost artwork" tile over every fixture
-      // image instead of the image.
-      // Artwork the browser can fetch for itself. The real command downloads a
-      // remote cover and returns a local path for the asset protocol; fixture
-      // artwork is already served by the dev server, so it only needs to come
-      // back absolute — a root-relative path would be handed to convertFileSrc
-      // and rewritten into an asset URL that resolves to nothing.
-      case "get_cover": {
-        const url = String(args.url ?? "");
-        if (!url) return null;
-        // The real command is a network download; here it is a same-origin
-        // path that resolves within a frame, which hides every defect that
-        // lives in the window between "a url is wanted" and "its pixels
-        // exist". `setCoverDelay` reopens that window on demand.
-        if (coverDelayMs > 0) await new Promise((done) => setTimeout(done, coverDelayMs));
-        return /^https?:/.test(url) ? url : new URL(url, location.origin).href;
-      }
       default:
         return null;
     }
@@ -1271,6 +1245,7 @@ window.__TAURI_INTERNALS__ = {
   transformCallback,
   runCallback,
   unregisterCallback,
+  convertFileSrc: (source) => new URL(source, location.origin).href,
   invoke: async (cmd, args = {}) => {
     calls.push({ cmd, args });
     return realMode ? realMode.invoke(cmd, args) : mock.invoke(cmd, args);
@@ -1304,7 +1279,7 @@ window.__harness = {
     emit("personal-api-changed", clone(personalStatus));
     return clone(personalStatus);
   },
-  getState: () => ({ ...clone(playback), queue_revision: queueRevision, upcoming: upcomingIndices() }),
+  getState: snapshot,
   /** Deterministic skip controls for browser checks: patch the store,
       refresh the open detail, and report the resulting ids. No timers. */
   setExcluded: (trackIds, excluded = true, playlistId = "p1") => {
@@ -1315,10 +1290,6 @@ window.__harness = {
     return [...(exclusionsFor(playlistId) ?? [])];
   },
   getExcluded: (playlistId = "p1") => [...(exclusionsFor(playlistId) ?? [])],
-  /** Make artwork resolution take as long as a real one does. Anything that
-      only misbehaves while a cover is on its way — a picture that has been
-      asked for and does not exist yet — is invisible without this. */
-  setCoverDelay: (ms = 0) => (coverDelayMs = Math.max(0, Number(ms) || 0)),
 };
 
 await import("../src/styles/app.css");
@@ -1477,10 +1448,10 @@ Object.assign(window.__harness, {
     // only writer that flips freshness back on, so final shelves mount once.
     const stamp = Math.floor(Date.now() / 1000);
     const [roadTrip, ...rest] = clone(fixtures.playlists);
-    emit("library", [
-      { ...roadTrip, last_played: stamp - 60, last_activity: stamp },
-      ...rest,
-    ]);
+    emit("library", {
+      playlists: [{ ...roadTrip, last_played: stamp - 60, last_activity: stamp }, ...rest],
+      playlist_tree: clone(fixtures.playlistTree),
+    });
   },
 });
 
@@ -1504,11 +1475,10 @@ if (new URLSearchParams(location.search).has("real")) {
     shuffleBag: {
       get: () => shuffleBag,
       set: (indices) => {
-        touchQueue();
         shuffleBag = indices;
       },
     },
-    snapshot: () => ({ ...clone(playback), queue_revision: queueRevision, upcoming: upcomingIndices() }),
+    snapshot,
   });
   if (realMode) window.__harness.real = realMode.helpers;
 }
@@ -1516,7 +1486,7 @@ if (new URLSearchParams(location.search).has("real")) {
 state.libraryState.loaded = true;
 state.session.auth_state = "ready";
 state.session.username = playback.username;
-state.setLibrary(realMode ? realMode.library : fixtures.playlists);
+state.setLibrary(realMode ? realMode.library : fixtures.playlists, { tree: realMode ? realMode.tree : fixtures.playlistTree });
 // Default boot is final/fresh so ordinary UI tests exercise the settled Home,
 // shelves included. bootCachedLibrary() below rewinds to the staged boot.
 state.libraryState.fresh = true;

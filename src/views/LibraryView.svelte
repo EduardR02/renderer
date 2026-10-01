@@ -11,7 +11,7 @@
     mergePersonalizedPlaylists,
   } from "../lib/state.svelte.js";
   import { playPlaylistById, playLikedSongs, cardPlay } from "../lib/play.js";
-  import { coverTone } from "../lib/covertone.svelte.js";
+  import { coverTone, cardTone } from "../lib/covertone.svelte.js";
   import Cover from "../components/Cover.svelte";
   import LikedMark from "../components/LikedMark.svelte";
   import Icon from "../components/Icon.svelte";
@@ -154,8 +154,7 @@
 {/snippet}
 
 {#snippet playlistCard(pl)}
-  {@const cardTone = coverTone(pl.cover_url || pl.cover_urls, pl.id)}
-  <div class="card" style:--tone-glow={cardTone.glow}>
+  <div class="card" use:cardTone={[pl.cover_url || pl.cover_urls, pl.id]}>
     <div class="card-art">
       <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} fill lg />
       <button

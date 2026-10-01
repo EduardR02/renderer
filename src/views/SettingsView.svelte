@@ -3,12 +3,13 @@
   import {
     playback,
     session,
-    stats,
     ui,
     cacheStats,
     refreshCacheStats,
     clearCache,
     api,
+    appSettings,
+    settingsState,
     openAuthUrl,
     isLoggedOut,
   } from "../lib/state.svelte.js";
@@ -65,10 +66,8 @@
   let clearTarget = $state(null);
   let clearing = $state(false);
   let clearError = $state("");
-  let appSettings = $state(null);
   let settingBusy = $state("");
   const settingErrors = $state({
-    load: "",
     audioCacheLimit: "",
     normalisation: "",
     launchAtLogin: "",
@@ -128,11 +127,11 @@
   );
 
   async function updateSetting(key, update, fallbackMessage) {
-    if (!appSettings || settingBusy) return;
+    if (!settingsState.loaded || settingBusy) return;
     settingBusy = key;
     settingErrors[key] = "";
     try {
-      appSettings = await update();
+      await update();
     } catch (error) {
       settingErrors[key] = String(error || fallbackMessage);
     } finally {
@@ -187,21 +186,12 @@
   // on every render.
   $effect(() => {
     refreshCacheStats().catch(() => {});
-    api.getAppSettings()
-      .then((value) => {
-        appSettings = value;
-        settingErrors.load = "";
-      })
-      .catch((error) => {
-        settingErrors.load = String(error || "Could not load app settings.");
-      });
   });
 </script>
 
 <section class="view page settings-page" class:compact>
   <div class="settings-intro">
     <h1 class="page-title">Settings</h1>
-    {#if settingErrors.load}<p class="inline-error" role="alert">{settingErrors.load}</p>{/if}
   </div>
 
   <!-- Hairline-separated rows rather than boxed cards: [label + helper] on the
@@ -366,7 +356,7 @@
             type="checkbox"
             aria-label="Volume normalization"
             checked={appSettings?.normalisation ?? false}
-            disabled={!appSettings || !!settingBusy}
+            disabled={!settingsState.loaded || !!settingBusy}
             onchange={(event) => updateNormalisation(event.currentTarget.checked)}
           />
         </div>
@@ -383,7 +373,7 @@
             type="checkbox"
             aria-label="Launch at login"
             checked={appSettings?.launch_at_login ?? false}
-            disabled={!appSettings || !!settingBusy}
+            disabled={!settingsState.loaded || !!settingBusy}
             onchange={(event) => updateLaunchAtLogin(event.currentTarget.checked)}
           />
         </div>
@@ -400,7 +390,7 @@
             type="checkbox"
             aria-label="Start minimized"
             checked={appSettings?.start_minimized ?? false}
-            disabled={!appSettings || !!settingBusy}
+            disabled={!settingsState.loaded || !!settingBusy}
             onchange={(event) => updateStartMinimized(event.currentTarget.checked)}
           />
         </div>
@@ -421,7 +411,7 @@
             type="checkbox"
             aria-label="Animated Canvas"
             checked={appSettings?.animated_canvas ?? false}
-            disabled={!appSettings || !!settingBusy}
+            disabled={!settingsState.loaded || !!settingBusy}
             onchange={(event) => updateAnimatedCanvas(event.currentTarget.checked)}
           />
         </div>
@@ -471,7 +461,7 @@
             label="Audio cache limit"
             options={CACHE_LIMITS}
             value={cacheLimitMb}
-            disabled={!appSettings || !!settingBusy}
+            disabled={!settingsState.loaded || !!settingBusy}
             onchange={updateAudioCacheLimit}
           />
         </div>
@@ -499,7 +489,7 @@
       <div class="set-row">
         <div>
           <div class="k">Cache activity</div>
-          <div class="d">{cacheStats.error ?? `${stats.coversResolved} cover requests this session`}</div>
+          <div class="d">{cacheStats.error ?? "Artwork is fetched on demand and cached."}</div>
         </div>
         <div class="set-ctl">
           <button class="pill" onclick={() => refreshCacheStats().catch(() => {})} disabled={cacheStats.loading}>

@@ -2,6 +2,7 @@
   import {
     detail,
     playback,
+    isPlayingSource,
     togglePlay,
     api,
     insertPlaylist,
@@ -58,10 +59,7 @@
   const seedAlbumId = $derived(artistRadio ? "" : seed?.album_id || "");
   const artSize = $derived(detailArtSize(ui.paneWidth));
 
-  const playingThis = $derived.by(() => {
-    if (!tracks.length || playback.queue.length !== tracks.length) return false;
-    return tracks.every((track, index) => playback.queue[index]?.uri === track.uri);
-  });
+  const playingThis = $derived(isPlayingSource(`radio:${route.id ?? ""}`));
 
   // Keep a successful create id when adding tracks fails. A retry then
   // completes the same playlist instead of creating a duplicate.

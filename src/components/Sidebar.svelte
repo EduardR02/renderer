@@ -92,25 +92,10 @@
     if (mode === "podcasts" && !connected) untrack(() => (mode = "playlists"));
   });
 
-  let tree = $state(null);
-  let treeError = $state("");
-  let treeGeneration = $state(0);
   $effect(() => { loadPins(session.username); });
   $effect(() => { loadAvatar(session.username); });
   $effect(() => watchPersonal());
-  $effect(() => {
-    const account = session.username;
-    const loaded = libraryState.loaded;
-    const retry = treeGeneration;
-    tree = null;
-    treeError = "";
-    if (!account || !loaded) return;
-    let active = true;
-    api.browsePlaylistTree().then((nodes) => { if (active) tree = nodes; })
-      .catch((error) => { if (active) treeError = String(error); });
-    return () => { active = false; };
-  });
-  const filteredLibrary = $derived(libraryRailEntries(library, tree, pins.ids, filterQuery, pins.folders));
+  const filteredLibrary = $derived(libraryRailEntries(library, libraryState.tree, pins.ids, filterQuery, pins.folders));
   const showLiked = $derived(!filterQuery.trim() || "liked songs".includes(filterQuery.trim().toLocaleLowerCase()));
 
   /* ---------------- Saved podcasts ----------------
@@ -586,9 +571,6 @@
           {/if}
         {/each}
         {#if showLiked && !isPinned("liked")}{@render likedRow()}{/if}
-        {#if treeError}
-          <p class="lib-filter-empty">Folders couldn't load. <button class="link-more" onclick={() => treeGeneration++}>Try again</button></p>
-        {/if}
         {#if !libraryState.loaded && !library.length}
           <!-- The rail's own loading frame. Rows at the real height with the
                real tile and name geometry, so the list does not jump when the

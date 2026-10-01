@@ -30,9 +30,8 @@
 //!   to stop rodio's converter from being rebuilt mid-stream, because each
 //!   rebuild leaked a fraction of a frame; that whole class of bug is gone
 //!   rather than managed.
-//! - **rodio stops resampling.** The sink reports the device rate, which sends
-//!   both of rodio's converters down their `from == to` pass-through branches,
-//!   so nothing downstream touches the samples.
+//! - **No downstream resampling.** The native callback receives device-rate
+//!   samples and only converts representation and channel layout.
 
 use std::f64::consts::PI;
 
@@ -181,6 +180,19 @@ impl Resampler {
         self.history.drain(..spent * self.channels);
         self.cursor = CENTER;
     }
+
+    /// Emit the remaining input frames using silence as EOF look-ahead.
+    /// Reset afterwards so a later Play cannot emit the padding as old audio.
+    pub fn finish(&mut self, out: &mut Vec<f32>) {
+        let frames = self.history.len() / self.channels;
+        let pending = frames.saturating_sub(self.cursor);
+        if pending != 0 {
+            // One fewer padded frame emits precisely the original remainder.
+            self.history.resize(self.history.len() + (TAPS - CENTER - 1) * self.channels, 0.0);
+            self.process(&[], out);
+        }
+        self.reset();
+    }
 }
 
 fn gcd(mut left: usize, mut right: usize) -> usize {
@@ -264,6 +276,27 @@ mod tests {
     const IN_RATE: u32 = 44_100;
     const OUT_RATE: u32 = 48_000;
     const CHANNELS: u16 = 2;
+
+    #[test]
+    fn eof_flush_emits_every_remaining_frame_once_and_resets_history() {
+        for (input_rate, output_rate) in [(44_100, 48_000), (48_000, 44_100), (44_100, 96_000)] {
+            for frames in [1, 17, 33, 137, 4_410] {
+                let mut resampler = Resampler::new(input_rate, output_rate, CHANNELS).unwrap();
+                let mut output = Vec::new();
+                resampler.process(&vec![0.25; frames * CHANNELS as usize], &mut output);
+                resampler.finish(&mut output);
+                let expected = (frames * output_rate as usize).div_ceil(input_rate as usize);
+                assert_eq!(output.len(), expected * CHANNELS as usize);
+                let flushed = output.len();
+                resampler.finish(&mut output);
+                assert_eq!(output.len(), flushed, "EOF must not emit padding twice");
+                let mut silence = Vec::new();
+                resampler.process(&vec![0.0; 100 * CHANNELS as usize], &mut silence);
+                resampler.finish(&mut silence);
+                assert!(silence.iter().all(|sample| *sample == 0.0), "old audio must not bleed into Play");
+            }
+        }
+    }
 
     fn resample_all(resampler: &mut Resampler, input: &[f32], chunk: usize) -> Vec<f32> {
         let mut out = Vec::new();

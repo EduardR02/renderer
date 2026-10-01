@@ -14,6 +14,7 @@ mod time_stretch;
 mod waveform;
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -22,112 +23,66 @@ use engine::{AuthSignal, Engine, PlayerSignal};
 use io::{Input, ProtocolWriter};
 use librespot_audio::AudioFetchParams;
 use librespot_core::cache::Cache;
-use renderer_engine::protocol::{
-    AlbumBrowse, ArtistBrowse, ArtistCataloguePage, ArtistRef, Canvas, Command, EpisodeRef,
-    HistoryQuery, LibraryNode, LikedSongsPage, LikedUrisPage, PlaylistBrowse,
-    PlaylistRecommendations, PlaylistRef, RadioBrowse, Response, SearchBrowse,
-    ShowBrowse, SongwriterPlaylist, TrackCredits, TrackRef, TrackWaveform, UserProfile,
-};
+use librespot_core::Session;
+use renderer_engine::protocol::{Command, HistoryQuery, Response, TrackWaveform};
+use serde::Serialize;
 use tokio::sync::mpsc;
-use tokio::time::MissedTickBehavior;
 use waveform::WaveformService;
 
 const AUDIO_CACHE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
-const POSITION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// A completed network round-trip (browse or playlist edit) produced off the
-/// command loop. The loop turns it into a protocol response; request ids are
-/// correlated by the UI, so out-of-order completion is safe.
-enum BrowseOutcome {
-    Playlists {
-        request_id: String,
-        result: Result<Vec<PlaylistRef>, String>,
-    },
-    Playlist {
-        request_id: String,
-        result: Result<PlaylistBrowse, String>,
-    },
-    PlaylistCovers {
-        request_id: String,
-        result: Result<Vec<PlaylistRef>, String>,
-    },
-    Radio {
-        request_id: String,
-        result: Result<RadioBrowse, String>,
-    },
-    PlaylistRecommendations {
-        request_id: String,
-        result: Result<PlaylistRecommendations, String>,
-    },
-    Track {
-        request_id: String,
-        result: Result<TrackRef, String>,
-    },
-    Album {
-        request_id: String,
-        result: Result<AlbumBrowse, String>,
-    },
-    Artist {
-        request_id: String,
-        result: Result<ArtistBrowse, String>,
-    },
-    Show {
-        request_id: String,
-        result: Result<ShowBrowse, String>,
-    },
-    Episode {
-        request_id: String,
-        result: Result<EpisodeRef, String>,
-    },
-    Profile {
-        request_id: String,
-        result: Result<UserProfile, String>,
-    },
-    PlaylistTree {
-        request_id: String,
-        result: Result<Vec<LibraryNode>, String>,
-    },
-    ArtistSongwriter {
-        request_id: String,
-        result: Result<Option<SongwriterPlaylist>, String>,
-    },
-    ArtistCatalogue {
-        request_id: String,
-        result: Result<ArtistCataloguePage, String>,
-    },
-    LikedSongs {
-        request_id: String,
-        result: Result<LikedSongsPage, String>,
-    },
-    LikedUris {
-        request_id: String,
-        result: Result<LikedUrisPage, String>,
-    },
-    TrackCredits {
-        request_id: String,
-        result: Result<TrackCredits, String>,
-    },
-    Canvas {
-        request_id: String,
-        result: Result<Option<Canvas>, String>,
-    },
-    Search {
-        request_id: String,
-        result: Result<SearchBrowse, String>,
-    },
-    FollowedArtists {
-        request_id: String,
-        result: Result<Vec<ArtistRef>, String>,
-    },
-    CreatePlaylist {
-        request_id: String,
-        result: Result<PlaylistRef, String>,
-    },
-    VoidEdit {
-        request_id: String,
-        kind: &'static str,
-        result: Result<(), String>,
-    },
+/// Runs one browse round-trip off the command loop and writes its typed
+/// `kind` response from the task. Request ids are correlated by the UI, so
+/// out-of-order completion is safe; without a session the reason is answered
+/// at once. Playback commands therefore stay prompt while a slow browse is in
+/// flight.
+fn spawn_browse<T, Fut>(
+    engine: &Engine,
+    request_id: String,
+    kind: &'static str,
+    work: impl FnOnce(Session) -> Fut + Send + 'static,
+) where
+    T: Serialize + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    spawn_round_trip(engine, request_id, kind, work, ProtocolWriter::send_browse::<T>);
+}
+
+/// [`spawn_browse`] for a void playlist edit, answered as `ok`/`error` only.
+fn spawn_edit<Fut>(
+    engine: &Engine,
+    request_id: String,
+    kind: &'static str,
+    work: impl FnOnce(Session) -> Fut + Send + 'static,
+) where
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    spawn_round_trip(engine, request_id, kind, work, ProtocolWriter::send_edit);
+}
+
+fn spawn_round_trip<T, Fut>(
+    engine: &Engine,
+    request_id: String,
+    kind: &'static str,
+    work: impl FnOnce(Session) -> Fut + Send + 'static,
+    reply: fn(&ProtocolWriter, &str, &'static str, &Result<T, String>) -> Result<(), String>,
+) where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    let writer = engine.writer().clone();
+    match engine.browse_session_clone() {
+        Ok(session) => {
+            tokio::spawn(async move {
+                let result = work(session).await;
+                // A dead pipe ends the command loop on its own next write.
+                let _ = reply(&writer, &request_id, kind, &result);
+            });
+        }
+        Err(error) => {
+            let _ = reply(&writer, &request_id, kind, &Err(error));
+        }
+    }
 }
 
 /// Audio fetch tuning at engine startup (before any playback).
@@ -208,7 +163,11 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    // Two workers: the command loop and the browse/auth tasks beside it. The
+    // default spawns one per core for an app that is idle almost always;
+    // blocking work (history writes and pages, device waits) has its own pool.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
     {
@@ -247,7 +206,6 @@ async fn run(
     let (input_sender, mut input_receiver) = mpsc::unbounded_channel();
     let (auth_sender, mut auth_receiver) = mpsc::unbounded_channel::<AuthSignal>();
     let (player_sender, mut player_receiver) = mpsc::unbounded_channel::<PlayerSignal>();
-    let (browse_sender, mut browse_receiver) = mpsc::unbounded_channel::<BrowseOutcome>();
     let (audio_sender, mut audio_receiver) = mpsc::unbounded_channel();
     let (output_sender, mut output_receiver) = mpsc::unbounded_channel();
     io::spawn_input_reader(input_sender);
@@ -275,26 +233,33 @@ async fn run(
             None
         }
     };
+    #[cfg(any(windows, target_os = "macos"))]
+    engine.set_device_notifications(_output_watcher.is_some());
     #[cfg(not(any(windows, target_os = "macos")))]
     drop(output_sender);
     engine.start_authentication(auth_sender.clone());
     engine.emit_state()?;
 
-    let mut position_heartbeat = tokio::time::interval(POSITION_HEARTBEAT_INTERVAL);
-    position_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
     loop {
+        let deadline = engine.next_work_deadline();
         tokio::select! {
             input = input_receiver.recv() => {
                 match input.unwrap_or(Input::Eof) {
                     Input::Request(request) => {
+                        // Idle sessions are observed on demand, not polled; a
+                        // dead one starts reconnecting before this command.
+                        if !matches!(&request.command, Command::Shutdown)
+                            && engine.tick_session_health(&auth_sender)
+                        {
+                            engine.emit_state()?;
+                        }
                         let request_id = request.request_id;
                         match request.command {
                             Command::Shutdown => {
                                 let cancelled: Result<TrackWaveform, String> =
                                     Err("waveform service is shutting down".to_owned());
                                 for pending_id in waveform_service.shutdown() {
-                                    engine.send_browse_response(
+                                    engine.writer().send_browse(
                                         &pending_id,
                                         "get_track_waveform",
                                         &cancelled,
@@ -311,13 +276,20 @@ async fn run(
                                 query,
                                 sort,
                             } => {
-                                let result = engine.history(&HistoryQuery {
-                                    offset,
-                                    limit,
-                                    query,
-                                    sort,
+                                // Filtering and name orders walk the whole
+                                // archive; that belongs on the blocking pool,
+                                // not ahead of the next transport command.
+                                let reader = engine.history_reader();
+                                let writer = engine.writer().clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = reader.page(&HistoryQuery {
+                                        offset,
+                                        limit,
+                                        query,
+                                        sort,
+                                    });
+                                    let _ = writer.send_browse(&request_id, "history", &result);
                                 });
-                                engine.send_browse_response(&request_id, "history", &result)?;
                             }
                             Command::ClearHistory => {
                                 let result = engine.clear_history();
@@ -330,7 +302,7 @@ async fn run(
                                     }
                                     Err(error) => {
                                         let result: Result<TrackWaveform, String> = Err(error);
-                                        engine.send_browse_response(
+                                        engine.writer().send_browse(
                                             &request_id,
                                             "get_track_waveform",
                                             &result,
@@ -342,7 +314,7 @@ async fn run(
                                 let cancelled: Result<TrackWaveform, String> =
                                     Err("waveform request was cancelled".to_owned());
                                 for pending_id in waveform_service.cancel(&track_id) {
-                                    engine.send_browse_response(
+                                    engine.writer().send_browse(
                                         &pending_id,
                                         "get_track_waveform",
                                         &cancelled,
@@ -354,7 +326,7 @@ async fn run(
                             Command::GetTrackEdit { track_id, playlist_id } => {
                                 let result: Result<_, String> =
                                     Ok(engine.track_edit_status(&track_id, playlist_id.as_deref()));
-                                engine.send_browse_response(&request_id, "get_track_edit", &result)?;
+                                engine.writer().send_browse(&request_id, "get_track_edit", &result)?;
                             }
                             Command::SaveTrackEdit {
                                 track_id,
@@ -364,7 +336,7 @@ async fn run(
                             } => {
                                 let result =
                                     engine.save_track_edit(track_id, duration_ms, cuts, loop_range);
-                                engine.send_browse_response(&request_id, "save_track_edit", &result)?;
+                                engine.writer().send_browse(&request_id, "save_track_edit", &result)?;
                             }
                             Command::DeleteTrackEdit { track_id } => {
                                 let result = engine
@@ -407,420 +379,152 @@ async fn run(
                                     engine.emit_state()?;
                                 }
                             }
-                            // Browse and edit commands run their network work
-                            // off the loop: the session clone is handed to a
-                            // spawned task whose outcome is dispatched from
-                            // the browse_receiver arm below. Playback
-                            // commands (volume/pause/seek/next/previous)
-                            // therefore stay prompt even while a slow browse
-                            // is in flight. When no session is available the
-                            // error is answered immediately through the same
-                            // outcome channel.
-                            Command::BrowsePlaylists { length } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::playlists_browse(&session, length).await;
-                                            let _ = sender.send(BrowseOutcome::Playlists { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Playlists { request_id, result: Err(error) });
-                                    }
-                                }
+                            Command::QueueMetadata { context } => {
+                                let result = engine.queue_metadata(context.as_deref());
+                                engine.writer().send_browse(&request_id, "queue_metadata", &result)?;
                             }
                             Command::BrowsePlaylist { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::playlist_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::Playlist { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Playlist { request_id, result: Err(error) });
-                                    }
-                                }
+                                // Exclusions are engine state, so they are read
+                                // here and joined to the browse when it lands.
+                                let excluded = engine.playlist_excluded_track_ids(&id);
+                                spawn_browse(&engine, request_id, "browse_playlist", move |session| async move {
+                                    let mut browse = browse::playlist_browse(&session, &id).await?;
+                                    browse.excluded_track_ids = excluded?;
+                                    Ok(browse)
+                                });
+                            }
+                            Command::BrowsePlaylistMembership { id } => {
+                                spawn_browse(&engine, request_id, "browse_playlist_membership", move |session| async move {
+                                    browse::playlist_membership_browse(&session, &id).await
+                                });
                             }
                             Command::BrowsePlaylistCovers { playlists } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::playlist_covers_browse(&session, playlists).await;
-                                            let _ = sender.send(BrowseOutcome::PlaylistCovers { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::PlaylistCovers { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_playlist_covers", move |session| async move {
+                                    browse::playlist_covers_browse(&session, playlists).await
+                                });
                             }
                             Command::BrowseRadio { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::radio_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::Radio { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Radio { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_radio", move |session| async move {
+                                    browse::radio_browse(&session, &id).await
+                                });
                             }
                             Command::BrowsePlaylistRecommendations { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::playlist_recommendations_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::PlaylistRecommendations { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::PlaylistRecommendations {
-                                            request_id,
-                                            result: Err(error),
-                                        });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_playlist_recommendations", move |session| async move {
+                                    browse::playlist_recommendations_browse(&session, &id).await
+                                });
                             }
                             Command::BrowseEpisode { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::episode_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::Episode { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Episode { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_episode", move |session| async move {
+                                    browse::episode_browse(&session, &id).await
+                                });
                             }
                             Command::BrowseShow { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::show_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::Show { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Show { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_show", move |session| async move {
+                                    browse::show_browse(&session, &id).await
+                                });
                             }
                             Command::BrowseProfile { username, known_playlists } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::user_profile_browse(&session, &username, &known_playlists).await;
-                                            let _ = sender.send(BrowseOutcome::Profile { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Profile { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_profile", move |session| async move {
+                                    browse::user_profile_browse(&session, &username, &known_playlists).await
+                                });
                             }
                             Command::BrowsePlaylistTree { length } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::playlist_tree_browse(&session, length).await;
-                                            let _ = sender.send(BrowseOutcome::PlaylistTree { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::PlaylistTree { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_playlist_tree", move |session| async move {
+                                    browse::playlist_tree_browse(&session, length).await
+                                });
                             }
                             Command::BrowseTrack { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::track_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::Track { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Track { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_track", move |session| async move {
+                                    browse::track_browse(&session, &id).await
+                                });
                             }
                             Command::BrowseAlbum { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::album_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::Album { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Album { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_album", move |session| async move {
+                                    browse::album_browse(&session, &id).await
+                                });
                             }
                             Command::BrowseArtist { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::artist_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::Artist { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Artist { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_artist", move |session| async move {
+                                    browse::artist_browse(&session, &id).await
+                                });
                             }
                             Command::BrowseArtistSongwriter { id, name } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result =
-                                                browse::artist_songwriter_browse(&session, &id, &name)
-                                                    .await;
-                                            let _ = sender.send(BrowseOutcome::ArtistSongwriter {
-                                                request_id,
-                                                result,
-                                            });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::ArtistSongwriter {
-                                            request_id,
-                                            result: Err(error),
-                                        });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_artist_songwriter", move |session| async move {
+                                    browse::artist_songwriter_browse(&session, &id, &name).await
+                                });
                             }
                             Command::BrowseArtistCatalogue { id, release_types, offset, limit, refs_only } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::artist_catalogue_browse(
-                                                &session,
-                                                &id,
-                                                &release_types,
-                                                offset,
-                                                limit,
-                                                refs_only,
-                                            )
-                                            .await;
-                                            let _ = sender.send(BrowseOutcome::ArtistCatalogue { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::ArtistCatalogue { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_artist_catalogue", move |session| async move {
+                                    browse::artist_catalogue_browse(
+                                        &session,
+                                        &id,
+                                        &release_types,
+                                        offset,
+                                        limit,
+                                        refs_only,
+                                    )
+                                    .await
+                                });
                             }
                             Command::BrowseLikedSongs { cursor } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::liked_songs_browse(
-                                                &session,
-                                                cursor.as_deref(),
-                                            )
-                                            .await;
-                                            let _ = sender.send(BrowseOutcome::LikedSongs {
-                                                request_id,
-                                                result,
-                                            });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::LikedSongs {
-                                            request_id,
-                                            result: Err(error),
-                                        });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_liked_songs", move |session| async move {
+                                    browse::liked_songs_browse(&session, cursor.as_deref()).await
+                                });
                             }
                             Command::BrowseLikedUris { cursor } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::liked_song_uris_browse(
-                                                &session,
-                                                cursor.as_deref(),
-                                            )
-                                            .await;
-                                            let _ = sender.send(BrowseOutcome::LikedUris {
-                                                request_id,
-                                                result,
-                                            });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::LikedUris {
-                                            request_id,
-                                            result: Err(error),
-                                        });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_liked_uris", move |session| async move {
+                                    browse::liked_song_uris_browse(&session, cursor.as_deref()).await
+                                });
                             }
                             Command::BrowseTrackCredits { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::track_credits_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::TrackCredits { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::TrackCredits { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_track_credits", move |session| async move {
+                                    browse::track_credits_browse(&session, &id).await
+                                });
                             }
                             Command::BrowseCanvas { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::canvas_browse(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::Canvas { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Canvas {
-                                            request_id,
-                                            result: Err(error),
-                                        });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_canvas", move |session| async move {
+                                    browse::canvas_browse(&session, &id).await
+                                });
                             }
                             Command::BrowseSearch { query, limit } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = browse::search_browse(&session, &query, limit).await;
-                                            let _ = sender.send(BrowseOutcome::Search { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::Search { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_search", move |session| async move {
+                                    browse::search_browse(&session, &query, limit).await
+                                });
                             }
                             Command::BrowseFollowedArtists => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = follow::followed_artists(&session).await;
-                                            let _ = sender.send(BrowseOutcome::FollowedArtists { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::FollowedArtists { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "browse_followed_artists", move |session| async move {
+                                    follow::followed_artists(&session).await
+                                });
                             }
                             Command::EditCreatePlaylist { name } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = edits::create_playlist(&session, &name).await;
-                                            let _ = sender.send(BrowseOutcome::CreatePlaylist { request_id, result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::CreatePlaylist { request_id, result: Err(error) });
-                                    }
-                                }
+                                spawn_browse(&engine, request_id, "edit_create_playlist", move |session| async move {
+                                    edits::create_playlist(&session, &name).await
+                                });
                             }
                             Command::EditRenamePlaylist { id, name } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = edits::rename_playlist(&session, &id, &name).await;
-                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_rename_playlist", result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_rename_playlist", result: Err(error) });
-                                    }
-                                }
+                                spawn_edit(&engine, request_id, "edit_rename_playlist", move |session| async move {
+                                    edits::rename_playlist(&session, &id, &name).await
+                                });
                             }
                             Command::EditDeletePlaylist { id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = edits::delete_playlist(&session, &id).await;
-                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_delete_playlist", result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_delete_playlist", result: Err(error) });
-                                    }
-                                }
+                                spawn_edit(&engine, request_id, "edit_delete_playlist", move |session| async move {
+                                    edits::delete_playlist(&session, &id).await
+                                });
                             }
                             Command::EditAddPlaylistTracks { id, uris } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = edits::add_tracks(&session, &id, &uris).await;
-                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_add_playlist_tracks", result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_add_playlist_tracks", result: Err(error) });
-                                    }
-                                }
+                                spawn_edit(&engine, request_id, "edit_add_playlist_tracks", move |session| async move {
+                                    edits::add_tracks(&session, &id, &uris).await
+                                });
                             }
                             Command::EditRemovePlaylistTracks { id, uris, expected_snapshot_id } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = edits::remove_tracks(&session, &id, &uris, expected_snapshot_id.as_deref()).await;
-                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_remove_playlist_tracks", result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_remove_playlist_tracks", result: Err(error) });
-                                    }
-                                }
+                                spawn_edit(&engine, request_id, "edit_remove_playlist_tracks", move |session| async move {
+                                    edits::remove_tracks(&session, &id, &uris, expected_snapshot_id.as_deref()).await
+                                });
                             }
                             Command::EditReorderPlaylistTracks { id, from, to } => {
-                                match engine.browse_session_clone() {
-                                    Ok(session) => {
-                                        let sender = browse_sender.clone();
-                                        tokio::spawn(async move {
-                                            let result = edits::reorder_tracks(&session, &id, from, to).await;
-                                            let _ = sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_reorder_playlist_tracks", result });
-                                        });
-                                    }
-                                    Err(error) => {
-                                        let _ = browse_sender.send(BrowseOutcome::VoidEdit { request_id, kind: "edit_reorder_playlist_tracks", result: Err(error) });
-                                    }
-                                }
+                                spawn_edit(&engine, request_id, "edit_reorder_playlist_tracks", move |session| async move {
+                                    edits::reorder_tracks(&session, &id, from, to).await
+                                });
                             }
                             command => {
                                 let result = engine.process_command(command, &auth_sender).await;
@@ -867,99 +571,11 @@ async fn run(
                     }
                 }
             }
-            outcome = browse_receiver.recv() => {
-                if let Some(outcome) = outcome {
-                    match outcome {
-                        BrowseOutcome::Playlists { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_playlists", &result)?;
-                        }
-                        BrowseOutcome::Playlist {
-                            request_id,
-                            result,
-                        } => {
-                            let result = result.and_then(|mut browse| {
-                                browse.excluded_track_ids =
-                                    engine.playlist_excluded_track_ids(&browse.id)?;
-                                Ok(browse)
-                            });
-                            engine.send_browse_response(&request_id, "browse_playlist", &result)?;
-                        }
-                        BrowseOutcome::PlaylistCovers { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_playlist_covers", &result)?;
-                        }
-                        BrowseOutcome::Radio { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_radio", &result)?;
-                        }
-                        BrowseOutcome::PlaylistRecommendations { request_id, result } => {
-                            engine.send_browse_response(
-                                &request_id,
-                                "browse_playlist_recommendations",
-                                &result,
-                            )?;
-                        }
-                        BrowseOutcome::Track { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_track", &result)?;
-                        }
-                        BrowseOutcome::Episode { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_episode", &result)?;
-                        }
-                        BrowseOutcome::Show { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_show", &result)?;
-                        }
-                        BrowseOutcome::Profile { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_profile", &result)?;
-                        }
-                        BrowseOutcome::PlaylistTree { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_playlist_tree", &result)?;
-                        }
-                        BrowseOutcome::Album { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_album", &result)?;
-                        }
-                        BrowseOutcome::Artist { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_artist", &result)?;
-                        }
-                        BrowseOutcome::ArtistSongwriter { request_id, result } => {
-                            engine.send_browse_response(
-                                &request_id,
-                                "browse_artist_songwriter",
-                                &result,
-                            )?;
-                        }
-                        BrowseOutcome::ArtistCatalogue { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_artist_catalogue", &result)?;
-                        }
-                        BrowseOutcome::LikedSongs { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_liked_songs", &result)?;
-                        }
-                        BrowseOutcome::LikedUris { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_liked_uris", &result)?;
-                        }
-                        BrowseOutcome::TrackCredits { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_track_credits", &result)?;
-                        }
-                        BrowseOutcome::Canvas { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_canvas", &result)?;
-                        }
-                        BrowseOutcome::Search { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_search", &result)?;
-                        }
-                        BrowseOutcome::FollowedArtists { request_id, result } => {
-                            engine.send_browse_response(&request_id, "browse_followed_artists", &result)?;
-                        }
-                        BrowseOutcome::CreatePlaylist { request_id, result } => {
-                            engine.send_browse_response(&request_id, "edit_create_playlist", &result)?;
-                        }
-                        BrowseOutcome::VoidEdit { request_id, kind, result } => {
-                            engine.send_edit_response(&request_id, kind, &result)?;
-                        }
-                    }
-                }
-            }
             outcome = waveform_receiver.recv() => {
                 if let Some(outcome) = outcome {
                     if let Some((request_ids, result)) = waveform_service.complete(outcome) {
                         for request_id in request_ids {
-                            engine.send_browse_response(
+                            engine.writer().send_browse(
                                 &request_id,
                                 "get_track_waveform",
                                 &result,
@@ -974,20 +590,22 @@ async fn run(
                     engine.tick_audio_device(&auth_sender);
                 }
             }
-            _ = position_heartbeat.tick() => {
+            _ = wait_for_work(deadline) => {
+                let active_tick = engine.take_active_tick();
                 // Writes a volume change that has stopped moving to the
                 // librespot cache. `set_volume` defers it there — a slider drag
                 // paces that command at 50 ms and every write is a file create
                 // — so this is the tick that pays for the whole gesture, once.
                 engine.tick_volume_persist();
+                // Stops the player once a finished queue's tail has played.
+                engine.tick_output_drain();
                 // Catches a session librespot invalidated on its own, which is
                 // otherwise invisible until a track refuses to load.
                 if engine.tick_session_health(&auth_sender) {
                     engine.emit_state()?;
                 }
-                // Opens an output device for a machine that did not have one —
-                // a dongle Windows recognised late, or one plugged back in —
-                // and puts the player back together around it.
+                // Builds a player again once a device can be there — a probe
+                // whose deadline the OS notification or a failed open armed.
                 if engine.tick_audio_device(&auth_sender) {
                     engine.emit_state()?;
                 }
@@ -997,12 +615,7 @@ async fn run(
                 if engine.tick_playback_health() {
                     engine.emit_state()?;
                 }
-                // A track finishes caching mid-listen, so the download mark has
-                // to be able to appear without reopening the list it is in.
-                if engine.refresh_cached_marks() {
-                    engine.emit_state()?;
-                }
-                if engine.tick_position() {
+                if active_tick && engine.tick_position() {
                     // Scalar playhead sync: O(1) regardless of queue size.
                     // Real changes (track, queue, play/pause, ...) still emit
                     // the full state through the other arms, and a volume step
@@ -1013,6 +626,13 @@ async fn run(
         }
     }
     Ok(())
+}
+
+async fn wait_for_work(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Parses `--state-dir <path>` (required), `--log-file <path>` (optional,

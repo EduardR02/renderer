@@ -1,147 +1,27 @@
-//! Immediate-stop rodio audio sink.
+//! Lazy, immediate-pause cpal output for librespot.
 //!
-//! Adapted from librespot-playback 0.8.0's rodio backend
-//! (`audio_backend/rodio.rs`, MIT licensed, copyright the librespot
-//! contributors). Two behavioral differences from the stock backend:
+//! Construction checks presence without opening a stream. First playback opens
+//! output; pause stops the native stream rather than running a silent mixer.
+//! The callback cursor and device's submitted buffer survive pause,
+//! together with queued packets, WSOLA overlap and rational resampler history.
+//! Loads and seeks invalidate retained audio; natural boundaries remain gapless.
 //!
-//! 1. [`RodioSink::stop`]: the stock backend calls
-//!    `rodio::Sink::sleep_until_end()` before pausing, which blocks the player
-//!    thread until the entire buffered queue has played out — about half a
-//!    second of audio at the default write-ahead — on every pause, stop, and
-//!    shutdown. This sink pauses immediately: user pauses retain audio, while
-//!    discontinuous stops discard it. Both silence output within one buffer.
-//! 2. [`SampleRing`]/[`LiveSource`]: the stock backend appends every decoded
-//!    packet to the sink as its own `rodio::Source`. That is the cause of a
-//!    measured playback-rate error; see "Playback rate and fidelity" below.
+//! Processing happens before the ring, at the device rate. The callback only
+//! converts sample representation/channel layout and applies transport gain:
+//! packet boundaries cannot reset the rational resampling phase.
 //!
-//! Resume semantics: a user pause retains the consumer's in-flight packet,
-//! queued packets, WSOLA overlap and resampler history. Resume continues those
-//! samples before decoding ahead, and the consumer clock excludes paused wall
-//! time. Loads and seeks explicitly invalidate this retained audio; a speed
-//! change does not. Natural track boundaries remain gapless.
-//!
-//! # Playback rate and fidelity
-//!
-//! librespot decodes at 44.1 kHz, and the device rate is not negotiable: cpal
-//! opens WASAPI in shared mode only and does not set
-//! `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`, so `IsFormatSupported` accepts nothing
-//! but the rate Windows is configured for. On a machine set to 48 kHz — the
-//! common case — [`select_output_config`] cannot find 44.1 kHz to ask for, and
-//! every sample is resampled on the way out. Two separate defects came out of
-//! that: one in *how many* frames arrived, one in *what was in them*.
-//!
-//! ## Frame count
-//!
-//! rodio's mixer wraps its queue in one `UniformSourceIterator`, which rebuilds
-//! its `SampleRateConverter` at every *span* boundary, and each rebuild loses
-//! the converter's rational phase and treats the last input frame as a new
-//! endpoint. `SourcesQueueOutput` derives that span from the current source's
-//! `current_span_len` or `size_hint`, so appending every decoded packet as its
-//! own `SamplesBuffer` — what the stock backend does — makes every packet a
-//! span. Measured on the reference rig by instrumenting input frames handed to
-//! rodio against output frames the device consumed, differencing two interior
-//! marks (3 s and 23 s) so start-up and drain cancel, against the correct ratio
-//! 48000/44100 = 160/147:
-//!
-//! | samples per packet | ratio     | error    |
-//! |--------------------|-----------|----------|
-//! | 256                | 1.0937486 | +0.4882% |
-//! | 368                | 1.0917131 | +0.3011% |
-//! | 912                | 1.0896387 | +0.1106% |
-//! | 1628               | 1.0884514 | +0.0015% |
-//! | one long source    | 1.0884402 | +0.0004% |
-//!
-//! Spotify's Ogg Vorbis blocks arrive as 256-2048 interleaved samples per
-//! `write`, so the +0.223% (33.5 ms over 15 s) originally reported against the
-//! official client sits inside that range. [`LiveSource`] is the answer: one
-//! endless source, appended once, so decoder packets are not visible to rodio
-//! at all. What remained after that was a much smaller residue from rodio's own
-//! forced spans — about three frames in fifteen seconds.
-//!
-//! ## Sample values
-//!
-//! That residue is now zero, because rodio no longer resamples at all.
-//!
-//! `SampleRateConverter` is, in its own documentation's words, "simple linear
-//! interpolation for up-sampling": a straight line drawn between adjacent
-//! samples. It is a poor reconstruction of a band-limited signal, and its error
-//! grows with the square of frequency — invisible in the bass, severe in the
-//! treble. Measured against the analytically exact resampling of a tone (the
-//! same measurement the [`crate::resample`] tests make):
-//!
-//! | tone   | rodio linear | [`crate::resample`] |
-//! |--------|--------------|---------------------|
-//! | 100 Hz | -94.6 dB     | -133.5 dB           |
-//! | 1 kHz  | -54.6 dB     | -120.9 dB           |
-//! | 5 kHz  | -26.8 dB     | -118.8 dB           |
-//! | 10 kHz | -15.0 dB     | -115.8 dB           |
-//! | 15 kHz |  -8.5 dB     | -131.2 dB           |
-//!
-//! An error 15 dB below the music at 10 kHz is far louder than anything the
-//! 320 kbps bitrate choice is there to protect; it was the dominant artefact in
-//! the entire signal path. [`RodioSink::write`] therefore resamples to the
-//! device rate itself, through [`crate::resample`], before the samples reach the
-//! ring. [`LiveSource`] then reports the *device* rate, which sends both of
-//! rodio's converters down their `from == to` branches — exact pass-throughs
-//! that consume no priming frames. Nothing downstream touches the audio.
-//!
-//! This retires the frame-count problem by construction rather than by
-//! management: [`crate::resample`] tracks position as an exact rational, so the
-//! output frame count is determined for any input length and no longer depends
-//! on rodio's span behaviour.
-//!
-//! Ruled out while diagnosing this, recorded so it is not re-investigated:
-//! - *Queue underrun silence.* rodio's queue does splice in 512 samples of
-//!   silence when it runs dry (`SourcesQueueOutput::go_next`), but with the
-//!   write-ahead budget below it never ran dry in measurement; inserted
-//!   silence was zero in every run.
-//! - *Mixer/stream rate mismatch.* `rodio::stream::OutputStream::open` builds
-//!   the mixer with `mixer(config.channel_count, config.sample_rate)` from the
-//!   same config it hands `build_output_stream`, so the mixer's conversion
-//!   target can never disagree with the rate the device opened at — including
-//!   on the `open_stream_or_fallback` path, which rebuilds both together.
-//!
-//! Failure hardening (engine-death audit): librespot-playback 0.8.0's
-//! player thread calls `process::exit(1)` when a sink call fails in
-//! `ensure_sink_stopped` or when its internal state machine reaches
-//! `Invalid`. This sink makes every such path unreachable from the engine's
-//! API surface:
-//! - `start` and `stop` are infallible by construction (rodio `play` and
-//!   `pause` only set an atomic, and clearing the ring cannot fail), so
-//!   `ensure_sink_stopped`'s `Err(e) => exit(1)` arm can never fire, and
-//!   `ensure_sink_running`'s error path (which would otherwise pause the
-//!   player mid-poll and trip the poll loop's `Invalid PlayerState` exit)
-//!   can never run.
-//! - `write` bounds the wait for buffer space: the stock loop waits forever
-//!   for the rodio queue to shrink, which wedges the player thread
-//!   permanently if the audio device dies. The bounded wait instead surfaces
-//!   the stall as a normal sink error after [`WRITE_DRAIN_TIMEOUT`];
-//!   librespot's `handle_packet` error path pauses the player (never exits),
-//!   so a dead output device degrades to pause-and-retry instead of a hang
-//!   or death. The sink also reports that stall as
-//!   [`AudioSignal::OutputStalled`], because the pause is all librespot says
-//!   about it and the engine has to know the device is what stopped.
-//! - the device is opened by [`SinkOpener`] rather than from a librespot sink
-//!   builder, which cannot report a failure at all: a machine with no output
-//!   device — a fresh boot whose dongle the driver has not recognised yet —
-//!   used to panic on the player thread from inside that builder, and the
-//!   engine answered by shutting the session down. [`open`] returns the typed
-//!   [`RodioError`] instead, and `auth::create_playback` turns it into a state
-//!   the engine recovers from without losing the session.
-//! The only remaining librespot `exit(1)` sites are state-machine asserts
-//! (`is_playing`, `playing_to_*`, `handle_player_stop`, `start_playback`
-//! transition checks) that are unreachable from the engine's serialized
-//! command surface: every transition they guard assigns a valid state
-//! synchronously within one poll iteration, and no command can interleave
-//! between `mem::replace(self, Invalid)` and the reassignment.
+//! librespot can exit the process on start/stop errors, so those methods always
+//! succeed. Native opening is deadline-bounded on a detached worker; failures
+//! notify the engine even without a subsequent write. Ring writes are bounded
+//! too, so dead output cannot wedge the player thread.
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
 use librespot_playback::config::AudioFormat;
 use librespot_playback::convert::Converter;
@@ -153,11 +33,8 @@ use tokio::sync::mpsc;
 use crate::resample::Resampler;
 use crate::time_stretch::{AudioPipeline, PipelineConfig};
 
-/// The audible pipeline: the rodio sink [`set_sink_volume`] applies transport
-/// volume to, the ring a discontinuity clears, and the processing state a
-/// natural boundary flushes through. All three name one [`RodioSink`] and are
-/// claimed together by [`RodioSink::start`] — the moment that sink becomes the
-/// one feeding the device — and released together by its `Drop`.
+/// The audible output, queue and processing state are claimed together at
+/// first start, never when a replacement player is merely constructed.
 ///
 /// Ownership has to be that explicit because two sinks exist at once whenever a
 /// player is replaced while another is still playing: a session reconnect that
@@ -167,11 +44,10 @@ use crate::time_stretch::{AudioPipeline, PipelineConfig};
 /// discarded (a stale rebuild) would leave them dangling at a pipeline nothing
 /// can hear — for the rest of the process. The `Drop` release is therefore
 /// conditional: a sink only ever clears an entry that is still its own.
-static LIVE_SINK: Mutex<Weak<rodio::Sink>> = Mutex::new(Weak::new());
-/// Retained even before the rodio sink is connected, because auth restores the
-/// cached transport volume while the librespot sink is still logically Closed.
-static SINK_VOLUME: AtomicU16 = AtomicU16::new(u16::MAX);
-const LIVE_SINK_POISON_MSG: &str = "live rodio sink registry should not be poisoned";
+static LIVE_OUTPUT: Mutex<Weak<OutputControl>> = Mutex::new(Weak::new());
+/// Cached gain is read once per device callback, including replacement output.
+static SINK_GAIN: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+const LIVE_OUTPUT_POISON_MSG: &str = "live output registry should not be poisoned";
 static LIVE_RING: Mutex<Weak<SampleRing>> = Mutex::new(Weak::new());
 const LIVE_RING_POISON_MSG: &str = "live sample ring should not be poisoned";
 static LIVE_PROCESSING: Mutex<Weak<Mutex<AudioProcessing>>> = Mutex::new(Weak::new());
@@ -212,17 +88,16 @@ pub enum AudioSignal {
     Output {
         revision: u64,
     },
-    /// The output stopped draining: a packet waited out the whole
-    /// [`WRITE_DRAIN_TIMEOUT`] without the device consuming the ring, which
-    /// on a machine whose dongle was just unplugged is the only evidence the
-    /// playback side ever gets. librespot turns the write error that follows
-    /// into a pause and never mentions the device, so the engine has to hear
-    /// it from here.
-    ///
-    /// Revision-gated like [`AudioSignal::Output`], and for the same reason:
-    /// this arrives on the player thread, two seconds after the write began,
-    /// and a player the engine has already replaced must not act on its
-    /// replacement.
+    /// Native callbacks are running for this revision. The callback only sets
+    /// an atomic; the player thread's next write reports it, so the realtime
+    /// thread never takes a lock or sends on a channel for it.
+    OutputReady { revision: u64 },
+    /// Native failure is observable even when no decoder write follows.
+    OutputFailed { revision: u64, blocked: bool },
+    /// A write waited out [`WRITE_DRAIN_TIMEOUT`] without output consumption.
+    /// librespot turns write failures into pause without identifying the device,
+    /// so this signal tells the engine to recover output rather than the track.
+    /// Revision gating prevents a retiring pipeline from replacing its successor.
     OutputStalled {
         revision: u64,
     },
@@ -316,10 +191,20 @@ fn set_customization(
         .fetch_add(1, Ordering::Release)
         .wrapping_add(1);
     drop(customization);
+    let output = LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade();
+    if let Some(output) = &output {
+        // The same native stream spans a natural boundary before the next
+        // decoder write. Its failure still belongs to the new configured load.
+        output.status.revision.store(revision, Ordering::Release);
+        output.status.ready.store(false, Ordering::Release);
+    }
 
     if discontinuous {
         if let Some(ring) = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade() {
             ring.clear();
+        }
+        if let Some(output) = output {
+            output.discard_if_paused();
         }
     }
 
@@ -332,8 +217,8 @@ pub fn customization_revision() -> u64 {
 
 /// Flushes the delayed WSOLA overlap region at decoder EOF without resetting
 /// the output queue. This is intentionally separate from `stop`: a natural
-/// boundary must drain audibly, while pause/seek/config changes are
-/// discontinuities and discard stale queued audio.
+/// boundary must drain audibly, while seeks/config changes discard stale
+/// queued audio. User pause retains both the queue and unflushed processing.
 pub fn finish_natural_boundary() -> Result<(), String> {
     let Some(processing) = LIVE_PROCESSING
         .lock()
@@ -365,85 +250,66 @@ pub fn finish_natural_boundary() -> Result<(), String> {
     }
     ring.push_timed_at_generation(ring.generation.load(Ordering::Acquire),
         queued, None, 0, WRITE_DRAIN_TIMEOUT, Some(timing))
-        .map_err(|()| "rodio sink stalled while flushing the natural EOF tail".to_owned())
+        .map_err(|()| "audio output stalled while flushing the natural EOF tail".to_owned())
+}
+
+/// Flush the rational filter only at queue EOF, never between gapless tracks.
+pub fn finish_output_tail() -> Result<(), String> {
+    let processing = LIVE_PROCESSING.lock().expect(LIVE_PROCESSING_POISON_MSG).upgrade();
+    let ring = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade();
+    let (Some(processing), Some(ring)) = (processing, ring) else { return Ok(()); };
+    let mut queued = Vec::new();
+    let timing;
+    {
+        let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(resampler) = &mut processing.resampler {
+            resampler.finish(&mut queued);
+        }
+        timing = (processing.pipeline_revision, processing.speed, processing.output_rate);
+    }
+    ring.push_timed_at_generation(ring.generation.load(Ordering::Acquire),
+        queued, None, 0, WRITE_DRAIN_TIMEOUT, Some(timing))
+        .map_err(|()| "audio output stalled while flushing the resampler tail".to_owned())
 }
 
 #[derive(Debug)]
-pub enum RodioError {
+pub enum OutputError {
     NoDeviceAvailable,
-    DeviceNotAvailable(String),
-    PlayError(rodio::PlayError),
-    StreamError(rodio::StreamError),
-    DevicesError(cpal::DevicesError),
-    Samples(String),
+    StreamError(cpal::BuildStreamError),
+    Other(String),
 }
 
-impl From<rodio::StreamError> for RodioError {
-    fn from(error: rodio::StreamError) -> RodioError {
-        RodioError::StreamError(error)
+impl From<cpal::BuildStreamError> for OutputError {
+    fn from(error: cpal::BuildStreamError) -> Self {
+        Self::StreamError(error)
     }
 }
 
-impl From<RodioError> for SinkError {
-    fn from(error: RodioError) -> SinkError {
-        use RodioError::*;
-        match error {
-            StreamError(_) | PlayError(_) | Samples(_) => SinkError::OnWrite(error_string(&error)),
-            NoDeviceAvailable | DeviceNotAvailable(_) => {
-                SinkError::ConnectionRefused(error_string(&error))
-            }
-            DevicesError(_) => SinkError::InvalidParams(error_string(&error)),
-        }
-    }
-}
-
-impl fmt::Display for RodioError {
-    /// What went wrong, for a reader who is not a librespot maintainer: this
-    /// string ends up in the engine's state event, which is the only thing the
-    /// owner sees when the machine has no output device. The library-style
-    /// rendering in [`error_string`] stays where librespot's own error type
-    /// carries it, but it leads with the sink's name and says "Not Available",
-    /// which is not a sentence to hand a user.
+impl fmt::Display for OutputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use RodioError::*;
         match self {
-            NoDeviceAvailable => formatter.write_str("no output device is present"),
-            DeviceNotAvailable(name) => {
-                write!(formatter, "output device \"{name}\" is not available")
+            Self::NoDeviceAvailable => formatter.write_str("no output device is present"),
+            Self::StreamError(error) => {
+                write!(formatter, "output device could not be opened: {error}")
             }
-            PlayError(error) => write!(formatter, "output device playback failed: {error}"),
-            StreamError(error) => write!(formatter, "output device could not be opened: {error}"),
-            DevicesError(error) => write!(formatter, "audio devices could not be listed: {error}"),
-            Samples(text) => formatter.write_str(text),
+            Self::Other(text) => formatter.write_str(text),
         }
     }
 }
 
-fn error_string(error: &RodioError) -> String {
-    use RodioError::*;
-    match error {
-        NoDeviceAvailable => "<RodioSink> No Device Available".to_owned(),
-        DeviceNotAvailable(name) => format!("<RodioSink> device \"{name}\" is Not Available"),
-        PlayError(error) => format!("<RodioSink> Play Error: {error}"),
-        StreamError(error) => format!("<RodioSink> Stream Error: {error}"),
-        DevicesError(error) => format!("<RodioSink> Cannot Get Audio Devices: {error}"),
-        Samples(text) => format!("<RodioSink> {text}"),
+impl From<cpal::DefaultStreamConfigError> for OutputError {
+    fn from(error: cpal::DefaultStreamConfigError) -> Self {
+        Self::Other(format!("output device configuration failed: {error}"))
     }
 }
 
-impl From<cpal::DefaultStreamConfigError> for RodioError {
-    fn from(_: cpal::DefaultStreamConfigError) -> RodioError {
-        RodioError::NoDeviceAvailable
+impl From<cpal::SupportedStreamConfigsError> for OutputError {
+    fn from(error: cpal::SupportedStreamConfigsError) -> Self {
+        Self::Other(format!("output device configurations could not be listed: {error}"))
     }
 }
 
-impl From<cpal::SupportedStreamConfigsError> for RodioError {
-    fn from(_: cpal::SupportedStreamConfigsError) -> RodioError {
-        RodioError::NoDeviceAvailable
-    }
-}
-
-/// How long [`RodioSink::write`] waits for ring space before declaring the
+/// How long [`OutputSink::write`] waits for ring space before declaring the
 /// output stalled. Healthy playback frees a chunk every few tens of
 /// milliseconds, so this only fires when the audio thread is dead (device
 /// unplugged, driver failure) — the case where the stock librespot loop would
@@ -462,45 +328,20 @@ const WRITE_AHEAD_MS: usize = 150;
 /// [`WRITE_AHEAD_MS`] as interleaved samples at `rate`. The ring holds
 /// device-rate audio (the resampler runs before it), so the budget is derived
 /// from the rate that is actually queued rather than from librespot's.
-fn write_ahead_samples(rate: rodio::SampleRate) -> usize {
+fn write_ahead_samples(rate: u32) -> usize {
     rate as usize * NUM_CHANNELS as usize * WRITE_AHEAD_MS / 1000
 }
 
-/// The largest span rodio will read before rebuilding its rate converter:
-/// `UniformSourceIterator::bootstrap` clamps the queue's reported span with
-/// `.map(|x| x.min(32768))`. [`LiveSource`] reports it so rodio takes the
-/// longest span it is willing to take. It is only an efficiency knob now —
-/// with the source at the device rate, a rebuild neither drops nor
-/// interpolates a sample — but there is no reason to make rodio do the work
-/// more often than it must.
-const RODIO_SPAN_SAMPLES: usize = 32_768;
-
-/// rodio bootstraps the mixer's first span from an empty queue, whose
-/// `current` is a `rodio::source::Empty` claiming 1 channel at 48 kHz. That
-/// first span is therefore read with the wrong channel count and no
-/// resampling, and it is created inside `Sink::connect_new` before anything
-/// can be appended. [`LiveSource`] opens with exactly this many samples of
-/// silence so the mangled span consumes silence instead of the first moments
-/// of the first track. It is a one-off at sink open, and if rodio ever changes
-/// its `THRESHOLD` the only cost is a few milliseconds of misrendered audio at
-/// start-up — never drift, because the second span onwards reads from this
-/// source and sees the correct rate and channel count.
-const RODIO_BOOTSTRAP_SPAN_SAMPLES: usize = 512;
 
 /// Audio handed from the player thread to the audio callback.
 ///
-/// The producer ([`RodioSink::write`]) pushes each decoded packet's processed
-/// samples as one ring packet, omitting packets removed entirely by cuts, and
-/// blocks with a deadline when the ring is full. The consumer ([`LiveSource`])
-/// takes one packet at a time. Locking once per packet (~20 ms) rather than
-/// once per sample keeps the callback cost negligible. Rodio's own sink takes
-/// several mutexes on the audio thread every 5 ms
-/// (`Sink::append`'s `periodic_access` closure), so this adds no new class of
-/// contention.
+/// The producer pushes processed packets with bounded backpressure. The
+/// consumer locks once per packet, never once per sample, and keeps the current
+/// packet in the native stream's callback for its entire lifetime.
 struct SampleRing {
     /// Interleaved samples the ring will hold before [`SampleRing::push`]
     /// blocks. See [`write_ahead_samples`].
-    capacity: usize,
+    capacity: AtomicUsize,
     state: Mutex<RingState>,
     /// Signalled when the consumer frees space, and when [`SampleRing::clear`]
     /// empties the ring, so a blocked producer wakes promptly instead of
@@ -557,7 +398,7 @@ struct RingState {
 impl SampleRing {
     fn new(capacity: usize) -> Arc<Self> {
         Arc::new(SampleRing {
-            capacity,
+            capacity: AtomicUsize::new(capacity),
             state: Mutex::new(RingState {
                 packets: VecDeque::with_capacity(64),
                 queued_samples: 0,
@@ -633,7 +474,7 @@ impl SampleRing {
         if self.generation.load(Ordering::Acquire) != generation {
             return Ok(());
         }
-        while state.queued_samples >= self.capacity
+        while state.queued_samples >= self.capacity.load(Ordering::Relaxed)
             && !self.retaining_pause.load(Ordering::Acquire)
         {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -740,6 +581,24 @@ impl SampleRing {
         self.audible_elapsed_at(revision, Instant::now())
     }
 
+    /// Wall time until everything handed to this ring has been heard: the rest
+    /// of the packet the device is playing plus every packet queued behind it.
+    /// `None` once it has all played.
+    fn tail_remaining_at(&self, now: Instant) -> Option<Duration> {
+        let state = self.lock();
+        let playing = state.audible.map_or(0.0, |clock| {
+            (clock.timing.duration_ms
+                - now.saturating_duration_since(clock.at).as_secs_f64() * 1_000.0)
+                .max(0.0)
+        });
+        let queued: f64 = state.packets.iter()
+            .filter_map(|packet| packet.timing)
+            .map(|timing| timing.duration_ms)
+            .sum();
+        let remaining = playing + queued;
+        (remaining > 0.0).then(|| Duration::from_secs_f64(remaining / 1_000.0))
+    }
+
     fn audible_elapsed_at(&self, revision: u64, at: Instant) -> Option<f64> {
         let state = self.lock();
         let Some(clock) = state.audible.filter(|clock| clock.timing.revision == revision) else {
@@ -812,6 +671,14 @@ pub fn audible_elapsed_ms(revision: u64) -> Option<f64> {
         .audible_elapsed_ms(revision)
 }
 
+/// How long the live output still needs to play what it already holds — the
+/// natural end of a queue drains this tail before the engine stops the player.
+/// `None` once it has drained, and when nothing owns the output.
+pub fn output_tail_remaining() -> Option<Duration> {
+    LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade()?
+        .tail_remaining_at(Instant::now())
+}
+
 pub fn audible_speed(revision: u64) -> Option<f32> {
     let ring = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade()?;
     let state = ring.lock();
@@ -825,50 +692,81 @@ pub fn audible_speed(revision: u64) -> Option<f32> {
 /// A user pause retains the audible packet, queued audio and processing
 /// lookahead. Seeks/loads still clear all three through customization.
 pub fn pause_output() {
+    let output = LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade();
+    if let Some(output) = output {
+        output.pause();
+    }
     if let Some(ring) = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade() {
         ring.pause_at(Instant::now());
     }
-    if let Some(sink) = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG).upgrade() {
-        sink.pause();
-    }
 }
 
-/// The single `rodio::Source` the sink appends, for the lifetime of the sink.
-///
-/// It never ends and never yields `None`: an empty ring produces silence, so
-/// rodio's queue never advances to another source. Decoder packet boundaries
-/// therefore cannot reset the converter; only rodio's configured spans remain.
+/// A native failure may race librespot's unsolicited Paused event. The engine
+/// uses this sink-owned fact to leave user playback intent for recovery.
+pub fn output_has_failed(revision: u64) -> bool {
+    LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade()
+        .is_some_and(|output| output.status.revision.load(Ordering::Acquire) == revision
+            && output.status.failed.load(Ordering::Acquire))
+}
+
+/// Callback proof remains valid after pause, even if no later write reports it.
+pub fn output_is_ready(revision: u64) -> bool {
+    LIVE_OUTPUT.lock().expect(LIVE_OUTPUT_POISON_MSG).upgrade()
+        .is_some_and(|output| output.status.revision.load(Ordering::Acquire) == revision
+            && output.status.ready.load(Ordering::Acquire)
+            && !output.status.failed.load(Ordering::Acquire))
+}
+
+/// The packet cursor belongs to the native callback and survives stream pause.
 struct LiveSource {
     ring: Arc<SampleRing>,
     /// The generation this source is playing; a mismatch means `stop()` ran.
     generation: u64,
     packet: RingPacket,
     pos: usize,
-    /// Samples of silence still owed. Silence is always emitted in whole
-    /// frames so an underrun (or the start-up priming) can never shift the
-    /// channel interleave and swap left with right.
+    /// Silence is emitted in whole frames so an underrun cannot swap channels.
     silence_remaining: usize,
-    /// Rate of the audio in the ring, which [`RodioSink::write`] has already
-    /// resampled to the device's rate.
-    rate: rodio::SampleRate,
 }
 
 impl LiveSource {
-    fn new(ring: Arc<SampleRing>, rate: rodio::SampleRate) -> Self {
+    fn new(ring: Arc<SampleRing>) -> Self {
         let generation = ring.generation.load(Ordering::Acquire);
         LiveSource {
             ring,
             generation,
             packet: RingPacket::default(),
             pos: 0,
-            silence_remaining: RODIO_BOOTSTRAP_SPAN_SAMPLES,
-            rate,
+            silence_remaining: 0,
+        }
+    }
+
+    fn render<T: cpal::Sample + cpal::FromSample<f32>>(
+        &mut self,
+        data: &mut [T],
+        channels: usize,
+        running: bool,
+        gain: f32,
+    ) {
+        if !running {
+            data.fill(T::EQUILIBRIUM);
+            return;
+        }
+        for frame in data.chunks_exact_mut(channels) {
+            let left = self.next().unwrap_or(0.0) * gain;
+            let right = self.next().unwrap_or(0.0) * gain;
+            if channels == 1 {
+                frame[0] = T::from_sample((left + right) * 0.5);
+            } else {
+                frame[0] = T::from_sample(left);
+                frame[1] = T::from_sample(right);
+                frame[2..].fill(T::EQUILIBRIUM);
+            }
         }
     }
 }
 
 impl Iterator for LiveSource {
-    type Item = rodio::Sample;
+    type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.silence_remaining > 0 {
@@ -917,65 +815,97 @@ impl Iterator for LiveSource {
         Some(sample)
     }
 
-    /// rodio's queue derives its span from this (see [`RODIO_SPAN_SAMPLES`]).
-    /// The lower bound is valid because this iterator is endless; it is not an
-    /// iterator-length promise, and nothing in the playback path treats it as
-    /// one.
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (RODIO_SPAN_SAMPLES, None)
-    }
 }
 
-impl rodio::Source for LiveSource {
-    /// `None` means "the rate and channel count never change", which is true:
-    /// this source outlives every track. The actual span length rodio reads
-    /// before rebuilding its converter comes from `size_hint`.
-    fn current_span_len(&self) -> Option<usize> {
-        None
-    }
-
-    fn channels(&self) -> rodio::ChannelCount {
-        NUM_CHANNELS as rodio::ChannelCount
-    }
-
-    /// The device's rate, not librespot's: [`RodioSink::write`] has already
-    /// resampled. Reporting it is what makes rodio's `SampleRateConverter` and
-    /// `ChannelCountConverter` take their `from == to` pass-through branches.
-    fn sample_rate(&self) -> rodio::SampleRate {
-        self.rate
-    }
-
-    fn total_duration(&self) -> Option<Duration> {
-        None
-    }
-}
-
-fn attach_live_source(sink: &rodio::Sink, ring: &Arc<SampleRing>, rate: rodio::SampleRate) {
-    sink.append(LiveSource::new(ring.clone(), rate));
-}
-
-/// Points one live-pipeline entry (the ring, the processing state) at this
-/// sink's half of it. [`LIVE_SINK`] is claimed by [`claim_live_sink`] instead,
-/// which hands the newcomer the transport volume in the same critical section.
 fn claim_live<T>(slot: &Mutex<Weak<T>>, value: &Arc<T>, poison: &str) {
     *slot.lock().expect(poison) = Arc::downgrade(value);
 }
 
-/// Registers the sink that is now feeding the device and hands it the
-/// remembered transport volume before releasing the registry.
-///
-/// Claimed and read in one critical section, which is the same one
-/// [`set_sink_volume`] stores and applies in. Reading the value first — as this
-/// used to — let a volume change land in between: the newcomer is not in the
-/// registry yet, so that change was not applied to it, and the gain it did
-/// read is then written over the newer one the change had just applied to
-/// whatever was live. The result is a sink audibly one step behind the volume
-/// every other component already agrees on.
-fn claim_live_sink(sink: &Arc<rodio::Sink>) {
-    let mut live = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG);
-    *live = Arc::downgrade(sink);
-    sink.set_volume(volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)));
+#[derive(Default)]
+struct OutputStatus {
+    running: AtomicBool,
+    failed: AtomicBool,
+    revision: AtomicU64,
+    attempt: AtomicU64,
+    /// Set by the native callback once it runs for the current revision;
+    /// reported to the engine by the player thread (see
+    /// [`AudioSignal::OutputReady`]).
+    ready: AtomicBool,
+    failure_gate: Mutex<()>,
+    #[cfg(test)]
+    callbacks: AtomicU64,
 }
+
+impl OutputStatus {
+    fn fail(&self, blocked: bool) {
+        self.fail_at_attempt(self.attempt.load(Ordering::Acquire), blocked);
+    }
+
+    fn fail_at_attempt(&self, attempt: u64, blocked: bool) {
+        let _guard = self.failure_gate.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.attempt.load(Ordering::Acquire) != attempt {
+            return;
+        }
+        self.running.store(false, Ordering::Release);
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            signal(AudioSignal::OutputFailed {
+                revision: self.revision.load(Ordering::Acquire),
+                blocked,
+            });
+        }
+    }
+
+    fn begin_attempt(&self) -> u64 {
+        let _guard = self.failure_gate.lock().unwrap_or_else(PoisonError::into_inner);
+        self.failed.store(false, Ordering::Release);
+        self.attempt.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    }
+
+    fn abandon_attempt(&self) {
+        let _guard = self.failure_gate.lock().unwrap_or_else(PoisonError::into_inner);
+        self.attempt.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Default)]
+struct OutputControl {
+    stream: Mutex<Option<cpal::Stream>>,
+    status: Arc<OutputStatus>,
+    error: Mutex<Option<String>>,
+    pending: Mutex<Option<std::sync::mpsc::Sender<Result<(cpal::Stream, cpal::SupportedStreamConfig), OutputError>>>>,
+}
+
+impl OutputControl {
+    fn fail(&self, error: impl fmt::Display) {
+        *self.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(error.to_string());
+        self.status.fail(false);
+    }
+
+    fn pause(&self) {
+        self.status.running.store(false, Ordering::Release);
+        if let Some(pending) = self.pending.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            let _ = pending.send(Err(OutputError::Other("audio opening cancelled".to_owned())));
+        }
+        let mut stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(output) = stream.as_ref() {
+            if let Err(error) = output.pause() {
+                self.fail(error);
+                // A failed pause must not leave callbacks running.
+                stream.take();
+            }
+        }
+    }
+
+    fn discard_if_paused(&self) {
+        let mut stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.status.running.load(Ordering::Acquire) {
+            // A paused seek/load invalidates the WASAPI buffer too, not just
+            // the callback cursor. The next start opens a fresh native stream.
+            stream.take();
+        }
+    }
+}
+
 
 /// Clears one live-pipeline entry, but only while it still names this sink. A
 /// sink outlived by its replacement must not deregister the pipeline that has
@@ -1081,10 +1011,12 @@ impl AudioProcessing {
     }
 }
 
-pub struct RodioSink {
-    rodio_sink: Option<Arc<rodio::Sink>>,
+pub struct OutputSink {
+    host: cpal::HostId,
+    format: AudioFormat,
+    output: Arc<OutputControl>,
     ring: Arc<SampleRing>,
-    output_rate: rodio::SampleRate,
+    output_rate: u32,
     processing: Arc<Mutex<AudioProcessing>>,
     /// Per-packet staging reused across writes. The final clone deliberately
     /// gives the ring a tight allocation: its budget counts audible samples,
@@ -1099,7 +1031,12 @@ pub struct RodioSink {
     /// every load, seek and loop jump, so this re-arms wherever the engine
     /// starts caring about a new stretch of audio. Only `write` touches it.
     signalled_revision: Option<u64>,
-    _stream: rodio::OutputStream,
+    /// The revision [`AudioSignal::OutputReady`] was last sent for, on the
+    /// same once-per-revision terms.
+    ready_revision: Option<u64>,
+    /// Pause can cancel native opening before the rate is known. Retain
+    /// in-flight decoded packets unprocessed until the resumed open.
+    deferred: VecDeque<(u64, AudioPacket)>,
 }
 
 /// Maps a u16 volume (librespot's 0..=65535 scale) to the audible gain used
@@ -1123,42 +1060,22 @@ fn volume_to_gain(volume: u16) -> f32 {
     }
 }
 
-/// Applies a transport volume change to the live rodio sink immediately.
-/// The sink's mixer gain multiplies every queued sample, so the audible
-/// change lands on the next audio callback (~10 ms) instead of after the
-/// write-ahead buffer plays out.
-///
-/// The remembered value and the apply happen inside the registry lock, which
-/// is also where [`claim_live_sink`] registers the next sink and reads the
-/// value it applies. Stored outside it, a sink that was being claimed could
-/// miss this change — it is not in the registry yet — and then hand the device
-/// the older gain it had already read: one step behind `state.volume`, the
-/// cache and the slider until the next change. Inside it, the two always move
-/// together.
+/// Gain changes apply to retained and queued samples on the next callback.
 pub fn set_sink_volume(volume: u16) {
-    let live = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG);
-    SINK_VOLUME.store(volume, Ordering::Release);
-    if let Some(sink) = live.upgrade() {
-        sink.set_volume(volume_to_gain(volume));
-    }
+    SINK_GAIN.store(volume_to_gain(volume).to_bits(), Ordering::Release);
 }
 
 /// Picks the stereo output config to open, in descending order of how little
 /// conversion it forces on the audio.
 ///
-/// The stock backend took the *first* stereo config the device listed and
-/// asked it for 44.1 kHz. That is arbitrary: on the reference dongle the first
-/// stereo entry is U8, and it only happens to be harmless because
-/// `SupportedStreamConfig::config()` drops the sample format and
-/// `with_sample_format` overrides it from librespot's `AudioFormat`. A device
-/// that exposes different rate ranges per format would get a rate chosen by
-/// list order. Preferring a config that actually supports 44.1 kHz matters
-/// most: at the native rate rodio skips resampling entirely.
+/// Prefer native 44.1 kHz, then the device's default rate, with the requested
+/// representation preferred at either rate. Use an actually supported sample
+/// format; do not overwrite the advertised format after selecting a config.
 fn select_output_config(
     device: &cpal::Device,
     sample_format: cpal::SampleFormat,
     default_config: &cpal::SupportedStreamConfig,
-) -> Result<cpal::SupportedStreamConfig, RodioError> {
+) -> Result<cpal::SupportedStreamConfig, OutputError> {
     let stereo: Vec<cpal::SupportedStreamConfigRange> = device
         .supported_output_configs()?
         .filter(|c| c.channels() == NUM_CHANNELS as cpal::ChannelCount)
@@ -1192,57 +1109,121 @@ fn select_output_config(
     )
 }
 
+fn build_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    ring: Arc<SampleRing>,
+    status: Arc<OutputStatus>,
+    attempt: u64,
+) -> Result<cpal::Stream, OutputError>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let channels = config.channels() as usize;
+    let mut source = LiveSource::new(ring);
+    let errors = Arc::clone(&status);
+    Ok(device.build_output_stream(
+        &config.config(),
+        move |data: &mut [T], _| {
+            #[cfg(test)]
+            status.callbacks.fetch_add(1, Ordering::Relaxed);
+            let running = status.running.load(Ordering::Acquire)
+                && status.attempt.load(Ordering::Acquire) == attempt;
+            if running && !status.ready.load(Ordering::Relaxed) {
+                status.ready.store(true, Ordering::Release);
+            }
+            source.render(data, channels, running,
+                f32::from_bits(SINK_GAIN.load(Ordering::Acquire)));
+        },
+        move |error| {
+            eprintln!("audio output failed: {error}");
+            errors.fail_at_attempt(attempt, false);
+        },
+        None,
+    )?)
+}
+
 fn create_stream(
     host: &cpal::Host,
     format: AudioFormat,
-) -> Result<rodio::OutputStream, RodioError> {
-    let cpal_device = host
-        .default_output_device()
-        .ok_or(RodioError::NoDeviceAvailable)?;
-
-    let sample_format = match format {
+    ring: &Arc<SampleRing>,
+    status: &Arc<OutputStatus>,
+    attempt: u64,
+) -> Result<(cpal::Stream, cpal::SupportedStreamConfig), OutputError> {
+    let device = host.default_output_device().ok_or(OutputError::NoDeviceAvailable)?;
+    let requested = match format {
         AudioFormat::F64 => cpal::SampleFormat::F64,
         AudioFormat::F32 => cpal::SampleFormat::F32,
         AudioFormat::S32 => cpal::SampleFormat::I32,
         AudioFormat::S24 | AudioFormat::S24_3 => cpal::SampleFormat::I24,
         AudioFormat::S16 => cpal::SampleFormat::I16,
     };
-
-    let default_config = cpal_device.default_output_config()?;
-    let config = select_output_config(&cpal_device, sample_format, &default_config)?;
-
-    // The fallback cannot introduce a rate error: rodio builds the mixer from
-    // the same config it hands cpal (`OutputStream::open`), so whatever config
-    // wins here, the mixer's conversion target matches the rate the device
-    // actually opened at.
-    let builder = rodio::OutputStreamBuilder::default()
-        .with_device(cpal_device)
-        .with_config(&config.config())
-        .with_sample_format(sample_format);
-    let mut stream = builder.open_stream_or_fallback()?;
-
-    // Disable logging on stream drop.
-    stream.log_on_drop(false);
-
-    Ok(stream)
+    let default = device.default_output_config()?;
+    let preferred = select_output_config(&device, requested, &default)?;
+    let build = |config: &cpal::SupportedStreamConfig| {
+        macro_rules! build {
+            ($sample:ty) => { build_stream::<$sample>(&device, config, Arc::clone(ring), Arc::clone(status), attempt) };
+        }
+        match config.sample_format() {
+            cpal::SampleFormat::I8 => build!(i8),
+            cpal::SampleFormat::I16 => build!(i16),
+            cpal::SampleFormat::I24 => build!(cpal::I24),
+            cpal::SampleFormat::I32 => build!(i32),
+            cpal::SampleFormat::I64 => build!(i64),
+            cpal::SampleFormat::U8 => build!(u8),
+            cpal::SampleFormat::U16 => build!(u16),
+            cpal::SampleFormat::U32 => build!(u32),
+            cpal::SampleFormat::U64 => build!(u64),
+            cpal::SampleFormat::F32 => build!(f32),
+            cpal::SampleFormat::F64 => build!(f64),
+            other => Err(OutputError::Other(format!("unsupported output sample format: {other}"))),
+        }
+    };
+    match build(&preferred) {
+        Ok(stream) => Ok((stream, preferred)),
+        Err(_) if preferred != default => Ok((build(&default)?, default)),
+        Err(error) => Err(error),
+    }
 }
 
-/// Opens the output device for one player: a sink, or the typed reason there
-/// is none.
-///
-/// The engine holds one of these instead of calling [`open`] directly, for two
-/// reasons that are the same reason seen from both ends. librespot's sink
-/// builder cannot report a failure — it runs on the player thread and must
-/// return a `Sink`, so the only way it can say "no device" is by killing that
-/// thread — so the device step has to happen where its answer can travel
-/// somewhere, and a machine with no output device is a state the engine has to
-/// reach on demand, which real hardware cannot be asked to arrange.
-pub type SinkOpener = Arc<dyn Fn(AudioFormat) -> Result<Box<dyn Sink>, RodioError> + Send + Sync>;
+/// The native opener may wedge in a driver. Its worker is deliberately detached:
+/// timeout frees the player thread, and a late stream is dropped without playing.
+fn open_with_deadline<T: Send + 'static>(
+    open: impl FnOnce() -> Result<T, OutputError> + Send + 'static,
+    timeout: Duration,
+    on_pending: impl FnOnce(std::sync::mpsc::Sender<Result<T, OutputError>>),
+) -> Result<T, (String, bool)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    on_pending(sender.clone());
+    if let Ok(result) = receiver.try_recv() {
+        return result.map_err(|error| (error.to_string(), false));
+    }
+    std::thread::Builder::new().name("audio-output-open".to_owned())
+        .spawn(move || { let _ = sender.send(open()); })
+        .map_err(|error| (format!("audio open worker failed: {error}"), false))?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result.map_err(|error| (error.to_string(), false)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) =>
+            Err(("audio output device did not answer while opening".to_owned(), true)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =>
+            Err(("audio output worker terminated while opening".to_owned(), false)),
+    }
+}
+
+/// Injectable construction boundary. Production constructs a lazy sink;
+/// tests may still return a typed construction failure for recovery scenarios.
+pub type SinkOpener = Arc<dyn Fn(AudioFormat) -> Result<Box<dyn Sink>, OutputError> + Send + Sync>;
 
 /// The opener the engine uses in production: whatever output device Windows
 /// currently calls the default, in the format the player feeds.
 pub fn default_sink_opener() -> SinkOpener {
-    Arc::new(|format| Ok(Box::new(open(cpal::default_host(), format)?)))
+    Arc::new(|format| {
+        let host = cpal::default_host();
+        if host.default_output_device().is_none() {
+            return Err(OutputError::NoDeviceAvailable);
+        }
+        Ok(Box::new(open(host, format)))
+    })
 }
 
 /// Answers whether the machine currently has a default output device, and
@@ -1258,11 +1239,9 @@ pub type DevicePresence = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// The presence check the engine uses in production: whether Windows has a
 /// default output device at all right now.
-///
-/// Deliberately not the whole truth — a device that is present can still
-/// refuse to open, and that failure keeps its typed reason and its message by
-/// going through [`SinkOpener`]. All this answers is whether a construction
-/// could find anything to open.
+/// Presence does not guarantee the device can open. Production discovers that
+/// on first start and reports failure from write; the engine's injected opener
+/// can also return a construction failure. This probe only answers presence.
 pub fn default_device_presence() -> DevicePresence {
     Arc::new(|| cpal::default_host().default_output_device().is_some())
 }
@@ -1281,69 +1260,34 @@ impl Sink for SilentSink {
     }
 }
 
-/// Opens the default host's output device with an immediate-stop sink.
-///
-/// Infallible in the sense that it never panics, which it used to: a machine
-/// whose dongle the driver has not recognised yet has no default output
-/// device, and that was an `expect` on librespot's player thread. It is an
-/// ordinary [`RodioError`] now, and the caller decides what to do about a
-/// machine that cannot currently play anything.
-pub fn open(host: cpal::Host, format: AudioFormat) -> Result<RodioSink, RodioError> {
-    let stream = create_stream(&host, format)?;
-    let output_rate = stream.config().sample_rate();
-    let resampler = Resampler::new(SAMPLE_RATE, output_rate, NUM_CHANNELS as u16);
-    let resampling = resampler.is_some();
-    let ring = SampleRing::new(write_ahead_samples(output_rate));
-    let processing = Arc::new(Mutex::new(AudioProcessing {
-        resampler,
-        pipeline_revision: CUSTOMIZATION_REVISION
-            .load(Ordering::Acquire)
-            .wrapping_sub(1),
-        pipeline: None,
-        speed: 1.0,
-        output_rate,
-    }));
-
-    // The one fact that decides output fidelity, and the one that is otherwise
-    // invisible: which rate the device actually opened at, and therefore
-    // whether anything is being resampled at all.
-    eprintln!(
-        "audio output: {} Hz, {} channels, {:?}; decoder {} Hz stereo, {}",
-        output_rate,
-        stream.config().channel_count(),
-        stream.config().sample_format(),
-        SAMPLE_RATE,
-        if resampling {
-            "resampling"
-        } else {
-            "no resampling (device is at the decoder's rate)"
-        }
-    );
-
-    // Opening the cpal stream validates the device while failure is still
-    // recoverable by the sink factory, but do not connect rodio's keep-alive
-    // SourcesQueueOutput yet. librespot creates this sink in logical Closed
-    // state; connecting early makes the active output callback allocate
-    // 512-sample Zero sources and rebuild converters forever while idle. The
-    // cpal callback itself remains active because rodio does not expose its
-    // stream handle, but an empty mixer has no queue/source work to perform.
-    Ok(RodioSink {
-        rodio_sink: None,
-        ring,
-        output_rate,
-        processing,
+/// Constructs an unstarted sink. No device or stream is opened until `start`.
+pub fn open(host: cpal::Host, format: AudioFormat) -> OutputSink {
+    OutputSink {
+        host: host.id(),
+        format,
+        output: Arc::new(OutputControl::default()),
+        ring: SampleRing::new(write_ahead_samples(SAMPLE_RATE)),
+        output_rate: SAMPLE_RATE,
+        processing: Arc::new(Mutex::new(AudioProcessing {
+            resampler: None,
+            pipeline_revision: CUSTOMIZATION_REVISION.load(Ordering::Acquire).wrapping_sub(1),
+            pipeline: None,
+            speed: 1.0,
+            output_rate: SAMPLE_RATE,
+        })),
         pipeline_scratch: Vec::new(),
         resampler_scratch: Vec::new(),
         signalled_revision: None,
-        _stream: stream,
-    })
+        ready_revision: None,
+        deferred: VecDeque::new(),
+    }
 }
 
-impl Drop for RodioSink {
+impl Drop for OutputSink {
     fn drop(&mut self) {
-        if let Some(sink) = &self.rodio_sink {
-            release_live(&LIVE_SINK, sink, LIVE_SINK_POISON_MSG);
-        }
+        self.output.pause();
+        self.output.stream.lock().unwrap_or_else(PoisonError::into_inner).take();
+        release_live(&LIVE_OUTPUT, &self.output, LIVE_OUTPUT_POISON_MSG);
         release_live(&LIVE_RING, &self.ring, LIVE_RING_POISON_MSG);
         release_live(
             &LIVE_PROCESSING,
@@ -1353,51 +1297,83 @@ impl Drop for RodioSink {
     }
 }
 
-impl Sink for RodioSink {
+impl Sink for OutputSink {
     fn start(&mut self) -> SinkResult<()> {
-        if self.rodio_sink.is_none() {
-            let sink = Arc::new(rodio::Sink::connect_new(self._stream.mixer()));
-            sink.pause();
-            // This sink is about to be the one feeding the device, so the whole
-            // pipeline changes hands here rather than at construction — and the
-            // claim hands it the remembered transport volume as it registers
-            // it, before anything can change that volume again.
-            claim_live_sink(&sink);
-            attach_live_source(&sink, &self.ring, self.output_rate);
-            claim_live(&LIVE_RING, &self.ring, LIVE_RING_POISON_MSG);
-            claim_live(
-                &LIVE_PROCESSING,
-                &self.processing,
-                LIVE_PROCESSING_POISON_MSG,
-            );
-            self.rodio_sink = Some(sink);
+        let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
+        self.output.status.revision.store(revision, Ordering::Release);
+        self.output.status.running.store(true, Ordering::Release);
+        self.output.status.ready.store(false, Ordering::Release);
+        claim_live(&LIVE_OUTPUT, &self.output, LIVE_OUTPUT_POISON_MSG);
+        claim_live(&LIVE_RING, &self.ring, LIVE_RING_POISON_MSG);
+        claim_live(&LIVE_PROCESSING, &self.processing, LIVE_PROCESSING_POISON_MSG);
+        let needs_open = self.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_none();
+        if needs_open {
+            let attempt = self.output.status.begin_attempt();
+            let host = self.host;
+            let format = self.format;
+            let ring = Arc::clone(&self.ring);
+            let status = Arc::clone(&self.output.status);
+            let opened = open_with_deadline(move || {
+                let host = cpal::host_from_id(host)
+                    .map_err(|error| OutputError::Other(error.to_string()))?;
+                create_stream(&host, format, &ring, &status, attempt)
+            }, crate::auth::AUDIO_START_TIMEOUT, |sender| {
+                *self.output.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
+                if !self.output.status.running.load(Ordering::Acquire) {
+                    self.output.pause();
+                }
+            });
+            self.output.pending.lock().unwrap_or_else(PoisonError::into_inner).take();
+            match opened {
+                Ok((stream, config)) => {
+                    self.output_rate = config.sample_rate().0;
+                    self.ring.capacity.store(write_ahead_samples(self.output_rate), Ordering::Relaxed);
+                    let mut processing = self.processing.lock().unwrap_or_else(PoisonError::into_inner);
+                    processing.output_rate = self.output_rate;
+                    processing.resampler = Resampler::new(SAMPLE_RATE, self.output_rate, NUM_CHANNELS as u16);
+                    eprintln!("audio output: {} Hz, {} channels, {:?}", self.output_rate, config.channels(), config.sample_format());
+                    *self.output.stream.lock().unwrap_or_else(PoisonError::into_inner) = Some(stream);
+                    *self.output.error.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                }
+                Err((error, blocked)) => {
+                    self.output.status.abandon_attempt();
+                    if !self.output.status.running.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    *self.output.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
+                    self.output.status.fail(blocked);
+                    return Ok(());
+                }
+            }
         }
-
+        // Pause may have arrived while native opening was in flight.
+        if !self.output.status.running.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.ring.resume_at(Instant::now());
-        self.rodio_sink
-            .as_ref()
-            .expect("rodio sink was connected above")
-            .play();
+        let stream = self.output.stream.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(stream) = stream.as_ref() {
+            if let Err(error) = stream.play() {
+                self.output.fail(format_args!("output device playback failed: {error}"));
+            }
+        }
+        drop(stream);
+        let _ = self.drain_deferred();
         Ok(())
     }
 
-    /// Stops without draining. A requested user pause retains samples and
-    /// processing state; seek/load/stop discontinuities discard them instead.
-    /// Both pause the device immediately without waiting on queued audio.
-    ///
-    /// This deliberately does not call `rodio::Sink::stop`, which the previous
-    /// per-packet version used: `Sink::stop` ends the current source for good,
-    /// and with a single long-lived source that would tear down the very thing
-    /// keeping the rate converter continuous. It would also make the next
-    /// `Sink::append` call `sleep_until_end()` — exactly the blocking wait this
-    /// sink exists to avoid. Pausing is equally instant and keeps the source
-    /// alive; a paused rodio sink stops pulling from the source entirely
-    /// (`Pausable` emits silence without polling its input), so the refilled
-    /// ring is not consumed while stopped.
+    /// Stops callbacks and keeps the native stream. librespot stops the sink
+    /// inside every seek (pause → seek → play) and at a loop pass, so dropping
+    /// the stream here reopened the device on each of them. A discontinuity
+    /// while paused is the one case whose submitted device buffer must not be
+    /// heard on resume, and the customization reset already drops the stream
+    /// for exactly that case (see [`OutputControl::discard_if_paused`]).
     fn stop(&mut self) -> SinkResult<()> {
+        self.output.pause();
+        let retaining = self.ring.retaining_pause.load(Ordering::Acquire);
         self.ring.stop_processing(&self.processing);
-        if let Some(sink) = &self.rodio_sink {
-            sink.pause();
+        if !retaining {
+            self.deferred.clear();
         }
         Ok(())
     }
@@ -1406,25 +1382,45 @@ impl Sink for RodioSink {
         let samples = packet
             .samples()
             .map_err(|error| SinkError::OnWrite(error.to_string()))?;
-        let samples_f32 = converter.f64_to_f32(samples);
 
         // A partial frame would shift the interleave for everything after it
         // and swap the channels, so refuse it rather than corrupt the stream.
-        if !samples_f32.len().is_multiple_of(NUM_CHANNELS as usize) {
+        if !samples.len().is_multiple_of(NUM_CHANNELS as usize) {
             return Err(SinkError::OnWrite(format!(
                 "decoder produced a partial frame: {} samples is not a multiple of {NUM_CHANNELS}",
-                samples_f32.len()
+                samples.len()
             )));
         }
 
         let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
-        // Before any processing, because the question this answers is about
-        // the decoder, not about what the edit pipeline does with its output:
-        // a packet the cuts remove entirely still proves the track decodes.
+        if self.output.status.failed.load(Ordering::Acquire) {
+            signal(AudioSignal::OutputStalled { revision });
+            let error = self.output.error.lock().unwrap_or_else(PoisonError::into_inner)
+                .clone().unwrap_or_else(|| "audio output device failed".to_owned());
+            return Err(SinkError::OnWrite(error));
+        }
+        if !self.output.status.running.load(Ordering::Acquire)
+            && self.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_none()
+        {
+            // Held for the resumed open; the replayed write reports it then.
+            self.deferred.push_back((ring_generation, packet));
+            return Ok(());
+        }
+        // Once the packet is accepted, and before any processing: the question
+        // this answers is about the decoder, not about what the edit pipeline
+        // does with its output — a packet the cuts remove entirely still
+        // proves the track decodes.
         if self.signalled_revision != Some(revision) {
             self.signalled_revision = Some(revision);
             signal(AudioSignal::Output { revision });
         }
+        if self.ready_revision != Some(revision)
+            && self.output.status.ready.load(Ordering::Acquire)
+        {
+            self.ready_revision = Some(revision);
+            signal(AudioSignal::OutputReady { revision });
+        }
+        let samples_f32 = converter.f64_to_f32(samples);
 
         let processing = Arc::clone(&self.processing);
         let mut processing = processing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1466,7 +1462,29 @@ impl Sink for RodioSink {
     }
 }
 
-impl RodioSink {
+impl OutputSink {
+    fn drain_deferred(&mut self) -> SinkResult<()> {
+        for _ in 0..self.deferred.len() {
+            if !self.output.status.running.load(Ordering::Acquire) {
+                break;
+            }
+            let Some((generation, packet)) = self.deferred.pop_front() else { break; };
+            if generation != self.ring.generation.load(Ordering::Acquire) {
+                continue;
+            }
+            let remaining = self.deferred.len();
+            // Converter's f32 path has no dither/config state.
+            self.write(packet, &mut Converter::new(None))?;
+            if self.deferred.len() > remaining {
+                // Pause raced this write and retained it again. Restore its
+                // place ahead of the still-unprocessed packets.
+                self.deferred.rotate_right(1);
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Hands one finished packet to the ring; the shared backpressure tail of
     /// every write path. The wait is bounded so a dead audio thread cannot
     /// wedge the player thread forever: after WRITE_DRAIN_TIMEOUT the write
@@ -1497,7 +1515,7 @@ impl RodioSink {
             // ever reports the resulting write error as a pause.
             signal(AudioSignal::OutputStalled { revision });
             return Err(SinkError::OnWrite(
-                "rodio sink stalled: audio output is not draining".to_owned(),
+                "audio output stalled: device is not draining".to_owned(),
             ));
         }
         Ok(())
@@ -1507,12 +1525,10 @@ impl RodioSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::percent_to_volume;
-    use rodio::Source as _;
 
     /// Every test here models the reference rig: a 48 kHz device, which is what
     /// the ring is sized for once the resampler has run.
-    const OUT_RATE: rodio::SampleRate = 48_000;
+    const OUT_RATE: u32 = 48_000;
     const TEST_RING_CAPACITY: usize =
         OUT_RATE as usize * NUM_CHANNELS as usize * WRITE_AHEAD_MS / 1000;
 
@@ -1524,40 +1540,105 @@ mod tests {
         vec![1.0; samples]
     }
 
-    /// The write backpressure must be bounded: a dead audio thread would
-    /// otherwise wedge the player thread forever inside the drain loop (the
-    /// stock librespot behavior), which the bounded wait converts into a
-    /// recoverable sink error. Pinning the budget keeps the failure mode
-    /// deliberate.
     #[test]
-    fn write_drain_wait_is_bounded_not_infinite() {
-        assert!(
-            WRITE_DRAIN_TIMEOUT >= Duration::from_secs(1),
-            "the drain wait must still absorb normal device hiccups"
-        );
-        assert!(
-            WRITE_DRAIN_TIMEOUT <= Duration::from_secs(5),
-            "a stalled output must surface quickly, not after minutes"
-        );
+    fn native_open_timeout_does_not_join_a_blocked_driver_and_drops_late_output() {
+        struct LateOutput(std::sync::mpsc::Sender<()>);
+        impl Drop for LateOutput {
+            fn drop(&mut self) { let _ = self.0.send(()); }
+        }
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (dropped, observed) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let result = open_with_deadline(move || {
+            blocked.recv().unwrap();
+            Ok(LateOutput(dropped))
+        }, Duration::from_millis(20), |_| {});
+        assert!(matches!(result, Err((_, true))), "a driver deadline is a blocked-device failure");
+        assert!(started.elapsed() < Duration::from_secs(1), "timeout must not join the driver");
+        release.send(()).unwrap();
+        observed.recv_timeout(Duration::from_secs(1)).expect("late output must be dropped");
     }
 
-    /// The decoded-audio write-ahead must stay small so seek/volume/track
-    /// changes land almost immediately (each waits for this much audio to
-    /// play out first), while still absorbing decode jitter. The stock
-    /// backend's ~0.5 s budget made every transport action feel delayed.
-    ///
-    /// It must also come out the same in wall-clock terms whatever rate the
-    /// device runs at, since the ring holds device-rate audio.
     #[test]
-    fn write_ahead_stays_in_latency_budget_at_every_device_rate() {
-        for rate in [SAMPLE_RATE, 48_000, 96_000, 192_000] {
-            let ms = write_ahead_samples(rate) as f64 / f64::from(rate) / f64::from(NUM_CHANNELS)
-                * 1000.0;
-            assert!(
-                (100.0..=200.0).contains(&ms),
-                "at {rate} Hz the write-ahead is {ms:.0} ms, not near 150 ms"
-            );
+    fn pause_cancels_open_wait_before_the_driver_returns() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (result, observed) = std::sync::mpsc::channel();
+        let (pending, cancellation) = std::sync::mpsc::channel();
+        let (started, opening) = std::sync::mpsc::channel();
+        let player = std::thread::spawn(move || {
+            let opened = open_with_deadline(move || {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+                Ok(42u32)
+            }, Duration::from_secs(10), |sender| pending.send(sender).unwrap());
+            result.send(opened).unwrap();
+        });
+        let cancellation = cancellation.recv().unwrap();
+        opening.recv_timeout(Duration::from_secs(1)).expect("native worker entered opening");
+        cancellation.send(Err(OutputError::Other("cancelled".to_owned()))).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(("cancelled".to_owned(), false)));
+        player.join().unwrap();
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn cancelled_open_retains_raw_audio_for_the_resumed_device_rate_and_seek_discards_it() {
+        let _guard = customization_guard();
+        configure_customization_at_loop_pass(None, 1.0, 0, 1);
+        let mut sink = open(cpal::default_host(), AudioFormat::F32);
+        let samples: Vec<f64> = (0..1024).map(|n| (n as f64 / 64.0).sin() * 0.25).collect();
+        sink.ring.pause_at(Instant::now());
+        for chunk in samples.chunks(512) {
+            sink.write(AudioPacket::Samples(chunk.to_vec()), &mut Converter::new(None)).unwrap();
         }
+        sink.stop().unwrap();
+        sink.output_rate = OUT_RATE;
+        {
+            let mut processing = sink.processing.lock().unwrap_or_else(PoisonError::into_inner);
+            processing.output_rate = OUT_RATE;
+            processing.resampler = Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16);
+        }
+        sink.output.status.running.store(true, Ordering::Release);
+        sink.ring.resume_at(Instant::now());
+        sink.drain_deferred().unwrap();
+        let mut expected = Vec::new();
+        Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16).unwrap()
+            .process(&samples.iter().map(|sample| *sample as f32).collect::<Vec<_>>(), &mut expected);
+        let mut source = LiveSource::new(Arc::clone(&sink.ring));
+        let mut rendered = vec![0.0f32; expected.len()];
+        source.render(&mut rendered, NUM_CHANNELS as usize, true, 1.0);
+        assert_eq!(rendered, expected, "retained packets must use the resumed rate without drops/repeats");
+        sink.output.status.running.store(false, Ordering::Release);
+        sink.ring.pause_at(Instant::now());
+        sink.write(AudioPacket::Samples(samples), &mut Converter::new(None)).unwrap();
+        sink.ring.clear();
+        sink.output.status.running.store(true, Ordering::Release);
+        sink.drain_deferred().unwrap();
+        let mut silence = [1.0f32; 8];
+        source.render(&mut silence, NUM_CHANNELS as usize, true, 1.0);
+        assert_eq!(silence, [0.0; 8], "seek invalidates retained decoded and consumer audio");
+    }
+
+    #[test]
+    fn native_failure_is_revision_owned_and_sent_once_without_a_decoder_write() {
+        let _guard = customization_guard();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        install_signal_sender(sender);
+        let status = OutputStatus::default();
+        status.revision.store(u64::MAX - 1, Ordering::Release);
+        status.attempt.store(42, Ordering::Release);
+        status.fail_at_attempt(41, true);
+        status.fail(false);
+        status.fail(false);
+        let mut failures = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let AudioSignal::OutputFailed { revision, blocked } = event {
+                failures.push((revision, blocked));
+            }
+        }
+        assert_eq!(failures, [(u64::MAX - 1, false)]);
+        *AUDIO_SIGNAL_SENDER.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// A full ring must not block the player thread forever. This is the
@@ -1603,12 +1684,8 @@ mod tests {
         ring.push(packet(8), Duration::from_millis(50)).unwrap();
         ring.push(packet(8), Duration::from_millis(50)).unwrap();
 
-        let mut source = LiveSource::new(ring.clone(), SAMPLE_RATE);
-        // Consume the start-up priming silence and enter the first packet.
-        for _ in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
-            assert_eq!(source.next(), Some(0.0));
-        }
-        assert_eq!(source.next(), Some(1.0), "real audio follows the priming");
+        let mut source = LiveSource::new(ring.clone());
+        assert_eq!(source.next(), Some(1.0));
 
         ring.clear();
         assert_eq!(ring.queued_samples(), 0, "queued packets are dropped");
@@ -1641,10 +1718,7 @@ mod tests {
         // Two frames of audio, then nothing.
         ring.push(vec![1.0, 2.0, 3.0, 4.0], Duration::from_millis(50))
             .unwrap();
-        let mut source = LiveSource::new(ring.clone(), SAMPLE_RATE);
-        for _ in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
-            source.next();
-        }
+        let mut source = LiveSource::new(ring.clone());
         assert_eq!(
             (0..4).filter_map(|_| source.next()).collect::<Vec<_>>(),
             vec![1.0, 2.0, 3.0, 4.0]
@@ -1668,73 +1742,13 @@ mod tests {
         assert_eq!(source.next(), Some(6.0));
     }
 
-    /// The start-up priming exists so rodio's first span — bootstrapped from
-    /// an empty queue that claims 1 channel at 48 kHz — consumes silence
-    /// instead of the first moments of the first track.
+    /// Packet boundaries must neither alter resampled values nor add frames.
     #[test]
-    fn source_primes_with_rodios_bootstrap_span_of_silence() {
-        let ring = test_ring();
-        ring.push(vec![1.0; 4], Duration::from_millis(50)).unwrap();
-        let mut source = LiveSource::new(ring, SAMPLE_RATE);
-        for i in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
-            assert_eq!(
-                source.next(),
-                Some(0.0),
-                "priming sample {i} must be silent"
-            );
-        }
-        assert_eq!(source.next(), Some(1.0));
-        assert!(
-            RODIO_BOOTSTRAP_SPAN_SAMPLES.is_multiple_of(NUM_CHANNELS as usize),
-            "priming silence must be a whole number of frames"
-        );
-    }
-
-    /// The source must describe itself to rodio as an endless stream *at the
-    /// device's rate*. That is the load-bearing claim of the whole arrangement:
-    /// it is what puts rodio's converters on their `from == to` pass-through
-    /// branches, so nothing downstream resamples or reinterleaves the audio.
-    #[test]
-    fn source_reports_the_device_rate_so_rodio_passes_samples_through() {
-        let source = LiveSource::new(test_ring(), OUT_RATE);
-        assert_eq!(
-            source.sample_rate(),
-            OUT_RATE,
-            "reporting 44.1 kHz here would hand resampling back to rodio"
-        );
-        assert_eq!(source.channels(), NUM_CHANNELS as rodio::ChannelCount);
-        assert_eq!(source.current_span_len(), None, "the format never changes");
-        assert_eq!(source.total_duration(), None, "the source never ends");
-        assert_eq!(source.size_hint().0, RODIO_SPAN_SAMPLES);
-    }
-
-    /// End-to-end rate accuracy and transparency through the real rodio graph.
-    ///
-    /// Builds the same `Sink` + `Mixer` pair first playback connects to the
-    /// opened stream (minus the cpal device, which only supplies a clock) at
-    /// the reference rig's 48 kHz, pushes 44.1 kHz audio through the sink's own
-    /// resampler in realistically varying packet sizes, and checks what comes
-    /// out the far end. This graph is a faithful model of the device path: run
-    /// against the real dongle it reproduced the same figures to four decimals
-    /// (256-sample packets measured +0.4882% both offline and on hardware).
-    ///
-    /// Two claims, and the second is the one that retired the drift:
-    /// the frame count must be the exact rational conversion regardless of
-    /// packet boundaries, and rodio must hand back the sample values it was
-    /// given, bit for bit, because at a matching rate its converters are
-    /// pass-throughs. See "Playback rate and fidelity" in the module docs.
-    #[test]
-    fn the_rodio_graph_is_transparent_at_the_device_rate() {
+    fn device_rendering_is_transparent_at_the_device_rate() {
         const BLOCK_FRAMES: usize = 480;
         const SECONDS: usize = 15;
-
-        let (sink, queue) = rodio::Sink::new();
-        let (mixer_in, mut mixer_out) =
-            rodio::mixer::mixer(NUM_CHANNELS as rodio::ChannelCount, OUT_RATE);
-        mixer_in.add(queue);
-
         let ring = test_ring();
-        sink.append(LiveSource::new(ring.clone(), OUT_RATE));
+        let mut source = LiveSource::new(ring.clone());
 
         let mut resampler =
             Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16).expect("rates differ");
@@ -1744,9 +1758,7 @@ mod tests {
         let sizes = [256usize, 2048, 1152, 2048, 256, 1024, 2048, 512];
         let total_samples = SECONDS * SAMPLE_RATE as usize * NUM_CHANNELS as usize;
 
-        // A ramp rather than a constant: a stuck or repeated sample is
-        // invisible against DC, and the mixer's own `from == to` path would
-        // hide a dropped frame too.
+        // A ramp exposes dropped or repeated samples that DC would hide.
         let mut phase = 0usize;
         let mut source_sample = || {
             phase += 1;
@@ -1762,6 +1774,7 @@ mod tests {
         let (mut first, mut last) = (None, None);
         let mut silent_blocks = 0usize;
         let mut interior_silent_frames = 0usize;
+        let mut block = [0.0f32; BLOCK_FRAMES * NUM_CHANNELS as usize];
 
         loop {
             while fed_samples < total_samples && ring.queued_samples() < TEST_RING_CAPACITY {
@@ -1779,9 +1792,9 @@ mod tests {
                 ring.push(resampled, Duration::from_millis(50)).unwrap();
             }
             let mut block_had_audio = false;
-            for _ in 0..BLOCK_FRAMES {
-                let left = mixer_out.next().unwrap_or(0.0);
-                let right = mixer_out.next().unwrap_or(0.0);
+            source.render(&mut block, NUM_CHANNELS as usize, true, 1.0);
+            for stereo in block.chunks_exact(NUM_CHANNELS as usize) {
+                let [left, right] = [stereo[0], stereo[1]];
                 if left != 0.0 || right != 0.0 {
                     first.get_or_insert(frame);
                     last = Some(frame);
@@ -1817,17 +1830,16 @@ mod tests {
 
         assert_eq!(
             interior_silent_frames, 0,
-            "rodio's queue splices in silence when it runs dry; the write-ahead \
-             budget must keep it fed"
+            "the write-ahead budget must keep device callbacks fed without gaps"
         );
         assert_eq!(
             rendered * NUM_CHANNELS as usize,
             queued_total,
-            "rodio must render every sample the sink queued and no others"
+            "the device must render every sample queued and no others"
         );
         assert_eq!(
             rendered_values, expected_values,
-            "at a matching rate rodio must not alter a single sample value"
+            "device-rate f32 output must not alter sample values"
         );
         // The only permitted shortfall is the filter look-ahead still holding
         // the last few input frames — a fixed handful, not a growing fraction.
@@ -1839,66 +1851,167 @@ mod tests {
         );
     }
 
-    /// The endless source must not be attached while librespot still considers
-    /// the sink Closed, and rodio's pause must stop polling it after the short
-    /// control-update period. Otherwise idle playback takes the ring mutex at
-    /// audio rate.
     #[test]
-    fn live_source_is_idle_before_start_and_while_paused() {
-        const TWENTY_MS_SAMPLES: usize = OUT_RATE as usize * NUM_CHANNELS as usize * 20 / 1000;
-
-        let (sink, queue) = rodio::Sink::new();
-        let (mixer_in, mut mixer_out) =
-            rodio::mixer::mixer(NUM_CHANNELS as rodio::ChannelCount, OUT_RATE);
-        mixer_in.add(queue);
-        sink.pause();
-
+    fn paused_callbacks_preserve_the_cursor_and_queued_audio() {
         let ring = test_ring();
-        ring.push(packet(1024), Duration::from_millis(50)).unwrap();
+        ring.push(vec![0.1, -0.1, 0.2, -0.2, 0.3, -0.3], Duration::from_millis(50)).unwrap();
+        ring.push(vec![0.4, -0.4], Duration::from_millis(50)).unwrap();
+        let mut source = LiveSource::new(ring.clone());
+        let mut frame = [0.0f32; 2];
+        source.render(&mut frame, 2, true, 1.0);
+        assert_eq!(frame, [0.1, -0.1]);
+        for _ in 0..8 {
+            source.render(&mut frame, 2, false, 1.0);
+            assert_eq!(frame, [0.0; 2]);
+        }
+        let mut resumed = [0.0f32; 6];
+        source.render(&mut resumed, 2, true, 1.0);
+        assert_eq!(resumed, [0.2, -0.2, 0.3, -0.3, 0.4, -0.4]);
+    }
 
-        for _ in 0..TWENTY_MS_SAMPLES {
-            mixer_out.next();
-        }
-        assert_eq!(
-            ring.queued_samples(),
-            1024,
-            "a Closed sink must not poll LiveSource before start"
-        );
+    #[test]
+    fn device_channel_layout_and_gain_do_not_shift_stereo_frames() {
+        let ring = test_ring();
+        ring.push(vec![0.2, 0.6, -0.4, -0.8, 0.5, -0.5], Duration::from_millis(50)).unwrap();
+        let mut source = LiveSource::new(ring);
+        let mut mono = [0.0f32; 1];
+        source.render(&mut mono, 1, true, 0.5);
+        assert!((mono[0] - 0.2).abs() < f32::EPSILON);
+        let mut surround = [1.0f32; 6];
+        source.render(&mut surround, 6, true, 0.5);
+        assert_eq!(surround, [-0.2, -0.4, 0.0, 0.0, 0.0, 0.0]);
+        let mut stereo = [0i16; 2];
+        source.render(&mut stereo, 2, true, 1.0);
+        assert_eq!(stereo, [16384, -16384]);
+    }
 
-        attach_live_source(&sink, &ring, OUT_RATE);
-        sink.play();
-        for _ in 0..TWENTY_MS_SAMPLES * 4 {
-            mixer_out.next();
-        }
-        assert_eq!(
-            ring.queued_samples(),
-            0,
-            "start must attach and poll the source"
-        );
+    #[test]
+    fn device_failure_surfaces_on_write_without_fallible_stop() {
+        let _guard = customization_guard();
+        let mut sink = open(cpal::default_host(), AudioFormat::F32);
+        sink.output.fail("device disappeared");
+        sink.stop().expect("librespot stop must remain infallible");
+        let error = sink.write(AudioPacket::Samples(vec![0.25, -0.25]),
+            &mut Converter::new(None)).unwrap_err();
+        assert!(matches!(error, SinkError::OnWrite(message) if message == "device disappeared"));
+    }
 
-        sink.pause();
-        for _ in 0..TWENTY_MS_SAMPLES {
-            mixer_out.next();
-        }
-        ring.push(packet(1024), Duration::from_millis(50)).unwrap();
-        for _ in 0..TWENTY_MS_SAMPLES * 4 {
-            mixer_out.next();
-        }
-        assert_eq!(
-            ring.queued_samples(),
-            1024,
-            "a paused sink must emit silence without polling LiveSource"
-        );
+    /// Run explicitly on a machine with an output device; no Spotify session
+    /// needed. Counts the actual native callbacks, not silence/source polls.
+    #[test]
+    #[ignore = "requires a default output device"]
+    fn native_stream_is_lazy_and_stops_callbacks_while_paused() {
+        let _guard = customization_guard();
+        let mut sink = open(cpal::default_host(), AudioFormat::F32);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(sink.output.status.callbacks.load(Ordering::Relaxed), 0,
+            "launch must not start device callbacks");
+        sink.start().unwrap();
+        assert!(!sink.output.status.failed.load(Ordering::Acquire));
+        sink.queue(sink.ring.generation.load(Ordering::Acquire),
+            customization_revision(), vec![0.0; sink.output_rate as usize / 10 * 2], None, 1.0).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sink.output.status.callbacks.load(Ordering::Relaxed) > 0, "first play must run the device");
+        pause_output();
+        sink.stop().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let paused = sink.output.status.callbacks.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(sink.output.status.callbacks.load(Ordering::Relaxed), paused,
+            "paused device must not issue callbacks");
+        sink.start().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sink.output.status.callbacks.load(Ordering::Relaxed) > paused, "resume must run the retained device");
+        pause_output();
+        sink.stop().unwrap();
+        let opened = sink.output.status.attempt.load(Ordering::Acquire);
+        let seek_revision = configure_customization_at_loop_pass(None, 1.0, 5_000, 1);
+        sink.start().unwrap();
+        assert!(!sink.output.status.failed.load(Ordering::Acquire));
+        assert!(sink.output.status.attempt.load(Ordering::Acquire) > opened,
+            "a paused seek must reopen output on resume");
+        sink.queue(sink.ring.generation.load(Ordering::Acquire),
+            seek_revision, vec![0.0; sink.output_rate as usize / 10 * 2], None, 1.0).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sink.output.status.callbacks.load(Ordering::Relaxed) > paused,
+            "the reopened output must run");
+        sink.ring.clear();
+        sink.stop().unwrap();
+        let stopped = sink.output.status.callbacks.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(sink.output.status.callbacks.load(Ordering::Relaxed), stopped);
+        eprintln!("native lifecycle: idle=0, played={paused}, paused={paused}, resumed={stopped}, stopped={stopped}");
+    }
 
-        sink.play();
-        for _ in 0..TWENTY_MS_SAMPLES * 4 {
-            mixer_out.next();
+    /// Run explicitly on a machine with an output device. A seek while playing
+    /// is librespot's pause → seek → play, which must keep the native stream;
+    /// the natural end of the queue must leave a tail that drains, after which
+    /// the engine's stop silences the callbacks for good.
+    #[test]
+    #[ignore = "requires a default output device"]
+    fn native_stream_survives_a_playing_seek_and_stops_after_the_queue_drains() {
+        let _guard = customization_guard();
+        let revision = configure_customization_at_loop_pass(None, 1.0, 0, 1);
+        let mut sink = open(cpal::default_host(), AudioFormat::F32);
+        sink.start().unwrap();
+        assert!(!sink.output.status.failed.load(Ordering::Acquire));
+        let opened = sink.output.status.attempt.load(Ordering::Acquire);
+        let tenth = sink.output_rate as usize / 10 * NUM_CHANNELS as usize;
+        sink.queue(sink.ring.generation.load(Ordering::Acquire), revision,
+            vec![0.0; 2 * tenth], None, 1.0).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let seek = configure_customization_at_loop_pass(None, 1.0, 30_000, 1);
+        sink.stop().unwrap();
+        sink.start().unwrap();
+        assert_eq!(sink.output.status.attempt.load(Ordering::Acquire), opened,
+            "a seek while playing must not reopen the device");
+        assert!(sink.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_some());
+        let before = sink.output.status.callbacks.load(Ordering::Relaxed);
+        sink.queue(sink.ring.generation.load(Ordering::Acquire), seek,
+            vec![0.0; tenth], None, 1.0).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(sink.output.status.callbacks.load(Ordering::Relaxed) > before,
+            "the kept stream runs after the seek");
+
+        finish_natural_boundary().unwrap();
+        finish_output_tail().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while output_tail_remaining().is_some() {
+            assert!(Instant::now() < deadline, "the queued tail must drain");
+            std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            ring.queued_samples(),
-            0,
-            "resume must poll the existing source"
-        );
+        // What the engine's drain stop amounts to at the sink.
+        sink.stop().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let stopped = sink.output.status.callbacks.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(sink.output.status.callbacks.load(Ordering::Relaxed), stopped,
+            "a drained queue must not keep the device calling back");
+    }
+
+    #[test]
+    fn the_tail_is_the_audible_remainder_plus_the_queue() {
+        let ring = test_ring();
+        let generation = ring.generation.load(Ordering::Acquire);
+        let frames = OUT_RATE as usize / 10;
+        for _ in 0..2 {
+            ring.push_timed_at_generation(generation, packet(frames * NUM_CHANNELS as usize),
+                None, 0, Duration::from_millis(50), Some((3, 1.0, OUT_RATE))).unwrap();
+        }
+        let remaining_ms = |at| ring.tail_remaining_at(at).map(|tail| tail.as_secs_f64() * 1_000.0);
+        let close = |actual: Option<f64>, expected: f64| {
+            actual.is_some_and(|actual| (actual - expected).abs() < 0.01)
+        };
+        let at = Instant::now();
+        assert!(close(remaining_ms(at), 200.0), "nothing audible yet: the whole queue");
+        let playing = ring.lock().packets.pop_front().unwrap();
+        ring.lock().audible = Some(AudibleClock { timing: playing.timing.unwrap(), at });
+        assert!(close(remaining_ms(at + Duration::from_millis(40)), 160.0));
+        ring.lock().packets.clear();
+        assert!(close(remaining_ms(at + Duration::from_millis(60)), 40.0));
+        assert_eq!(remaining_ms(at + Duration::from_millis(100)), None,
+            "a played-out packet with nothing behind it is a drained output");
     }
 
     /// `configure_customization` owns process-wide statics, so the tests that
@@ -2030,8 +2143,7 @@ mod tests {
         let samples = vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0];
         ring.push(samples.clone(), Duration::from_millis(50)).unwrap();
         ring.push(vec![4.0, -4.0], Duration::from_millis(50)).unwrap();
-        let mut source = LiveSource::new(ring.clone(), OUT_RATE);
-        source.silence_remaining = 0;
+        let mut source = LiveSource::new(ring.clone());
         assert_eq!(source.next(), Some(1.0));
         assert_eq!(source.next(), Some(-1.0));
         let at = Instant::now();
@@ -2158,6 +2270,7 @@ mod tests {
     /// the end of the empty packet on the way.
     #[test]
     fn a_marker_without_samples_is_delivered_and_does_not_panic() {
+        let _guard = customization_guard();
         let ring = test_ring();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         install_signal_sender(sender);
@@ -2171,10 +2284,7 @@ mod tests {
             std::thread::yield_now();
         }
 
-        let mut source = LiveSource::new(Arc::clone(&ring), OUT_RATE);
-        for _ in 0..RODIO_BOOTSTRAP_SPAN_SAMPLES {
-            source.next();
-        }
+        let mut source = LiveSource::new(Arc::clone(&ring));
         // Pulling once drains the empty marker, acknowledges its backpressure,
         // and returns underrun silence without indexing the empty vector.
         assert_eq!(source.next(), Some(0.0));
@@ -2207,17 +2317,15 @@ mod tests {
             std::thread::yield_now();
         }
 
-        let mut source = LiveSource::new(ring, OUT_RATE);
-        for _ in 0..=RODIO_BOOTSTRAP_SPAN_SAMPLES {
-            source.next();
-        }
+        let mut source = LiveSource::new(ring);
+        source.next();
         done_rx
             .recv_timeout(Duration::from_millis(100))
             .expect("audible boundary releases decoder backpressure");
         producer.join().unwrap();
     }
 
-    /// The rodio gain curve must mirror librespot's `Cubic(60)` volume
+    /// The gain curve must mirror librespot's `Cubic(60)` volume
     /// control so switching volume from per-packet attenuation to the sink
     /// does not change the audible volume curve.
     #[test]
@@ -2272,49 +2380,4 @@ mod tests {
         }
     }
 
-    /// The sink that joins the registry is handed the remembered transport
-    /// volume as it is claimed, and a change afterwards lands on the same sink:
-    /// the two are one critical section, which is what keeps the audible gain
-    /// and the volume every other component agrees on from drifting apart.
-    ///
-    /// Both readings are taken under the registry lock on purpose: a change
-    /// made by another test in this binary is serialized by that lock, so the
-    /// pair can be compared without a torn read.
-    #[test]
-    fn the_claimed_sink_is_handed_the_volume_the_registry_remembers() {
-        let (sink, _queue) = rodio::Sink::new();
-        let sink = Arc::new(sink);
-        assert_eq!(
-            sink.volume(),
-            1.0,
-            "a fresh rodio sink starts at full gain, so a claim that does not \
-             apply the remembered volume is audible as a jump to full volume"
-        );
-
-        set_sink_volume(percent_to_volume(17));
-        claim_live_sink(&sink);
-        {
-            let live = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG);
-            assert_eq!(
-                sink.volume(),
-                volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)),
-                "the claim must hand the newcomer the remembered volume"
-            );
-            drop(live);
-        }
-
-        set_sink_volume(percent_to_volume(83));
-        {
-            let live = LIVE_SINK.lock().expect(LIVE_SINK_POISON_MSG);
-            assert_eq!(
-                sink.volume(),
-                volume_to_gain(SINK_VOLUME.load(Ordering::Acquire)),
-                "and a change after the claim reaches this sink"
-            );
-            drop(live);
-        }
-
-        // Leave the registry as this test found it.
-        release_live(&LIVE_SINK, &sink, LIVE_SINK_POISON_MSG);
-    }
 }

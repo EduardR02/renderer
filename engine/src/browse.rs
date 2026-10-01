@@ -79,25 +79,8 @@ const COVER_BASE: &str = "https://i.scdn.co/image/";
 /// 1000-track playlist is ~25 requests instead of 1000.
 const METADATA_BATCH_SIZE: usize = 40;
 
-/// Retries after the first attempt when a metadata batch POST fails. Items
-/// are skipped only once the retries are exhausted.
-const METADATA_RETRY_ATTEMPTS: usize = 3;
-
-/// Capped exponential backoff between batch attempts, starting at this many
-/// milliseconds and doubling up to [`METADATA_BACKOFF_MAX_MS`].
-const METADATA_BACKOFF_BASE_MS: u64 = 250;
-const METADATA_BACKOFF_MAX_MS: u64 = 2_000;
-
-/// Retries after the first attempt when a browse request fails: the spclient
-/// front door answers transient 5xx (502/503) and the metadata/search
-/// services sit behind the same proxy/CDN layer, so a bounded retry absorbs
-/// them before an error reaches the UI. Longer than the per-batch metadata
-/// schedule because a rootlist/playlist fetch is one round-trip: 5 retries
-/// with capped exponential backoff (500 ms doubling to a 4 s cap, at most
-/// 11.5 s of sleep) ride out multi-second proxy hiccups while staying inside
-/// the UI's 20-second browse round-trip timeout. Transient 502s fail fast
-/// (connection error, no body), so the typical retry costs well under a
-/// second; only a sustained outage reaches the sleep bound.
+/// Mercury metadata requests do not have spclient's transport recovery.
+/// Keep their bounded retry schedule separate from spclient operations.
 const BROWSE_RETRY_ATTEMPTS: usize = 5;
 const BROWSE_BACKOFF_BASE_MS: u64 = 500;
 const BROWSE_BACKOFF_MAX_MS: u64 = 4_000;
@@ -811,10 +794,8 @@ pub fn album_ref(album: &Album) -> AlbumRef {
 // batched metadata resolution (extended-metadata)
 // ---------------------------------------------------------------------------
 
-/// The retry/backoff schedule between extended-metadata batch attempts:
-/// `METADATA_RETRY_ATTEMPTS` retries after the first attempt, backing off
-/// from `base_ms`, doubling, and capping at `max_ms`. Pure so the schedule is
-/// unit-testable.
+/// Bounded retry delays for Mercury metadata requests.
+/// Start at `base_ms`, double, and cap at `max_ms`.
 pub(crate) fn backoff_sequence(attempts: usize, base_ms: u64, max_ms: u64) -> Vec<u64> {
     (0..attempts)
         .map(|attempt| (base_ms << attempt).min(max_ms))
@@ -844,6 +825,33 @@ pub(crate) fn browse_error_is_transient(kind: ErrorKind, status: Option<u16>) ->
         ErrorKind::Unknown => status.is_some_and(|code| (500..=599).contains(&code)),
         _ => false,
     }
+}
+
+/// Complements spclient's native recovery, never retries its exhausted ladder.
+/// In librespot 0.8 only Unknown-wrapped server statuses (notably 502) fail
+/// immediately; Unavailable/DeadlineExceeded already retry inside spclient.
+pub(crate) async fn spclient_read<T, F, Fut>(mut operation: F) -> Result<T, librespot_core::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, librespot_core::Error>>,
+{
+    for attempt in 0..=BROWSE_RETRY_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if error.kind != ErrorKind::Unknown
+                    || !http_status_of(&error).is_some_and(|status| (500..=599).contains(&status))
+                    || attempt == BROWSE_RETRY_ATTEMPTS
+                {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    (BROWSE_BACKOFF_BASE_MS << attempt).min(BROWSE_BACKOFF_MAX_MS),
+                )).await;
+            }
+        }
+    }
+    unreachable!("bounded loop returns on its last attempt")
 }
 
 /// Deduplicates URIs by entity id, keeping first-appearance order
@@ -888,15 +896,12 @@ fn build_batched_request(
     request
 }
 
-/// Pulls `(entity_uri, payload bytes)` pairs out of a batch response: only
-/// entries whose kind matches the request and whose per-entity status is 200
-/// OK count; per-entity failures (unresolvable/removed items) are skipped
-/// individually, never as a whole batch. Pure so the mapping is
-/// unit-testable.
+/// Removed/unresolvable entities may be omitted, but transient server failures
+/// invalidate the batch so the owning retry boundary cannot cache partial rows.
 fn collect_extension_payloads(
     response: &BatchedExtensionResponse,
     kind: ExtensionKind,
-) -> Vec<(String, Vec<u8>)> {
+) -> Result<Vec<(String, Vec<u8>)>, librespot_core::Error> {
     let mut out = Vec::new();
     for array in &response.extended_metadata {
         if array
@@ -907,6 +912,21 @@ fn collect_extension_payloads(
             continue;
         }
         for entry in &array.extension_data {
+            let status = entry.header.status_code;
+            if (500..=599).contains(&status) {
+                // The outer HTTP request succeeded; native spclient recovery
+                // never saw this per-entity refusal. Share the same one ladder.
+                let code = http::StatusCode::from_u16(status as u16)
+                    .expect("5xx is a valid HTTP status");
+                return Err(librespot_core::Error::unknown(
+                    librespot_core::http_client::HttpClientError::StatusCode(code),
+                ));
+            }
+            if status == 429 || status == 401 || status == 403 {
+                return Err(librespot_core::Error::failed_precondition(
+                    format!("metadata entity {} returned HTTP {status}", entry.entity_uri),
+                ));
+            }
             if entry.header.status_code != 200 {
                 continue;
             }
@@ -916,52 +936,20 @@ fn collect_extension_payloads(
             out.push((entry.entity_uri.clone(), payload));
         }
     }
-    out
+    Ok(out)
 }
 
-/// Posts one batch with retries: a failed POST is retried up to
-/// [`METADATA_RETRY_ATTEMPTS`] times with capped exponential backoff, and
-/// only then reported as an error (the caller skips that batch's items).
-/// Batches are posted sequentially so the endpoint never sees a burst.
+/// Share one classified retry boundary for transport and per-entity failures.
 async fn fetch_extended_batch(
     session: &Session,
     uris: &[SpotifyUri],
     kind: ExtensionKind,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let request = build_batched_request(uris, kind, &session.country());
-    let backoffs = backoff_sequence(
-        METADATA_RETRY_ATTEMPTS,
-        METADATA_BACKOFF_BASE_MS,
-        METADATA_BACKOFF_MAX_MS,
-    );
-    let mut attempt = 0usize;
-    loop {
-        match session
-            .spclient()
-            .get_extended_metadata(request.clone())
-            .await
-        {
-            Ok(response) => return Ok(collect_extension_payloads(&response, kind)),
-            Err(error) => {
-                if attempt >= backoffs.len() {
-                    return Err(format!(
-                        "metadata batch of {} {kind:?} URIs failed after {} attempts: {error}",
-                        uris.len(),
-                        attempt + 1,
-                    ));
-                }
-                let backoff = backoffs[attempt];
-                eprintln!(
-                    "metadata batch of {} {kind:?} URIs failed ({error}); retrying in {backoff} ms (attempt {}/{})",
-                    uris.len(),
-                    attempt + 1,
-                    backoffs.len() + 1,
-                );
-                tokio::time::sleep(Duration::from_millis(backoff)).await;
-                attempt += 1;
-            }
-        }
-    }
+    spclient_read(|| async {
+        let response = session.spclient().get_extended_metadata(request.clone()).await?;
+        collect_extension_payloads(&response, kind)
+    }).await.map_err(|error| format!("metadata batch of {} {kind:?} URIs failed: {error}", uris.len()))
 }
 
 /// Maps each deduplicated URI's canonical string form to its first-appearance
@@ -979,17 +967,9 @@ fn build_uri_index(uris: &[SpotifyUri]) -> HashMap<String, usize> {
     index_by_uri
 }
 
-/// Resolves extended-metadata entities (tracks, albums, ...) in batches of
-/// [`METADATA_BATCH_SIZE`]. URIs are deduplicated by id in first-appearance
-/// order; each batch is one POST; items missing from the response or failing
-/// per-entity resolution are skipped; a batch is skipped only after its
-/// retries with backoff are exhausted.
-///
-/// A *total* batch failure is an error, never an empty result: returning a
-/// success with zero items when the endpoint is failing (e.g. rate-limited)
-/// would make the app cache "empty playlist" and show a bare list for a
-/// playlist that actually has tracks. Partial failures keep the resolved
-/// items and skip the failed batch, like before.
+/// Resolves deduplicated URIs in first-appearance order in bounded batches.
+/// Transport/transient per-entity failures are all-or-error: never cache a
+/// successful partial playlist after one metadata batch failed.
 async fn fetch_extended<'a, T>(
     session: &Session,
     uris: impl IntoIterator<Item = &'a SpotifyUri>,
@@ -1002,33 +982,15 @@ async fn fetch_extended<'a, T>(
     }
     let index_by_uri = build_uri_index(&unique);
     let mut results: Vec<Option<T>> = (0..unique.len()).map(|_| None).collect();
-    let mut batches_total = 0usize;
-    let mut batches_failed = 0usize;
+    // Every requested batch must succeed before these rows can be published.
     for chunk in metadata_chunks(&unique, METADATA_BATCH_SIZE) {
-        batches_total += 1;
-        match fetch_extended_batch(session, chunk, kind).await {
-            Ok(entries) => {
-                for (entity_uri, payload) in entries {
-                    let Some(&index) = index_by_uri.get(&entity_uri) else {
-                        continue;
-                    };
-                    results[index] = parse(&entity_uri, &payload);
-                }
-            }
-            Err(error) => {
-                // Only a fully retried batch failure skips its items.
-                batches_failed += 1;
-                eprintln!(
-                    "skipping {count} unresolvable item(s): {error}",
-                    count = chunk.len()
-                );
-            }
+        let entries = fetch_extended_batch(session, chunk, kind).await?;
+        for (entity_uri, payload) in entries {
+            let Some(&index) = index_by_uri.get(&entity_uri) else {
+                continue;
+            };
+            results[index] = parse(&entity_uri, &payload);
         }
-    }
-    if batches_failed == batches_total {
-        return Err(format!(
-            "all {batches_total} {kind:?} metadata batch(es) failed; no items could be resolved"
-        ));
     }
     Ok(results.into_iter().flatten().collect())
 }
@@ -1162,31 +1124,24 @@ fn episode_ref(episode: &Episode, show_id: String, policy: &AvailabilityPolicy) 
     let cover_url = cover_url(&episode.covers);
     let duration_ms = u32::try_from(episode.duration).unwrap_or_default();
     let track = TrackRef {
-        id: id.clone(),
-        uri: uri.clone(),
+        id,
+        uri,
         name: episode.name.clone(),
         artist_names: vec![episode.show_name.clone()],
         album_id: show_id.clone(),
         album_name: episode.show_name.clone(),
-        cover_url: cover_url.clone().unwrap_or_default(),
+        cover_url: cover_url.unwrap_or_default(),
         duration_ms,
         unavailable: unavailable_reason.is_some(),
-        unavailable_reason: unavailable_reason.clone(),
+        unavailable_reason,
         ..TrackRef::default()
     };
     EpisodeRef {
-        id,
-        uri,
-        name: episode.name.clone(),
         show_id,
         show_name: episode.show_name.clone(),
         description: episode.description.clone(),
-        cover_url,
-        duration_ms,
         published_at: (episode.publish_time.as_timestamp_ms() > 0)
             .then(|| episode.publish_time.as_timestamp_ms()),
-        unavailable: unavailable_reason.is_some(),
-        unavailable_reason,
         track,
     }
 }
@@ -1236,7 +1191,7 @@ pub async fn show_browse(session: &Session, id: &str) -> Result<ShowBrowse, Stri
     .await?;
     let mut by_uri: HashMap<String, EpisodeRef> = resolved
         .into_iter()
-        .map(|episode| (episode.uri.clone(), episode))
+        .map(|episode| (episode.track.uri.clone(), episode))
         .collect();
     let episodes = show
         .episodes
@@ -1419,14 +1374,11 @@ async fn resolve_playlist_metadata(session: &Session, playlist: &PlaylistRef) ->
     }
     let _permit = PROFILE_PLAYLIST_REQUESTS.acquire().await
         .map_err(|_| "playlist artwork resolver is unavailable")?;
-    let endpoint = format!("/playlist/v2/playlist/{}?from=0&length=0", playlist.id);
-    let body = session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await
+    let endpoint = format!("/playlist/v2/playlist/{}?from=0&length={PROFILE_PLAYLIST_COVER_TRACKS}", playlist.id);
+    let body = spclient_read(|| async { session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await }).await
         .map_err(|error| format!("playlist artwork GET {endpoint} failed: {error}"))?;
     let mut metadata = parse_profile_playlist_header(&body, playlist)?;
     if metadata.cover_url.is_none() && metadata.track_count != Some(0) {
-        let endpoint = format!("/playlist/v2/playlist/{}?from=0&length={PROFILE_PLAYLIST_COVER_TRACKS}", playlist.id);
-        let body = session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await
-            .map_err(|error| format!("playlist cover sample GET {endpoint} failed: {error}"))?;
         let uris = profile_cover_track_uris(&body)?;
         let tracks = fetch_tracks(session, uris.iter()).await?;
         let expected = uris.iter().enumerate()
@@ -1543,8 +1495,8 @@ async fn enrich_profile_playlists(session: &Session, playlists: &mut [PlaylistRe
             }
         }
     }
-    // First read attributes only. A playlist without artwork needs at most
-    // four source track URIs, resolved in one existing metadata batch.
+    // Header and up to four source URIs share one playlist request. Only
+    // playlists without artwork resolve those URIs in a metadata batch.
     // Results are placed back by index: concurrent completion cannot re-rank.
     let resolved: Vec<(usize, PlaylistRef)> = stream::iter(unresolved)
         .map(|(index, playlist)| {
@@ -1608,7 +1560,7 @@ async fn user_profile_header(session: &Session, username: &str) -> Result<UserPr
     if let Some(entry) = entries.get(&key) {
         return Ok(entry.profile.clone());
     }
-    let payload = session.spclient().get_user_profile(&encoded, Some(0), Some(0)).await
+    let payload = spclient_read(|| async { session.spclient().get_user_profile(&encoded, Some(0), Some(0)).await }).await
         .map_err(|error| format!("private user profile request failed: {error}"))?;
     let profile = parse_user_profile(&payload, username)?;
     evict_oldest_for_fresh_key(&mut entries, 64, 1, true, |entry| entry.fetched_at);
@@ -1641,7 +1593,7 @@ pub async fn user_profile_browse(
         let endpoint = format!(
             "/user-profile-view/v3/profile/{encoded}/playlists?offset={offset}&limit={PAGE_SIZE}&market=from_token"
         );
-        let body = session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await
+        let body = spclient_read(|| async { session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await }).await
             .map_err(|error| format!("private profile public playlists request failed: {error}"))?;
         let (page, row_count) = parse_profile_playlists(&body, username, &profile.name)
             .map_err(|error| {
@@ -1884,17 +1836,14 @@ async fn track_radio_browse(
     session: &Session,
     seed_uri: SpotifyUri,
 ) -> Result<RadioBrowse, String> {
-    let bytes = session
-        .spclient()
-        .get_radio_for_track(&seed_uri)
-        .await
+    let bytes = spclient_read(|| async { session.spclient().get_radio_for_track(&seed_uri).await }).await
         .map_err(|error| format!("inspired-by fetch for {seed_uri} failed: {error}"))?;
     let source = parse_inspired_by(&bytes)?;
 
     let (recommendation_uris, cover_url) = match source {
         InspiredBySource::Tracks(uris) => (uris, None),
         InspiredBySource::Playlist(uri) => {
-            let playlist: Playlist = metadata_get(session, &uri, "radio playlist").await?;
+            let playlist: Playlist = spclient_read(|| Playlist::get(session, &uri)).await.map_err(|error| format!("{} fetch failed: {error}", "radio playlist"))?;
             let cover_url = playlist_attributes_cover(&playlist.attributes);
             let recommendation_uris = playlist
                 .contents
@@ -1942,16 +1891,11 @@ async fn artist_radio_browse(
     let artist: Artist = metadata_get(session, &artist_uri, "artist radio artist").await?;
     let artist_id = id_of(&artist_uri);
     let context = format!("spotify:station:artist:{artist_id}");
-    let bytes = session
-        .spclient()
-        .get_apollo_station(
-            "stations",
-            &context,
-            Some(APOLLO_REQUEST_COUNT),
-            Vec::new(),
-            false,
-        )
-        .await
+    let bytes = spclient_read(|| async { session.spclient().get_apollo_station("stations",
+    &context,
+    Some(APOLLO_REQUEST_COUNT),
+    Vec::new(),
+    false,).await }).await
         .map_err(|error| format!("artist radio for {context} failed: {error}"))?;
     let candidates = parse_apollo_tracks(&bytes)?;
     let candidates = dedupe_uris(candidates.iter())
@@ -1997,23 +1941,18 @@ pub async fn playlist_recommendations_browse(
     id: &str,
 ) -> Result<PlaylistRecommendations, String> {
     let uri = playlist_uri(id)?;
-    let playlist: Playlist = metadata_get(session, &uri, "playlist").await?;
+    let playlist: Playlist = spclient_read(|| Playlist::get(session, &uri)).await.map_err(|error| format!("{} fetch failed: {error}", "playlist"))?;
     let existing: HashSet<String> = playlist
         .contents
         .items
         .iter()
         .map(|item| id_of(&item.id))
         .collect();
-    let bytes = session
-        .spclient()
-        .get_apollo_station(
-            "stations",
-            &format!("spotify:station:playlist:{id}"),
-            Some(APOLLO_REQUEST_COUNT),
-            Vec::new(),
-            false,
-        )
-        .await
+    let bytes = spclient_read(|| async { session.spclient().get_apollo_station("stations",
+    &format!("spotify:station:playlist:{id}"),
+    Some(APOLLO_REQUEST_COUNT),
+    Vec::new(),
+    false,).await }).await
         .map_err(|error| format!("playlist recommendations for {id} failed: {error}"))?;
     let candidates = parse_apollo_tracks(&bytes)?;
     let candidates = dedupe_uris(candidates.iter())
@@ -2232,6 +2171,7 @@ fn parse_rootlist_tree(payload: &[u8]) -> Result<Vec<LibraryNode>, String> {
     rootlist_nodes(contents)
 }
 
+#[cfg(test)]
 fn flatten_library_nodes(nodes: Vec<LibraryNode>, playlists: &mut Vec<PlaylistRef>) {
     for node in nodes {
         match node {
@@ -2239,23 +2179,6 @@ fn flatten_library_nodes(nodes: Vec<LibraryNode>, playlists: &mut Vec<PlaylistRe
             LibraryNode::Folder { children, .. } => flatten_library_nodes(children, playlists),
         }
     }
-}
-
-/// The user's playlist library from the spclient rootlist endpoint. The GET
-/// is retried with the bounded capped-exponential schedule: the spclient
-/// front door answers transient 502/503s that a retry absorbs before the
-/// error reaches the UI (librespot's own HTTP retry only covers
-/// network-level failures, never 5xx responses). The final failure carries
-/// the method/path (the session's own account username, not a credential)
-/// and the last error, which embeds the HTTP status.
-pub async fn playlists_browse(
-    session: &Session,
-    length: usize,
-) -> Result<Vec<PlaylistRef>, String> {
-    let nodes = playlist_tree_browse(session, length).await?;
-    let mut playlists = Vec::new();
-    flatten_library_nodes(nodes, &mut playlists);
-    Ok(playlists)
 }
 
 pub async fn playlist_tree_browse(
@@ -2267,39 +2190,8 @@ pub async fn playlist_tree_browse(
         "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from=0&length={length}",
         user = session.username(),
     );
-    let backoffs = backoff_sequence(
-        BROWSE_RETRY_ATTEMPTS,
-        BROWSE_BACKOFF_BASE_MS,
-        BROWSE_BACKOFF_MAX_MS,
-    );
-    let mut attempt = 0usize;
-    let body = loop {
-        match session
-            .spclient()
-            .request_as_json(&Method::GET, &endpoint, None, None)
-            .await
-        {
-            Ok(body) => break body,
-            Err(error) => {
-                if !browse_error_is_transient(error.kind, http_status_of(&error))
-                    || attempt >= backoffs.len()
-                {
-                    return Err(format!(
-                        "rootlist request failed: GET {endpoint} after {} attempts (last error: {error})",
-                        attempt + 1,
-                    ));
-                }
-                let backoff = backoffs[attempt];
-                eprintln!(
-                    "rootlist request GET {endpoint} failed ({error}); retrying in {backoff} ms (attempt {}/{})",
-                    attempt + 1,
-                    backoffs.len() + 1,
-                );
-                tokio::time::sleep(Duration::from_millis(backoff)).await;
-                attempt += 1;
-            }
-        }
-    };
+    let body = spclient_read(|| async { session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await }).await
+        .map_err(|error| format!("rootlist request failed: GET {endpoint}: {error}"))?;
     let nodes = parse_rootlist_tree(&body)?;
     fn remember_nodes(user: &str, nodes: &[LibraryNode]) {
         for node in nodes {
@@ -2320,6 +2212,79 @@ pub async fn playlist_tree_browse(
 fn playlist_uri(id: &str) -> Result<SpotifyUri, String> {
     SpotifyUri::from_uri(&format!("spotify:playlist:{id}"))
         .map_err(|error| format!("invalid playlist id: {error}"))
+}
+
+const PLAYLIST_MEMBERSHIP_PAGE_SIZE: usize = 1_000;
+
+#[derive(Deserialize)]
+struct PlaylistMembershipPage {
+    revision: String,
+    length: usize,
+    contents: PlaylistMembershipContents,
+}
+
+#[derive(Deserialize)]
+struct PlaylistMembershipContents {
+    #[serde(default)]
+    items: Vec<RootlistItemJson>,
+}
+
+fn parse_playlist_membership_page(payload: &[u8]) -> Result<PlaylistMembershipPage, String> {
+    let mut page: PlaylistMembershipPage = serde_json::from_slice(payload)
+        .map_err(|error| format!("unparseable playlist membership: {error}"))?;
+    let revision = base64::engine::general_purpose::STANDARD.decode(&page.revision)
+        .map_err(|error| format!("invalid playlist membership revision: {error}"))?;
+    page.revision = hex(&revision);
+    Ok(page)
+}
+
+fn append_playlist_membership_page(
+    membership: &mut renderer_engine::protocol::PlaylistMembership,
+    page: PlaylistMembershipPage,
+    offset: usize,
+) -> Result<(usize, bool), String> {
+    if offset == 0 {
+        membership.revision = page.revision;
+        membership.uris.reserve(page.length);
+    } else if membership.revision != page.revision {
+        return Err("playlist changed while reading membership".to_owned());
+    }
+    let count = page.contents.items.len();
+    if count == 0 && offset < page.length {
+        return Err("playlist membership page ended before the playlist did".to_owned());
+    }
+    membership.uris.extend(page.contents.items.into_iter()
+        .filter_map(|item| item.uri)
+        .filter(|raw| matches!(SpotifyUri::from_uri(raw), Ok(SpotifyUri::Track { .. }))));
+    let next = offset + count;
+    Ok((next, next >= page.length))
+}
+
+/// Reads source items only. Pagination advances by source slots, not by songs:
+/// local files, episodes and duplicate tracks must not hide the next page.
+pub async fn playlist_membership_browse(
+    session: &Session,
+    id: &str,
+) -> Result<renderer_engine::protocol::PlaylistMembership, String> {
+    playlist_uri(id)?;
+    let mut membership = renderer_engine::protocol::PlaylistMembership {
+        id: id.to_owned(),
+        ..Default::default()
+    };
+    let mut offset = 0usize;
+    loop {
+        let endpoint = format!(
+            "/playlist/v2/playlist/{id}?from={offset}&length={PLAYLIST_MEMBERSHIP_PAGE_SIZE}"
+        );
+        let body = spclient_read(|| async { session.spclient().request_as_json(&Method::GET, &endpoint, None, None).await }).await
+            .map_err(|error| format!("playlist membership GET {endpoint} failed: {error}"))?;
+        let page = parse_playlist_membership_page(&body)?;
+        let (next, complete) = append_playlist_membership_page(&mut membership, page, offset)?;
+        offset = next;
+        if complete {
+            return Ok(membership);
+        }
+    }
 }
 
 /// Fetches one metadata entity with the bounded retry/backoff schedule:
@@ -2392,7 +2357,7 @@ pub async fn playlist_browse(
     id: &str,
 ) -> Result<renderer_engine::protocol::PlaylistBrowse, String> {
     let uri = playlist_uri(id)?;
-    let playlist: Playlist = metadata_get(session, &uri, "playlist").await?;
+    let playlist: Playlist = spclient_read(|| Playlist::get(session, &uri)).await.map_err(|error| format!("{} fetch failed: {error}", "playlist"))?;
     let owner_id = match &playlist.id {
         SpotifyUri::Playlist { user, .. } => user.clone().unwrap_or_default(),
         _ => String::new(),
@@ -2694,12 +2659,10 @@ async fn artist_visual_identity(
             ..Default::default()
         },
     );
-    let response = session
-        .spclient()
-        .get_extended_metadata(request)
-        .await
+    let response = spclient_read(|| async { session.spclient().get_extended_metadata(request.clone()).await }).await
         .map_err(|error| format!("artist visual identity request failed: {error}"))?;
     let payload = collect_extension_payloads(&response, ExtensionKind::VISUAL_IDENTITY_TRAIT)
+        .map_err(|error| format!("artist visual identity response failed: {error}"))?
         .into_iter()
         .next()
         .map(|(_, payload)| payload);
@@ -2829,15 +2792,14 @@ pub async fn canvas_browse(session: &Session, id: &str) -> Result<Option<Canvas>
         CONTENT_TYPE,
         HeaderValue::from_static("application/x-protobuf"),
     );
-    let payload = session
-        .spclient()
-        .request(
+    let payload = spclient_read(|| async {
+        session.spclient().request(
             &Method::POST,
             "/canvaz-cache/v0/canvases",
-            Some(headers),
+            Some(headers.clone()),
             Some(&request_body),
-        )
-        .await
+        ).await
+    }).await
         .map_err(|error| format!("Canvas request failed: {error}"))?;
     let result = parse_canvas_response(&payload, &track_uri)?;
     remember_canvas(&track_uri, result.clone());
@@ -3175,7 +3137,7 @@ async fn discover_songwriter_playlist(
     };
     let candidate_uri = SpotifyUri::from_uri(&candidate.uri)
         .map_err(|error| format!("invalid songwriter playlist URI: {error}"))?;
-    let playlist: Playlist = metadata_get(session, &candidate_uri, "songwriter playlist").await?;
+    let playlist: Playlist = spclient_read(|| Playlist::get(session, &candidate_uri)).await.map_err(|error| format!("{} fetch failed: {error}", "songwriter playlist"))?;
     let Some(reference) = official_songwriter_playlist_ref(&playlist, &candidate) else {
         return Ok(None);
     };
@@ -3860,10 +3822,7 @@ pub async fn liked_songs_browse(
     cursor: Option<&str>,
 ) -> Result<renderer_engine::protocol::LikedSongsPage, String> {
     let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-        let payload = session
-            .spclient()
-            .get_next_page(cursor)
-            .await
+        let payload = spclient_read(|| async { session.spclient().get_next_page(cursor).await }).await
             .map_err(|error| format!("liked songs page request failed: {error}"))?;
         let json = std::str::from_utf8(&payload)
             .map_err(|error| format!("liked songs page was not utf-8: {error}"))?;
@@ -3877,10 +3836,7 @@ pub async fn liked_songs_browse(
         )
     } else {
         let context_uri = format!("spotify:user:{}:collection", session.username());
-        let context = session
-            .spclient()
-            .get_context(&context_uri)
-            .await
+        let context = spclient_read(|| async { session.spclient().get_context(&context_uri).await }).await
             .map_err(|error| format!("liked songs request failed: {error}"))?;
         let uris = context
             .pages
@@ -3908,10 +3864,7 @@ pub async fn liked_song_uris_browse(
     cursor: Option<&str>,
 ) -> Result<renderer_engine::protocol::LikedUrisPage, String> {
     let (uris, next_cursor) = if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-        let payload = session
-            .spclient()
-            .get_next_page(cursor)
-            .await
+        let payload = spclient_read(|| async { session.spclient().get_next_page(cursor).await }).await
             .map_err(|error| format!("liked song uris page request failed: {error}"))?;
         let json = std::str::from_utf8(&payload)
             .map_err(|error| format!("liked song uris page was not utf-8: {error}"))?;
@@ -3925,10 +3878,7 @@ pub async fn liked_song_uris_browse(
         )
     } else {
         let context_uri = format!("spotify:user:{}:collection", session.username());
-        let context = session
-            .spclient()
-            .get_context(&context_uri)
-            .await
+        let context = spclient_read(|| async { session.spclient().get_context(&context_uri).await }).await
             .map_err(|error| format!("liked song uris request failed: {error}"))?;
         let uris = context
             .pages
@@ -4865,16 +4815,9 @@ fn podcast_episode_hit(hit: &SearchPodcastHitJson) -> Option<EpisodeRef> {
     let duration_ms = hit.duration.as_ref()
         .and_then(|duration| parse_count(duration.totalMilliseconds.as_ref())).unwrap_or_default();
     Some(EpisodeRef {
-        id: id.clone(),
-        uri: uri.to_owned(),
-        name: name.to_owned(),
         show_id: show_id.clone(),
         show_name: show_name.clone(),
         description: hit.description.clone().unwrap_or_default(),
-        cover_url: cover_url.clone(),
-        duration_ms,
-        unavailable: true,
-        unavailable_reason: Some("Open this episode to check audio availability".to_owned()),
         track: TrackRef {
             id,
             uri: uri.to_owned(),
@@ -4890,19 +4833,6 @@ fn podcast_episode_hit(hit: &SearchPodcastHitJson) -> Option<EpisodeRef> {
         },
         ..EpisodeRef::default()
     })
-}
-
-fn resolved_search_top(
-    top: Option<renderer_engine::protocol::SearchTopRef>,
-    episodes: &[EpisodeRef],
-) -> Option<renderer_engine::protocol::SearchTopRef> {
-    use renderer_engine::protocol::SearchTopRef;
-    match top {
-        Some(SearchTopRef::Episode(hit)) => Some(SearchTopRef::Episode(
-            episodes.iter().find(|episode| episode.uri == hit.uri).cloned().unwrap_or(hit),
-        )),
-        other => other,
-    }
 }
 
 /// Picks the top result: best name match wins, and Spotify's own order breaks
@@ -4946,8 +4876,8 @@ fn search_top_ref(
                 }
                 SearchTopDataJson::Episode(hit) => {
                     let reference = podcast_episode_hit(hit)?;
-                    let (id, name) = (reference.id.clone(), reference.name.clone());
-                    (SearchTopRef::Episode(reference), id, name)
+                    let (id, name) = (reference.track.id, reference.track.name);
+                    (SearchTopRef::Episode { uri: reference.track.uri }, id, name)
                 }
                 SearchTopDataJson::Unsupported => return None,
             };
@@ -6126,9 +6056,9 @@ pub async fn search_browse(
                 _ => {}
             }
         }
-        let mut episodes = openable_by_id(episodes, |episode| (episode.id.as_str(), episode.name.as_str()));
+        let mut episodes = openable_by_id(episodes, |episode| (episode.track.id.as_str(), episode.track.name.as_str()));
         let episode_uris = episodes.iter()
-            .filter_map(|episode| SpotifyUri::from_uri(&episode.uri).ok())
+            .filter_map(|episode| SpotifyUri::from_uri(&episode.track.uri).ok())
             .collect::<Vec<_>>();
         if !episode_uris.is_empty() {
             let policy = AvailabilityPolicy::for_session(session);
@@ -6137,17 +6067,17 @@ pub async fn search_browse(
                 |uri, payload| parse_episode_payload(uri, payload, &policy),
             ).await {
                 let mut by_uri = resolved.into_iter()
-                    .map(|episode| (episode.uri.clone(), episode))
+                    .map(|episode| (episode.track.uri.clone(), episode))
                     .collect::<HashMap<_, _>>();
                 for episode in &mut episodes {
-                    if let Some(resolved) = by_uri.remove(&episode.uri) {
+                    if let Some(resolved) = by_uri.remove(&episode.track.uri) {
                         *episode = resolved;
                     }
                 }
             }
         }
         return Ok(renderer_engine::protocol::SearchBrowse {
-            top: resolved_search_top(search_top_ref(query.trim(), &search.topResultsV2), &episodes),
+            top: search_top_ref(query.trim(), &search.topResultsV2),
             tracks: parsed
                 .data
                 .searchV2
@@ -6215,6 +6145,65 @@ mod tests {
 
     use librespot_core::date::Date;
 
+    #[tokio::test(start_paused = true)]
+    async fn spclient_read_retries_unhandled_server_errors_but_not_native_retry_classes() {
+        use std::cell::Cell;
+        use librespot_core::http_client::HttpClientError;
+        let attempts = Cell::new(0);
+        let result = spclient_read(|| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            async move {
+                if attempt == 3 {
+                    Ok("recovered")
+                } else {
+                    Err(HttpClientError::StatusCode(http::StatusCode::BAD_GATEWAY).into())
+                }
+            }
+        }).await;
+        assert_eq!(result.unwrap(), "recovered");
+        assert_eq!(attempts.get(), 3);
+        for status in [http::StatusCode::BAD_GATEWAY, http::StatusCode::SERVICE_UNAVAILABLE,
+            http::StatusCode::GATEWAY_TIMEOUT, http::StatusCode::NOT_FOUND,
+            http::StatusCode::UNAUTHORIZED, http::StatusCode::TOO_MANY_REQUESTS]
+        {
+            attempts.set(0);
+            let result: Result<(), _> = spclient_read(|| {
+                attempts.set(attempts.get() + 1);
+                async move { Err(HttpClientError::StatusCode(status).into()) }
+            }).await;
+            assert!(result.is_err());
+            assert_eq!(attempts.get(), if status == http::StatusCode::BAD_GATEWAY {
+                BROWSE_RETRY_ATTEMPTS + 1
+            } else { 1 }, "HTTP {status} retry boundary");
+        }
+    }
+
+    #[test]
+    fn transient_entity_metadata_errors_never_produce_partial_rows() {
+        use librespot_protocol::entity_extension_data::{EntityExtensionData, EntityExtensionDataHeader};
+        use librespot_protocol::extended_metadata::EntityExtensionDataArray;
+        let mut entry = EntityExtensionData::new();
+        entry.entity_uri = "spotify:track:0123456789ABCDEFGHIJKL".to_owned();
+        for status in [500, 502, 503, 504, 429, 401, 403] {
+            entry.header = protobuf::MessageField::some(EntityExtensionDataHeader {
+                status_code: status,
+                ..Default::default()
+            });
+            let response = BatchedExtensionResponse {
+                extended_metadata: vec![EntityExtensionDataArray {
+                    extension_kind: EnumOrUnknown::new(ExtensionKind::TRACK_V4),
+                    extension_data: vec![entry.clone()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let error = collect_extension_payloads(&response, ExtensionKind::TRACK_V4).unwrap_err();
+            if status >= 500 {
+                assert_eq!(http_status_of(&error), Some(status as u16));
+            }
+        }
+    }
     #[test]
     fn profile_username_is_one_encoded_path_segment() {
         assert_eq!(profile_username_path("a b/+?#%é").unwrap(), "a%20b%2F%2B%3F%23%25%C3%A9");
@@ -6251,19 +6240,17 @@ mod tests {
         assert_eq!(episode.track.album_id, show.id);
         assert_eq!(episode.track.album_name, "A show");
         assert_eq!(episode.track.duration_ms, 12000);
-        assert!(episode.unavailable, "search alone cannot prove playable audio");
+        assert!(episode.track.unavailable, "search alone cannot prove playable audio");
         assert!(podcast_episode_hit(search.podcasts.as_ref().unwrap().items[0].hit().unwrap()).is_none());
-        episode.unavailable = false;
-        episode.unavailable_reason = None;
         episode.track.unavailable = false;
         episode.track.unavailable_reason = None;
-        let top = resolved_search_top(search_top_ref("An episode", &search.topResultsV2), &[episode]);
-        let Some(renderer_engine::protocol::SearchTopRef::Episode(top)) = top else {
+        let top = search_top_ref("An episode", &search.topResultsV2);
+        let Some(renderer_engine::protocol::SearchTopRef::Episode { uri }) = top else {
             panic!("expected the ranked episode");
         };
-        assert!(!top.unavailable);
-        assert!(!top.track.unavailable);
-        assert_eq!(top.track.album_name, "A show");
+        assert_eq!(uri, episode.track.uri);
+        assert!(!episode.track.unavailable);
+        assert_eq!(episode.track.album_name, "A show");
     }
 
     #[test]
@@ -6423,24 +6410,24 @@ mod tests {
         };
         episode.audio.insert(AudioFileFormat::OGG_VORBIS_96, file_id(1));
         let available = episode_ref(&episode, String::new(), &policy);
-        assert!(!available.unavailable);
+        assert!(!available.track.unavailable);
         assert_eq!(available.track.uri, episode.id.to_uri().unwrap());
         assert_eq!(available.track.duration_ms, 12_345);
         episode.audio.clear();
         episode.videos.push(file_id(2));
         let video = episode_ref(&episode, String::new(), &policy);
-        assert_eq!(video.unavailable_reason.as_deref(), Some("Video-only episodes cannot be played as audio"));
+        assert_eq!(video.track.unavailable_reason.as_deref(), Some("Video-only episodes cannot be played as audio"));
         episode.videos.clear();
         episode.external_url = "https://example.com/audio.mp3".to_owned();
         let external = episode_ref(&episode, String::new(), &policy);
-        assert_eq!(external.unavailable_reason.as_deref(), Some("Externally hosted episode has no Spotify audio"));
+        assert_eq!(external.track.unavailable_reason.as_deref(), Some("Externally hosted episode has no Spotify audio"));
         episode.audio.insert(AudioFileFormat::OGG_VORBIS_96, file_id(1));
         episode.videos.push(file_id(2));
-        assert!(!episode_ref(&episode, String::new(), &policy).unavailable,
+        assert!(!episode_ref(&episode, String::new(), &policy).track.unavailable,
             "a video episode with supported audio remains audio-playable");
         episode.videos.clear();
         episode.is_explicit = true;
-        assert!(episode_ref(&episode, String::new(), &policy).unavailable);
+        assert!(episode_ref(&episode, String::new(), &policy).track.unavailable);
         episode.is_explicit = false;
         episode.restrictions = librespot_metadata::restriction::Restrictions(vec![
             librespot_metadata::restriction::Restriction {
@@ -6451,7 +6438,7 @@ mod tests {
                 countries_forbidden: None,
             },
         ]);
-        assert_eq!(episode_ref(&episode, String::new(), &policy).unavailable_reason.as_deref(),
+        assert_eq!(episode_ref(&episode, String::new(), &policy).track.unavailable_reason.as_deref(),
             Some("not available in your country"));
         episode.restrictions = Default::default();
         episode.availability = librespot_metadata::availability::Availabilities(vec![
@@ -6460,11 +6447,11 @@ mod tests {
                 start: Date::from_timestamp_ms(4_102_444_800_000).unwrap(),
             },
         ]);
-        assert_eq!(episode_ref(&episode, String::new(), &policy).unavailable_reason.as_deref(),
+        assert_eq!(episode_ref(&episode, String::new(), &policy).track.unavailable_reason.as_deref(),
             Some(RELEASE_EMBARGO_REASON));
         episode.availability = Default::default();
         episode.is_audiobook_chapter = true;
-        assert!(episode_ref(&episode, String::new(), &policy).unavailable);
+        assert!(episode_ref(&episode, String::new(), &policy).track.unavailable);
     }
 
     #[test]
@@ -8975,7 +8962,7 @@ mod tests {
             ..Default::default()
         };
 
-        let entries = collect_extension_payloads(&response, ExtensionKind::TRACK_V4);
+        let entries = collect_extension_payloads(&response, ExtensionKind::TRACK_V4).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "spotify:track:aaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(entries[0].1, vec![0xAA, 0xBB]);
@@ -9160,7 +9147,7 @@ mod file_index_tests {
             country: "US".into(), catalogue: "premium".into(), filter_explicit: false,
         };
         let reference = episode_ref(&episode, String::new(), &policy);
-        let ids = vec![reference.id.clone()];
+        let ids = vec![reference.track.id.clone()];
         let video_path = cache.file_path(video).unwrap();
         std::fs::create_dir_all(video_path.parent().unwrap()).unwrap();
         std::fs::write(video_path, b"video").unwrap();
@@ -9602,5 +9589,56 @@ mod file_index_tests {
                 .is_some(),
             "a verdict the clock cannot overturn is kept"
         );
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::{append_playlist_membership_page, parse_playlist_membership_page};
+    use renderer_engine::protocol::PlaylistMembership;
+    use serde_json::json;
+
+    fn page(items: Vec<serde_json::Value>, length: usize, revision: &str) -> super::PlaylistMembershipPage {
+        parse_playlist_membership_page(&serde_json::to_vec(&json!({
+            "revision": revision, "length": length, "contents": { "items": items }
+        })).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn membership_pages_count_source_slots_and_preserve_song_order_and_duplicates() {
+        let song = "spotify:track:0123456789ABCDEFGHIJKL";
+        let last = "spotify:track:1abcdefghijklmnopqrstu";
+        let mut items = vec![json!({"uri": "spotify:local:artist:album:song:123"}); 1_000];
+        items[0] = json!({"uri": song});
+        items[999] = json!({"uri": song});
+        let mut membership = PlaylistMembership::default();
+        let (offset, complete) = append_playlist_membership_page(
+            &mut membership, page(items, 1_002, "AQID"), 0,
+        ).unwrap();
+        assert_eq!(offset, 1_000);
+        assert!(!complete);
+        let (offset, complete) = append_playlist_membership_page(
+            &mut membership,
+            page(vec![json!({"uri": "spotify:episode:0123456789ABCDEFGHIJKL"}), json!({"uri": last})], 1_002, "AQID"),
+            offset,
+        ).unwrap();
+        assert_eq!(offset, 1_002);
+        assert!(complete);
+        assert_eq!(membership.revision, "010203");
+        assert_eq!(membership.uris, [song, song, last]);
+    }
+
+    #[test]
+    fn membership_does_not_report_mixed_revisions_or_incomplete_pages_as_success() {
+        let mut membership = PlaylistMembership::default();
+        let song = json!({"uri": "spotify:track:0123456789ABCDEFGHIJKL"});
+        append_playlist_membership_page(&mut membership, page(vec![song], 2, "AQID"), 0).unwrap();
+        assert!(append_playlist_membership_page(&mut membership, page(Vec::new(), 2, "AQIE"), 1).is_err());
+        assert!(append_playlist_membership_page(&mut membership, page(Vec::new(), 2, "AQID"), 1).is_err());
+        assert!(parse_playlist_membership_page(br#"{"revision":"bad!","length":0,"contents":{"items":[]}}"#).is_err());
+        let mut empty = PlaylistMembership::default();
+        let omitted = parse_playlist_membership_page(br#"{"revision":"AQID","length":0,"contents":{}}"#).unwrap();
+        assert_eq!(append_playlist_membership_page(&mut empty, omitted, 0).unwrap(), (0, true));
+        assert!(empty.uris.is_empty());
     }
 }

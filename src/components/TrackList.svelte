@@ -5,6 +5,7 @@
     navigate,
     navigateArtist,
     playback,
+    isPlayingSource,
     togglePlay,
     library,
     promotePlaylist,
@@ -14,6 +15,7 @@
   } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
+  import Menu from "./Menu.svelte";
   import ArtistLinks from "./ArtistLinks.svelte";
   import { personalConnected, watchPersonal, setLiked } from "../lib/personal.svelte.js";
   import { formatTime } from "../lib/time.js";
@@ -281,30 +283,6 @@
     return `Sort by ${label}, currently ${sortDirection === "asc" ? "ascending" : "descending"}`;
   }
 
-  /**
-   * Puts a popover in the browser's TOP LAYER, and it is the whole fix for the
-   * row menu disappearing behind the page.
-   *
-   * These menus are `position: fixed`, but fixed positioning does not take an
-   * element out of its ancestors' PAINT order, and this one is rendered inside
-   * the page: a detail page wraps its content in `.wash`, which gives every
-   * child `z-index: 1` and the header `z-index: 2`, so the menu was competing
-   * inside a local stacking context it could never win. Opening upward near the
-   * top of a list put it under the header; opening downward near the bottom put
-   * it under the "Recommended" section, which is simply a LATER child of the
-   * same wash at the same z-index. No number fixes that — `z-index: 200` was
-   * already there and lost to a `z-index: 1` sibling, because the comparison
-   * that decides it happens one level up.
-   *
-   * The top layer is outside every stacking context and every clip on the page,
-   * so there is nothing left to lose to. `manual` rather than `auto` because
-   * the menu and its submenus have to coexist (an `auto` popover light-dismisses
-   * its siblings) and because dismissal is already handled below.
-   */
-  function topLayer(node) {
-    node.showPopover();
-    return { destroy: () => node.isConnected && node.hidePopover() };
-  }
 
   /**
    * Closes every menu surface. The kebab gets its focus back only when the
@@ -353,18 +331,11 @@
     if (menu.open || picker.open || artistPicker.open) untrack(closeMenus);
   });
 
-  /**
-   * Which row is the playing one, as an index into `tracks`.
-   *
-   * `playback.current_index` indexes the QUEUE, not this list — this list is
-   * whatever playlist/album/search result is on screen. Using it directly lit
-   * up the row that merely sat at the same ordinal, so switching playlists kept
-   * marking position N as playing even though it was a different song.
-   * Identity is the only thing the two lists share, so resolve by URI.
-   */
+  /** Highlight and toggle only the active source. Its displayed order may be
+      sorted or windowed, so resolve the row by URI rather than queue index. */
   const currentRow = $derived.by(() => {
     const uri = playback.current_uri;
-    if (!uri) return -1;
+    if (!uri || !isPlayingSource(queueSource)) return -1;
     // When this list IS the playing context the index still agrees, and taking
     // it keeps duplicates resolving to the instance actually playing.
     const i = playback.current_index;
@@ -864,37 +835,6 @@
   let headStuck = $state(false);
   $effect(() => observeStuck(headSentinel, (stuck) => (headStuck = stuck)));
 
-  $effect(() => {
-    if (!menu.open && !picker.open && !artistPicker.open) return;
-    const onDown = (e) => {
-      const el = e.target;
-      /* The kebab is exempt so that its own click can toggle; see openRowMenu. */
-      if (el?.closest?.(".menu, .c-more")) return;
-      closeMenus();
-    };
-    const onKey = (e) => {
-      if (e.key === "Escape") closeMenus();
-    };
-    /* A menu is placed against a row, from that row's rect, once. Scrolling or
-       resizing moves the row and not the menu, so the anchoring is stale the
-       moment either happens — and a menu that follows a scrolling row is a
-       per-frame layout read on the scroller, which this app does not do
-       anywhere. Dismissing is both cheaper and what the pointer is asking for.
-       The wrapper is not decoration: registered directly, the Event would land
-       in `returnFocus` and the kebab would take focus back mid-scroll. */
-    const closeOnViewportChange = () => closeMenus();
-    const scroller = rootEl?.closest(".scroll");
-    window.addEventListener("pointerdown", onDown, true);
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("resize", closeOnViewportChange);
-    scroller?.addEventListener("scroll", closeOnViewportChange, { passive: true });
-    return () => {
-      window.removeEventListener("pointerdown", onDown, true);
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("resize", closeOnViewportChange);
-      scroller?.removeEventListener("scroll", closeOnViewportChange);
-    };
-  });
 </script>
 
 {#snippet trackRows(items, start)}
@@ -1121,15 +1061,7 @@
 {#if menu.open}
   <!-- The popover is the glass and its child is the scroller, so that the
        scroller's overlay bar is laid inside the popover, in the top layer. -->
-  <div
-    class="menu track-menu glass-overlay"
-    popover="manual"
-    use:topLayer
-    bind:this={menuEl}
-    style:left="{menu.x}px"
-    style:top={menu.top === null ? null : menu.top + "px"}
-    style:bottom={menu.bottom === null ? null : menu.bottom + "px"}
-  >
+  <Menu class="track-menu" placement={menu} anchor={menu.anchor} group bind:element={menuEl} label="Track actions" onclose={closeMenus}>
     <div class="menu-scroll" use:scrollbar style:max-height="{menu.maxH}px">
     <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track, queueSource).catch(() => {}); }}>
       Add to queue
@@ -1249,35 +1181,21 @@
       </button>
     {/if}
     </div>
-  </div>
+  </Menu>
 {/if}
 
 {#if picker.open}
-  <div
-    class="menu submenu glass-overlay"
-    popover="manual"
-    use:topLayer
-    style:left="{picker.x}px"
-    style:top={picker.top === null ? null : picker.top + "px"}
-    style:bottom={picker.bottom === null ? null : picker.bottom + "px"}
-  >
+  <Menu class="track-submenu submenu" placement={picker} returnTo={menu.anchor} group label="Add to playlist" onclose={() => (picker.open = false)}>
     <div class="menu-scroll" use:scrollbar style:max-height="{picker.maxH}px">
       {#each library as pl (pl.id)}
         <button class="menu-item" title={pl.name} onclick={() => addToPlaylist(pl)}><span class="menu-label">{pl.name}</span></button>
       {/each}
     </div>
-  </div>
+  </Menu>
 {/if}
 
 {#if artistPicker.open}
-  <div
-    class="menu submenu glass-overlay"
-    popover="manual"
-    use:topLayer
-    style:left="{artistPicker.x}px"
-    style:top={artistPicker.top === null ? null : artistPicker.top + "px"}
-    style:bottom={artistPicker.bottom === null ? null : artistPicker.bottom + "px"}
-  >
+  <Menu class="track-submenu submenu" placement={artistPicker} returnTo={menu.anchor} group label="Go to artist" onclose={() => (artistPicker.open = false)}>
     <div class="menu-scroll" use:scrollbar style:max-height="{artistPicker.maxH}px">
     {#each artistPicker.artists as artist (artist.id)}
       <button
@@ -1291,7 +1209,7 @@
       ><span class="menu-label">{artist.name}</span></button>
     {/each}
     </div>
-  </div>
+  </Menu>
 {/if}
 
 <style>
@@ -1304,13 +1222,8 @@
      sets `inset: 0; margin: auto` to centre a popover in the viewport. The
      three declarations that follow it are the position; the UA's `right: 0`
      would otherwise stretch every menu to the right edge of the window. */
-  .menu {
-    position: fixed;
-    inset: auto;
-    margin: 0;
-    padding: 0;
-  }
-  .track-menu { width: 240px; min-width: 0; max-width: calc(100vw - 16px); }
+  :global(.menu.track-menu), :global(.menu.track-submenu) { padding: 0; }
+  :global(.menu.track-menu) { width: 240px; min-width: 0; max-width: calc(100vw - 16px); }
   .menu-scroll {
     padding: var(--s1);
     overflow-y: auto;

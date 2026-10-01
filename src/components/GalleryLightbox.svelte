@@ -1,5 +1,5 @@
 <script>
-  import { resolveCoverUrl } from "../lib/state.svelte.js";
+  import { coverUrl } from "../lib/state.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import Icon from "./Icon.svelte";
 
@@ -23,16 +23,13 @@
   let { open = false, images = [], index = 0, name = "", onStep, onClose } = $props();
 
   let dialog = $state(null);
-  /** Resolved `cover://` urls, keyed by source. `""` records a failure, which
-      is what keeps the effect below from retrying a dead url forever. */
-  let resolved = $state({});
   const captionId = "gallery-lightbox-caption";
 
   const total = $derived(images.length);
   const position = $derived(total ? Math.min(index, total - 1) : 0);
   const shot = $derived(images[position] ?? null);
   const source = $derived(shot?.url ?? "");
-  const src = $derived(resolved[source] || "");
+  const src = $derived(coverUrl(source));
   const width = $derived(Number(shot?.width) > 0 ? Number(shot.width) : null);
   const height = $derived(Number(shot?.height) > 0 ? Number(shot.height) : null);
   /* Something has to hold the middle of the screen while a cold picture
@@ -48,15 +45,10 @@
 
   $effect(() => {
     if (!open || !total) return;
-    /* The neighbours as well as the picture on screen. A step that waits on a
-       round trip reads as a stall, and by the time anyone has stepped twice
-       these are already on disk. */
-    const wanted = [position, (position + 1) % total, (position - 1 + total) % total]
-      .map((i) => images[i]?.url)
-      .filter(Boolean);
-    for (const url of wanted) {
-      if (url in resolved) continue;
-      resolveCoverUrl(url).then((local) => (resolved[url] = local || ""));
+    /* Warm only adjacent photographs; the current image fetches itself. */
+    for (const offset of [1, -1]) {
+      const url = images[(position + offset + total) % total]?.url;
+      if (url) new Image().src = coverUrl(url);
     }
   });
 

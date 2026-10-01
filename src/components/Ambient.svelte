@@ -1,6 +1,6 @@
 <script>
   import { untrack } from "svelte";
-  import { playback, ui, resolveCoverUrl } from "../lib/state.svelte.js";
+  import { playback, ui, coverUrl as imageUrl } from "../lib/state.svelte.js";
   import { coverTone } from "../lib/covertone.svelte.js";
   import { haze, publishLight, frost, watchFrost } from "../lib/ambient.svelte.js";
   import { rgbOf, parseFrost, RESTRAINED } from "../lib/haze.js";
@@ -100,7 +100,7 @@
   });
 
   /** Counters, for the harness to read. Not state: nothing renders them. */
-  const stats = { posts: 0, received: 0, renders: 0, uploads: 0, samples: 0, workerMs: 0, gpu: null, fades: [], settles: [] };
+  const stats = import.meta.env.DEV ? { posts: 0, received: 0, renders: 0, uploads: 0, samples: 0, workerMs: 0, gpu: null, fades: [], settles: [] } : null;
   if (import.meta.env?.DEV) {
     window.__haze = stats;
     /* The harness can frost planes that do not wear the action yet. */
@@ -149,18 +149,18 @@
     }
     const [hazeCanvas, frostCanvas] = el.children;
     hazeCanvas.getContext("bitmaprenderer").transferFromImageBitmap(bitmap);
-    stats.uploads++;
+    if (stats) stats.uploads++;
     frostCanvas.hidden = !frosted;
     if (frosted) {
       frostCanvas.getContext("bitmaprenderer").transferFromImageBitmap(frosted);
-      stats.uploads++;
+      if (stats) stats.uploads++;
     }
     el.style.zIndex = String(++z);
     el.style.visibility = "visible";
     const { ms, easing } = FADES[fade];
     const entry = { el, anim: el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: ms, easing, fill: "forwards" }) };
     stack.push(entry);
-    stats.fades.push({ fade, ms, at: Math.round(performance.now()), key: asked?.key });
+    if (stats) stats.fades.push({ fade, ms, at: Math.round(performance.now()), key: asked?.key });
     entry.anim.finished.then(
       () => {
         el.style.opacity = "1";
@@ -205,7 +205,7 @@
   let lightKey = "";
 
   function post(message, transfer = []) {
-    stats.posts++;
+    if (stats) stats.posts++;
     worker.postMessage(message, transfer);
   }
 
@@ -232,13 +232,15 @@
   });
 
   function receive(m) {
-    stats.received++;
+    if (stats) stats.received++;
     switch (m.type) {
       case "haze": {
-        stats.renders++;
-        stats.workerMs += m.ms;
-        stats.gpu = m.gpu;
-        if (m.distance !== undefined) stats.settles.push(+m.distance.toFixed(3));
+        if (stats) {
+          stats.renders++;
+          stats.workerMs += m.ms;
+          stats.gpu = m.gpu;
+          if (m.distance !== undefined) stats.settles.push(+m.distance.toFixed(3));
+        }
         if (m.seq !== seq) {
           m.bitmap.close();
           m.frost?.close();
@@ -266,7 +268,7 @@
         if (m.key === lightKey && !unreadableShown()) publishLight(m.light);
         return;
       case "done":
-        if (m.distance !== undefined) stats.settles.push(+m.distance.toFixed(3));
+        if (stats && m.distance !== undefined) stats.settles.push(+m.distance.toFixed(3));
         if (m.key === lightKey && !unreadableShown()) publishLight(m.light);
         return;
     }
@@ -305,17 +307,11 @@
       fallback();
       return () => (cancelled = true);
     }
-    resolveCoverUrl(url)
-      .then((local) => {
-        if (cancelled) return;
-        if (!local) return fallback();
-        const img = new Image();
-        img.crossOrigin = "anonymous";
-        img.onload = () => createImageBitmap(img).then((b) => settle(b, url), fallback);
-        img.onerror = fallback;
-        img.src = local;
-      })
-      .catch(fallback);
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => createImageBitmap(img).then((b) => settle(b, url), fallback);
+    img.onerror = fallback;
+    img.src = imageUrl(url);
     return () => (cancelled = true);
   });
 
@@ -509,7 +505,7 @@
         } catch {
           return stopPass();
         }
-        stats.samples++;
+        if (stats) stats.samples++;
         post({ type: "sample", key: p.key, frame, geo: geometry() }, [frame]);
         p.covered += p.every;
         p.taken++;

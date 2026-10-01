@@ -9,11 +9,11 @@
     ui,
     retryDetail,
     loadCataloguePage,
-    resolveCoverUrl,
+    coverUrl,
   } from "../lib/state.svelte.js";
   import { playAlbumById, playPlaylistById } from "../lib/play.js";
   import { spotifyLink } from "../lib/spotify-link.js";
-  import { coverTone } from "../lib/covertone.svelte.js";
+  import { coverTone, cardTone } from "../lib/covertone.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Cover from "../components/Cover.svelte";
   import Icon from "../components/Icon.svelte";
@@ -93,23 +93,14 @@
     if (n < 2) return;
     figureIndex = (figurePosition + delta + n) % n;
   }
-  /* Both neighbours, warmed as soon as you land on a picture. The frame no
-     longer breaks while a photograph is on its way — it holds the outgoing one
-     until the incoming has decoded, see Cover — but held is still waited, and
-     a step should not be a wait at all. One picture ahead in each direction is
-     the same bet the lightbox already makes, and `resolveCoverUrl` is cached,
-     so stepping back over ground you have covered costs nothing. The <img> is
-     what puts the bytes in the browser's own cache; the command only says
-     where the file landed on disk. */
+  /* Warm both neighbours through the browser's ordinary image cache. */
   $effect(() => {
     const n = aboutFigures.length;
     if (n < 2) return;
     for (const offset of [1, -1]) {
       const url = aboutFigures[(figurePosition + offset + n) % n]?.url;
       if (!url) continue;
-      resolveCoverUrl(url).then((local) => {
-        if (local) new Image().src = local;
-      });
+      new Image().src = coverUrl(url);
     }
   });
   /* ------------------------------------------------------- the About frame
@@ -760,8 +751,7 @@
   }
 </script>
 {#snippet playlistCard(pl)}
-  {@const tone = coverTone(pl.cover_url || pl.cover_urls, pl.id)}
-  <div class="card" style:--tone-glow={tone.glow}>
+  <div class="card" use:cardTone={[pl.cover_url || pl.cover_urls, pl.id]}>
     <div class="card-art">
       <Cover src={pl.cover_url} srcs={pl.cover_urls ?? []} id={pl.id} name={pl.name} fill lg />
       <button
@@ -798,12 +788,10 @@
   either looking like a mistake.
 -->
 {#snippet pickCard(item)}
-  {@const tone = coverTone(item.cover || item.covers, item.id)}
   <div
     class="pick glass-card"
     class:playable={item.kind === "track"}
-    style:--tone-wash={tone.wash}
-    style:--tone-glow={tone.glow}
+    use:cardTone={[item.cover || item.covers, item.id, true]}
   >
     <div class="pick-art">
       <Cover
@@ -1078,8 +1066,7 @@
           <div class="shelf" style:--per-row={perRow}>
             {#each visibleShelf as entry (entry.release.id)}
               {@const release = entry.release}
-              {@const tone = coverTone(release.cover_url, release.id)}
-              <div class="card" style:--tone-glow={tone.glow}>
+              <div class="card" use:cardTone={[release.cover_url, release.id]}>
                 <div class="card-art">
                   <Cover src={release.cover_url} id={release.id} name={release.name} fill lg />
                   <button
@@ -1375,10 +1362,9 @@
         </div>
         <div class="shelf" style:--per-row={perRow}>
           {#each visibleRelatedArtists as related (related.id)}
-            {@const tone = coverTone(related.cover_url, related.id)}
             <button
               class="card"
-              style:--tone-glow={tone.glow}
+              use:cardTone={[related.cover_url, related.id]}
               onclick={() => navigateArtist(related.id, related.name)}
             >
               <span class="card-art">
@@ -1415,8 +1401,7 @@
         <div class="shelf appears-shelf" style:--per-row={perRow} bind:this={appearsOnSentinel}>
           {#if visibleAppearsOn.length}
             {#each visibleAppearsOn as release (release.id)}
-              {@const tone = coverTone(release.cover_url, release.id)}
-              <div class="card" style:--tone-glow={tone.glow}>
+              <div class="card" use:cardTone={[release.cover_url, release.id]}>
                 <div class="card-art">
                   <Cover src={release.cover_url} id={release.id} name={release.name} fill lg />
                   <button

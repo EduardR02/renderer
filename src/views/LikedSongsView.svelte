@@ -1,11 +1,12 @@
 <script>
   import { untrack } from "svelte";
-  import { api, ui, session, libraryChanges } from "../lib/state.svelte.js";
+  import { api, ui, session, sessionEpoch, watchSavedTracks } from "../lib/state.svelte.js";
   import TrackList from "../components/TrackList.svelte";
   import Icon from "../components/Icon.svelte";
   import LikedMark from "../components/LikedMark.svelte";
   import { paletteFor } from "../lib/covertone.svelte.js";
   import { detailArtSize } from "../lib/layout.js";
+  import { mergeLikedRows, reconcileLikedRows, mergeLikedPage, applyLikedDelta } from "../lib/liked-songs.js";
 
   /* Rose's own hue, rebuilt at the header's fixed dark. Every other detail
      page takes its colour from artwork; this collection has none, and does not
@@ -16,41 +17,50 @@
   /* Same rule as every other detail header: the artwork gives way first. */
   const artSize = $derived(detailArtSize(ui.paneWidth));
 
-  let tracks = $state([]);
-  let nextCursor = $state(null);
+  const collection = $state({ tracks: [], nextCursor: null, loadedPages: 0, removed: new Set() });
+  const tracks = $derived(collection.tracks);
+  const nextCursor = $derived(collection.nextCursor);
   let loading = $state(false);
   let error = $state("");
   let loadGeneration = 0;
+  let changes = Promise.resolve();
+  let pageRequest = null;
 
   async function loadPage(cursor = null, generation = loadGeneration) {
     if (loading) return;
     loading = true;
     error = "";
     try {
-      const page = await api.browseLikedSongs(cursor);
+      await changes;
       if (generation !== loadGeneration) return;
-      const seen = new Set(tracks.map((track) => track.uri));
-      const additions = [];
-      for (const track of page?.tracks ?? []) {
-        if (!track?.uri || seen.has(track.uri)) continue;
-        seen.add(track.uri);
-        additions.push(track);
+      if (cursor != null) {
+        cursor = nextCursor;
+        if (cursor == null) return;
       }
-      tracks.push(...additions);
-      nextCursor = page?.next_cursor ?? null;
+      pageRequest = api.browseLikedSongs(cursor);
+      const page = await pageRequest;
+      if (generation !== loadGeneration) return;
+      mergeLikedPage(collection, page);
     } catch (reason) {
       if (generation === loadGeneration) {
         error = String(reason || "Could not load Liked Songs.");
       }
     } finally {
-      if (generation === loadGeneration) loading = false;
+      if (generation === loadGeneration) {
+        pageRequest = null;
+        loading = false;
+      }
     }
   }
 
   function reloadCollection() {
     const generation = ++loadGeneration;
-    tracks = [];
-    nextCursor = null;
+    collection.tracks = [];
+    collection.loadedPages = 0;
+    collection.removed.clear();
+    changes = Promise.resolve();
+    pageRequest = null;
+    collection.nextCursor = null;
     loading = false;
     error = "";
     loadPage(null, generation);
@@ -58,9 +68,47 @@
 
   $effect(() => {
     const account = session.username;
-    const revision = libraryChanges.savedTracks;
+    const epoch = sessionEpoch();
     untrack(reloadCollection);
   });
+
+  async function applySavedChange(change, generation) {
+    if (generation !== loadGeneration) return;
+    const uris = change?.uris?.filter((uri) => uri.startsWith("spotify:track:"));
+    if (uris && typeof change.saved === "boolean") {
+      if (!change.saved) {
+        applyLikedDelta(collection, uris, false);
+        return;
+      }
+      const saved = [];
+      for (const uri of uris) {
+        if (tracks.some((track) => track.uri === uri)) continue;
+        saved.push(await api.browseTrack(uri.slice("spotify:track:".length)));
+      }
+      if (generation === loadGeneration) applyLikedDelta(collection, uris, true, saved);
+      return;
+    }
+    // Unidentified external changes refresh only the pages already displayed.
+    const fresh = [];
+    let cursor = null;
+    for (let page = 0; page < Math.max(1, collection.loadedPages); page++) {
+      const result = await api.browseLikedSongs(cursor);
+      if (generation !== loadGeneration) return;
+      mergeLikedRows(fresh, result?.tracks);
+      cursor = result?.next_cursor ?? null;
+      if (!cursor) break;
+    }
+    reconcileLikedRows(tracks, fresh);
+    collection.nextCursor = cursor;
+  }
+
+  $effect(() => watchSavedTracks((change) => {
+    const generation = loadGeneration;
+    changes = Promise.all([changes, pageRequest?.catch(() => {})]).then(() => applySavedChange(change, generation))
+      .catch((reason) => {
+        if (generation === loadGeneration) error = String(reason || "Could not update Liked Songs.");
+      });
+  }));
 
   function playFrom(index) {
     if (tracks.length) api.playQueue(tracks, index, "liked").catch(() => {});

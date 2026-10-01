@@ -867,34 +867,20 @@ impl From<ShowRef> for Show {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct EpisodeDetail {
-    pub id: String,
-    pub uri: String,
-    pub name: String,
     pub show_id: String,
     pub show_name: String,
     pub description: String,
-    pub cover_url: String,
-    pub duration_ms: u32,
     pub published_at: Option<i64>,
-    pub unavailable: bool,
-    pub unavailable_reason: Option<String>,
     pub track: Track,
 }
 
 impl From<EpisodeRef> for EpisodeDetail {
     fn from(reference: EpisodeRef) -> Self {
         Self {
-            id: reference.id,
-            uri: reference.uri,
-            name: reference.name,
             show_id: reference.show_id,
             show_name: reference.show_name,
             description: reference.description,
-            cover_url: reference.cover_url.unwrap_or_default(),
-            duration_ms: reference.duration_ms,
             published_at: reference.published_at,
-            unavailable: reference.unavailable,
-            unavailable_reason: reference.unavailable_reason,
             track: Track::from(reference.track),
         }
     }
@@ -1017,7 +1003,7 @@ pub enum SearchTop {
     Artist(Artist),
     Playlist(Playlist),
     Show(Show),
-    Episode(EpisodeDetail),
+    Episode { uri: String },
 }
 
 impl From<SearchTopRef> for SearchTop {
@@ -1028,7 +1014,7 @@ impl From<SearchTopRef> for SearchTop {
             SearchTopRef::Artist(reference) => Self::Artist(Artist::from(reference)),
             SearchTopRef::Playlist(reference) => Self::Playlist(Playlist::from(&reference)),
             SearchTopRef::Show(reference) => Self::Show(Show::from(reference)),
-            SearchTopRef::Episode(reference) => Self::Episode(EpisodeDetail::from(reference)),
+            SearchTopRef::Episode { uri } => Self::Episode { uri },
         }
     }
 }
@@ -1145,8 +1131,8 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// Mirror of the engine's `state` line, projected locally between the
-/// engine's 2-second heartbeats.
+/// Mirror of the engine's `state` line, with a locally projected playhead
+/// between its scalar transport updates.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PlaybackState {
@@ -1176,38 +1162,20 @@ pub struct PlaybackState {
     pub current_index: Option<usize>,
     #[serde(deserialize_with = "string_or_default")]
     pub current_uri: String,
+    pub context: String,
     pub queue: Vec<Track>,
-    /// The queue generation this payload describes.
-    ///
-    /// The engine sends the queue rows with every payload whose revision is
-    /// new and omits them entirely when they are the ones it already sent, so
-    /// a receiver can tell "these rows are unchanged" from "the queue is
-    /// empty". The parsed fields cannot: an omitted pair deserializes to the
-    /// same two empty vectors an empty queue does. A receiver has to note
-    /// whether `queue` was on the wire at all — `EngineClient::parse_line`
-    /// reads that off the raw message and hands it to `on_state` as
-    /// `PayloadRows` — and keep the rows of the newest payload that carried
-    /// any, keyed by the revision it named, which is what the client's wire
-    /// delta base is for. That base is deliberately not the durability copy
-    /// (`last_state`): previews and crash-restore intermediates carry rows a
-    /// later payload leans on, and they are exactly the ones never persisted.
-    /// The webview, which holds its own array across the states of one track
-    /// change, keys that copy off this number rather than re-adopting
-    /// identical rows.
-    ///
-    /// `0` is the pre-revision payload: an engine that does not speak this
-    /// field, or a snapshot written before it existed, means "assume changed".
-    /// It is never a generation to compare against — two payloads that both
-    /// leave it at `0` describe unrelated queues, so a receiver must take the
-    /// rows such a payload carries rather than merge them against the ones it
-    /// holds under the same number.
+    /// Generation of the canonical queue rows. Omission retains those rows;
+    /// an explicit empty array clears them. Zero means an unnamed snapshot.
     #[serde(default)]
     pub queue_revision: u64,
+    /// Generation of the upcoming order, independent of row edits.
+    #[serde(default)]
+    pub order_revision: u64,
     /// Queue indexes in the order automatic playback will actually reach them,
     /// current row excluded. Derived by the engine from shuffle's live bag or
     /// the sequential walk, with exclusions and unavailable rows removed, so it
-    /// is never restored or persisted — only forwarded. Omitted together with
-    /// `queue`, and for the same reason.
+    /// is never restored or persisted — only forwarded. It may be omitted
+    /// independently of `queue` when `order_revision` is unchanged.
     pub upcoming: Vec<usize>,
     #[serde(deserialize_with = "string_or_default")]
     pub error: String,
@@ -1236,11 +1204,51 @@ impl Default for PlaybackState {
             audible_playback_speed: 1.0,
             current_index: None,
             current_uri: String::new(),
+            context: String::new(),
             queue: Vec::new(),
             queue_revision: 0,
+            order_revision: 0,
             upcoming: Vec::new(),
             error: String::new(),
         }
+    }
+}
+
+/// Borrowed event projection: do not clone or serialize unchanged queue rows.
+#[derive(Clone, Copy)]
+pub struct PlaybackEvent<'a> {
+    state: &'a PlaybackState,
+    include_queue: bool,
+    include_order: bool,
+}
+
+impl<'a> PlaybackEvent<'a> {
+    pub fn new(state: &'a PlaybackState, include_queue: bool, include_order: bool) -> Self {
+        Self { state, include_queue, include_order }
+    }
+}
+
+impl Serialize for PlaybackEvent<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        let state = self.state;
+        macro_rules! fields {
+            ($($field:ident),* $(,)?) => {
+                $(map.serialize_entry(stringify!($field), &state.$field)?;)*
+            };
+        }
+        fields!(ready, auth_state, auth_url, playing, buffering, output_device_id,
+            output_device_name, preview, username, position_ms, duration_ms, volume,
+            shuffle, repeat, playback_speed, audible_playback_speed, current_index,
+            current_uri, context, queue_revision, order_revision, error);
+        if self.include_queue {
+            map.serialize_entry("queue", &state.queue)?;
+        }
+        if self.include_order {
+            map.serialize_entry("upcoming", &state.upcoming)?;
+        }
+        map.end()
     }
 }
 
@@ -1249,6 +1257,8 @@ impl Default for PlaybackState {
 pub struct AppState {
     pub playback: PlaybackState,
     pub playlists: Vec<Playlist>,
+    pub playlist_tree: Vec<LibraryNodeDetail>,
+    pub settings: crate::app::AppSettings,
     pub library_fresh: bool,
     pub me_id: String,
 }
@@ -1276,6 +1286,24 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_events_preserve_plan_and_current_context_without_queue_rows() {
+        let state = PlaybackState { queue: vec![Track { id: "song".into(), ..Track::default() }],
+            current_index: Some(0), context: "playlist:p".into(), queue_revision: 17,
+            upcoming: vec![3, 2], playing: true, ..PlaybackState::default() };
+        let compact = serde_json::to_value(PlaybackEvent::new(&state, false, true)).unwrap();
+        assert!(compact.get("queue").is_none());
+        assert_eq!(compact["queue_revision"], 17);
+        assert_eq!(compact["context"], "playlist:p");
+        assert_eq!(compact["upcoming"], serde_json::json!([3, 2]));
+        assert_eq!(compact["current_index"], 0);
+        let full = serde_json::to_value(PlaybackEvent::new(&state, true, true)).unwrap();
+        assert_eq!(full["queue"][0]["id"], "song");
+        let empty = PlaybackState { queue_revision: 18, ..PlaybackState::default() };
+        let cleared = serde_json::to_value(PlaybackEvent::new(&empty, true, true)).unwrap();
+        assert_eq!(cleared["queue"], serde_json::json!([]));
+    }
 
     fn track(cover_url: &str) -> Track {
         Track {
@@ -1331,21 +1359,19 @@ mod tests {
     #[test]
     fn show_and_episode_detail_keep_playback_and_availability_fields() {
         let episode = EpisodeRef {
-            id: "ep".into(),
-            uri: "spotify:episode:ep".into(),
-            name: "Interview".into(),
             show_id: "show".into(),
             show_name: "The Show".into(),
             description: "Audio episode".into(),
-            cover_url: Some("episode-cover".into()),
-            duration_ms: 83_000,
             published_at: Some(1_726_000_000),
-            unavailable: true,
-            unavailable_reason: Some("Region restricted".into()),
             track: TrackRef {
                 id: "ep".into(),
                 uri: "spotify:episode:ep".into(),
                 context: "show:show".into(),
+                name: "Interview".into(),
+                cover_url: "episode-cover".into(),
+                duration_ms: 83_000,
+                unavailable: true,
+                unavailable_reason: Some("Region restricted".into()),
                 ..TrackRef::default()
             },
         };
@@ -1362,12 +1388,12 @@ mod tests {
         assert_eq!(json["name"], "The Show");
         assert_eq!(json["publisher"], "Publisher");
         assert_eq!(json["cover_url"], "show-cover");
-        assert_eq!(json["episodes"][0]["uri"], "spotify:episode:ep");
+        assert_eq!(json["episodes"][0]["track"]["uri"], "spotify:episode:ep");
         assert_eq!(json["episodes"][0]["show_name"], "The Show");
         assert_eq!(json["episodes"][0]["published_at"], 1_726_000_000_i64);
-        assert_eq!(json["episodes"][0]["duration_ms"], 83_000);
-        assert_eq!(json["episodes"][0]["unavailable"], true);
-        assert_eq!(json["episodes"][0]["unavailable_reason"], "Region restricted");
+        assert_eq!(json["episodes"][0]["track"]["duration_ms"], 83_000);
+        assert_eq!(json["episodes"][0]["track"]["unavailable"], true);
+        assert_eq!(json["episodes"][0]["track"]["unavailable_reason"], "Region restricted");
         assert_eq!(json["episodes"][0]["track"]["context"], "show:show");
     }
 
@@ -1455,27 +1481,26 @@ mod tests {
             ..ShowRef::default()
         };
         let episode = EpisodeRef {
-            id: "ep".into(),
             show_id: "show".into(),
-            name: "Interview".into(),
             track: TrackRef {
+                id: "ep".into(),
+                name: "Interview".into(),
                 uri: "spotify:episode:ep".into(),
                 ..TrackRef::default()
             },
             ..EpisodeRef::default()
         };
         let results = SearchResult::from(SearchBrowse {
-            top: Some(SearchTopRef::Episode(episode.clone())),
+            top: Some(SearchTopRef::Episode { uri: episode.track.uri.clone() }),
             shows: vec![show.clone()],
             episodes: vec![episode],
             ..SearchBrowse::default()
         });
         let json = serde_json::to_value(results).unwrap();
         assert_eq!(json["top"]["kind"], "episode");
-        assert_eq!(json["top"]["show_id"], "show");
-        assert_eq!(json["top"]["track"]["uri"], "spotify:episode:ep");
+        assert_eq!(json["top"]["uri"], "spotify:episode:ep");
         assert_eq!(json["shows"][0]["publisher"], "Publisher");
-        assert_eq!(json["episodes"][0]["name"], "Interview");
+        assert_eq!(json["episodes"][0]["track"]["name"], "Interview");
         let top_show = serde_json::to_value(SearchTop::from(SearchTopRef::Show(show))).unwrap();
         assert_eq!(top_show["kind"], "show");
         assert_eq!(top_show["name"], "The Show");

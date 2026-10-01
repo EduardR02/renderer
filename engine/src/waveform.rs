@@ -804,9 +804,9 @@ fn write_artifact_atomic(path: &Path, duration_ms: u32, payload: &[u8]) -> Resul
             .and_then(|_| file.write_all(&payload_len.to_le_bytes()))
             .and_then(|_| file.write_all(&crc32(payload).to_le_bytes()))
             .and_then(|_| file.write_all(payload))
-            .and_then(|_| file.sync_all())
             .map_err(|error| format!("could not write waveform cache artifact: {error}"))?;
-        replace_file_atomically(&temp, path)
+        drop(file);
+        replace_file_atomically(&temp, path, false)
             .map_err(|error| format!("could not commit waveform cache artifact: {error}"))?;
         Ok(())
     })();

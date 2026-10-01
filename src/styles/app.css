@@ -2099,7 +2099,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    header wash to carry it — the library and search results — and a grid of
    forty covers each throwing its own light is the single biggest difference
    between this looking like a music app and looking like a file browser. */
-.card:hover .card-art .art {
+.card:hover .card-art .art,
+.card:focus-within .card-art .art {
   box-shadow:
     0 16px 26px -14px rgba(0, 0, 0, 0.9),
     0 16px 40px -8px color-mix(in srgb, var(--tone-glow) 72%, transparent);

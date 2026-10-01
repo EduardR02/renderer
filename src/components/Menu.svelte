@@ -31,11 +31,14 @@
     side = "below",
     label = "",
     class: extra = "",
+    placement = null,
+    group = false,
+    element = $bindable(null),
     onclose,
     children,
   } = $props();
 
-  let el = $state(null);
+  const el = $derived(element);
   let left = $state(0);
   let top = $state(0);
 
@@ -47,6 +50,7 @@
   }
 
   function place() {
+    if (placement) return;
     const box = el.getBoundingClientRect();
     const w = box.width;
     const h = box.height;
@@ -76,6 +80,7 @@
   $effect(() => {
     const node = el;
     if (!node) return;
+    for (const item of node.querySelectorAll(".menu-item:not([role])")) item.setAttribute("role", "menuitem");
     node.showPopover();
     untrack(place);
     queueMicrotask(() => items()[0]?.focus());
@@ -83,10 +88,12 @@
     const trigger = untrack(() => anchor);
     const onDown = (event) => {
       if (node.contains(event.target) || trigger?.contains(event.target)) return;
+      if (group && event.target.closest?.(".menu")) return;
       close();
     };
     const onScroll = (event) => {
-      if (!node.contains(event.target)) close();
+      if (node.contains(event.target) || (group && event.target.closest?.(".menu"))) return;
+      close();
     };
     const onResize = () => close();
     document.addEventListener("pointerdown", onDown, true);
@@ -131,9 +138,10 @@
   role="menu"
   tabindex="-1"
   aria-label={label || undefined}
-  bind:this={el}
-  style:left="{left}px"
-  style:top="{top}px"
+  bind:this={element}
+  style:left="{placement ? placement.x : left}px"
+  style:top={placement ? (placement.top === null ? null : `${placement.top}px`) : `${top}px`}
+  style:bottom={placement?.bottom == null ? null : `${placement.bottom}px`}
   onkeydown={onKeyDown}
 >
   {@render children?.(close)}

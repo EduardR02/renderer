@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -15,11 +15,11 @@ use renderer_engine::protocol::normalize_canonical_playlist_description;
 
 use crate::types::{
     align_artist_ids, cover_urls_from_tracks, forget_cached_audio, CacheStats, CacheUsage,
-    PlaybackState, Playlist, PlaylistDetail, Track,
+    LibraryNodeDetail, PlaybackState, Playlist, PlaylistDetail, Track,
 };
 
 /// Number of playlists requested from the engine's rootlist browse.
-pub const LIBRARY_LENGTH: usize = 100;
+pub const LIBRARY_LENGTH: usize = 1000;
 
 /// Most-recent-first cap for the playlist tracks cache.
 const TRACKS_CACHE_MAX: usize = 25;
@@ -30,7 +30,7 @@ pub const DEFAULT_AUDIO_CACHE_LIMIT_MB: u64 = 1024;
 
 /// Persistent preferences that affect process startup rather than live
 /// playback state. Zero means an unlimited audio cache.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct AppSettings {
     pub audio_cache_limit_mb: u64,
@@ -192,6 +192,7 @@ pub struct PlayheadSnapshot {
 pub struct AppState {
     pub playback: PlaybackState,
     pub playlists: Vec<Playlist>,
+    pub playlist_tree: Vec<LibraryNodeDetail>,
     pub me_id: String,
     #[serde(skip)]
     pub playlists_fetched_at: Option<i64>,
@@ -214,7 +215,7 @@ pub struct AppState {
     /// re-open while a fetch is out is not queued: that fetch answers it.
     #[serde(skip)]
     playlist_refresh_queued: HashSet<String>,
-    /// Serializes playlist state mutation with its bounded atomic cache write.
+    /// Serializes playlist state mutation with its rebuildable cache write.
     /// Async fetches may finish out of order; holding this outside the
     /// AppState lock lets disk I/O proceed without blocking state readers while
     /// still making memory and disk observe one completion order.
@@ -257,6 +258,7 @@ impl AppState {
         Self {
             playback: PlaybackState::default(),
             playlists: Vec::new(),
+            playlist_tree: Vec::new(),
             me_id: String::new(),
             playlists_fetched_at: None,
             library_fresh: false,
@@ -359,7 +361,7 @@ fn settings_path() -> PathBuf {
     data_dir().join("settings.json")
 }
 
-pub fn load_app_settings() -> AppSettings {
+static SETTINGS: LazyLock<Mutex<AppSettings>> = LazyLock::new(|| {
     let mut settings: AppSettings = std::fs::read(settings_path())
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -367,19 +369,28 @@ pub fn load_app_settings() -> AppSettings {
     if !matches!(settings.audio_cache_limit_mb, 0 | 1024 | 2048 | 4096 | 8192) {
         settings.audio_cache_limit_mb = DEFAULT_AUDIO_CACHE_LIMIT_MB;
     }
-    settings
+    Mutex::new(settings)
+});
+
+pub fn load_app_settings() -> AppSettings {
+    SETTINGS.lock().clone()
 }
 
-pub fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
+pub fn update_app_settings(change: impl FnOnce(&mut AppSettings)) -> Result<AppSettings, String> {
+    let mut guard = SETTINGS.lock();
+    let mut next = guard.clone();
+    change(&mut next);
+    if next == *guard { return Ok(next); }
     let path = settings_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("could not create settings directory: {error}"))?;
     }
-    let bytes = serde_json::to_vec_pretty(settings)
-        .map_err(|error| format!("could not serialize settings: {error}"))?;
-    std::fs::write(path, bytes).map_err(|error| format!("could not save settings: {error}"))
+    write_json_atomic_result(path, &next)?;
+    *guard = next.clone();
+    Ok(next)
 }
+
 
 fn playback_state_path(dir: &Path) -> PathBuf {
     dir.join("playback_state.json")
@@ -534,6 +545,8 @@ pub struct PlaylistListCache {
     pub fetched_at: Option<i64>,
     pub me_id: String,
     pub playlists: Vec<Playlist>,
+    #[serde(default)]
+    pub playlist_tree: Vec<LibraryNodeDetail>,
 }
 
 pub fn load_playlist_list(dir: &Path) -> Option<PlaylistListCache> {
@@ -546,7 +559,7 @@ pub fn load_playlist_list(dir: &Path) -> Option<PlaylistListCache> {
 }
 
 pub fn save_playlist_list(dir: &Path, cache: &PlaylistListCache) {
-    write_json_atomic(dir.join("playlist_list.json"), cache);
+    write_json_cache(dir.join("playlist_list.json"), cache);
 }
 
 // ---------------------------------------------------------------------------
@@ -602,10 +615,8 @@ fn tracks_cache_ref(playlists: &[PlaylistTracksEntry]) -> PlaylistTracksCacheRef
 }
 
 pub fn save_tracks_cache(dir: &Path, playlists: &[PlaylistTracksEntry]) {
-    write_json_atomic(
-        dir.join("playlist_tracks_cache.json"),
-        &tracks_cache_ref(playlists),
-    );
+    write_json_cache(dir.join("playlist_tracks_cache.json"),
+    &tracks_cache_ref(playlists),);
 }
 
 /// The cache serialized to the exact bytes [`write_tracks_cache_bytes`]
@@ -624,11 +635,11 @@ pub fn tracks_cache_bytes(playlists: &[PlaylistTracksEntry]) -> Option<Vec<u8>> 
     }
 }
 
-/// Writes bytes from [`tracks_cache_bytes`], with the same atomic replacement
-/// and failure reporting as [`save_tracks_cache`].
+/// Writes bytes from [`tracks_cache_bytes`], with the same failure reporting
+/// as [`save_tracks_cache`]. A partial cache is discarded on its next read.
 pub fn write_tracks_cache_bytes(dir: &Path, bytes: &[u8]) {
     let path = dir.join("playlist_tracks_cache.json");
-    if let Err(error) = write_bytes_atomic_result(path.clone(), bytes) {
+    if let Err(error) = std::fs::write(&path, bytes) {
         eprintln!(
             "SpotifyRenderer: could not write cache {}: {error}",
             path.display()
@@ -640,8 +651,8 @@ pub fn write_tracks_cache_bytes(dir: &Path, bytes: &[u8]) {
 /// dropping the oldest entries beyond the cap, and reports whether the stored
 /// entry actually changed.
 ///
-/// The comparison is what keeps an open from rewriting — and fsyncing — the
-/// whole cache to store what it already holds. `fetched_at` is deliberately
+/// The comparison keeps an open from rewriting the whole rebuildable cache
+/// to store what it already holds. `fetched_at` is deliberately
 /// not part of it: nothing reads that field back, and counting it would make
 /// every browse a change. Moving an unchanged entry to the front is not worth
 /// a write either; the next real change persists the list in this order.
@@ -687,14 +698,6 @@ impl MembershipEntry {
         self.uris.contains(uri)
     }
 
-    /// Whether a refetch is due given the container's current revision.
-    /// An empty stored revision means "never fetched" (or "has no revision",
-    /// like Liked Songs), and both cases always refetch; Liked Songs is small
-    /// enough that re-walking it on every reconciliation pass is the cheapest
-    /// honest way to see external likes and unlikes.
-    pub fn stale(&self, snapshot_id: &str) -> bool {
-        self.revision.is_empty() || (!snapshot_id.is_empty() && snapshot_id != self.revision)
-    }
 }
 
 /// On-disk shape of `playlist_membership.json`. The URI sets serialize as
@@ -722,7 +725,7 @@ pub fn save_membership(dir: &Path, entries: &[MembershipEntry]) {
         saved_at: Some(now_secs()),
         entries: entries.to_vec(),
     };
-    write_json_atomic(dir.join("playlist_membership.json"), &cache);
+    write_json_cache(dir.join("playlist_membership.json"), &cache);
 }
 
 /// Inserts or replaces one container's membership. Returns whether anything
@@ -881,8 +884,8 @@ pub fn carry_local_fields(previous: &[Playlist], fresh: &mut [Playlist]) {
             if playlist.cover_url.is_empty() {
                 playlist.cover_url = old.cover_url.clone();
             }
-            playlist.cover_urls = old.cover_urls.clone();
-            playlist.snapshot_id = old.snapshot_id.clone();
+            if playlist.cover_urls.is_empty() { playlist.cover_urls = old.cover_urls.clone(); }
+            if playlist.snapshot_id.is_empty() { playlist.snapshot_id = old.snapshot_id.clone(); }
             playlist.last_played = old.last_played;
             playlist.last_activity = old.last_activity;
             if playlist.description.is_empty() {
@@ -1082,12 +1085,12 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Writes via the same platform-correct temp-file replacement as durable
-/// playback state. In particular, Windows `rename` does not replace an
-/// existing destination; using it directly made every playlist cache save
-/// after the first one a silent no-op.
-fn write_json_atomic<T: Serialize>(path: PathBuf, value: &T) {
-    if let Err(error) = write_json_atomic_result(path.clone(), value) {
+/// Rebuildable caches are best-effort writes, not durable application state.
+fn write_json_cache<T: Serialize>(path: PathBuf, value: &T) {
+    let result = serde_json::to_vec(value)
+        .map_err(|error| format!("could not serialize {}: {error}", path.display()))
+        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()));
+    if let Err(error) = result {
         eprintln!(
             "SpotifyRenderer: could not write cache {}: {error}",
             path.display()
@@ -1108,50 +1111,13 @@ fn write_bytes_atomic_result(path: PathBuf, bytes: &[u8]) -> Result<(), String> 
     let mut file = std::fs::File::create(&temp)
         .map_err(|error| format!("could not create {}: {error}", temp.display()))?;
     file.write_all(bytes)
-        .and_then(|()| file.sync_all())
         .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
-    replace_file_atomically(&temp, &path)
+    file.sync_all().map_err(|error| format!("could not flush {}: {error}", temp.display()))?;
+    drop(file);
+    renderer_engine::atomic::replace_file_atomically(&temp, &path, true)
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
 }
 
-#[cfg(not(windows))]
-pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "Kernel32")]
-    extern "system" {
-        fn MoveFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            flags: u32,
-        ) -> i32;
-    }
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1160,6 +1126,42 @@ pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_rootlist_revision_wins_but_sparse_rows_keep_browsed_metadata() {
+        let mut old = playlist("p");
+        old.snapshot_id = "before".into();
+        old.cover_urls = vec!["old-cover".into()];
+        let mut fresh = vec![Playlist { snapshot_id: "after".into(), cover_urls: vec!["new-cover".into()],
+            ..playlist("p") }];
+        carry_local_fields(&[old.clone()], &mut fresh);
+        assert_eq!(fresh[0].snapshot_id, "after");
+        assert_eq!(fresh[0].cover_urls, ["new-cover"]);
+        let mut sparse = vec![playlist("p")];
+        carry_local_fields(&[old], &mut sparse);
+        assert_eq!(sparse[0].snapshot_id, "before");
+        assert_eq!(sparse[0].cover_urls, ["old-cover"]);
+    }
+
+    #[test]
+    fn folder_tree_survives_cache_replacement_and_deleted_playlists_stay_deleted() {
+        let dir = std::env::temp_dir().join(format!("renderer-tree-{}-{}", std::process::id(), now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder = |children| LibraryNodeDetail::Folder { id: "folder".into(), name: "Music".into(), children };
+        let node = |id| LibraryNodeDetail::Playlist { playlist: playlist(id) };
+        let first = PlaylistListCache { version: 1, fetched_at: Some(1), me_id: "me".into(),
+            playlists: vec![playlist("a"), playlist("b")], playlist_tree: vec![folder(vec![node("a"), node("b")])] };
+        save_playlist_list(&dir, &first);
+        assert_eq!(load_playlist_list(&dir).unwrap().playlist_tree, first.playlist_tree);
+        let refreshed = PlaylistListCache { version: 1, fetched_at: Some(2), me_id: "me".into(),
+            playlists: vec![playlist("b")], playlist_tree: vec![folder(vec![node("b")])] };
+        save_playlist_list(&dir, &refreshed);
+        let loaded = load_playlist_list(&dir).unwrap();
+        assert_eq!(loaded.playlists, refreshed.playlists);
+        assert_eq!(loaded.playlist_tree, refreshed.playlist_tree);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
 
     #[test]
     fn app_settings_missing_startup_fields_use_safe_defaults() {
@@ -1233,23 +1235,6 @@ mod tests {
         assert!(entries.iter().find(|entry| entry.id == "p1").unwrap().contains("spotify:track:a"));
     }
 
-    #[test]
-    fn membership_staleness_tracks_revisions_and_liked_always_refreshes() {
-        let playlist = membership("p1", "rev1", &["spotify:track:a"]);
-        assert!(
-            !playlist.stale("rev1"),
-            "unchanged revision must not refetch"
-        );
-        assert!(playlist.stale("rev2"), "moved revision must refetch");
-        // A rootlist row with no revision carries no signal of change; the
-        // indexed data stands until a revision shows up and differs.
-        assert!(!playlist.stale(""));
-
-        // Liked Songs permanently carries an empty revision and is re-walked
-        // every pass — that is how external likes become visible.
-        let liked = membership(LIKED_MEMBERSHIP_ID, "", &[]);
-        assert!(liked.stale(""));
-    }
 
     #[test]
     fn membership_round_trips_through_the_disk_format() {
@@ -2082,6 +2067,7 @@ mod tests {
                 version: 1,
                 fetched_at: Some(42),
                 me_id: "me".to_owned(),
+                playlist_tree: Vec::new(),
                 playlists: vec![
                     Playlist {
                         last_played: Some(1_700),
@@ -2115,6 +2101,7 @@ mod tests {
                     version: 1,
                     fetched_at: Some(42),
                     me_id: "me".to_owned(),
+                    playlist_tree: Vec::new(),
                     playlists: vec![Playlist {
                         name: name.to_owned(),
                         ..playlist("p1")

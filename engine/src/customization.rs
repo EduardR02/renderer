@@ -337,7 +337,7 @@ impl TrackEditStore {
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-        replace_file_atomically(&temporary, &self.path)
+        replace_file_atomically(&temporary, &self.path, true)
             .map_err(|error| format!("could not install {}: {error}", self.path.display()))
     }
 }

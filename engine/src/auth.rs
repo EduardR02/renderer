@@ -23,7 +23,7 @@ use oauth2::{
 };
 use url::Url;
 
-use crate::audio::{RodioError, SinkOpener, SilentSink};
+use crate::audio::{OutputError, SinkOpener, SilentSink};
 
 const OAUTH_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const OAUTH_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
@@ -109,7 +109,7 @@ pub struct ConnectedSession {
     pub session: Session,
     /// `Ok` is a player. `Err` is a machine with no output device to open —
     /// the string names that and what to do about it, and the engine keeps the
-    /// session, reports the message, and retries the device on its heartbeat.
+    /// session, reports the message, and retries the device when one can be there.
     /// Every other playback failure arrives as an [`AuthFailure`] instead,
     /// with the session shut down.
     pub playback: Result<PlaybackHandles, String>,
@@ -176,9 +176,9 @@ const NO_OUTPUT_DEVICE_REMEDY: &str = "Plug in or enable headphones, speakers, o
 /// reason. What this replaced was a panic on librespot's player thread and,
 /// where that was caught, a WASAPI stack trace — neither of which says that
 /// plugging the headphones back in is the fix.
-fn no_output_device_message(error: &RodioError) -> String {
+fn no_output_device_message(error: &OutputError) -> String {
     let detail = match error {
-        RodioError::NoDeviceAvailable => String::new(),
+        OutputError::NoDeviceAvailable => String::new(),
         error => format!(" ({error})"),
     };
     format!("no audio output device{detail}. {NO_OUTPUT_DEVICE_REMEDY}")
@@ -194,7 +194,7 @@ fn no_output_device_message(error: &RodioError) -> String {
 /// on a much longer clock (see [`PlaybackError::DeviceOpenBlocked`]). The
 /// builder never being reached is not about the device at all.
 fn device_step_failure(
-    answer: Result<Option<RodioError>, std_mpsc::RecvTimeoutError>,
+    answer: Result<Option<OutputError>, std_mpsc::RecvTimeoutError>,
 ) -> Option<PlaybackError> {
     match answer {
         Ok(None) => None,
@@ -787,23 +787,20 @@ pub async fn create_playback(
     let cached_volume = stored_volume(&cache);
     mixer.set_volume(cached_volume);
 
-    // The device step runs inside the sink builder, on librespot's player
-    // thread, because that is where a cpal stream has always been opened — and
-    // because the builder has no way to report failure: it must hand back a
-    // `Sink`, so a device error raised in there can only kill the thread. The
-    // answer therefore travels back beside the builder, over this channel, and
-    // the builder hands back a sink that discards everything for the moment
-    // between opening and the caller reading the error off the other end.
+    // Construction runs in librespot's sink builder, which cannot return an
+    // error. Its typed result travels over this channel. Production only checks
+    // device presence and builds an unstarted sink here; actual native opening
+    // is lazy and independently deadline-bounded in audio::OutputSink::start.
     let (device_tx, device_rx) = std_mpsc::sync_channel(1);
     let config = player_config(normalisation);
-    // Volume is applied by the rodio sink (see audio::set_sink_volume), not
+    // Volume is applied by the output callback (see audio::set_sink_volume), not
     // per decoded packet, so a transport volume change is audible on the
     // next output callback instead of after the write-ahead buffer plays
     // out. The player's volume getter is therefore a no-op (always 1.0);
     // the SoftMixer is kept purely as the volume store/persistence.
     let player = Player::new(config, session.clone(), Box::new(NoOpVolume), move || {
-        // Custom immediate-stop rodio sink: pause/stop must not drain the
-        // buffered queue before silencing the output.
+        // Custom immediate-stop output sink: pause/stop must not drain the
+        // buffered audio before silencing the output.
         // F32, not S16: WASAPI's shared-mode engine is float internally, and
         // the sink's own path is float end to end, so asking cpal for 16-bit
         // would insert an undithered quantisation that nothing downstream
@@ -827,6 +824,10 @@ pub async fn create_playback(
             PlaybackError::Fatal(format!("audio initialization worker failed: {error}"))
         })?;
     if let Some(failure) = device_step_failure(device) {
+        // A stuck injected/construction opener must not turn its timeout into
+        // a synchronous Player::drop join on the authentication task.
+        player.stop();
+        std::thread::spawn(move || drop(player));
         return Err(failure);
     }
     if player.is_invalid() {
@@ -836,7 +837,6 @@ pub async fn create_playback(
     }
 
     let events = player.get_player_event_channel();
-    player.emit_volume_changed_event(cached_volume);
     Ok(PlaybackHandles {
         player,
         events,
@@ -877,7 +877,7 @@ mod tests {
         mixer_config, oauth_callback_path, oauth_failed_response, oauth_listener_addr,
         oauth_success_response, player_config, prepare_oauth, std_mpsc, wait_for_oauth_code_within,
     };
-    use crate::audio::RodioError;
+    use crate::audio::OutputError;
     use librespot_playback::config::VolumeCtrl;
     use librespot_playback::mixer::Mixer;
     use librespot_playback::mixer::softmixer::SoftMixer;
@@ -1144,7 +1144,7 @@ mod tests {
             "a device that opened is not a failure"
         );
 
-        let refused = device_step_failure(Ok(Some(RodioError::NoDeviceAvailable)))
+        let refused = device_step_failure(Ok(Some(OutputError::NoDeviceAvailable)))
             .expect("a refused open is a failure");
         assert!(
             matches!(refused, PlaybackError::NoOutputDevice(_)),

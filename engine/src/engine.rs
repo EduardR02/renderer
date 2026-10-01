@@ -20,11 +20,10 @@ use crate::customization::{EditTimeline, TrackEditStore, validate_definition};
 use crate::history::ListeningHistory;
 use crate::io::ProtocolWriter;
 use renderer_engine::protocol::{
-    AuthState, BrowseResponse, Command, HistoryPage, HistoryQuery, LoopRange, PositionEvent,
+    AuthState, Command, LoopRange, PositionEvent,
     RepeatMode, Response, StateEvent, TimeRange, TrackEdit, TrackEditDefinition, TrackEditStatus,
     TrackRef, VolumeEvent,
 };
-use serde::Serialize;
 /// Pressing previous within this many milliseconds of a track start restarts
 /// the current track instead of switching tracks. Mirrors the UI's optimistic
 /// restart window (OnPrevious in app.cpp) so both sides agree.
@@ -144,40 +143,38 @@ const PRELOAD_WATERMARK_MS: u32 = 30_000;
 /// nothing surfaces the problem except tracks refusing to start. Nothing here
 /// used to notice, so the engine held the corpse until it was restarted.
 ///
-/// The first attempt is quick because the common cause is a transient drop the
-/// reconnect will simply fix. The ceiling exists so a genuine outage is not
-/// hammered at heartbeat rate.
+/// The first reconnect runs as soon as the dead session is noticed, because
+/// the common cause is a transient drop the reconnect will simply fix; these
+/// space out the attempts after a failed one. The ceiling exists so a genuine
+/// outage is not hammered.
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-/// How long the heartbeat waits before trying the output device again after a
-/// failed open, and the ceiling that wait doubles up to.
+/// Wait before trying a present output device again after a failed open, and
+/// the ceiling that wait doubles up to.
 ///
-/// These are short because this wait is the delay between the owner plugging
-/// the dongle back in and hearing music. A probe that finds nothing is one
-/// device enumeration — the player construction only runs once a device is
-/// actually there (see [`Engine::tick_audio_device`]), so the no-device case
-/// costs no mixer, no player thread and no failed cpal open. The first retry
-/// is a heartbeat or two after the device would have landed; the ceiling keeps
-/// a machine that has been without audio since boot from enumerating WASAPI
-/// every tick, and is low enough that a dongle Windows recognises late still
-/// plays without anyone pressing anything.
+/// These are short because this wait is the delay between a device that
+/// refused its first open and hearing music. A machine with no device at all
+/// waits on no clock: the OS reports the default output appearing, and that
+/// notification is what probes it (see [`Engine::tick_audio_device`]).
 const AUDIO_PROBE_BACKOFF_MIN: Duration = Duration::from_secs(2);
 const AUDIO_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(10);
 /// The longest wait a probe may reach after an open that never returned. See
 /// [`PlayerFailure::Blocked`].
 const AUDIO_BLOCKED_PROBE_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
+/// Slack added to the output's own account of its queued tail before the
+/// natural end of a queue stops the player: the device holds a buffer of its
+/// own past the ring (a wireless one, a long one), and stopping late only
+/// costs a few silent callbacks once per finished queue.
+const OUTPUT_DRAIN_MARGIN: Duration = Duration::from_millis(500);
+
 /// How long a changed volume has to sit still before [`Engine::tick_volume_persist`]
 /// writes it to the librespot cache.
 ///
 /// The write is a file create, and the UI paces `set_volume` at 50 ms while a
-/// slider is dragged, so it is deferred to the tick that follows the gesture
-/// rather than paid per step. A second of quiet is short enough that a value
-/// the user has settled on is on disk by the next heartbeat — the heartbeat
-/// itself is 2 s, so the cache is never more than a couple of seconds behind a
-/// stopped drag — and long enough that a continuing drag is one write instead
-/// of twenty a second.
+/// slider is dragged. A one-second quiet deadline coalesces the gesture into
+/// one write without needing a timer while no change is pending.
 const VOLUME_PERSIST_QUIET: Duration = Duration::from_secs(1);
 
 pub struct Engine {
@@ -190,25 +187,44 @@ pub struct Engine {
     credentials_file: std::path::PathBuf,
     track_edits: TrackEditStore,
     state: PlaybackState,
-    /// The generation of the queue rows and of the plan derived from them.
+    /// The generation of the queue rows themselves.
     ///
-    /// Every writer that changes what a state event says about the queue has
-    /// to bump this through [`Engine::queue_changed`]: the rows themselves,
-    /// the current row, the shuffle bag, the shuffle and repeat modes, and a
-    /// playlist exclusion. [`Engine::emit_state`] sends the rows and the plan
-    /// only when the generation is newer than the one the last state carried,
-    /// and the shell and the webview keep the copy they already have
-    /// otherwise — so this number is the entire contract for "the queue did
-    /// not move": a writer that forgets it leaves both of them rendering a
-    /// queue the engine no longer has.
-    queue_revision: u64,
+    /// Bumped through [`Engine::rows_changed`] by every writer of the rows:
+    /// an install, an append, a removal, a move. [`Engine::emit_state`] sends
+    /// the rows only when this is newer than what the last state carried, and
+    /// the shell and the webview keep the rows they hold otherwise — so a
+    /// writer that forgets it leaves both rendering rows the engine no longer
+    /// has.
+    rows_revision: u64,
     /// The generation [`Engine::emit_state`] last published rows under. `None`
-    /// until the first state of this process, because a fresh engine has not
-    /// handed its queue to anyone yet.
-    emitted_queue_revision: Option<u64>,
+    /// until the first state of this process (and after `status`, which asks
+    /// for everything again).
+    emitted_rows_revision: Option<u64>,
+    /// The generation of the play order derived from the rows: the current
+    /// row, the shuffle bag, the shuffle and repeat modes, and what counts as
+    /// eligible. Bumped through [`Engine::order_changed`] — and by every rows
+    /// change, because the order indexes the rows. A track change moves only
+    /// this, so it costs the `upcoming` list and never the rows.
+    order_revision: u64,
+    emitted_order_revision: Option<u64>,
+    /// Queue track ids found in the audio cache since the rows were last
+    /// published. The rows held here are marked too; this list is how the
+    /// mark reaches holders of the published rows without re-sending them.
+    cached_marks: Vec<String>,
+    /// How much of [`Self::cached_marks`] the last state carried.
+    emitted_cached_marks: usize,
+    /// The track the latest load was for. Its audio is on disk by the time it
+    /// is left, so the next track change asks the cache about it.
+    loaded_track_id: Option<String>,
+    /// The natural end of the queue left a tail draining through the output.
+    /// Due, the player is stopped so the device stops calling back.
+    drain_stop_at: Option<Instant>,
     player: Option<Arc<Player>>,
     mixer: Option<Arc<SoftMixer>>,
     session: Option<librespot_core::Session>,
+    /// Construction in flight for this generation; deadlines do not authorize
+    /// overlapping probes while its bounded worker result is still pending.
+    audio_probe_generation: Option<u64>,
     play_request_id: Option<u64>,
     /// Set when librespot reports `Unavailable` for the current load. The
     /// player remains in librespot's failed `Loading` state unless it is
@@ -336,13 +352,18 @@ pub struct Engine {
     /// Set while the machine has no output device to open. See
     /// [`AudioUnavailable`].
     audio_unavailable: Option<AudioUnavailable>,
-    /// How long the heartbeat waits before probing for an output device
-    /// again, doubling per failed probe up to the ceiling of the failure the
-    /// last probe answered with (see [`PlayerFailure`]).
+    /// How long the next device probe waits after a failed open, doubling per
+    /// failure up to the ceiling of the failure the last probe answered with
+    /// (see [`PlayerFailure`]). Reset only once native output runs.
     audio_probe_backoff: Duration,
+    /// Whether the OS reports default-output changes to this engine. Without
+    /// them a machine with no device has to be asked again on a clock.
+    device_notifications: bool,
     /// The transport volume the librespot cache does not hold yet. See
     /// [`VOLUME_PERSIST_QUIET`] for why the write is not paid per change.
     pending_volume: Option<PendingVolume>,
+    /// Armed only while playback needs position/cache/session observation.
+    next_active_tick: Option<Instant>,
 }
 
 /// A volume change that is not in the librespot cache yet, in librespot's u16
@@ -361,18 +382,20 @@ struct PendingVolume {
 /// the session is live, and the only thing missing is the player. Whether the
 /// machine has no output device, a device whose open failed, or a
 /// reconstruction that failed outright, the answer is the same — the device is
-/// a property of the machine that the user changes without telling the engine,
-/// so the engine asks again on its heartbeat until a player exists.
+/// a property of the machine that the user changes, so the engine asks again
+/// when the OS reports a new default output, or on the backoff ladder while a
+/// present device keeps refusing.
 struct AudioUnavailable {
     /// What the user is shown: the cause and the way out.
     message: String,
-    /// The next moment the heartbeat may build a player. A probe already
-    /// running holds this at the instant its own open must have finished by
-    /// ([`AUDIO_START_TIMEOUT`]), so one runs at a time — and a probe whose
-    /// answer is dropped, because the session was replaced while it ran, is
-    /// still replaced by another instead of leaving the device untried for
-    /// good.
-    retry_at: Instant,
+    /// The next moment a probe may build a player, or `None` while there is
+    /// no device and the OS notification is what will ask again. A probe
+    /// already running holds this at the instant its own open must have
+    /// finished by ([`AUDIO_START_TIMEOUT`]), so one runs at a time — and a
+    /// probe whose answer is dropped, because the session was replaced while
+    /// it ran, is still replaced by another instead of leaving the device
+    /// untried for good.
+    retry_at: Option<Instant>,
 }
 
 /// Why the engine has no player, which is what its retry ladder is sized
@@ -507,8 +530,15 @@ impl Engine {
             mixer: None,
             session: None,
             play_request_id: None,
-            queue_revision: initial_queue_revision(),
-            emitted_queue_revision: None,
+            rows_revision: initial_revision(),
+            emitted_rows_revision: None,
+            order_revision: initial_revision(),
+            emitted_order_revision: None,
+            cached_marks: Vec::new(),
+            emitted_cached_marks: 0,
+            loaded_track_id: None,
+            drain_stop_at: None,
+            audio_probe_generation: None,
             loading_failed: false,
             current_needs_load: false,
             preview_mode: false,
@@ -548,12 +578,21 @@ impl Engine {
             audio_device_present,
             audio_unavailable: None,
             audio_probe_backoff: AUDIO_PROBE_BACKOFF_MIN,
+            device_notifications: false,
             pending_volume: None,
+            next_active_tick: None,
         }
     }
 
-    pub fn history(&self, request: &HistoryQuery) -> Result<HistoryPage, String> {
-        self.listening_history.page(request)
+    /// Records that the OS will report default-output changes, so a machine
+    /// with no output device is not asked again on a clock.
+    pub fn set_device_notifications(&mut self, available: bool) {
+        self.device_notifications = available;
+    }
+
+    /// A handle that pages the listening archive off the command loop.
+    pub fn history_reader(&self) -> crate::history::HistoryReader {
+        self.listening_history.reader()
     }
 
     pub fn clear_history(&mut self) -> Result<bool, String> {
@@ -594,6 +633,23 @@ impl Engine {
         self.track_edits.list_excluded_track_ids(playlist_id)
     }
 
+    pub fn queue_metadata(&self, context: Option<&str>) -> Result<renderer_engine::protocol::QueueMetadata, String> {
+        let context = context.unwrap_or_else(|| self.current_context());
+        let excluded_track_ids = match context.strip_prefix("playlist:") {
+            Some(id) => self.playlist_excluded_track_ids(id)?,
+            None => Vec::new(),
+        };
+        Ok(renderer_engine::protocol::QueueMetadata {
+            excluded_track_ids,
+            upcoming: self.upcoming_indices(),
+        })
+    }
+
+    fn current_context(&self) -> &str {
+        self.state.current_index.and_then(|index| self.state.queue.get(index))
+            .map_or("", |track| track.context.as_str())
+    }
+
     pub fn set_playlist_track_excluded(
         &mut self,
         playlist_id: &str,
@@ -610,27 +666,39 @@ impl Engine {
         Ok(())
     }
 
-    /// Marks the queue rows, or the plan derived from them, as moved.
-    ///
-    /// See [`Engine::queue_revision`]: the revision is the only thing that
-    /// tells the shell and the webview that the rows they hold are still the
-    /// rows this engine means, so every writer of the queue, of the current
-    /// row, of the shuffle bag, of the shuffle/repeat modes, or of an
-    /// exclusion that automatic playback respects must call this.
-    fn queue_changed(&mut self) {
-        self.queue_revision = self.queue_revision.wrapping_add(1);
+    /// Marks the queue rows as moved: an install, an append, a removal or a
+    /// move. The play order indexes the rows, so it moves with them.
+    fn rows_changed(&mut self) {
+        self.rows_revision = self.rows_revision.wrapping_add(1);
+        self.order_changed();
     }
 
-    /// Emits the full state, with the queue rows and the derived plan only
-    /// when their revision is one this process has not already handed over.
+    /// Marks the play order as moved without touching the rows: the current
+    /// row, the shuffle bag, the shuffle/repeat modes, or an exclusion that
+    /// automatic playback respects.
+    fn order_changed(&mut self) {
+        self.order_revision = self.order_revision.wrapping_add(1);
+    }
+
+    /// Makes the next state carry the rows, the order and the download marks
+    /// whatever was published before — what a `status` request asks for.
+    fn republish_queue(&mut self) {
+        self.emitted_rows_revision = None;
+        self.emitted_order_revision = None;
+        self.emitted_cached_marks = 0;
+    }
+
+    /// Emits the full state. The rows travel only under a rows revision this
+    /// process has not handed over, the `upcoming` order only under a new
+    /// order revision, and the download marks only when they grew.
     ///
     /// The shell and the webview keep the rows they hold across the several
     /// states of one track change (that is what preserves row identity, and
     /// with it every consumer keyed on a row object), so re-sending identical
-    /// rows would be serializing a megabyte of queue to say nothing. What the
-    /// revision cannot express — the playhead, the modes, the current row, the
-    /// track — still travels in every state, which is why a changed revision,
-    /// not a changed row, is what puts the rows on the wire.
+    /// rows would be serializing a megabyte of queue to say nothing. A track
+    /// change moves the order alone, which costs a list of indexes. What the
+    /// revisions cannot express — the playhead, the modes, the current row,
+    /// the track — still travels in every state.
     pub fn emit_state(&mut self) -> Result<(), String> {
         let current_uri = self
             .state
@@ -638,10 +706,15 @@ impl Engine {
             .and_then(|index| self.state.queue.get(index))
             .map(|track| track.uri.as_str());
         let (position_ms, duration_ms) = self.transport_position_and_duration();
-        let queue_revision = self.queue_revision;
-        let sending_queue = self.emitted_queue_revision != Some(queue_revision);
-        let queue = sending_queue.then_some(self.state.queue.as_slice());
-        let upcoming = sending_queue.then(|| self.upcoming_indices());
+        let queue_revision = self.rows_revision;
+        let order_revision = self.order_revision;
+        let sending_rows = self.emitted_rows_revision != Some(queue_revision);
+        let sending_order = sending_rows || self.emitted_order_revision != Some(order_revision);
+        let sending_marks = self.cached_marks.len() != self.emitted_cached_marks
+            || (sending_rows && !self.cached_marks.is_empty());
+        let queue = sending_rows.then_some(self.state.queue.as_slice());
+        let upcoming = sending_order.then(|| self.upcoming_indices());
+        let cached_ids = sending_marks.then_some(self.cached_marks.as_slice());
         self.writer.send(&StateEvent {
             kind: "state",
             ready: self.state.ready,
@@ -669,14 +742,21 @@ impl Engine {
             audible_playback_speed: self.audible_speed.unwrap_or(self.state.playback_speed),
             current_index: self.state.current_index,
             current_uri,
+            context: self.current_context(),
             queue,
             queue_revision,
+            order_revision,
             upcoming,
+            cached_ids,
             error: self.state.error.as_deref(),
         })?;
-        if sending_queue {
-            self.emitted_queue_revision = Some(queue_revision);
+        self.emitted_rows_revision = Some(queue_revision);
+        self.emitted_order_revision = Some(order_revision);
+        if sending_rows {
+            // The rows just sent carry every mark this list held.
+            self.cached_marks.clear();
         }
+        self.emitted_cached_marks = self.cached_marks.len();
         Ok(())
     }
 
@@ -713,10 +793,8 @@ impl Engine {
 
     /// Writes a volume that has stopped changing to the librespot cache.
     ///
-    /// Called from the same heartbeat that advances the playhead, and the only
-    /// place a drag's cache write is paid: [`Engine::set_volume`] defers it, so
-    /// a gesture that would otherwise create and rewrite a file twenty times a
-    /// second costs one write, a second after the value stops moving.
+    /// The next-due timer pays a drag's cache write once, a second after
+    /// the value stops moving. Player construction and shutdown also flush it.
     pub fn tick_volume_persist(&mut self) {
         let Some(pending) = self.pending_volume.as_ref() else {
             return;
@@ -728,10 +806,74 @@ impl Engine {
 
     /// Hands the volume the cache is missing to librespot, which reports its
     /// own write failures (`Cache::save_volume` returns nothing else). Called
-    /// by the heartbeat tick and by [`Engine::shutdown`].
+    /// by the work timer and by [`Engine::shutdown`].
     fn flush_pending_volume(&mut self) {
         if let Some(pending) = self.pending_volume.take() {
             self.cache.save_volume(pending.volume);
+        }
+    }
+
+    /// The command loop owns one sleep for real work, not an idle interval.
+    /// Active playback still observes silent session failures every two seconds.
+    pub fn next_work_deadline(&mut self) -> Option<Instant> {
+        let active = self.state.playing && self.session.is_some();
+        if active {
+            self.next_active_tick.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+        } else {
+            self.next_active_tick = None;
+        }
+        let volume = self.pending_volume.as_ref()
+            .map(|pending| pending.changed_at + VOLUME_PERSIST_QUIET);
+        let reconnect = (!self.auth_running).then_some(self.next_reconnect).flatten();
+        let audio = self.session.as_ref().and(self.audio_unavailable.as_ref())
+            .filter(|_| self.player.is_none())
+            .filter(|_| self.audio_probe_generation != Some(self.generation))
+            .and_then(|unavailable| unavailable.retry_at);
+        let retry = self.state.playing.then_some(self.retry_current_at).flatten();
+        let preload = if active && self.current_load_produced_audio && !self.loading_failed
+            && !self.preload_armed
+        {
+            self.tick_position();
+            let (position, duration) = self.transport_position_and_duration();
+            (duration > 0).then(|| {
+                let remaining = duration.saturating_sub(position)
+                    .saturating_sub(PRELOAD_WATERMARK_MS.min(duration / 2));
+                Instant::now() + Duration::from_secs_f64(
+                    f64::from(remaining) / (1_000.0 * f64::from(self.audible_speed.unwrap_or(self.state.playback_speed)))
+                )
+            })
+        } else {
+            None
+        };
+        [self.next_active_tick, volume, reconnect, audio, retry, preload, self.drain_stop_at]
+            .into_iter().flatten().min()
+    }
+
+    /// Stops the player once the tail the natural end of the queue left in the
+    /// output has been heard. librespot leaves a finished queue in its
+    /// end-of-track state with the sink running, so without this the device
+    /// would keep calling back over an empty ring for as long as the app ran.
+    ///
+    /// The deadline is taken once, when the decoder reaches the end: nothing
+    /// can be queued behind the tail after that, and a device that stopped
+    /// consuming must not keep this re-arming at rest.
+    pub fn tick_output_drain(&mut self) {
+        if self.drain_stop_at.is_none_or(|due| Instant::now() < due) {
+            return;
+        }
+        self.drain_stop_at = None;
+        if let Some(player) = &self.player {
+            player.stop();
+        }
+        self.invalidate_audio_signals();
+    }
+
+    pub fn take_active_tick(&mut self) -> bool {
+        if self.next_active_tick.is_some_and(|due| Instant::now() >= due) {
+            self.next_active_tick = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -877,66 +1019,66 @@ impl Engine {
         true
     }
 
-    /// Re-checks the download mark on the only tracks that can have changed.
+    /// Asks the audio cache about the tracks a track change can have finished
+    /// downloading: the one being left (librespot stores a track once its
+    /// download completes, which a track played for any length has) and the
+    /// one starting (a gapless preload may already have stored it).
     ///
-    /// A track's audio reaches the cache because librespot streamed it, so the
-    /// set that can newly become cached while you are looking at a list is the
-    /// one playing and the one queued behind it — not the other two hundred
-    /// rows. That is what makes this affordable on a heartbeat: two lookups,
-    /// each a path join and one file-attribute call, rather than a walk of the
-    /// queue or a directory scan.
-    ///
-    /// Returns whether anything changed, so a quiet tick still emits nothing.
-    pub fn refresh_cached_marks(&mut self) -> bool {
-        let Some(current) = self.state.current_index else {
-            return false;
-        };
-        let ids: Vec<String> = [current, current + 1]
+    /// Two lookups per track change, each a path join and one file-attribute
+    /// call — never on a clock, never a walk of the queue's files. A new mark
+    /// flips the rows held here and joins [`Engine::cached_marks`], which the
+    /// next state carries without re-sending the rows.
+    fn mark_cached_tracks(&mut self, outgoing: Option<String>) {
+        let current = self
+            .state
+            .current_index
+            .and_then(|index| self.state.queue.get(index))
+            .filter(|track| track.uri.starts_with("spotify:track:"))
+            .map(|track| track.id.clone());
+        let candidates: Vec<String> = outgoing
             .into_iter()
-            .filter_map(|index| self.state.queue.get(index))
-            .filter(|track| !track.cached && track.uri.starts_with("spotify:track:"))
-            .map(|track| track.id.clone())
+            .chain(current)
+            .filter(|id| !self.cached_marks.contains(id))
+            .filter(|id| !self.state.queue.iter().any(|track| track.id == *id && track.cached))
             .collect();
-        if ids.is_empty() {
-            return false;
+        if candidates.is_empty() {
+            return;
         }
-        let now_cached = crate::browse::cached_track_ids(&ids, Some(&self.cache));
-        if now_cached.is_empty() {
-            return false;
-        }
-        let mut changed = false;
-        for track in &mut self.state.queue {
-            if !track.cached
-                && track.uri.starts_with("spotify:track:")
-                && now_cached.contains(&track.id)
-            {
-                track.cached = true;
-                changed = true;
+        for id in crate::browse::cached_track_ids(&candidates, Some(&self.cache)) {
+            for track in &mut self.state.queue {
+                if track.id == id && track.uri.starts_with("spotify:track:") {
+                    track.cached = true;
+                }
+            }
+            if !self.cached_marks.contains(&id) {
+                self.cached_marks.push(id);
             }
         }
-        if changed {
-            self.queue_changed();
-        }
-        changed
     }
 
     /// Notices a session librespot has invalidated underneath us and rebuilds
-    /// it, with backoff. Driven from the same heartbeat that advances the
-    /// playhead, so no extra timer is needed; the check is one `RwLock` read.
+    /// it. Asked before every command, and by the work timer while playing;
+    /// the check is one `RwLock` read, and nothing polls it at rest.
     ///
     /// Returns whether the engine's state changed and should be emitted.
     ///
     /// The failure this recovers from is silent by construction — see
-    /// [`RECONNECT_BACKOFF_MIN`]. An active player remains logically playing
-    /// during the reconnect so its projected playhead and listening row reach
-    /// the handover without an artificial gap.
-    pub fn tick_session_health(&mut self, sender: &mpsc::UnboundedSender<AuthSignal>) -> bool {
+    /// [`RECONNECT_BACKOFF_MIN`]. The first reconnect starts the moment the
+    /// corpse is seen, because whoever saw it is usually a command waiting on
+    /// it: a session that died during sleep is found by the first Play after
+    /// waking, and that Play is recorded as the reconnect's resume intent (see
+    /// [`Engine::runs_during_reconnect`]) instead of being refused. Later
+    /// attempts after a failed one wait out the backoff. An active player
+    /// remains logically playing during the reconnect so its projected
+    /// playhead and listening row reach the handover without an artificial
+    /// gap.
+    fn prepare_session_reconnect(&mut self) -> Option<bool> {
         if self.auth_running {
             // An attempt is in flight; it clears this when it answers. An
             // answer that arrives stale hands the flag back through
             // [`Engine::abandon_cached_authentication`], so this guard can
             // never be the reason reconnecting stops happening.
-            return false;
+            return None;
         }
         let dead = self
             .session
@@ -950,33 +1092,48 @@ impl Engine {
             // A healthy session ends any backoff a previous outage built up.
             self.next_reconnect = None;
             self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
-            return false;
+            return None;
         }
 
         let now = Instant::now();
-        let Some(due) = self.next_reconnect else {
-            // First sight of the corpse schedules the reconnect. Preserve an
-            // active queue's playback intent: the old player may still have
-            // buffered audio, and its playhead remains the best handover
-            // position until replacement handles exist.
-            self.next_reconnect = Some(now + self.reconnect_backoff);
-            self.resume_after_reconnect = self.state.playing && self.state.current_index.is_some();
-            self.state.ready = false;
-            self.state.error = Some("the Spotify connection dropped; reconnecting".to_owned());
+        if let Some(due) = self.next_reconnect {
+            if now < due {
+                return None;
+            }
+            self.reconnect_backoff = (self.reconnect_backoff * 2).min(RECONNECT_BACKOFF_MAX);
+        } else {
             eprintln!("Spotify session went invalid; reconnecting");
-            return true;
-        };
-        if now < due {
-            return false;
         }
-
-        self.reconnect_backoff = (self.reconnect_backoff * 2).min(RECONNECT_BACKOFF_MAX);
         self.next_reconnect = Some(now + self.reconnect_backoff);
-        // Reauthentication bumps the generation before its asynchronous work,
-        // making every event from the preserved player stale. Paused and
-        // queue-less reconnects take the normal cold teardown path.
+        // The intent is read now, when the reconnect starts, not when the
+        // corpse was first seen: a Play in between is what it must resume.
+        // A playing queue keeps its old player until the replacement handles
+        // exist (reauthentication bumps the generation first, making that
+        // player's events stale); paused and queue-less reconnects take the
+        // cold teardown path.
+        self.resume_after_reconnect = self.state.playing && self.state.current_index.is_some();
+        Some(dead)
+    }
+
+    pub fn tick_session_health(&mut self, sender: &mpsc::UnboundedSender<AuthSignal>) -> bool {
+        let Some(dead) = self.prepare_session_reconnect() else {
+            return false;
+        };
         self.start_cached_authentication(sender.clone(), self.resume_after_reconnect);
+        if dead && self.auth_running {
+            self.state.error = Some("the Spotify connection dropped; reconnecting".to_owned());
+        }
         true
+    }
+
+    /// Whether `command` can be applied while a reconnect is rebuilding the
+    /// session under an installed queue. Play and Pause are the listener's
+    /// intent, which the reconnect resumes or not when it completes; anything
+    /// else needs the session and waits for it.
+    fn runs_during_reconnect(&self, command: &Command) -> bool {
+        self.auth_running
+            && self.state.current_index.is_some()
+            && matches!(command, Command::Play | Command::Pause)
     }
 
     /// The system changed its default render endpoint while a player was
@@ -984,9 +1141,9 @@ impl Engine {
     /// stale, then let the existing device probe open the new default.
     ///
     /// Preserve the projected playhead, queue and play/pause intent. The caller
-    /// probes immediately; the heartbeat retains the usual backoff if opening
-    /// the replacement fails. A second change while that open is in flight
-    /// invalidates its generation and starts a probe for the newer default.
+    /// probes immediately; a failed open of the replacement keeps the usual
+    /// backoff. A second change while that open is in flight invalidates its
+    /// generation and starts a probe for the newer default.
     pub fn on_default_output_changed(&mut self) -> bool {
         if !self.state.ready || self.session.is_none() {
             return false;
@@ -997,33 +1154,40 @@ impl Engine {
             PlayerFailure::Ordinary,
         );
         if let Some(unavailable) = self.audio_unavailable.as_mut() {
-            unavailable.retry_at = Instant::now();
+            unavailable.retry_at = Some(Instant::now());
         }
         true
     }
 
-    /// Probes for an output device while the machine has none, on the same
-    /// heartbeat that advances the playhead.
+    /// Probes for an output device while the engine has no player, once the
+    /// probe's deadline is due.
     ///
     /// Returns whether the engine's state changed and should be emitted.
     ///
     /// A probe starts with the cheap question — is there a default output
     /// device at all — because the construction behind it is not cheap: a
-    /// mixer, a librespot player thread and a cpal open, all of it spawned on
-    /// a machine that reported no device every two to ten seconds since boot.
-    /// With nothing plugged in the device list already answers no, so the
-    /// construction is skipped entirely and the wait stays on the same ladder;
-    /// the full construction runs once, when a device is really there. The
-    /// rebuild it starts is the same one a normalisation change performs, and
-    /// the only unusual thing about it is that it runs while a session is
+    /// mixer, a librespot player thread and a cpal open. With nothing plugged
+    /// in the device list already answers no, so the construction is skipped
+    /// entirely and no clock is armed: the OS reports the default output
+    /// appearing ([`Engine::on_default_output_changed`]), which is what asks
+    /// again. Only an engine without those notifications keeps asking on the
+    /// ladder. The full construction runs once, when a device is really there.
+    /// The rebuild it starts is the same one a normalisation change performs,
+    /// and the only unusual thing about it is that it runs while a session is
     /// already up. Its own answer re-arms the clock — success clears the
-    /// state, failure reschedules with the next backoff — so nothing here
-    /// needs a timer of its own.
+    /// state, failure reschedules with the next backoff.
     pub fn tick_audio_device(&mut self, sender: &mpsc::UnboundedSender<AuthSignal>) -> bool {
+        if self.audio_probe_generation == Some(self.generation) {
+            return false;
+        }
+        if self.player.is_some() {
+            // A lazy recovery player owns the next attempt at actual playback.
+            return false;
+        }
         let Some(unavailable) = self.audio_unavailable.as_ref() else {
             return false;
         };
-        if Instant::now() < unavailable.retry_at {
+        if unavailable.retry_at.is_none_or(|due| Instant::now() < due) {
             return false;
         }
         let Some(session) = self.session.clone() else {
@@ -1032,11 +1196,10 @@ impl Engine {
             return false;
         };
         // One enumeration of the device list, and no construction behind it
-        // when it says nothing is there. The miss waits on the same ladder a
-        // failed open does, so a dongle Windows recognises late is still
-        // picked up within [`AUDIO_PROBE_BACKOFF_MAX`].
+        // when it says nothing is there.
         if !(self.audio_device_present)() {
-            let retry_at = self.next_device_probe(PlayerFailure::Ordinary);
+            let retry_at = (!self.device_notifications)
+                .then(|| self.next_device_probe(PlayerFailure::Ordinary));
             if let Some(unavailable) = self.audio_unavailable.as_mut() {
                 unavailable.retry_at = retry_at;
             }
@@ -1045,9 +1208,10 @@ impl Engine {
         // The probe now owns the clock for as long as its open may take, which
         // is what keeps a second one from starting beside it.
         if let Some(unavailable) = self.audio_unavailable.as_mut() {
-            unavailable.retry_at = Instant::now() + AUDIO_START_TIMEOUT;
+            unavailable.retry_at = Some(Instant::now() + AUDIO_START_TIMEOUT);
         }
         let generation = self.generation;
+        self.audio_probe_generation = Some(generation);
         let cache = self.construction_cache();
         let normalisation = Arc::clone(&self.normalisation);
         let audio = Arc::clone(&self.audio_device);
@@ -1116,16 +1280,16 @@ impl Engine {
             eprintln!("audio: {message}");
         }
         self.state.error = Some(message.clone());
-        let retry_at = self.next_device_probe(failure);
+        let retry_at = Some(self.next_device_probe(failure));
         self.audio_unavailable = Some(AudioUnavailable { message, retry_at });
     }
 
-    /// A player exists, so whatever was wrong with the device — or with the
-    /// construction that was replacing it — is over: drop the message and start
-    /// the next outage at the short backoff.
+    /// Release the native-outage error only once a callback proves the
+    /// replacement device answers, not when a lazy player is constructed.
     fn clear_audio_unavailable(&mut self) {
-        self.audio_unavailable = None;
-        self.audio_probe_backoff = AUDIO_PROBE_BACKOFF_MIN;
+        if self.audio_unavailable.take().is_some() {
+            self.state.error = None;
+        }
     }
 
     /// Whether `command` can be applied while the machine has no output device.
@@ -1152,13 +1316,14 @@ impl Engine {
                     | Command::SetShuffle { .. }
                     | Command::SetRepeat { .. }
                     | Command::RestoreQueue { .. }
+                    | Command::SetQueueCursor { .. }
             )
     }
 
     /// Clears the last error, unless the machine has no output device: nothing
     /// a command does brings the audio back, so a command that succeeds while
     /// it is in force has not made the silence go away. The message is released
-    /// where the condition is — by the probe that opens a device, in
+    /// where the condition is — by the player that replaces the missing one, in
     /// [`Engine::clear_audio_unavailable`].
     fn clear_error(&mut self) {
         if self.audio_unavailable.is_none() {
@@ -1179,7 +1344,7 @@ impl Engine {
         if self.normalisation.swap(enabled, Ordering::AcqRel) == enabled {
             return false;
         }
-        if !self.state.ready {
+        if !self.state.ready || self.player.is_none() {
             return true;
         }
         let Some(session) = self.session.clone() else {
@@ -1266,7 +1431,7 @@ impl Engine {
         self.state.duration_ms = 0;
         self.state.current_index = None;
         self.state.queue.clear();
-        self.queue_changed();
+        self.rows_changed();
         self.current_needs_load = false;
         self.preview_mode = false;
         self.preview_lease_id = 0;
@@ -1276,7 +1441,8 @@ impl Engine {
         // The device state belongs to a live session: a machine that is being
         // asked to log in again is not also missing its output device as far as
         // the user or the next connection is concerned.
-        self.clear_audio_unavailable();
+        self.audio_unavailable = None;
+        self.audio_probe_backoff = AUDIO_PROBE_BACKOFF_MIN;
         self.shuffle_pool.clear();
         self.history.clear();
         self.state.error = None;
@@ -1445,13 +1611,12 @@ impl Engine {
                         self.awaiting_transport_retry = false;
                         match connected.playback {
                             Ok(handles) => {
-                                self.clear_audio_unavailable();
                                 self.state.volume = if had_queue {
                                     restored_volume
                                 } else {
                                     handles.volume_percent
                                 };
-                                self.state.error = None;
+                                self.clear_error();
                                 self.player = Some(handles.player);
                                 self.mixer = Some(handles.mixer);
                                 if had_queue {
@@ -1478,8 +1643,8 @@ impl Engine {
                             Err(message) => {
                                 // No output device. Everything a session is
                                 // for still happened — the queue, the volume,
-                                // the auth state — and the player arrives from
-                                // the heartbeat once the machine has one.
+                                // the auth state — and the device probe builds
+                                // the player once the machine has one.
                                 //
                                 // `playback` crosses this boundary as the
                                 // message alone, so a boot whose open timed out
@@ -1523,6 +1688,9 @@ impl Engine {
                 normalisation,
                 result,
             } => {
+                if self.audio_probe_generation == Some(generation) {
+                    self.audio_probe_generation = None;
+                }
                 if !self.player_rebuild_is_current(generation, normalisation) {
                     return false;
                 }
@@ -1564,12 +1732,13 @@ impl Engine {
                         return true;
                     }
                 };
-                self.clear_audio_unavailable();
 
                 let was_playing = self.state.playing;
+                crate::audio::pause_output();
                 if let Some(player) = self.player.take() {
                     player.stop();
                 }
+                self.drain_stop_at = None;
                 self.generation = self.generation.wrapping_add(1);
                 let generation = self.generation;
                 let volume = percent_to_volume(self.state.volume);
@@ -1579,7 +1748,6 @@ impl Engine {
                 self.mixer = Some(handles.mixer);
                 self.current_needs_load = self.state.current_index.is_some();
                 self.play_request_id = None;
-                self.state.error = None;
                 if was_playing {
                     if let Err(error) = self.load_current(true) {
                         self.state.playing = false;
@@ -1772,13 +1940,10 @@ impl Engine {
             if self.state.auth_state == AuthState::Error {
                 self.start_authentication(auth_sender.clone());
             }
+            // `status` is the shell's re-sync request: its answer carries
+            // everything, including what an earlier state already handed over.
+            self.republish_queue();
             return Ok(true);
-        }
-        if matches!(&command, Command::GetHistory { .. }) {
-            return Ok(true);
-        }
-        if matches!(&command, Command::ClearHistory) {
-            return self.clear_history();
         }
         if matches!(&command, Command::Login) {
             return self.login(auth_sender);
@@ -1806,11 +1971,12 @@ impl Engine {
                 return Ok(false);
             }
         }
-        // A machine with no output device can still be *told* what to do: see
-        // [`Engine::runs_without_output_device`]. Everything else needs a
-        // player to act on — and gets the device's own message, not a generic
-        // "player unavailable", when there is none.
-        if !self.runs_without_output_device(&command) {
+        // A machine with no output device, or a session being rebuilt, can
+        // still be *told* what to do: see [`Engine::runs_without_output_device`]
+        // and [`Engine::runs_during_reconnect`]. Everything else needs a player
+        // to act on — and gets the device's own message, not a generic "player
+        // unavailable", when there is none.
+        if !self.runs_without_output_device(&command) && !self.runs_during_reconnect(&command) {
             self.ensure_ready()?;
         }
         // Pace command-driven track changes so rapid next/prev spam cannot
@@ -1836,8 +2002,9 @@ impl Engine {
             | Command::Login
             | Command::Logout
             | Command::SetNormalisation { .. }
-            | Command::BrowsePlaylists { .. }
             | Command::BrowsePlaylist { .. }
+            | Command::BrowsePlaylistMembership { .. }
+            | Command::QueueMetadata { .. }
             | Command::BrowsePlaylistCovers { .. }
             | Command::BrowsePlaylistTree { .. }
             | Command::BrowseRadio { .. }
@@ -1907,6 +2074,7 @@ impl Engine {
                 preview_lease_id,
             } => self.preview_track_edit(track, cuts, loop_range, position_ms, preview_lease_id),
             Command::PlayQueueIndex { index } => self.play_queue_index(index),
+            Command::SetQueueCursor { index, position_ms } => self.set_queue_cursor(index, position_ms),
             Command::Play => self.play(),
             Command::Pause => self.pause(),
             Command::Next => self.advance_with_current_skip(false, false, true),
@@ -1933,50 +2101,6 @@ impl Engine {
             request_id,
             ok: result.is_ok(),
             error: result.as_ref().err().map(String::as_str),
-        })
-    }
-
-    /// Sends a typed `browse_*` response: `data` carries the payload on
-    /// success, error text only on failure. `kind` must match the command
-    /// name so the UI can route the response.
-    pub fn send_browse_response<T: Serialize>(
-        &self,
-        request_id: &str,
-        kind: &'static str,
-        result: &Result<T, String>,
-    ) -> Result<(), String> {
-        let (ok, error, data) = match result {
-            Ok(data) => (true, None, Some(data)),
-            Err(error) => (false, Some(error.as_str()), None),
-        };
-        self.writer.send(&BrowseResponse {
-            kind,
-            request_id,
-            ok,
-            error,
-            data,
-        })
-    }
-
-    /// Sends an `edit_*` response for a void edit: `ok`/`error` only, with
-    /// no `data` payload on success (the UI routes these like browse
-    /// responses but has nothing to parse).
-    pub fn send_edit_response(
-        &self,
-        request_id: &str,
-        kind: &'static str,
-        result: &Result<(), String>,
-    ) -> Result<(), String> {
-        let (ok, error) = match result {
-            Ok(()) => (true, None),
-            Err(error) => (false, Some(error.as_str())),
-        };
-        self.writer.send(&BrowseResponse::<()> {
-            kind,
-            request_id,
-            ok,
-            error,
-            data: None,
         })
     }
 
@@ -2067,6 +2191,27 @@ impl Engine {
 
     pub fn on_audio_signal(&mut self, signal: AudioSignal) -> bool {
         match signal {
+            // Construction alone proves nothing for lazy output. A callback
+            // for this load does, even if the listener has since paused it.
+            AudioSignal::OutputReady { revision } => {
+                if revision == self.audio_revision && self.player.is_some() {
+                    self.audio_probe_backoff = AUDIO_PROBE_BACKOFF_MIN;
+                    let recovered = self.audio_unavailable.is_some();
+                    self.clear_audio_unavailable();
+                    return recovered;
+                }
+                false
+            }
+            AudioSignal::OutputFailed { revision, blocked } => {
+                if revision != self.audio_revision || self.player.is_none() {
+                    return false;
+                }
+                // Native errors may arrive after pause or at EOF without a
+                // subsequent decoder write. Keep the user's current intent.
+                self.enter_audio_unavailable(audio_stalled_message(),
+                    if blocked { PlayerFailure::Blocked } else { PlayerFailure::Ordinary });
+                true
+            }
             AudioSignal::SpeedBoundary { speed, revision, at } => {
                 if revision != self.audio_revision {
                     return false;
@@ -2077,8 +2222,13 @@ impl Engine {
                     self.tick_position_at(at);
                     self.position_anchor = Some((self.state.position_ms, at));
                 }
+                // Every load and seek opens with a boundary at the rate it was
+                // configured with; only a rate the listener can see change is
+                // worth a state. The re-anchored playhead rides the position
+                // lane.
+                let reported = self.audible_speed.unwrap_or(self.state.playback_speed);
                 self.audible_speed = Some(speed);
-                true
+                reported != speed
             }
             // The one fact librespot's transport events cannot supply: this
             // load is real. Everything that has to tell a playing track from a
@@ -2148,7 +2298,7 @@ impl Engine {
                     // player that replaced it.
                     return false;
                 }
-                if self.audio_unavailable.is_some() {
+                if self.player.is_none() {
                     return false;
                 }
                 // A stalled write means librespot had audio in flight when the
@@ -2170,7 +2320,7 @@ impl Engine {
         self.auth_running = false;
         self.generation = self.generation.wrapping_add(1);
         self.shutdown_playback();
-        // A clean exit must not lose the volume the heartbeat has not written
+        // A clean exit must not lose the volume the deferred write has not stored
         // yet. The write it was waiting for is never going to come, and the
         // cache file is the engine's only copy — the shell's snapshot is a
         // different file with a different clock.
@@ -2374,14 +2524,14 @@ impl Engine {
         self.player()?.stop();
         self.invalidate_audio_signals();
         self.state.queue = queue;
-        self.queue_changed();
+        self.rows_changed();
         self.state.current_index = None;
         self.state.position_ms = 0;
         self.state.duration_ms = 0;
         self.state.playing = false;
         self.history.clear();
         self.shuffle_pool.clear();
-        self.state.error = None;
+        self.clear_error();
         self.loading_failed = false;
         self.loop_pass = 1;
         self.current_needs_load = false;
@@ -2496,7 +2646,7 @@ impl Engine {
         }
 
         self.state.queue = queue;
-        self.queue_changed();
+        self.rows_changed();
         self.state.current_index = Some(playable_index);
         self.state.duration_ms = self.state.queue[playable_index].duration_ms;
         let position_ms = if playable_index == index {
@@ -2508,7 +2658,7 @@ impl Engine {
             PositionSpace::Source => self.update_position(position_ms),
             PositionSpace::Transport => self.update_transport_position(position_ms),
         }
-        self.state.error = None;
+        self.clear_error();
         self.history.clear();
         self.rebuild_shuffle_pool();
         // The first load starts a fresh pacing window for subsequent
@@ -2564,7 +2714,7 @@ impl Engine {
             first_available_wrapping(&queue, index)
         };
         self.state.queue = queue;
-        self.queue_changed();
+        self.rows_changed();
         self.state.current_index = playable_index;
         self.state.duration_ms = playable_index
             .map(|current| self.state.queue[current].duration_ms)
@@ -2635,10 +2785,10 @@ impl Engine {
             }
         }
         self.state.current_index = Some(index);
-        self.queue_changed();
+        self.order_changed();
         self.state.duration_ms = duration_ms;
         self.update_transport_position(0);
-        self.state.error = None;
+        self.clear_error();
         // Clicking a row asks to hear that row, not to be handed a different
         // random ordering of everything behind it, so the drawn plan survives
         // minus the row that just became current. The row being left is not put
@@ -2649,33 +2799,112 @@ impl Engine {
         Ok(true)
     }
 
+    fn set_queue_cursor(&mut self, index: usize, position_ms: u32) -> Result<bool, String> {
+        let track = self.state.queue.get(index)
+            .ok_or_else(|| format!("queue index {index} is out of range"))?;
+        playable_track_uri(track)?;
+        let duration_ms = track.duration_ms;
+        if self.state.playing {
+            return Err("remote queue cursor requires paused local playback".to_owned());
+        }
+        let current = self.state.current_index;
+        if current != Some(index) {
+            let upcoming = if current.is_some() { self.upcoming_indices() } else { Vec::new() };
+            if let Some(offset) = upcoming.iter().position(|candidate| *candidate == index) {
+                // Commit each skipped draw, not a new shuffle. The shell may
+                // observe multiple phone Next actions in one poll.
+                for _ in 0..=offset {
+                    if let Some(previous) = self.state.current_index {
+                        self.history.push(previous);
+                    }
+                    let next = self.take_next_index_with_skip(false, true)
+                        .ok_or_else(|| "canonical queue plan was exhausted".to_owned())?;
+                    self.state.current_index = Some(next);
+                }
+            } else if let Some(offset) = self.history.iter().rposition(|candidate| *candidate == index) {
+                // Returning through history makes the departed rows upcoming
+                // again, in the same order as local Previous.
+                while self.history.len() > offset {
+                    let previous = self.history.pop().expect("history offset exists");
+                    if let Some(departed) = self.state.current_index {
+                        if self.state.shuffle && departed != previous
+                            && self.automatic_track_eligible(departed)
+                            && !self.shuffle_pool.contains(&departed)
+                        {
+                            self.shuffle_pool.push(departed);
+                        }
+                    }
+                    self.shuffle_pool.retain(|candidate| *candidate != previous);
+                    self.state.current_index = Some(previous);
+                }
+            } else {
+                if let Some(previous) = current {
+                    self.history.push(previous);
+                }
+                self.state.current_index = Some(index);
+                self.repair_shuffle_pool(|candidate| Some(candidate));
+            }
+            if self.state.shuffle && self.shuffle_pool.is_empty()
+                && self.state.repeat == RepeatMode::Context
+            {
+                self.rebuild_shuffle_pool();
+            }
+            self.order_changed();
+        }
+        self.finalize_listening(false);
+        if let Some(player) = &self.player {
+            player.stop();
+        }
+        self.drain_stop_at = None;
+        self.play_request_id = None;
+        self.invalidate_audio_signals();
+        self.current_needs_load = true;
+        self.current_load_produced_audio = false;
+        self.loading_failed = false;
+        self.retry_current_at = None;
+        self.preload_armed = false;
+        self.loop_decoder_eof = false;
+        self.loop_jump_pending = false;
+        self.state.duration_ms = duration_ms;
+        self.update_transport_position(position_ms);
+        Ok(true)
+    }
+
     fn play(&mut self) -> Result<bool, String> {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
-        if self.audio_unavailable.is_some() {
+        if self.player.is_none() && (self.audio_unavailable.is_some() || self.auth_running) {
             // There is no player to send this to, but the request itself is
             // worth keeping: `state.playing` is what the device probe starts
-            // from when it finds one, so pressing play into a mute machine is
-            // answered by music as soon as the machine can make any. The row is
-            // marked as not loaded for the same reason a teardown marks it.
+            // from when it finds a device, and what a reconnect resumes when
+            // its session arrives — so pressing play into a mute machine, or
+            // into a session that died while the machine slept, is answered by
+            // music as soon as there can be any. The row is marked as not
+            // loaded for the same reason a teardown marks it.
             self.state.playing = true;
             self.current_needs_load = true;
+            if self.auth_running {
+                self.resume_after_reconnect = true;
+            }
             eprintln!(
-                "transport: play at {} ms with no output device; it starts when one appears",
+                "transport: play at {} ms with no player yet; it starts when one exists",
                 self.state.position_ms,
             );
             return Ok(true);
         }
         let was_playing = self.state.playing;
         // There is no live load to resume when one is pending, has failed, or
-        // has run off the end of the track, so those all start a fresh one.
+        // has run off the end of the track, so those all start a fresh one —
+        // from the top when the track had ended, where it stands otherwise.
+        let at_track_end =
+            self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms;
         let reload = self.loop_decoder_eof
             || self.current_needs_load
             || self.loading_failed
-            || (self.state.duration_ms > 0 && self.state.position_ms >= self.state.duration_ms);
+            || at_track_end;
         if reload {
-            if !self.loading_failed && !self.current_needs_load {
+            if at_track_end || !(self.loading_failed || self.current_needs_load) {
                 self.update_transport_position(0);
             }
             self.load_current(true)?;
@@ -2685,8 +2914,13 @@ impl Engine {
             player.play();
         }
         self.state.playing = true;
+        if self.auth_running {
+            // A reconnect keeping this player alive resumes whatever the
+            // listener last asked for.
+            self.resume_after_reconnect = true;
+        }
         self.update_position(self.state.position_ms);
-        self.state.error = None;
+        self.clear_error();
         // Transport commands are otherwise invisible in the log: a resume
         // prints nothing, and neither does a load librespot satisfies from the
         // track it already holds. A session where the engine and librespot
@@ -2705,16 +2939,21 @@ impl Engine {
         if self.state.current_index.is_none() {
             return Err("the queue has no current track".to_owned());
         }
-        if self.audio_unavailable.is_some() {
+        // A reconnect resumes the listener's latest intent, whichever player
+        // path this pause takes.
+        if self.auth_running {
+            self.resume_after_reconnect = false;
+        }
+        if self.player.is_none() && (self.audio_unavailable.is_some() || self.auth_running) {
             // Nothing is audible, so there is nothing to stop — but the intent
-            // still has to be cleared here, or the device probe would start
-            // playing something the user asked to stop.
+            // still has to be cleared here, or the device probe (or the
+            // reconnect) would start playing something the user asked to stop.
             let was_playing = self.state.playing;
             self.state.playing = false;
             self.pause_listening();
             self.update_position(self.state.position_ms);
             eprintln!(
-                "transport: pause at {} ms with no output device (engine was {})",
+                "transport: pause at {} ms with no player (engine was {})",
                 self.state.position_ms,
                 if was_playing { "playing" } else { "paused" },
             );
@@ -2738,6 +2977,9 @@ impl Engine {
         let player = Arc::clone(self.player()?);
         crate::audio::pause_output();
         self.tick_position();
+        if crate::audio::output_is_ready(self.audio_revision) {
+            self.on_audio_signal(AudioSignal::OutputReady { revision: self.audio_revision });
+        }
         player.pause();
         // Only now, with the stop actually issued: a user pause supersedes any
         // in-flight seek transition, so its own Paused event must be delivered
@@ -2746,7 +2988,7 @@ impl Engine {
         self.state.playing = false;
         self.update_position(self.state.position_ms);
         self.pause_listening();
-        self.state.error = None;
+        self.clear_error();
         // See the note in `play`. A pause arriving at an already paused engine
         // is the specific signature of a stale UI, and it used to leave no
         // trace at all.
@@ -2779,13 +3021,13 @@ impl Engine {
             let start_playing = self.state.playing;
             self.update_position(position);
             self.load_current_at_loop_pass(start_playing)?;
-            self.state.error = None;
+            self.clear_error();
             return Ok(true);
         }
         self.configure_current_audio_at_loop_pass(position, self.loop_pass);
         if self.current_needs_load {
             self.update_position(position);
-            self.state.error = None;
+            self.clear_error();
             return Ok(true);
         }
         if self.loading_failed {
@@ -2795,11 +3037,11 @@ impl Engine {
             let start_playing = self.state.playing;
             self.update_position(position);
             self.load_current_at_loop_pass(start_playing)?;
-            self.state.error = None;
+            self.clear_error();
             return Ok(true);
         }
-        // Pause clears the rodio output queue instantly (the custom sink's
-        // stop), seek while paused skips librespot's full read-ahead wait
+        // Pause retains queued audio instantly; seek clears it before reloading.
+        // Seeking while paused skips librespot's full read-ahead wait
         // (preload_data_before_playback is a no-op in the Paused state).
         // Capture the intent before pausing: a paused seek must remain paused,
         // while a playing seek resumes at the target without a UI blip.
@@ -2820,7 +3062,7 @@ impl Engine {
             player.play();
         }
         self.update_position(position);
-        self.state.error = None;
+        self.clear_error();
         Ok(true)
     }
 
@@ -2846,10 +3088,10 @@ impl Engine {
                 }
             }
             self.state.current_index = Some(index);
-            self.queue_changed();
+            self.order_changed();
             self.state.duration_ms = self.state.queue[index].duration_ms;
             self.update_transport_position(0);
-            self.state.error = None;
+            self.clear_error();
             // Symmetric with Next: the press is the request to hear it.
             self.load_current(true)?;
             Ok(true)
@@ -2905,11 +3147,16 @@ impl Engine {
     ) -> Result<bool, String> {
         // Every path out of here moves the published plan: the row that plays,
         // the row the bag popped, or the end of the queue itself.
-        self.queue_changed();
+        self.order_changed();
         if at_end {
             // Flush delayed speed/cut output before changing configuration.
             // The queue itself remains live so the tail can drain audibly.
-            crate::audio::finish_natural_boundary()?;
+            if let Err(error) = crate::audio::finish_natural_boundary() {
+                // A bounded flush timeout is output failure, not a bad row.
+                // Retire the stalled native stream and retain recovery intent.
+                self.enter_audio_unavailable(error, PlayerFailure::Ordinary);
+                return Ok(true);
+            }
             self.last_track_change = Some(Instant::now());
         }
         let current = self
@@ -2927,10 +3174,9 @@ impl Engine {
                     self.history.push(current);
                 }
                 self.state.current_index = Some(index);
-                self.queue_changed();
                 self.state.duration_ms = self.state.queue[index].duration_ms;
                 self.update_transport_position(0);
-                self.state.error = None;
+                self.clear_error();
                 // Either way the load and `state.playing` agree, which is the
                 // part that matters: loading with a fixed `true` used to leave
                 // the engine calling itself paused while librespot played the
@@ -2945,13 +3191,27 @@ impl Engine {
             None => {
                 // At natural EOF librespot is already in EndOfTrack. Calling
                 // stop here would clear correctly queued audio before the
-                // device drains it; explicit queue exhaustion still stops.
-                if !at_end {
+                // device drains it, so the stop waits for the tail; explicit
+                // queue exhaustion stops at once.
+                if at_end {
+                    match audio::finish_output_tail() {
+                        Ok(()) => {
+                            let tail = audio::output_tail_remaining().unwrap_or_default();
+                            self.drain_stop_at = Some(Instant::now() + tail + OUTPUT_DRAIN_MARGIN);
+                        }
+                        Err(error) => self.enter_audio_unavailable(error, PlayerFailure::Ordinary),
+                    }
+                } else {
                     self.player()?.stop();
                     self.invalidate_audio_signals();
                 }
+                // librespot holds nothing it can resume either way: Play loads
+                // again, and a seek only moves the playhead it will load at.
+                self.current_needs_load = true;
                 self.state.playing = false;
                 self.update_position(self.state.duration_ms);
+                let finished = self.loaded_track_id.take();
+                self.mark_cached_tracks(finished);
                 eprintln!("transport: no eligible track follows queue index {current}; stopping");
             }
         }
@@ -3007,14 +3267,14 @@ impl Engine {
         // paces this command at 50 ms and `Cache::save_volume` creates and
         // rewrites a file per call, so writing per step would mean twenty file
         // creations a second for a number that has already moved on. The
-        // heartbeat writes the value the drag stops at
+        // work timer writes the value the drag stops at
         // ([`Engine::tick_volume_persist`]), and a clean exit writes whatever
         // is still pending ([`Engine::shutdown`]).
         self.pending_volume = Some(PendingVolume {
             volume,
             changed_at: Instant::now(),
         });
-        // The audible volume lives on the rodio sink (per-packet attenuation
+        // The audible volume lives on the output callback (per-packet attenuation
         // is disabled); apply it there so the change is heard immediately.
         crate::audio::set_sink_volume(volume);
         self.state.volume = percent;
@@ -3030,7 +3290,7 @@ impl Engine {
             return Ok(false);
         }
         self.state.shuffle = enabled;
-        self.queue_changed();
+        self.order_changed();
         self.history.clear();
         // Switching shuffle on is the one place a full draw is the point: there
         // is no earlier plan to preserve. Switching it off empties the bag by
@@ -3045,7 +3305,7 @@ impl Engine {
             return Ok(false);
         }
         self.state.repeat = mode;
-        self.queue_changed();
+        self.order_changed();
         self.preload_next();
         Ok(true)
     }
@@ -3054,7 +3314,7 @@ impl Engine {
         self.resolve_queue_edits(std::slice::from_mut(&mut track));
         parse_track_uri(&track)?;
         self.state.queue.push(track);
-        self.queue_changed();
+        self.rows_changed();
         self.splice_new_rows_into_shuffle_pool(self.state.queue.len() - 1);
         self.preload_next();
         Ok(true)
@@ -3075,7 +3335,7 @@ impl Engine {
         }
         let first_new = self.state.queue.len();
         self.state.queue.extend(tracks);
-        self.queue_changed();
+        self.rows_changed();
         self.splice_new_rows_into_shuffle_pool(first_new);
         self.preload_next();
         Ok(true)
@@ -3091,7 +3351,7 @@ impl Engine {
             self.leave_preview_mode();
         }
         self.state.queue.remove(index);
-        self.queue_changed();
+        self.rows_changed();
         self.history.retain_mut(|visited| {
             if *visited == index {
                 false
@@ -3170,7 +3430,7 @@ impl Engine {
         }
         let track = self.state.queue.remove(from);
         self.state.queue.insert(to, track);
-        self.queue_changed();
+        self.rows_changed();
         if let Some(current) = self.state.current_index {
             self.state.current_index = Some(remap_current_index_after_move(current, from, to));
         }
@@ -3216,6 +3476,7 @@ impl Engine {
             .get(index)
             .ok_or_else(|| "the queue has no current track (index out of range)".to_owned())?;
         let uri = playable_track_uri(track)?;
+        let incoming = track.uri.starts_with("spotify:track:").then(|| track.id.clone());
         let position_ms = self.state.position_ms;
         if natural_boundary {
             self.configure_current_audio_after_natural_boundary(position_ms);
@@ -3256,7 +3517,11 @@ impl Engine {
         // load handler demands one, so this cannot disagree with them.
         self.update_position(position_ms);
         self.note_track_change(Instant::now());
+        self.drain_stop_at = None;
+        let outgoing = std::mem::replace(&mut self.loaded_track_id, incoming)
+            .filter(|outgoing| self.loaded_track_id.as_ref() != Some(outgoing));
         player.load(uri, start_playing, position_ms);
+        self.mark_cached_tracks(outgoing);
         Ok(())
     }
 
@@ -3419,8 +3684,8 @@ impl Engine {
     }
 
     /// Drives the two things a failing or recovering load needs a clock for.
-    /// Called from the same heartbeat that advances the playhead, so no extra
-    /// timer exists; both checks are a comparison on engine-local state.
+    /// Called from the work timer when its preload or retry deadline is due, so
+    /// no extra timer exists; both checks are a comparison on engine-local state.
     ///
     /// Returns whether the engine's state changed and should be emitted.
     pub fn tick_playback_health(&mut self) -> bool {
@@ -3591,7 +3856,7 @@ impl Engine {
     /// off.
     fn rebuild_shuffle_pool(&mut self) {
         // A redraw replaces the published plan wholesale.
-        self.queue_changed();
+        self.order_changed();
         self.shuffle_pool.clear();
         if !self.state.shuffle {
             return;
@@ -3633,7 +3898,7 @@ impl Engine {
     /// panic waiting in `take_next_index_with_skip`.
     fn repair_shuffle_pool(&mut self, remap: impl Fn(usize) -> Option<usize>) {
         // The bag *is* the published plan: any repair moves rows in it.
-        self.queue_changed();
+        self.order_changed();
         if !self.state.shuffle {
             // `rebuild_shuffle_pool` empties the bag when shuffle goes off, and
             // a repair must never be the thing that resurrects entries into it.
@@ -3666,7 +3931,7 @@ impl Engine {
     fn splice_new_rows_into_shuffle_pool(&mut self, first_new: usize) {
         // Appended rows enter the published plan, so the revision moves even
         // when the bag is empty because shuffle is off.
-        self.queue_changed();
+        self.order_changed();
         if !self.state.shuffle {
             self.shuffle_pool.clear();
             return;
@@ -3687,7 +3952,7 @@ impl Engine {
         // Eligibility is part of the published plan even with shuffle off — a
         // row that just became excluded leaves the sequential walk too — so the
         // bump happens before the bag's own early return.
-        self.queue_changed();
+        self.order_changed();
         if !self.state.shuffle {
             self.shuffle_pool.clear();
             return;
@@ -3718,11 +3983,42 @@ impl Engine {
         value
     }
 
+    /// Decoder metadata can correct a restored row. Publish every occurrence
+    /// together rather than leaving duplicate rows or shell snapshots stale.
+    fn update_loaded_metadata(&mut self, uri: &str, duration_ms: u32, name: &str) -> bool {
+        let mut changed = false;
+        for track in &mut self.state.queue {
+            if track.uri == uri {
+                if track.duration_ms != duration_ms {
+                    track.duration_ms = duration_ms;
+                    changed = true;
+                }
+                if track.name != name {
+                    track.name = name.to_owned();
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return false;
+        }
+        self.state.duration_ms = duration_ms;
+        self.state.position_ms = self.state.position_ms.min(duration_ms);
+        self.rows_changed();
+        true
+    }
     fn on_player_event(&mut self, event: PlayerEvent) -> bool {
         match event {
             PlayerEvent::PlayRequestIdChanged { play_request_id } => {
                 self.play_request_id = Some(play_request_id);
                 false
+            }
+            PlayerEvent::TrackChanged { audio_item } => {
+                let Some(index) = self.state.current_index else { return false; };
+                if audio_item.uri != self.state.queue[index].uri {
+                    return false;
+                }
+                self.update_loaded_metadata(&audio_item.uri, audio_item.duration_ms, &audio_item.name)
             }
             PlayerEvent::Loading {
                 play_request_id,
@@ -3731,12 +4027,17 @@ impl Engine {
             } if self.is_current_event(play_request_id, &track_id) => {
                 // A fresh load (including a retry after Unavailable) puts the
                 // engine back into an in-progress state. Keep the requested
-                // play/pause intent already held in `state.playing`.
+                // play/pause intent already held in `state.playing`. The load
+                // command already reported all of this; only a position or an
+                // error the report did not carry is worth a state.
+                let previous_position = self.state.position_ms;
+                let had_error = self.state.error.is_some();
                 self.loading_failed = false;
                 self.update_position(position_ms);
                 self.loop_jump_pending = false;
-                self.state.error = None;
-                true
+                self.clear_error();
+                self.state.position_ms != previous_position
+                    || had_error != self.state.error.is_some()
             }
 
             PlayerEvent::Playing {
@@ -3774,7 +4075,7 @@ impl Engine {
                 let was_failed = self.state.error.is_some();
                 self.state.playing = true;
                 self.update_player_position(position_ms);
-                self.state.error = None;
+                self.clear_error();
                 !was_playing || was_failed
             }
             // The Paused produced by a seek's own pause() is transient: the
@@ -3792,6 +4093,11 @@ impl Engine {
                 track_id,
                 position_ms,
             } if self.is_current_event(play_request_id, &track_id) => {
+                if audio::output_has_failed(self.audio_revision) {
+                    // OutputFailed owns recovery. A driver-induced Paused is
+                    // not a user pause, whichever channel is handled first.
+                    return false;
+                }
                 self.loading_failed = false;
                 let was_playing = self.state.playing;
                 // What the state event would say that it does not say already:
@@ -3924,9 +4230,10 @@ impl Engine {
                 play_request_id,
                 track_id,
             } if self.is_current_event(play_request_id, &track_id) => {
-                self.state.playing = false;
+                // The engine's own stops (an exhausted queue, a drained one)
+                // have already said so; only a stop that ends playback is news.
                 self.finalize_listening(false);
-                true
+                std::mem::replace(&mut self.state.playing, false)
             }
             // Every arm above is gated on `is_current_event`, so a transport
             // event landing here is one the engine refused: its play request or
@@ -3991,6 +4298,10 @@ impl Engine {
     /// The caller owns the generation bump that discards events still in
     /// flight from this player — see [`Engine::enter_audio_unavailable`].
     fn detach_player(&mut self) {
+        self.audio_probe_generation = None;
+        // Cancel a pending native open before dropping Player (which joins its
+        // thread). The native worker is detached and never owns that join.
+        crate::audio::pause_output();
         if let Some(player) = self.player.take() {
             player.stop();
         }
@@ -4007,27 +4318,29 @@ impl Engine {
         self.retry_current_at = None;
         self.current_load_is_retry = false;
         self.preload_armed = false;
+        self.drain_stop_at = None;
         self.mixer = None;
     }
 }
 
-/// The first queue revision of a process.
+/// The first rows or order revision of a process.
 ///
-/// The revision is the shell's and the webview's only way to tell an omitted
-/// queue from an empty one, so it must name one set of rows and nothing else —
-/// including across a respawn. A counter starting at one would let a fresh
-/// engine's first, empty queue be mistaken for rows a previous engine had
-/// already published under the same number; the wall clock costs one call at
-/// construction and cannot repeat that way within any plausible uptime.
+/// A revision is the shell's and the webview's only way to tell an omitted
+/// queue (or order) from an empty one, so it must name one generation and
+/// nothing else — including across a respawn. A counter starting at one would
+/// let a fresh engine's first, empty queue be mistaken for rows a previous
+/// engine had already published under the same number; the wall clock costs
+/// one call at construction and cannot repeat that way within any plausible
+/// uptime.
 ///
-/// Milliseconds, not nanoseconds, because the webview reads this field as a
-/// JSON number — a double, which holds integers exactly only to 2^53. An epoch
+/// Milliseconds, not nanoseconds, because the webview reads these fields as
+/// JSON numbers — doubles, which hold integers exactly only to 2^53. An epoch
 /// in nanoseconds is ~1.79e18, where the numbers that are representable are 256
 /// apart: two generations one bump apart arrive as the same number, and the
 /// webview keeps the rows of the first. Milliseconds are ~1.75e12, exact for
 /// every value, and a bump of one stays exact through any uptime — so a
-/// revision in flight always names one set of rows and no other.
-fn initial_queue_revision() -> u64 {
+/// revision in flight always names one generation and no other.
+fn initial_revision() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since_epoch| since_epoch.as_millis() as u64)
@@ -4239,7 +4552,7 @@ mod tests {
         remap_current_index_after_move, sequential_automatic_index, sequential_available_index,
         sequential_next_index, track_change_wait, with_preview_edit,
     };
-    use crate::audio::{self, RodioError};
+    use crate::audio::{self, OutputError};
     use crate::auth::{PlaybackError, create_playback, percent_to_volume};
     use crate::customization::TrackEditStore;
     use crate::io::ProtocolWriter;
@@ -4251,6 +4564,105 @@ mod tests {
     use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume, softmixer::SoftMixer};
     use librespot_playback::player::{Player, PlayerEvent};
     use renderer_engine::protocol::{Command, LoopRange, RepeatMode, TimeRange, TrackEdit, TrackRef};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_and_paused_engines_have_no_work_timer() {
+        let (mut engine, _) = test_engine();
+        assert_eq!(engine.next_work_deadline(), None);
+        engine.session = Some(librespot_core::Session::new(librespot_core::SessionConfig::default(), None));
+        engine.state = playback_state(240_000);
+        assert_eq!(engine.next_work_deadline(), None);
+        engine.state.playing = true;
+        let deadline = engine.next_work_deadline().expect("active session observation");
+        assert_eq!(engine.next_work_deadline(), Some(deadline), "commands do not postpone observation");
+        engine.state.playing = false;
+        assert_eq!(engine.next_work_deadline(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn paused_audio_recovery_keeps_a_deadline_only_with_a_live_session() {
+        let (mut engine, _) = test_engine();
+        engine.session = Some(librespot_core::Session::new(librespot_core::SessionConfig::default(), None));
+        let retry_at = Instant::now() + AUDIO_PROBE_BACKOFF_MIN;
+        engine.audio_unavailable = Some(super::AudioUnavailable {
+            message: "recovering output".to_owned(),
+            retry_at: Some(retry_at),
+        });
+        assert_eq!(engine.next_work_deadline(), Some(retry_at));
+        engine.session = None;
+        assert_eq!(engine.next_work_deadline(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_inflight_device_probe_does_not_rearm_on_an_expired_deadline() {
+        let (mut engine, _) = test_engine();
+        engine.session = Some(librespot_core::Session::new(librespot_core::SessionConfig::default(), None));
+        engine.state = playback_state(240_000);
+        engine.audio_unavailable = Some(super::AudioUnavailable {
+            message: "opening".to_owned(),
+            retry_at: Some(Instant::now() - Duration::from_millis(1)),
+        });
+        engine.audio_probe_generation = Some(engine.generation);
+        assert_eq!(engine.next_work_deadline(), None);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(!engine.tick_audio_device(&sender));
+        let enabled = !engine.normalisation.load(Ordering::Acquire);
+        assert!(engine.set_normalisation(enabled, &sender));
+        assert_eq!(engine.audio_probe_generation, Some(engine.generation));
+        assert!(engine.on_default_output_changed());
+        assert_eq!(engine.audio_probe_generation, None);
+        assert!(engine.next_work_deadline().is_some());
+    }
+
+    #[test]
+    fn volume_and_future_reconnects_keep_only_their_actual_deadlines() {
+        let (mut engine, _) = test_engine();
+        engine.set_volume(65).unwrap();
+        let volume_due = engine.pending_volume.as_ref().unwrap().changed_at + VOLUME_PERSIST_QUIET;
+        assert_eq!(engine.next_work_deadline(), Some(volume_due));
+        settle_volume(&mut engine);
+        engine.tick_volume_persist();
+        assert_eq!(engine.next_work_deadline(), None);
+        let reconnect = Instant::now() + RECONNECT_BACKOFF_MIN;
+        engine.awaiting_transport_retry = true;
+        engine.next_reconnect = Some(reconnect);
+        assert_eq!(engine.next_work_deadline(), Some(reconnect));
+        engine.auth_running = true;
+        assert_eq!(engine.next_work_deadline(), None, "in-flight auth is event-driven");
+    }
+
+    #[test]
+    fn pausing_cancels_a_load_retry_timer_without_idle_polling() {
+        let (mut engine, _) = test_engine();
+        let retry = Instant::now() + LOAD_RETRY_BACKOFF;
+        engine.retry_current_at = Some(retry);
+        engine.state.playing = true;
+        assert_eq!(engine.next_work_deadline(), Some(retry));
+        engine.state.playing = false;
+        assert_eq!(engine.next_work_deadline(), None);
+    }
+
+    #[test]
+    fn queue_metadata_uses_requested_exclusion_context_and_the_live_plan() {
+        let excluded = "0abcdefghijklmnopqrstu";
+        let eligible = "1abcdefghijklmnopqrstu";
+        let (directory, store) = store_with_exclusions(&[("one", excluded)]);
+        let (mut engine, _) = test_engine();
+        engine.track_edits = store;
+        engine.state.queue = vec![
+            contextual_track(eligible, "playlist:one"),
+            contextual_track(excluded, "playlist:one"),
+            contextual_track(eligible, "playlist:one"),
+        ];
+        engine.state.current_index = Some(0);
+        let current = engine.queue_metadata(None).unwrap();
+        assert_eq!(current.excluded_track_ids, [excluded]);
+        assert_eq!(current.upcoming, [2]);
+        let other = engine.queue_metadata(Some("playlist:two")).unwrap();
+        assert!(other.excluded_track_ids.is_empty());
+        assert_eq!(other.upcoming, [2]);
+        drop(directory);
+    }
 
     #[test]
     fn audio_queue_accepts_episodes_but_refuses_song_edits_for_them() {
@@ -4414,7 +4826,7 @@ mod tests {
             Arc::new(move |_| {
                 device.asked.fetch_add(1, Ordering::AcqRel);
                 if !device.present.load(Ordering::Acquire) {
-                    return Err(RodioError::NoDeviceAvailable);
+                    return Err(OutputError::NoDeviceAvailable);
                 }
                 device.opened.fetch_add(1, Ordering::AcqRel);
                 Ok(Box::new(TestSink))
@@ -4619,6 +5031,93 @@ mod tests {
         engine.session = Some(session);
         (engine, probe)
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_idle_invalid_session_reconnects_before_play_and_keeps_resume_intent() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state.playing = false;
+        engine.session.as_ref().unwrap().shutdown();
+        assert_eq!(engine.next_work_deadline(), None);
+        // This is the same on-demand check the actual command loop runs.
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(engine.prepare_session_reconnect(), Some(true));
+        // Drive the real authentication transition without spawning a network
+        // task. No credentials or Spotify requests are needed for this proof.
+        engine.begin_cached_authentication(false);
+        assert!(engine.auth_running);
+        assert!(engine.process_command(Command::Play, &sender).await.unwrap());
+        assert!(engine.state.playing);
+        assert!(engine.resume_after_reconnect);
+        engine.shutdown();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_callback_proof_clears_recovery_error_even_after_pause() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state.playing = false;
+        engine.state.error = Some("output outage".to_owned());
+        engine.audio_unavailable = Some(super::AudioUnavailable {
+            message: "output outage".to_owned(),
+            retry_at: None,
+        });
+        assert!(!engine.on_audio_signal(AudioSignal::OutputReady { revision: engine.audio_revision.wrapping_sub(1) }));
+        assert!(engine.state.error.is_some());
+        assert!(engine.on_audio_signal(AudioSignal::OutputReady { revision: engine.audio_revision }));
+        assert!(engine.state.error.is_none());
+        assert!(engine.audio_unavailable.is_none());
+        assert!(!engine.state.playing);
+    }
+
+    #[test]
+    fn canonical_remote_cursor_consumes_draws_and_retains_rows_and_history() {
+        let (directory, store) = store_with_exclusions(&[]);
+        let mut engine = shuffling_engine(store, 0, &[3, 2, 1]);
+        engine.state.playing = false;
+        let rows = engine.rows_revision;
+        engine.set_queue_cursor(2, 12_000).unwrap();
+        assert_eq!(engine.state.current_index, Some(2));
+        assert_eq!(engine.history, vec![0, 1]);
+        assert_eq!(engine.upcoming_indices(), vec![3]);
+        assert_eq!(engine.rows_revision, rows);
+        assert_eq!(engine.state.position_ms, 12_000);
+        assert!(engine.current_needs_load);
+        engine.set_queue_cursor(1, 1_000).unwrap();
+        assert_eq!(engine.history, vec![0]);
+        assert_eq!(engine.upcoming_indices(), vec![2, 3]);
+        engine.state.repeat = RepeatMode::Context;
+        engine.set_queue_cursor(3, 0).unwrap();
+        assert_eq!(engine.history, vec![0, 1, 2]);
+        assert_eq!(engine.upcoming_indices().len(), 3);
+        assert!(!engine.upcoming_indices().contains(&3));
+        let current = engine.state.current_index;
+        assert!(engine.set_queue_cursor(99, 0).is_err());
+        assert_eq!(engine.state.current_index, current);
+        drop(directory);
+    }
+
+    #[test]
+    fn queue_metadata_corrections_publish_once_and_empty_orders_clear_the_plan() {
+        let (mut engine, buffer) = test_engine();
+        engine.state = two_track_state();
+        engine.state.queue.push(engine.state.queue[0].clone());
+        engine.emit_state().unwrap();
+        let uri = engine.state.queue[0].uri.clone();
+        assert!(engine.update_loaded_metadata(&uri, 180_000, "corrected"));
+        engine.emit_state().unwrap();
+        assert!(!engine.update_loaded_metadata(&uri, 180_000, "corrected"));
+        engine.emit_state().unwrap();
+        engine.set_queue_cursor(2, 0).unwrap();
+        engine.emit_state().unwrap();
+        let values = captured_messages(&buffer);
+        assert_eq!(values[1]["queue"][0]["name"], "corrected");
+        assert_eq!(values[1]["queue"][2]["duration_ms"], 180_000);
+        assert_ne!(values[0]["queue_revision"], values[1]["queue_revision"]);
+        assert!(values[2].get("queue").is_none());
+        assert!(values[2].get("upcoming").is_none());
+        assert!(values[3].get("queue").is_none());
+        assert_eq!(values[3]["upcoming"], serde_json::json!([]));
+        assert_ne!(values[2]["order_revision"], values[3]["order_revision"]);
+    }
     /// Fails the load of whatever row is current, the way librespot does:
     /// with the play request the engine is holding and the row's own uri.
     fn fail_current_row(engine: &mut Engine, play_request_id: u64) -> bool {
@@ -4679,7 +5178,8 @@ mod tests {
 
     fn history_rows(engine: &Engine) -> Vec<renderer_engine::protocol::HistoryItem> {
         engine
-            .history(&renderer_engine::protocol::HistoryQuery {
+            .history_reader()
+            .page(&renderer_engine::protocol::HistoryQuery {
                 limit: usize::MAX,
                 ..renderer_engine::protocol::HistoryQuery::default()
             })
@@ -7424,12 +7924,7 @@ mod tests {
             "a rebuild started while the session was ready is initially current"
         );
 
-        assert!(engine.tick_session_health(&sender));
-        assert!(
-            !engine.player_rebuild_is_current(generation, false),
-            "a queued rebuild on the dead session must be rejected during backoff"
-        );
-        assert!(!engine.state.ready);
+        assert_eq!(engine.prepare_session_reconnect(), Some(true));
         assert!(engine.state.playing, "the logical transport must not blip");
         assert!(engine.resume_after_reconnect);
         assert!(
@@ -7441,18 +7936,13 @@ mod tests {
             "position must still project from the pre-drop anchor: {}",
             engine.state.position_ms
         );
-        assert_eq!(
-            engine.generation, generation,
-            "scheduling alone does not stale events"
-        );
         assert!(engine.set_normalisation(true, &sender));
         assert!(
             receiver.try_recv().is_err(),
             "backoff must not rebuild a player on the dead session"
         );
 
-        // Exercise the synchronous transition used when the reconnect becomes
-        // due without spawning a network task.
+        // Exercise handover without credentials or a Spotify network task.
         let reconnect_generation = engine.begin_cached_authentication(true);
         assert_ne!(reconnect_generation, generation);
         assert!(engine.auth_running);
@@ -7507,11 +7997,7 @@ mod tests {
         engine.session = Some(old_session.clone());
         old_session.shutdown();
 
-        let (auth_sender, _auth_receiver) = tokio::sync::mpsc::unbounded_channel();
-        assert!(
-            engine.tick_session_health(&auth_sender),
-            "the invalid session is noticed"
-        );
+        assert_eq!(engine.prepare_session_reconnect(), Some(true));
         assert!(engine.resume_after_reconnect);
         let generation = engine.begin_cached_authentication(true);
         assert!(
@@ -7608,8 +8094,8 @@ mod tests {
         );
     }
 
-    /// Paused reconnects retain the existing cold teardown and exponential
-    /// retry schedule; no cached credentials means the normal login state.
+    /// Paused reconnects back off between attempts and fall back to explicit
+    /// login when there are no cached credentials.
     #[tokio::test(flavor = "current_thread")]
     async fn paused_session_reconnect_remains_cold_and_uses_backoff() {
         let (mut engine, _) = test_engine();
@@ -7620,20 +8106,21 @@ mod tests {
         let generation = engine.generation;
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        assert!(engine.tick_session_health(&sender));
+        assert_eq!(engine.prepare_session_reconnect(), Some(true));
         assert!(!engine.resume_after_reconnect);
-        assert!(!engine.tick_session_health(&sender));
-        assert_eq!(engine.generation, generation);
-
+        assert_eq!(engine.prepare_session_reconnect(), None);
+        engine.next_reconnect = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(engine.prepare_session_reconnect(), Some(true));
+        assert!(engine.reconnect_backoff > RECONNECT_BACKOFF_MIN);
+        assert!(engine.reconnect_backoff <= RECONNECT_BACKOFF_MAX);
         engine.next_reconnect = Some(Instant::now() - Duration::from_millis(1));
         assert!(engine.tick_session_health(&sender));
-        assert_ne!(engine.generation, generation, "the due reconnect must fire");
+        assert_ne!(engine.generation, generation, "the reconnect must fire immediately");
         assert!(!engine.auth_running, "no implicit OAuth flow may start");
         assert!(!engine.state.playing);
         assert!(engine.state.current_index.is_none());
         assert!(engine.session.is_none());
-        assert!(engine.reconnect_backoff > RECONNECT_BACKOFF_MIN);
-        assert!(engine.reconnect_backoff <= RECONNECT_BACKOFF_MAX);
+        assert_eq!(engine.state.auth_state, renderer_engine::protocol::AuthState::NeedsLogin);
     }
 
     /// A healthy session must cost nothing and must clear any backoff a past
@@ -7816,9 +8303,9 @@ mod tests {
         let (mut engine, buffer) = test_engine();
         engine.state = two_track_state();
 
-        let seed = engine.queue_revision;
+        let seed = engine.rows_revision;
         engine.emit_state().expect("first state emits");
-        engine.queue_changed();
+        engine.rows_changed();
         engine.emit_state().expect("bumped state emits");
 
         // `as_f64` is the rounding JavaScript's `Number` applies to a JSON
@@ -9074,8 +9561,7 @@ mod tests {
         engine
             .audio_unavailable
             .as_mut()
-            .expect("no device")
-            .retry_at = Instant::now() - Duration::from_millis(1);
+            .expect("no device").retry_at = Some(Instant::now() - Duration::from_millis(1));
         let constructions = device.asked();
         assert!(
             !engine.tick_audio_device(&auth_sender),
@@ -9091,6 +9577,8 @@ mod tests {
         );
         assert_eq!(device.opened(), 1, "the probe opened the device");
         assert!(engine.player.is_some(), "the player is back");
+        assert!(engine.audio_unavailable.is_some(), "lazy construction is not proof of recovery");
+        assert!(engine.on_audio_signal(AudioSignal::OutputReady { revision: engine.audio_revision }));
         assert!(engine.audio_unavailable.is_none());
         assert!(
             engine.state.error.is_none(),
@@ -9151,6 +9639,8 @@ mod tests {
         assert!(engine.on_auth_signal(new_answer, player_sender));
 
         assert_eq!(device.opened(), 2, "one open per notified default change");
+        assert!(engine.audio_unavailable.is_some(), "switch waits for native output confirmation");
+        assert!(engine.on_audio_signal(AudioSignal::OutputReady { revision: engine.audio_revision }));
         assert!(engine.player.is_some() && engine.audio_unavailable.is_none());
         assert!(engine.state.playing);
         assert!(engine.state.position_ms >= 42_000);
@@ -9175,6 +9665,7 @@ mod tests {
         let (player_sender, _player_receiver) = tokio::sync::mpsc::unbounded_channel();
 
         assert!(engine.on_default_output_changed());
+        let backoff = engine.audio_probe_backoff;
         assert!(!engine.tick_audio_device(&auth_sender));
         let answer = receive_auth_signal(&mut auth_receiver).await;
         assert!(engine.on_auth_signal(answer, player_sender));
@@ -9182,6 +9673,28 @@ mod tests {
         assert!(!engine.state.playing);
         assert_eq!(engine.state.position_ms, 32_000);
         assert!(engine.current_needs_load, "play will load from the paused position");
+        assert!(engine.audio_unavailable.is_some(), "unstarted output has not recovered");
+        assert!(engine.state.error.is_some());
+        assert_eq!(engine.audio_probe_backoff, backoff, "lazy replacement must not reset the ladder");
+        assert_eq!(engine.next_work_deadline(), None, "paused lazy output does not spin probes");
+        let attempts = device.asked();
+        assert!(!engine.tick_audio_device(&auth_sender));
+        assert_eq!(device.asked(), attempts);
+        engine.seek_transport(45_000).unwrap();
+        assert_eq!(engine.state.position_ms, 45_000);
+        assert!(engine.state.error.is_some(), "paused seek cannot confirm native recovery");
+        engine.play().unwrap();
+        assert!(engine.state.error.is_some(), "a requested load is not native recovery");
+        engine.pause().unwrap();
+        assert!(!engine.state.playing);
+        assert!(engine.state.error.is_some(), "pause retains the unresolved native outage");
+        let revision = engine.audio_revision;
+        assert!(engine.on_audio_signal(AudioSignal::OutputFailed { revision, blocked: false }));
+        assert!(!engine.state.playing, "a paused native error must not resurrect playback");
+        assert!(engine.player.is_none());
+        assert!(engine.audio_probe_backoff > backoff, "repeated native failure advances the ladder");
+        assert!(!engine.on_audio_signal(AudioSignal::OutputFailed { revision, blocked: false }),
+            "retired native errors must not tear down a replacement");
     }
 
     /// A device that disappears mid-track lands in the same recoverable state,
@@ -9271,8 +9784,7 @@ mod tests {
         engine
             .audio_unavailable
             .as_mut()
-            .expect("no device")
-            .retry_at = Instant::now() - Duration::from_millis(1);
+            .expect("no device").retry_at = Some(Instant::now() - Duration::from_millis(1));
         let constructions = device.asked();
         assert!(!engine.tick_audio_device(&auth_sender));
         assert_eq!(
@@ -9291,32 +9803,26 @@ mod tests {
                 .as_ref()
                 .expect("still no device")
                 .retry_at
-                > Instant::now(),
+                .is_some_and(|deadline| deadline > Instant::now()),
             "the next attempt waits its backoff"
         );
-        assert!(
-            engine
-                .state
-                .error
-                .as_deref()
-                .is_some_and(|message| message.contains("stopped responding")),
-            "the last established cause is not replaced by a probe that built nothing: {:?}",
-            engine.state.error
-        );
+        assert!(engine.state.error.is_some(), "failed probing retains the unresolved output error");
 
         // The dongle is plugged back in.
         device.plug_in();
         engine
             .audio_unavailable
             .as_mut()
-            .expect("no device")
-            .retry_at = Instant::now() - Duration::from_millis(1);
+            .expect("no device").retry_at = Some(Instant::now() - Duration::from_millis(1));
         assert!(!engine.tick_audio_device(&auth_sender));
         let signal = receive_auth_signal(&mut auth_receiver).await;
         assert!(engine.on_auth_signal(signal, player_sender));
 
         assert!(engine.player.is_some(), "the player comes back");
-        assert!(engine.state.error.is_none(), "and the message does not");
+        assert!(engine.audio_unavailable.is_some(), "a lazy replacement has not recovered native output");
+        assert!(engine.on_audio_signal(AudioSignal::OutputReady { revision: engine.audio_revision }));
+        assert!(engine.audio_unavailable.is_none());
+        assert!(engine.state.error.is_none());
         assert!(engine.state.playing, "the track plays again");
         assert_eq!(engine.state.position_ms, 42_000);
         receive_load(&mut player_receiver).await;
@@ -9377,13 +9883,12 @@ mod tests {
         let mut waits = Vec::new();
         for _ in 0..5 {
             let retry_at = engine.audio_unavailable.as_ref().expect("no device").retry_at;
-            waits.push(retry_at.saturating_duration_since(Instant::now()));
+            waits.push(retry_at.expect("fallback deadline").saturating_duration_since(Instant::now()));
             // Bring the due time forward, the way a heartbeat would.
             engine
                 .audio_unavailable
                 .as_mut()
-                .expect("no device")
-                .retry_at = Instant::now() - Duration::from_millis(1);
+                .expect("no device").retry_at = Some(Instant::now() - Duration::from_millis(1));
             let constructions = device.asked();
             assert!(!engine.tick_audio_device(&auth_sender));
             assert_eq!(
@@ -9398,7 +9903,7 @@ mod tests {
             // The probe owns the clock until its next due time, so a tick
             // arriving meanwhile cannot start a second one beside it.
             let held = engine.audio_unavailable.as_ref().expect("no device").retry_at;
-            assert!(held > Instant::now(), "the probe holds the clock");
+            assert!(held.expect("fallback deadline") > Instant::now(), "the probe holds the clock");
             assert!(!engine.tick_audio_device(&auth_sender));
             assert_eq!(
                 engine.audio_unavailable.as_ref().expect("no device").retry_at,
@@ -9475,6 +9980,7 @@ mod tests {
                     .as_ref()
                     .expect("no device")
                     .retry_at
+                    .expect("retry deadline armed")
                     .saturating_duration_since(Instant::now()),
             );
             assert!(engine.on_auth_signal(blocked_answer(&engine), player_sender.clone()));
@@ -9519,6 +10025,7 @@ mod tests {
             .as_ref()
             .expect("still no device")
             .retry_at
+            .expect("retry deadline armed")
             .saturating_duration_since(Instant::now());
         assert!(
             wait <= AUDIO_PROBE_BACKOFF_MAX,
