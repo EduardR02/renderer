@@ -52,7 +52,7 @@
     actionError = "";
     try {
       await api.setShuffle(true);
-      await api.playQueue(queue, 0, `album:${id}`);
+      await api.playQueue(queue, 0, `album:${id}`, { automaticStart: true });
     } catch (reason) {
       if (album?.id === id) {
         actionError = String(reason || "Could not shuffle this album.");

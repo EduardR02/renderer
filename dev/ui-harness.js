@@ -538,22 +538,23 @@ function refreshQueueEdits() {
 }
 
 /**
- * Harness stand-in for the engine's skip-aware start: walk forward from the
- * requested row to the first included, available one. Only automatic starts
- * consult exclusions — direct plays keep exactly the row they were handed.
+ * Automatic shuffle starts consume the first draw from the same filtered bag
+ * as the upcoming rows. Ordered starts walk to the first eligible row;
+ * direct plays keep the row they were handed.
  */
-function automaticStartIndex(from, playlistId) {
+function automaticStartIndex(from) {
   const length = playback.queue.length;
-  if (!length) return 0;
-  const skipped = (exclusionsFor(playlistId) ?? []).map((value) => String(value));
+  if (!length) return null;
+  if (playback.shuffle) {
+    playback.current_index = null;
+    redrawShuffleBag();
+    return shuffleBag.pop() ?? null;
+  }
   for (let step = 0; step < length; step += 1) {
     const at = (((from + step) % length) + length) % length;
-    const track = findTrack(playback.queue[at].uri);
-    if (!track || (!track.unavailable && !skipped.includes(String(track.id)))) return at;
+    if (queueRowEligible(at)) return at;
   }
-  // Nowhere legal to begin: the engine refuses to auto-start rather than fall
-  // through to a skipped row, so the requested index simply stands.
-  return from;
+  return null;
 }
 
 function waveformFor(trackId, durationMs) {
@@ -1162,14 +1163,22 @@ const mock = {
         const automaticStart = Boolean(args.automaticStart ?? args.automatic_start);
         const requestedIndex = Number(args.index ?? args.startIndex ?? 0);
         const startedIndex = automaticStart
-          ? automaticStartIndex(requestedIndex, String(args.context ?? "").replace(/^playlist:/, ""))
+          ? automaticStartIndex(requestedIndex)
           : requestedIndex;
         playQueueLog.push({ automaticStart, requestedIndex, startedIndex });
-        setCurrent(startedIndex);
-        // A different queue has no plan worth keeping, which is the one case
-        // where the engine redraws the bag rather than repairing it.
-        redrawShuffleBag();
-        playback.playing = true;
+        if (startedIndex === null) {
+          playback.current_index = null;
+          playback.current_uri = null;
+          playback.duration_ms = 0;
+          playback.position_ms = 0;
+          playback.playing = false;
+        } else {
+          setCurrent(startedIndex);
+          playback.playing = true;
+        }
+        // An automatic shuffle start has already drawn and consumed its first
+        // row; redrawing here would replace the remaining published order.
+        if (!(automaticStart && playback.shuffle)) redrawShuffleBag();
         playback.preview = false;
         emitState();
         return null;

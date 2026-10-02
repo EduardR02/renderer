@@ -1596,7 +1596,7 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> 
     client.set_playback_speeds(snapshot.track_speed, snapshot.episode_speed).await?;
     let index = snapshot.current_index.unwrap_or(0);
     client
-        .restore_queue(&snapshot.queue, index, snapshot.position_ms, "")
+        .restore_queue(&snapshot.queue, index, snapshot.position_ms, "", false)
         .await?;
     if snapshot.resume_playing && snapshot.current_index.is_some() {
         client.play().await?;

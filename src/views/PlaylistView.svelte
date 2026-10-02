@@ -706,11 +706,14 @@
     playQueue(queue, automaticStartIndex, { automaticStart: true }).catch(() => {});
   }
 
-  function shufflePlay() {
+  async function shufflePlay() {
     const queue = sortedTracks;
-    if (!queue.length || automaticStartIndex < 0) return;
-    api.setShuffle(true).catch(() => {});
-    playQueue(queue, automaticStartIndex, { automaticStart: true }).catch(() => {});
+    const index = automaticStartIndex;
+    if (!queue.length || index < 0) return;
+    try {
+      await api.setShuffle(true);
+      await playQueue(queue, index, { automaticStart: true });
+    } catch {}
   }
 
   function startRename() {

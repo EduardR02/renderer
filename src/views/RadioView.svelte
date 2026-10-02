@@ -92,10 +92,14 @@
     if (tracks.length) api.playQueue(tracks, 0, `radio:${route.id ?? ""}`).catch(() => {});
   }
 
-  function shufflePlay() {
+  async function shufflePlay() {
     if (!tracks.length) return;
-    api.setShuffle(true).catch(() => {});
-    api.playQueue(tracks, 0, `radio:${route.id ?? ""}`).catch(() => {});
+    const queue = tracks;
+    const source = `radio:${route.id ?? ""}`;
+    try {
+      await api.setShuffle(true);
+      await api.playQueue(queue, 0, source, { automaticStart: true });
+    } catch {}
   }
 
   async function saveAsPlaylist() {

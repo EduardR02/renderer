@@ -60,7 +60,7 @@ pub enum Action {
 /// A queue command for the paused engine. None of these load audio, except
 /// that removing the engine's own current row loads its replacement paused.
 pub(crate) enum EngineOp<'a> {
-    Restore { queue: &'a [Track], index: usize, position_ms: u32, context: &'a str },
+    Restore { queue: &'a [Track], index: usize, position_ms: u32, context: &'a str, automatic: bool },
     Cursor { index: usize, position_ms: u32 },
     Add(&'a Track, &'a str),
     AddBatch(&'a [Track], &'a str),
@@ -865,7 +865,7 @@ impl Core {
 
     async fn play_queue<H: Host>(&self, host: &H, queue: Vec<Track>, index: usize, context: String, automatic: bool) -> Result<(), String> {
         if queue.is_empty() {
-            let view = host.engine(Some(EngineOp::Restore { queue: &queue, index: 0, position_ms: 0, context: &context })).await?;
+            let view = host.engine(Some(EngineOp::Restore { queue: &queue, index: 0, position_ms: 0, context: &context, automatic: false })).await?;
             {
                 let mut guard = self.remote.lock();
                 let remote = guard.as_mut().ok_or(RELEASED)?;
@@ -893,7 +893,7 @@ impl Core {
                 .ok_or("No eligible tracks remain for automatic playback")?
         } else { index };
         validate_remote_track(&queue[index])?;
-        let view = host.engine(Some(EngineOp::Restore { queue: &queue, index, position_ms: 0, context: &context })).await?;
+        let view = host.engine(Some(EngineOp::Restore { queue: &queue, index, position_ms: 0, context: &context, automatic })).await?;
         let current = {
             let mut guard = self.remote.lock();
             let remote = guard.as_mut().ok_or(RELEASED)?;
@@ -1663,7 +1663,7 @@ impl Host for AppHost<'_> {
         let mut lines = self.client.subscribe_lines();
         match op {
             None => {}
-            Some(EngineOp::Restore { queue, index, position_ms, context }) => self.client.restore_queue(queue, index, position_ms, context).await?,
+            Some(EngineOp::Restore { queue, index, position_ms, context, automatic }) => self.client.restore_queue(queue, index, position_ms, context, automatic).await?,
             Some(EngineOp::Cursor { index, position_ms }) => self.client.set_queue_cursor(index, position_ms).await?,
             Some(EngineOp::Add(track, context)) => self.client.add_queue(track, context).await?,
             Some(EngineOp::AddBatch(tracks, context)) => self.client.add_queue_batch(tracks, context).await?,

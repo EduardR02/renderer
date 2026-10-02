@@ -2262,11 +2262,11 @@ export const api = {
     });
   },
   /**
-   * `automaticStart` marks a queue start that must respect the playlist's
-   * skip preference: the engine begins at `index` only when that row is not
-   * excluded (the caller picks an included row; see PlaylistView) and then
-   * advances past excluded rows. Direct plays — a clicked row, a search hit —
-   * keep the default false and play exactly what was asked for.
+   * `automaticStart` respects playlist skips and unavailable rows. With shuffle
+   * enabled the engine chooses a random eligible starting row; otherwise it
+   * starts at the first eligible row at or after `index`, wrapping once.
+   * Direct plays — a clicked row, a search hit — keep the default false and
+   * play exactly what was asked for, even with shuffle enabled.
    */
   playQueue: (queue, index, context = "", { automaticStart = false } = {}) => {
     clearLazyQueue();

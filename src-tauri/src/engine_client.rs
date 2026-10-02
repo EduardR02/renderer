@@ -1230,6 +1230,7 @@ impl EngineClient {
         index: usize,
         position_ms: u32,
         context: &str,
+        automatic_start: bool,
     ) -> Result<(), String> {
         let result = self
             .request(
@@ -1239,6 +1240,7 @@ impl EngineClient {
                     "index": index,
                     "position_ms": position_ms,
                     "context": context,
+                    "automatic_start": automatic_start,
                 }),
             )
             .await

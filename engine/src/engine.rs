@@ -2091,6 +2091,7 @@ impl Engine {
                 preview_lease_id,
                 only_if_preview,
                 resume_playing,
+                automatic_start,
             } => self.restore_queue(
                 queue,
                 index,
@@ -2099,6 +2100,7 @@ impl Engine {
                 preview_lease_id,
                 only_if_preview,
                 resume_playing,
+                automatic_start,
             ),
             Command::PreviewTrackEdit {
                 track,
@@ -2654,6 +2656,26 @@ impl Engine {
             false,
         )
     }
+
+    /// Automatic shuffle starts draw their current row from the same filtered
+    /// Fisher–Yates bag as the rest of playback, rather than fixing it first.
+    fn install_queue_start(
+        &mut self,
+        queue: Vec<TrackRef>,
+        current: Option<usize>,
+        automatic_start: bool,
+    ) -> Option<usize> {
+        self.state.queue = queue;
+        self.rows_changed();
+        let draw_first = automatic_start && self.state.shuffle;
+        self.state.current_index = if draw_first { None } else { current };
+        self.rebuild_shuffle_pool();
+        if draw_first {
+            self.state.current_index = self.shuffle_pool.pop();
+        }
+        self.state.current_index
+    }
+
     /// Installs queue rows whose `effective_edit` values are already final.
     /// Preview uses this path so its draft is never resolved against the
     /// persisted edit store.
@@ -2699,9 +2721,9 @@ impl Engine {
             self.leave_preview_mode();
         }
 
-        self.state.queue = queue;
-        self.rows_changed();
-        self.state.current_index = Some(playable_index);
+        let playable_index = self
+            .install_queue_start(queue, Some(playable_index), automatic_start)
+            .expect("validated queue has an eligible starting row");
         self.state.duration_ms = self.state.queue[playable_index].duration_ms;
         let position_ms = if playable_index == index {
             position_ms
@@ -2714,7 +2736,6 @@ impl Engine {
         }
         self.clear_error();
         self.history.clear();
-        self.rebuild_shuffle_pool();
         // The first load starts a fresh pacing window for subsequent
         // command-driven changes.
         self.last_track_change = Some(Instant::now());
@@ -2734,6 +2755,7 @@ impl Engine {
         preview_lease_id: u64,
         only_if_preview: bool,
         resume_playing: bool,
+        automatic_start: bool,
     ) -> Result<bool, String> {
         // A preview teardown can race with a real queue command. Once the
         // latter wins, this stale restore must not even validate or resolve
@@ -2764,12 +2786,12 @@ impl Engine {
         self.invalidate_audio_signals();
         let playable_index = if queue.is_empty() {
             None
+        } else if automatic_start {
+            first_automatic_wrapping(&queue, index, &self.track_edits)
         } else {
             first_available_wrapping(&queue, index)
         };
-        self.state.queue = queue;
-        self.rows_changed();
-        self.state.current_index = playable_index;
+        let playable_index = self.install_queue_start(queue, playable_index, automatic_start);
         self.state.duration_ms = playable_index
             .map(|current| self.state.queue[current].duration_ms)
             .unwrap_or(0);
@@ -2784,7 +2806,6 @@ impl Engine {
         // take the message that says why there is no sound with it.
         self.clear_error();
         self.history.clear();
-        self.rebuild_shuffle_pool();
         self.play_request_id = None;
         self.loop_decoder_eof = false;
         self.loop_jump_pending = false;
@@ -4757,7 +4778,7 @@ mod tests {
         };
 
         engine
-            .restore_queue(vec![song, episode], 0, 0, String::new(), 0, false, false)
+            .restore_queue(vec![song, episode], 0, 0, String::new(), 0, false, false, false)
             .expect("restore mixed queue");
         assert!(engine.state.queue[0].cached);
         assert!(!engine.state.queue[1].cached);
@@ -5571,7 +5592,7 @@ mod tests {
         ];
 
         assert_eq!(
-            engine.restore_queue(queue, 0, 42_000, String::new(), 0, false, false),
+            engine.restore_queue(queue, 0, 42_000, String::new(), 0, false, false, false),
             Ok(true)
         );
         assert_eq!(engine.state.current_index, Some(1));
@@ -5602,6 +5623,7 @@ mod tests {
             1,
             true,
             true,
+            false,
         );
 
         assert_eq!(result, Ok(false));
@@ -5627,6 +5649,7 @@ mod tests {
             String::new(),
             11,
             true,
+            false,
             false,
         );
 
@@ -5668,6 +5691,7 @@ mod tests {
                 String::new(),
                 2,
                 true,
+                false,
                 false,
             ),
             Ok(true)
@@ -5711,6 +5735,7 @@ mod tests {
                 1,
                 true,
                 false,
+                false,
             )
             .expect_err("out-of-range restore index must be rejected");
 
@@ -5733,7 +5758,7 @@ mod tests {
         // queue and reports the failed resume in state instead of reviving
         // the editor preview.
         assert_eq!(
-            engine.restore_queue(vec![track], 0, 42_000, String::new(), 1, true, true),
+            engine.restore_queue(vec![track], 0, 42_000, String::new(), 1, true, true, false),
             Ok(true)
         );
         assert!(!engine.preview_mode);
@@ -6018,6 +6043,85 @@ mod tests {
     }
 
     #[test]
+    fn automatic_shuffle_start_draws_from_all_eligible_rows() {
+        let queue = vec![
+            contextual_track(QUEUE_IDS[0], "playlist:playlist"),
+            contextual_track(QUEUE_IDS[1], "playlist:playlist"),
+            unavailable_track(QUEUE_IDS[2]),
+            contextual_track(QUEUE_IDS[3], "playlist:playlist"),
+        ];
+        let (directory, store) = store_with_exclusions(&[("playlist", QUEUE_IDS[1])]);
+        drop(store);
+
+        for (seed, expected) in [(1, 3), (2, 0)] {
+            let (mut engine, _) = test_engine_in(directory.path().to_path_buf());
+            engine.state.shuffle = true;
+            engine.random_state = seed;
+            assert!(
+                engine
+                    .play_queue_with_automatic_start(
+                        queue.clone(), 0, 0, "playlist:playlist".to_owned(), true,
+                    )
+                    .is_err(),
+                "the capture engine has no player"
+            );
+            assert_eq!(engine.state.current_index, Some(expected));
+            assert_eq!(engine.upcoming_indices(), vec![3 - expected]);
+            assert_shuffle_pool_invariants(&engine);
+
+            let (mut paused, _) = test_engine_in(directory.path().to_path_buf());
+            paused.state.shuffle = true;
+            paused.random_state = seed;
+            paused
+                .restore_queue(
+                    queue.clone(), 0, 0, "playlist:playlist".to_owned(),
+                    0, false, false, true,
+                )
+                .expect("remote queue installs without loading local audio");
+            assert_eq!(paused.state.current_index, Some(expected));
+            assert_eq!(paused.upcoming_indices(), vec![3 - expected]);
+            assert!(!paused.state.playing);
+            assert_shuffle_pool_invariants(&paused);
+
+            paused
+                .restore_queue(
+                    queue.clone(), 1, 12_000, "playlist:playlist".to_owned(),
+                    0, false, false, false,
+                )
+                .expect("snapshot restore preserves its explicit row");
+            assert_eq!(paused.state.current_index, Some(1));
+            assert_eq!(paused.state.position_ms, 12_000);
+        }
+    }
+
+    #[test]
+    fn automatic_shuffle_start_handles_zero_or_one_eligible_row() {
+        let (directory, store) =
+            store_with_exclusions(&[("playlist", QUEUE_IDS[0])]);
+        drop(store);
+        for has_eligible in [false, true] {
+            let mut queue = vec![
+                contextual_track(QUEUE_IDS[0], "playlist:playlist"),
+                unavailable_track(QUEUE_IDS[1]),
+            ];
+            if has_eligible {
+                queue.push(contextual_track(QUEUE_IDS[2], "playlist:playlist"));
+            }
+            let (mut engine, _) = test_engine_in(directory.path().to_path_buf());
+            engine.state.shuffle = true;
+            engine
+                .restore_queue(
+                    queue, 0, 0, "playlist:playlist".to_owned(),
+                    0, false, false, true,
+                )
+                .expect("automatic paused start handles an exhausted queue");
+            assert_eq!(engine.state.current_index, has_eligible.then_some(2));
+            assert!(engine.upcoming_indices().is_empty());
+            assert!(!engine.state.playing);
+        }
+    }
+
+    #[test]
     fn automatic_start_skips_excluded_but_direct_play_and_index_accept_it() {
         let excluded_id = "0abcdefghijklmnopqrstu";
         let queue = vec![
@@ -6047,6 +6151,7 @@ mod tests {
         );
 
         let (mut direct_engine, _) = test_engine_in(directory.path().to_path_buf());
+        direct_engine.state.shuffle = true;
         assert!(
             direct_engine
                 .play_queue(queue.clone(), 0, 12_000, "playlist:playlist".to_owned())
@@ -6872,7 +6977,7 @@ mod tests {
         let (mut engine, _) = test_engine_in(directory.path().to_path_buf());
 
         assert_eq!(
-            engine.restore_queue(queue, 0, 42_000, String::new(), 0, false, false),
+            engine.restore_queue(queue, 0, 42_000, String::new(), 0, false, false, false),
             Ok(true)
         );
         assert_eq!(
@@ -8115,7 +8220,7 @@ mod tests {
         };
         let queue = vec![song, episode_ref("2abcdefghijklmnopqrstu", 300_000)];
         assert_eq!(
-            engine.restore_queue(queue, 1, 60_000, String::new(), 0, false, false),
+            engine.restore_queue(queue, 1, 60_000, String::new(), 0, false, false, false),
             Ok(true)
         );
         assert_eq!(engine.state.playback_speed(), 1.75);
@@ -8874,7 +8979,7 @@ mod tests {
         };
 
         engine
-            .restore_queue(vec![track], 0, 10_000, String::new(), 0, false, false)
+            .restore_queue(vec![track], 0, 10_000, String::new(), 0, false, false, false)
             .expect("restore");
         assert_eq!(
             engine.state.position_ms, 60_000,

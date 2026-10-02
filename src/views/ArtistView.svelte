@@ -552,10 +552,14 @@
     if (top.length) api.playQueue(top, i, `artist:${artist?.id ?? ""}`).catch(() => {});
   }
 
-  function shuffleTop() {
+  async function shuffleTop() {
     if (!top.length) return;
-    api.setShuffle(true).catch(() => {});
-    api.playQueue(top, 0, `artist:${artist?.id ?? ""}`).catch(() => {});
+    const queue = top;
+    const source = `artist:${artist?.id ?? ""}`;
+    try {
+      await api.setShuffle(true);
+      await api.playQueue(queue, 0, source, { automaticStart: true });
+    } catch {}
   }
 
   function openArtistRadio() {

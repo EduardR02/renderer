@@ -162,9 +162,9 @@ pub enum Command {
         position_ms: u32,
         #[serde(default)]
         context: String,
-        /// When true, choose the first eligible row at or after `index`,
-        /// wrapping once. Header Play/Shuffle uses this automatic path;
-        /// direct row playback leaves it false.
+        /// When true, respect exclusions and choose a random eligible row if
+        /// shuffle is enabled; otherwise choose the first eligible row at or
+        /// after `index`, wrapping once. Direct row playback leaves it false.
         #[serde(default)]
         automatic_start: bool,
     },
@@ -177,6 +177,10 @@ pub enum Command {
         position_ms: u32,
         #[serde(default)]
         context: String,
+        /// Automatic starts use the same eligibility and shuffle selection as
+        /// PlayQueue. Snapshot and preview restores leave this false.
+        #[serde(default)]
+        automatic_start: bool,
         /// The editor preview lease this restore is allowed to tear down.
         ///
         /// Startup restores omit this field and retain the original

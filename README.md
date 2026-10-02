@@ -70,6 +70,8 @@ removed by drag and drop or in bulk by rules (artist, album, title, length),
 with a preview of exactly which entries go. Playlists can be pinned to the top
 of the library, and folders are kept.
 
+Drag and drop songs to add to a playlist or reorder them.
+
 Some extra things I added because we control playback here:
 
 - Paste a shared Spotify link (song, album, artist, playlist, podcast, episode
