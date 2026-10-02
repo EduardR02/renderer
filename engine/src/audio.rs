@@ -916,12 +916,36 @@ impl OutputStatus {
     }
 }
 
+/// A native output stream that is built on the detached opener thread, kept by
+/// the player thread, and paused or dropped from whichever thread stops the sink.
+///
+/// cpal 0.16 declares its CoreAudio `Stream` `!Send` only by omission: the boxed
+/// closure of its device-disconnect listener has no `Send` bound. Everything
+/// that closure captures is `Send` (a `Weak` of the mutex-guarded stream state
+/// and an `Arc<Mutex<_>>` of the `Send` error callback), `AudioUnit` is `Send`,
+/// and CoreAudio already invokes the closure from its own thread, so moving the
+/// stream between threads adds no new access. cpal 0.17 makes this official.
+/// Other platforms keep the compiler-checked `Send`.
+struct OutputStream(cpal::Stream);
+
+#[cfg(target_os = "macos")]
+// SAFETY: see the type's documentation; the stream state is mutex-guarded.
+unsafe impl Send for OutputStream {}
+
+impl std::ops::Deref for OutputStream {
+    type Target = cpal::Stream;
+
+    fn deref(&self) -> &cpal::Stream {
+        &self.0
+    }
+}
+
 #[derive(Default)]
 struct OutputControl {
-    stream: Mutex<Option<cpal::Stream>>,
+    stream: Mutex<Option<OutputStream>>,
     status: Arc<OutputStatus>,
     error: Mutex<Option<String>>,
-    pending: Mutex<Option<std::sync::mpsc::Sender<Result<(cpal::Stream, cpal::SupportedStreamConfig), OutputError>>>>,
+    pending: Mutex<Option<std::sync::mpsc::Sender<Result<(OutputStream, cpal::SupportedStreamConfig), OutputError>>>>,
 }
 
 impl OutputControl {
@@ -1204,7 +1228,7 @@ fn create_stream(
     ring: &Arc<SampleRing>,
     status: &Arc<OutputStatus>,
     attempt: u64,
-) -> Result<(cpal::Stream, cpal::SupportedStreamConfig), OutputError> {
+) -> Result<(OutputStream, cpal::SupportedStreamConfig), OutputError> {
     let device = host.default_output_device().ok_or(OutputError::NoDeviceAvailable)?;
     let requested = match format {
         AudioFormat::F64 => cpal::SampleFormat::F64,
@@ -1235,8 +1259,8 @@ fn create_stream(
         }
     };
     match build(&preferred) {
-        Ok(stream) => Ok((stream, preferred)),
-        Err(_) if preferred != default => Ok((build(&default)?, default)),
+        Ok(stream) => Ok((OutputStream(stream), preferred)),
+        Err(_) if preferred != default => Ok((OutputStream(build(&default)?), default)),
         Err(error) => Err(error),
     }
 }
