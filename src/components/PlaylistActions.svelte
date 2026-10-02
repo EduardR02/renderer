@@ -14,6 +14,7 @@
   import { isPinned, togglePin } from "../lib/pins.svelte.js";
   import { spotifyLink } from "../lib/spotify-link.js";
   import CopyLinkItem from "./CopyLinkItem.svelte";
+  import Icon from "./Icon.svelte";
 
   /**
    * THE playlist menu: the items of the playlist header's "…" and of the
@@ -51,16 +52,16 @@
 </script>
 
 {#if pinnable}
-  <button class="menu-item" role="menuitem" onclick={pin}>{isPinned(id) ? "Unpin" : "Pin to top"}</button>
+  <button class="menu-item" role="menuitem" onclick={pin}><Icon name="pin-line" size={16} />{isPinned(id) ? "Unpin" : "Pin to top"}</button>
 {/if}
 {#if editable}
-  <button class="menu-item" role="menuitem" onclick={() => run("rename", onRename)}>Rename…</button>
-  <button class="menu-item" role="menuitem" disabled={!count} onclick={() => run("cleanup", onCleanup)}>Remove songs by rules…</button>
+  <button class="menu-item" role="menuitem" onclick={() => run("rename", onRename)}><Icon name="pencil" size={16} />Rename…</button>
+  <button class="menu-item" role="menuitem" disabled={!count} onclick={() => run("cleanup", onCleanup)}><Icon name="filter" size={16} />Remove songs by rules…</button>
 {/if}
 {#if !liked}
   <CopyLinkItem link={spotifyLink("playlist", id)} {close} />
 {/if}
 {#if editable}
   <div class="menu-sep" role="separator"></div>
-  <button class="menu-item danger" role="menuitem" onclick={() => run("delete", onDelete)}>Delete playlist…</button>
+  <button class="menu-item danger" role="menuitem" onclick={() => run("delete", onDelete)}><Icon name="trash" size={16} />Delete playlist…</button>
 {/if}

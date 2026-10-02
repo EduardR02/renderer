@@ -152,6 +152,7 @@ pub fn run() {
             commands::set_launch_at_login,
             commands::set_start_minimized,
             commands::set_animated_canvas,
+            commands::enable_account_canvas,
             commands::touch_playlist,
             commands::touch_playlist_activity,
             commands::get_track_playlists,

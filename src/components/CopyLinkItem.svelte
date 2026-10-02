@@ -1,15 +1,16 @@
 <script>
   import { writeClipboard } from "../lib/spotify-link.js";
+  import Icon from "./Icon.svelte";
 
   /**
    * "Copy link", the one item every shareable thing's menu carries.
    *
    * The confirmation lives on the item, which is why the menu does not close
    * on click: a copy with no feedback is indistinguishable from a dead
-   * control. A copy that landed closes the menu shortly after, through the
-   * menu's own close, so the trigger gets its focus back; a refused write
-   * stays up and says so — the item is also the retry. The item dies with its
-   * menu, and so do its state and its timer.
+   * control. A copy that landed turns its glyph into a foam check and closes
+   * the menu shortly after, through the menu's own close, so the trigger gets
+   * its focus back; a refused write stays up and says so — the item is also
+   * the retry. The item dies with its menu, and so do its state and its timer.
    */
   let { link, close } = $props();
 
@@ -34,5 +35,6 @@
   disabled={!link}
   onclick={copy}
 >
+  <Icon name={copied === "copied" ? "check" : "copy"} size={16} />
   {copied === "copied" ? "Link copied" : copied === "failed" ? "Copy failed" : "Copy link"}
 </button>

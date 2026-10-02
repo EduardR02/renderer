@@ -342,7 +342,7 @@
             <HeaderMenu label="Episode actions">
               {#snippet children(close)}
                 {#if data.show_id}
-                  <button class="menu-item" role="menuitem" onclick={() => { close(); navigate("show", data.show_id); }}>Go to podcast</button>
+                  <button class="menu-item" role="menuitem" onclick={() => { close(); navigate("show", data.show_id); }}><Icon name="podcast" size={16} />Go to podcast</button>
                 {/if}
                 <CopyLinkItem link={spotifyLink("episode", record.id)} {close} />
               {/snippet}
@@ -509,7 +509,7 @@
 {#if rowMenu}
   <Menu anchor={rowMenu.anchor} align="end" label="Episode actions" onclose={() => (rowMenu = null)}>
     {#snippet children(close)}
-      <button class="menu-item" role="menuitem" onclick={() => { const id = rowMenu.episode.track.id; close(); navigate("episode", id); }}>Open episode</button>
+      <button class="menu-item" role="menuitem" onclick={() => { const id = rowMenu.episode.track.id; close(); navigate("episode", id); }}><Icon name="episode" size={16} />Open episode</button>
       <CopyLinkItem link={spotifyLink("episode", rowMenu.episode.track.id)} {close} />
     {/snippet}
   </Menu>

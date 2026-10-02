@@ -2211,11 +2211,10 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   align-items: center; gap: var(--s5);
   height: 100%; padding: 0 var(--s5);
 }
-/* A narrower bar lets go of the queue first (the rail has Queue) and
-   shortens the volume rail; a genuinely narrow one folds the identity to
-   its cover and the volume to its mute button, and draws the transport in. */
+/* A narrower bar shortens the volume rail first; a genuinely narrow one
+   folds the identity to its cover and the volume to its mute button, and
+   draws the transport in. */
 @container player (max-width: 900px) {
-  .p-queue { display: none; }
   .p-body .vol { width: 64px; }
 }
 @container player (max-width: 680px) {
@@ -2390,14 +2389,23 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    a refused one takes the failure colour, so the two never read alike. */
 .menu-item.done { color: var(--accent); }
 .menu-item.failed { color: var(--love); }
-/* A state on an item — the heart of Liked Songs, the active device — sits at
-   the item's far end, in a fixed slot, so nothing moves when it lands. */
-.menu-item .mark { margin-left: auto; flex: none; display: grid; place-items: center; color: var(--fg-3); }
-.menu-item .mark.on { color: var(--rose-ink); }
-.menu-item[aria-busy="true"] .mark { opacity: 0.45; }
-.menu-item > .icon:first-child { color: var(--fg-2); }
+/* An action menu leads every item with its glyph, 16px in --fg-3, in one
+   column: the labels line up, and the eye finds an item by its shape before
+   it reads the word. The glyph comes up with its label under the pointer or
+   the focus, and wears the item's own colour when it has one — the love of
+   a destructive act, the foam of a copy that landed. A liked song's heart is
+   rose: it is a statement about what is yours, not only a shape. A pure list
+   (the playlist and artist pickers, an order to choose) has no glyphs. */
+.menu-item > .icon:first-child { color: var(--fg-3); transition: color var(--d1) var(--ease), opacity var(--d1) var(--ease); }
 .menu-item:hover:not(:disabled) > .icon:first-child,
-.menu-item:focus-visible > .icon:first-child { color: var(--fg); }
+.menu-item:focus-visible > .icon:first-child,
+.menu-item:is(.danger, .done, .failed) > .icon:first-child { color: inherit; }
+.menu-item.liked > .icon:first-child { color: var(--rose-ink); }
+.menu-item[aria-busy="true"] > .icon:first-child { opacity: 0.45; }
+/* A state on an item — a chosen order, an active device — and the chevron
+   of an item that opens a submenu sit at the item's far end, in a fixed
+   slot, so nothing moves when they land. */
+.menu-item :is(.mark, .chev) { margin-left: auto; flex: none; display: grid; place-items: center; color: var(--fg-3); }
 .menu-item.danger:hover:not(:disabled),
 .menu-item.danger:focus-visible { background: var(--danger-wash); color: var(--love); }
 .menu-sep { height: 1px; margin: var(--s1) var(--s3); background: rgba(255, 255, 255, 0.08); }

@@ -1160,7 +1160,11 @@ pub struct PlaybackState {
     pub shuffle: bool,
     /// One of `off`, `context`, `track`.
     pub repeat: String,
+    /// The current item's speed: its kind's, of the two below.
     pub playback_speed: f32,
+    /// Remembered apart for songs and podcast episodes, and persisted.
+    pub track_speed: f32,
+    pub episode_speed: f32,
     pub audible_playback_speed: f32,
     pub current_index: Option<usize>,
     #[serde(deserialize_with = "string_or_default")]
@@ -1211,6 +1215,8 @@ impl Default for PlaybackState {
             shuffle: false,
             repeat: "off".to_owned(),
             playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
             audible_playback_speed: 1.0,
             current_index: None,
             current_uri: String::new(),

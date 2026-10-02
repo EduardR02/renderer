@@ -229,8 +229,14 @@ pub enum Command {
     SetRepeat {
         mode: RepeatMode,
     },
+    /// The speed of the current item's kind (songs or podcast episodes).
     SetPlaybackSpeed {
         speed: f32,
+    },
+    /// Both remembered speeds at once: the shell's restore of what it saved.
+    SetPlaybackSpeeds {
+        track_speed: f32,
+        episode_speed: f32,
     },
     AddQueue {
         track: TrackRef,
@@ -408,6 +414,11 @@ pub enum Command {
     BrowseCanvas {
         id: String,
     },
+    /// Turns the account's Canvas preference on when it is off, as the
+    /// official "Videos and Canvas" setting does; never turns it off.
+    /// Responded to with an `enable_account_canvas` message carrying whether
+    /// anything was written. Sent only when the listener turns Canvas on.
+    EnableAccountCanvas,
     /// Every artist this account follows, in one answer. Responded to with a
     /// `browse_followed_artists` message carrying an array of [`ArtistRef`].
     /// There is no cursor: the engine's `follow` module records why this read
@@ -1323,7 +1334,12 @@ pub struct StateEvent<'a> {
     pub volume: u8,
     pub shuffle: bool,
     pub repeat: RepeatMode,
+    /// The speed of the current item: `episode_speed` for a podcast episode,
+    /// `track_speed` for anything else.
     pub playback_speed: f32,
+    /// Remembered apart, and both persisted by the shell.
+    pub track_speed: f32,
+    pub episode_speed: f32,
     /// Rate of the audio currently reaching the output, which can trail a
     /// requested change until already-queued samples have drained.
     pub audible_playback_speed: f32,
@@ -1630,6 +1646,8 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Context,
             playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
             audible_playback_speed: 1.0,
             current_index: Some(0),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
@@ -1681,6 +1699,8 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
             audible_playback_speed: 1.0,
             current_index: Some(3),
             current_uri: Some("spotify:track:0123456789ABCDEFGHIJKL"),
@@ -1719,6 +1739,8 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
             audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,
@@ -2266,6 +2288,8 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
             audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,
@@ -2294,6 +2318,8 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
             audible_playback_speed: 1.0,
             current_index: None,
             current_uri: None,

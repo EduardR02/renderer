@@ -584,6 +584,14 @@ pub async fn browse_canvas(
     client.browse_canvas(&id).await
 }
 
+/// Turns Canvas on for the account, as the official "Videos and Canvas"
+/// setting does, when the account has it off. Asked for only when the
+/// listener turns Canvas on in Settings; turning it off stays local.
+#[tauri::command]
+pub async fn enable_account_canvas(client: State<'_, Arc<EngineClient>>) -> Result<bool, String> {
+    client.enable_account_canvas().await
+}
+
 // ---------------------------------------------------------------------------
 // Follow commands
 // ---------------------------------------------------------------------------
@@ -1585,7 +1593,7 @@ async fn restore_playback(client: &EngineClient, snapshot: &RestoreSnapshot) -> 
     client.set_volume(snapshot.volume).await?;
     client.set_shuffle(snapshot.shuffle).await?;
     client.set_repeat(&snapshot.repeat).await?;
-    client.set_playback_speed(snapshot.playback_speed).await?;
+    client.set_playback_speeds(snapshot.track_speed, snapshot.episode_speed).await?;
     let index = snapshot.current_index.unwrap_or(0);
     client
         .restore_queue(&snapshot.queue, index, snapshot.position_ms, "")

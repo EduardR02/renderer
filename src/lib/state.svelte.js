@@ -2365,6 +2365,9 @@ export const api = {
   setStartMinimized: (enabled) => mutateAppSettings("set_start_minimized", { enabled: !!enabled }),
   setAnimatedCanvas: (enabled) =>
     mutateAppSettings("set_animated_canvas", { enabled: !!enabled }),
+  /* Canvas is an account preference on Spotify's side; this turns it on there
+     when it is off. Resolves to whether anything was written. */
+  enableAccountCanvas: () => invoke("enable_account_canvas"),
   browseShow: (id) => invoke("browse_show", { id }),
   browseEpisode: (id) => invoke("browse_episode", { id }),
   browseProfile: (username) => invoke("browse_profile", { username }),

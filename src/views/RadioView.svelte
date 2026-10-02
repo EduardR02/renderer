@@ -224,10 +224,10 @@
             <HeaderMenu label="Radio actions">
               {#snippet children(close)}
                 {#if seedAlbumId}
-                  <button class="menu-item" role="menuitem" onclick={() => { close(); navigate("album", seedAlbumId); }}>Go to album</button>
+                  <button class="menu-item" role="menuitem" onclick={() => { close(); navigate("album", seedAlbumId); }}><Icon name="album" size={16} />Go to album</button>
                 {/if}
                 {#if seedArtistId}
-                  <button class="menu-item" role="menuitem" onclick={() => { close(); navigateArtist(seedArtistId, seedArtistName); }}>Go to artist</button>
+                  <button class="menu-item" role="menuitem" onclick={() => { close(); navigateArtist(seedArtistId, seedArtistName); }}><Icon name="artist" size={16} />Go to artist</button>
                 {/if}
               {/snippet}
             </HeaderMenu>

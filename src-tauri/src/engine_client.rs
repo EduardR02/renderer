@@ -134,7 +134,8 @@ pub struct RestoreSnapshot {
     pub volume: u8,
     pub shuffle: bool,
     pub repeat: String,
-    pub playback_speed: f32,
+    pub track_speed: f32,
+    pub episode_speed: f32,
     pub resume_playing: bool,
 }
 
@@ -165,7 +166,8 @@ impl RestoreSnapshot {
             volume: state.volume,
             shuffle: state.shuffle,
             repeat: state.repeat.clone(),
-            playback_speed: state.playback_speed,
+            track_speed: state.track_speed,
+            episode_speed: state.episode_speed,
             resume_playing,
         }
         .normalized()
@@ -179,7 +181,8 @@ impl RestoreSnapshot {
             volume: snapshot.volume,
             shuffle: snapshot.shuffle,
             repeat: snapshot.repeat,
-            playback_speed: snapshot.playback_speed,
+            track_speed: snapshot.track_speed,
+            episode_speed: snapshot.episode_speed,
             resume_playing: false,
         }
         .normalized()
@@ -230,7 +233,8 @@ impl RestoreSnapshot {
             && state.volume == self.volume
             && state.shuffle == self.shuffle
             && state.repeat == self.repeat
-            && state.playback_speed == self.playback_speed
+            && state.track_speed == self.track_speed
+            && state.episode_speed == self.episode_speed
             && state.playing == self.resume_playing
             && position_matches
     }
@@ -243,7 +247,8 @@ impl RestoreSnapshot {
         state.volume = self.volume;
         state.shuffle = self.shuffle;
         state.repeat = self.repeat.clone();
-        state.playback_speed = self.playback_speed;
+        state.track_speed = self.track_speed;
+        state.episode_speed = self.episode_speed;
         PlaybackSnapshot::from_playback(&state)
     }
 }
@@ -271,7 +276,8 @@ impl PersistedSnapshot {
         previous.volume != next.volume
             || previous.shuffle != next.shuffle
             || previous.repeat != next.repeat
-            || previous.playback_speed != next.playback_speed
+            || previous.track_speed != next.track_speed
+            || previous.episode_speed != next.episode_speed
             || self.queue_differs_from(next, queue_generation)
     }
 
@@ -1106,6 +1112,23 @@ impl EngineClient {
             .map(|_| ())
     }
 
+    /// Both remembered speeds, songs' and episodes', as a restore hands them
+    /// back; the engine applies whichever the current item's kind uses.
+    pub async fn set_playback_speeds(&self, track_speed: f32, episode_speed: f32) -> Result<(), String> {
+        if ![track_speed, episode_speed]
+            .iter()
+            .all(|speed| speed.is_finite() && (0.5..=4.0).contains(speed))
+        {
+            return Err("playback speed must be between 0.5 and 4.0".to_owned());
+        }
+        self.request(
+            "set_playback_speeds",
+            json!({"track_speed": track_speed, "episode_speed": episode_speed}),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn play_queue(
         &self,
         queue: &[Track],
@@ -1555,6 +1578,13 @@ impl EngineClient {
     ) -> Result<Option<renderer_engine::protocol::Canvas>, String> {
         let reply = self.request("browse_canvas", json!({"id": id})).await?;
         parse_data(reply, "browse_canvas")
+    }
+
+    /// Turns the account's Canvas preference on when it is off; answers
+    /// whether anything was written.
+    pub async fn enable_account_canvas(&self) -> Result<bool, String> {
+        let reply = self.request("enable_account_canvas", json!({})).await?;
+        parse_data(reply, "enable_account_canvas")
     }
 
     pub async fn track_edit_status(
@@ -2757,6 +2787,17 @@ mod tests {
             !written.playhead_differs_from(&paused_elsewhere),
             "a volume change is not a playhead move, however small its drift"
         );
+
+        // The speed the bar does not show right now — episodes', while a song
+        // plays — is persisted as soon as it changes too.
+        let mut episodes_faster = state.clone();
+        episodes_faster.episode_speed = 1.5;
+        assert!(
+            written.differs_structurally_from(&episodes_faster, 7),
+            "either kind's speed is worth a write"
+        );
+        let rewritten = PlaybackSnapshot::from_playback(&episodes_faster);
+        assert_eq!((rewritten.track_speed, rewritten.episode_speed), (1.0, 1.5));
     }
 
     /// The deadline arm's split, as the writer sees it: a heartbeat that has

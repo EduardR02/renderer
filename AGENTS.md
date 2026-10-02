@@ -42,3 +42,7 @@ There is no requirement to preserve old internal APIs, cache formats, persisted 
 If something can be removed and done better, remove it. Migrate callers and delete the old path. Do not leave shims, aliases, deprecated exports, fallback implementations, or parallel systems “just in case.” Favor the cleanest current design over historical accidents.
 
 Leave unrelated user work untouched.
+
+## UI harness
+
+`dev/ui-harness.html` runs the frontend in a browser. With `?real` it reads the owner's actual library from the running app instead of fixtures: quit the app, start `bun run dev --host 127.0.0.1` (a plain `bun run dev` binds only `::1`), run `bun dev/real-app.js`, then open `http://127.0.0.1:1420/dev/ui-harness.html?real`. Playback there is simulated and account writes are refused. That app copy opens a local debugging port any program can use to control it, so close it when done. Keep `dev/.real-cache/` (account data) out of commits and public screenshots.

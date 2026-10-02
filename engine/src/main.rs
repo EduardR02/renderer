@@ -487,6 +487,11 @@ async fn run(
                                     browse::canvas_browse(&session, &id).await
                                 });
                             }
+                            Command::EnableAccountCanvas => {
+                                spawn_browse(&engine, request_id, "enable_account_canvas", move |session| async move {
+                                    browse::enable_account_canvas(&session).await
+                                });
+                            }
                             Command::BrowseSearch { query, limit } => {
                                 spawn_browse(&engine, request_id, "browse_search", move |session| async move {
                                     browse::search_browse(&session, &query, limit).await

@@ -954,7 +954,7 @@
       <FollowPill {artist} />
       <HeaderMenu label="Artist actions">
         {#snippet children(close)}
-          <button class="menu-item" role="menuitem" disabled={!artist?.id} onclick={() => { close(); openArtistRadio(); }}>Go to artist radio</button>
+          <button class="menu-item" role="menuitem" disabled={!artist?.id} onclick={() => { close(); openArtistRadio(); }}><Icon name="radio" size={16} />Go to artist radio</button>
           <CopyLinkItem link={spotifyLink("artist", artist?.id)} {close} />
         {/snippet}
       </HeaderMenu>

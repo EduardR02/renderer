@@ -2822,6 +2822,92 @@ pub async fn canvas_browse(session: &Session, id: &str) -> Result<Option<Canvas>
     Ok(result)
 }
 
+/// The account preference the canvaz backend enforces for every client: the
+/// product-state key `canvas-disabled` ("1" withholds Canvas), which a Family
+/// plan manager can lock (`lock-canvas-disabled`). The official app's "Videos
+/// and Canvas" setting writes it, and this mirrors that write exactly: its
+/// `ProductStateWriter` PUTs the key and its new value to the spclient
+/// `clientsettings/api/v1/` endpoint as a `spotify.settingsapi.v1`
+/// `UpdateSettingRequest` (both read from the official desktop client).
+const CANVAS_DISABLED: &str = "canvas-disabled";
+const CANVAS_LOCKED: &str = "lock-canvas-disabled";
+const CLIENT_SETTINGS_ENDPOINT: &str = "/clientsettings/api/v1/";
+
+/// What turning Canvas on has to do to the account.
+#[derive(Debug, PartialEq, Eq)]
+enum AccountCanvas {
+    /// The session's product state says it is already on: nothing to write.
+    On,
+    /// The plan manager controls it; a write would be refused.
+    Locked,
+    /// Off, or not in the product state this session was given: write it on,
+    /// which is a no-op for an account that already has it.
+    Enable,
+}
+
+fn account_canvas(attributes: &HashMap<String, String>) -> AccountCanvas {
+    if attributes.get(CANVAS_LOCKED).is_some_and(|value| value == "1") {
+        AccountCanvas::Locked
+    } else if attributes.get(CANVAS_DISABLED).is_some_and(|value| value == "0") {
+        AccountCanvas::On
+    } else {
+        AccountCanvas::Enable
+    }
+}
+
+/// The official schema, from the descriptor in the desktop client:
+///
+/// ```text
+/// message SettingValue { string string_value = 4; }
+/// message UpdateSettingRequest {
+///   string setting_identifier = 1;
+///   SettingValue new_value = 2;
+/// }
+/// ```
+///
+/// Both strings are short product-state keys and values, so every length is
+/// a single varint byte.
+fn update_setting_request(identifier: &str, value: &str) -> Vec<u8> {
+    debug_assert!(identifier.len() < 0x80 && value.len() + 2 < 0x80);
+    let mut request = Vec::with_capacity(identifier.len() + value.len() + 6);
+    request.extend_from_slice(&[0x0a, identifier.len() as u8]);
+    request.extend_from_slice(identifier.as_bytes());
+    request.extend_from_slice(&[0x12, value.len() as u8 + 2, 0x22, value.len() as u8]);
+    request.extend_from_slice(value.as_bytes());
+    request
+}
+
+/// Turns the account's Canvas preference on, when it is off, the way the
+/// official app does. Never turns it off: hiding Canvas is a local choice.
+///
+/// Answers whether anything was written. A landed write updates this
+/// session's copy of the key and drops the cached Canvas answers, which
+/// were empty while the preference was off.
+pub async fn enable_account_canvas(session: &Session) -> Result<bool, String> {
+    match account_canvas(&session.user_data().attributes) {
+        AccountCanvas::On => return Ok(false),
+        AccountCanvas::Locked => return Err("Your plan manager controls Canvas for this account".to_owned()),
+        AccountCanvas::Enable => {}
+    }
+    let body = update_setting_request(CANVAS_DISABLED, "0");
+    // Setting a value is idempotent, so the reads' bounded retry of a server
+    // error suits this write too.
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-protobuf"));
+    spclient_read(|| async {
+        session.spclient().request(
+            &Method::PUT,
+            CLIENT_SETTINGS_ENDPOINT,
+            Some(headers.clone()),
+            Some(&body),
+        ).await
+    }).await
+        .map_err(|error| format!("Spotify refused the Canvas setting: {error}"))?;
+    session.set_user_attribute(CANVAS_DISABLED, "0");
+    clear_canvas_cache();
+    Ok(true)
+}
+
 const INITIAL_ARTIST_RELEASES: usize = 12;
 const MAX_ARTIST_RELEASE_PAGE: usize = 40;
 
@@ -6514,6 +6600,48 @@ mod tests {
             {"uri":"spotify:start-group:abc:Folder"},{"uri":"spotify:end-group:def"}
         ],"metaItems":[{},{}]}}"#;
         assert!(parse_rootlist_tree(malformed).is_err());
+    }
+
+    /// The Canvas write is the official app's, byte for byte: an
+    /// `UpdateSettingRequest` naming the product-state key, with the new value
+    /// as `SettingValue.string_value` (field 4). Turning Canvas on writes "0"
+    /// to `canvas-disabled`.
+    #[test]
+    fn the_canvas_setting_write_is_the_official_update_setting_request() {
+        let body = update_setting_request(CANVAS_DISABLED, "0");
+        let mut expected = vec![0x0a, 15];
+        expected.extend_from_slice(b"canvas-disabled");
+        expected.extend_from_slice(&[0x12, 3, 0x22, 1, b'0']);
+        assert_eq!(body, expected);
+        assert_eq!(CLIENT_SETTINGS_ENDPOINT, "/clientsettings/api/v1/");
+
+        // Read back with a generic wire walk: field 1 is the key, field 2 a
+        // message whose only field, 4, is the value.
+        assert_eq!(&body[2..17], b"canvas-disabled");
+        assert_eq!(body[17] >> 3, 2);
+        assert_eq!(body[19] >> 3, 4);
+        assert_eq!(body[19] & 7, 2);
+    }
+
+    /// Only an account whose preference is off — or a session that was not
+    /// told — is written to; one that has it on is left alone, and a plan
+    /// manager's lock is reported instead of attempted.
+    #[test]
+    fn turning_canvas_on_writes_only_when_the_account_preference_may_be_off() {
+        let attributes = |pairs: &[(&str, &str)]| {
+            pairs.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect::<HashMap<_, _>>()
+        };
+        assert_eq!(account_canvas(&attributes(&[("canvas-disabled", "0")])), AccountCanvas::On);
+        assert_eq!(account_canvas(&attributes(&[("canvas-disabled", "1")])), AccountCanvas::Enable);
+        assert_eq!(account_canvas(&attributes(&[])), AccountCanvas::Enable);
+        assert_eq!(
+            account_canvas(&attributes(&[("canvas-disabled", "1"), ("lock-canvas-disabled", "1")])),
+            AccountCanvas::Locked
+        );
+        assert_eq!(
+            account_canvas(&attributes(&[("canvas-disabled", "0"), ("lock-canvas-disabled", "0")])),
+            AccountCanvas::On
+        );
     }
 
     #[test]

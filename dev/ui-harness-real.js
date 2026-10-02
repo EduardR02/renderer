@@ -38,6 +38,7 @@ const LOCAL_MOCK = new Set([
   "move_queue",
   "clear_queue",
   "set_animated_canvas",
+  "enable_account_canvas",
   "login",
   "logout",
 ]);
@@ -109,6 +110,10 @@ export async function createRealMode(h) {
     shuffle: Boolean(seeded.shuffle),
     repeat: seeded.repeat ?? "off",
     playback_speed: seeded.playback_speed ?? 1,
+    // The webview is only told the current item's speed; the harness starts
+    // both kinds there.
+    track_speed: seeded.track_speed ?? seeded.playback_speed ?? 1,
+    episode_speed: seeded.episode_speed ?? seeded.playback_speed ?? 1,
     audible_playback_speed: seeded.audible_playback_speed ?? 1,
     queue: clone(seeded.queue ?? []),
     error: available ? seeded.error || "" : `Real account state unavailable: ${boot.error || "start the native app with its DevTools bridge."}`,

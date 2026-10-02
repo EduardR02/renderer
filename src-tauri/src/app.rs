@@ -58,7 +58,8 @@ impl Default for AppSettings {
     }
 }
 
-pub const PLAYBACK_STATE_VERSION: u32 = 3;
+/// Version 4 remembers the speed apart for songs and podcast episodes.
+pub const PLAYBACK_STATE_VERSION: u32 = 4;
 
 /// Version of the playhead sidecar. Versioned apart from the snapshot it
 /// refines: the two files are written on different cadences and either can be
@@ -81,7 +82,8 @@ pub struct PlaybackSnapshot {
     pub volume: u8,
     pub shuffle: bool,
     pub repeat: String,
-    pub playback_speed: f32,
+    pub track_speed: f32,
+    pub episode_speed: f32,
 }
 
 impl PlaybackSnapshot {
@@ -102,7 +104,8 @@ impl PlaybackSnapshot {
             volume: state.volume,
             shuffle: state.shuffle,
             repeat: state.repeat.clone(),
-            playback_speed: state.playback_speed,
+            track_speed: state.track_speed,
+            episode_speed: state.episode_speed,
         }
     }
 
@@ -110,8 +113,9 @@ impl PlaybackSnapshot {
         self.version == PLAYBACK_STATE_VERSION
             && self.volume <= 100
             && matches!(self.repeat.as_str(), "off" | "context" | "track")
-            && self.playback_speed.is_finite()
-            && (0.5..=4.0).contains(&self.playback_speed)
+            && [self.track_speed, self.episode_speed]
+                .iter()
+                .all(|speed| speed.is_finite() && (0.5..=4.0).contains(speed))
             && self
                 .current_index
                 .is_none_or(|index| index < self.queue.len())
@@ -1365,7 +1369,8 @@ mod tests {
             volume: 37,
             shuffle: true,
             repeat: "context".to_owned(),
-            playback_speed: 1.25,
+            track_speed: 1.25,
+            episode_speed: 1.5,
         };
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
         assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
@@ -1379,8 +1384,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Songs and episodes keep their own speed across a restart, and either
+    /// one out of range rejects the file rather than restoring half of it.
     #[test]
-    fn mixed_episode_queue_restores_at_four_times_speed() {
+    fn mixed_episode_queue_restores_each_kinds_speed() {
         let dir = std::env::temp_dir().join(format!(
             "renderer-episode-playback-state-{}-{}",
             std::process::id(),
@@ -1402,19 +1409,27 @@ mod tests {
             volume: 37,
             shuffle: false,
             repeat: "off".to_owned(),
-            playback_speed: 4.0,
+            track_speed: 1.0,
+            episode_speed: 4.0,
         };
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
-        assert_eq!(load_playback_snapshot_from(&dir), Some(snapshot.clone()));
+        let loaded = load_playback_snapshot_from(&dir).expect("the snapshot restores");
+        assert_eq!((loaded.track_speed, loaded.episode_speed), (1.0, 4.0));
+        assert_eq!(loaded, snapshot);
         for speed in [0.5, 1.0, 3.0, 4.0] {
-            snapshot.playback_speed = speed;
+            snapshot.track_speed = speed;
+            snapshot.episode_speed = speed;
             assert!(snapshot.is_valid(), "valid speed {speed} must restore");
         }
         for speed in [0.49, 4.01, f32::NAN, f32::INFINITY] {
-            snapshot.playback_speed = speed;
-            assert!(!snapshot.is_valid(), "invalid speed {speed} must be rejected");
+            snapshot.track_speed = speed;
+            snapshot.episode_speed = 1.0;
+            assert!(!snapshot.is_valid(), "invalid song speed {speed} must be rejected");
+            snapshot.track_speed = 1.0;
+            snapshot.episode_speed = speed;
+            assert!(!snapshot.is_valid(), "invalid episode speed {speed} must be rejected");
         }
-        snapshot.playback_speed = 1.0;
+        snapshot.episode_speed = 1.0;
         snapshot.queue[1].uri = "spotify:show:show".to_owned();
         assert!(!snapshot.is_valid(), "a show is not a playable queue item");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1452,7 +1467,8 @@ mod tests {
             volume: 50,
             shuffle: false,
             repeat: "off".to_owned(),
-            playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
         };
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
 
@@ -1539,7 +1555,8 @@ mod tests {
             volume: 50,
             shuffle: false,
             repeat: "off".to_owned(),
-            playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
         };
         save_playback_snapshot_to(&dir, &first).unwrap();
         save_playhead_snapshot_to(&dir, Some(1), 12_000, first.queue_identity()).unwrap();
@@ -1624,7 +1641,8 @@ mod tests {
             volume: 50,
             shuffle: false,
             repeat: "off".to_owned(),
-            playback_speed: 1.0,
+            track_speed: 1.0,
+            episode_speed: 1.0,
         };
         save_playback_snapshot_to(&dir, &snapshot).unwrap();
         let loaded = load_playback_snapshot_from(&dir).expect("snapshot reads back");
@@ -1674,6 +1692,15 @@ mod tests {
         assert!(
             load_playback_snapshot_from(&dir).is_none(),
             "source-coordinate snapshots must not be restored as compiled positions"
+        );
+        std::fs::write(
+            playback_state_path(&dir),
+            br#"{"version":3,"queue":[{"id":"0123456789ABCDEFGHIJKL","uri":"spotify:track:0123456789ABCDEFGHIJKL","duration_ms":240000}],"current_index":0,"position_ms":42000,"volume":50,"shuffle":false,"repeat":"off","playback_speed":1.5}"#,
+        )
+        .unwrap();
+        assert!(
+            load_playback_snapshot_from(&dir).is_none(),
+            "a single speed cannot say which kind of item it was for"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

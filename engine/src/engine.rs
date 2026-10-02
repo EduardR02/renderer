@@ -437,10 +437,48 @@ struct PlaybackState {
     volume: u8,
     shuffle: bool,
     repeat: RepeatMode,
-    playback_speed: f32,
+    speeds: PlaybackSpeeds,
     current_index: Option<usize>,
     queue: Vec<TrackRef>,
     error: Option<String>,
+}
+
+impl PlaybackState {
+    fn current_uri(&self) -> Option<&str> {
+        self.current_index
+            .and_then(|index| self.queue.get(index))
+            .map(|track| track.uri.as_str())
+    }
+
+    /// The speed the current item plays at: its kind's. With no current item
+    /// it is the songs' speed, which is what a speed change then edits.
+    fn playback_speed(&self) -> f32 {
+        self.speeds.of(self.current_uri())
+    }
+}
+
+/// Playback speed, remembered apart for songs and for podcast episodes: a
+/// talk show at 1.5× and music at 1× are both "the speed", and which one
+/// applies is the engine's to decide, because only the engine sees the item
+/// change — at a natural boundary in the queue as much as on a click. Every
+/// load applies the speed of the item it loads (`configure_current_audio_*`),
+/// and a speed change edits the current item's kind. The shell persists both.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlaybackSpeeds {
+    track: f32,
+    episode: f32,
+}
+
+impl PlaybackSpeeds {
+    const NORMAL: Self = Self { track: 1.0, episode: 1.0 };
+
+    fn of(self, uri: Option<&str>) -> f32 {
+        if uri.is_some_and(|uri| uri.starts_with("spotify:episode:")) {
+            self.episode
+        } else {
+            self.track
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -515,7 +553,7 @@ impl Engine {
                 volume,
                 shuffle: false,
                 repeat: RepeatMode::Off,
-                playback_speed: 1.0,
+                speeds: PlaybackSpeeds::NORMAL,
                 current_index: None,
                 queue: Vec::new(),
                 error: None,
@@ -731,8 +769,10 @@ impl Engine {
             volume: self.state.volume,
             shuffle: self.state.shuffle,
             repeat: self.state.repeat,
-            playback_speed: self.state.playback_speed,
-            audible_playback_speed: self.audible_speed.unwrap_or(self.state.playback_speed),
+            playback_speed: self.state.playback_speed(),
+            track_speed: self.state.speeds.track,
+            episode_speed: self.state.speeds.episode,
+            audible_playback_speed: self.audible_speed.unwrap_or(self.state.playback_speed()),
             current_index: self.state.current_index,
             current_uri,
             context: self.current_context(),
@@ -838,7 +878,7 @@ impl Engine {
                 let remaining = duration.saturating_sub(position)
                     .saturating_sub(PRELOAD_WATERMARK_MS.min(duration / 2));
                 Instant::now() + Duration::from_secs_f64(
-                    f64::from(remaining) / (1_000.0 * f64::from(self.audible_speed.unwrap_or(self.state.playback_speed)))
+                    f64::from(remaining) / (1_000.0 * f64::from(self.audible_speed.unwrap_or(self.state.playback_speed())))
                 )
             })
         } else {
@@ -1003,7 +1043,7 @@ impl Engine {
         };
         let elapsed_ms =
             (at.saturating_duration_since(anchor_time).as_secs_f64() * 1_000.0
-                * f64::from(self.audible_speed.unwrap_or(self.state.playback_speed)))
+                * f64::from(self.audible_speed.unwrap_or(self.state.playback_speed())))
                 .round()
                 .min(f64::from(u32::MAX)) as u32;
         let source_position_ms = {
@@ -1288,9 +1328,10 @@ impl Engine {
 
     /// Whether `command` can be applied while the machine has no output device.
     ///
-    /// The queue, the volume, the shuffle mode and the play/pause intent are
-    /// engine state that a player is built *from*; everything else needs a
-    /// player to act on and is answered with the device's own message instead.
+    /// The queue, the volume, the shuffle and repeat modes, the speeds and the
+    /// play/pause intent are engine state that a player is built *from*;
+    /// everything else needs a player to act on and is answered with the
+    /// device's own message instead.
     /// Refusing these too would leave a machine that booted without audio with
     /// a player bar that cannot be filled and a startup restore the shell
     /// reports as failed — for a device that may appear a second later.
@@ -1309,6 +1350,8 @@ impl Engine {
                     | Command::SetVolume { .. }
                     | Command::SetShuffle { .. }
                     | Command::SetRepeat { .. }
+                    | Command::SetPlaybackSpeed { .. }
+                    | Command::SetPlaybackSpeeds { .. }
                     | Command::RestoreQueue { .. }
                     | Command::SetQueueCursor { .. }
             )
@@ -2012,6 +2055,7 @@ impl Engine {
             | Command::BrowseSearch { .. }
             | Command::BrowseTrackCredits { .. }
             | Command::BrowseCanvas { .. }
+            | Command::EnableAccountCanvas
             | Command::BrowseFollowedArtists
             | Command::GetTrackWaveform { .. }
             | Command::CancelTrackWaveform { .. }
@@ -2074,6 +2118,9 @@ impl Engine {
             Command::SetShuffle { enabled } => self.set_shuffle(enabled),
             Command::SetRepeat { mode } => self.set_repeat(mode),
             Command::SetPlaybackSpeed { speed } => self.set_playback_speed(speed),
+            Command::SetPlaybackSpeeds { track_speed, episode_speed } => {
+                self.set_playback_speeds(PlaybackSpeeds { track: track_speed, episode: episode_speed })
+            }
             Command::AddQueue { track, context } => self.add_queue(track, context),
             Command::AddQueueBatch { tracks, context } => self.add_queue_batch(tracks, context),
             Command::RemoveQueue { index } => self.remove_queue(index),
@@ -2216,7 +2263,7 @@ impl Engine {
                 // configured with; only a rate the listener can see change is
                 // worth a state. The re-anchored playhead rides the position
                 // lane.
-                let reported = self.audible_speed.unwrap_or(self.state.playback_speed);
+                let reported = self.audible_speed.unwrap_or(self.state.playback_speed());
                 self.audible_speed = Some(speed);
                 reported != speed
             }
@@ -2372,7 +2419,7 @@ impl Engine {
             .and_then(|track| track.effective_edit.clone());
         self.audio_revision = crate::audio::configure_customization_at_loop_pass(
             edit,
-            self.state.playback_speed,
+            self.state.playback_speed(),
             position_ms,
             loop_pass,
         );
@@ -2388,7 +2435,7 @@ impl Engine {
             .and_then(|track| track.effective_edit.clone());
         self.audio_revision = crate::audio::configure_customization_after_natural_boundary(
             edit,
-            self.state.playback_speed,
+            self.state.playback_speed(),
             position_ms,
         );
     }
@@ -3211,12 +3258,35 @@ impl Engine {
         Ok(true)
     }
 
+    /// Sets the speed of the current item's kind, which is the one the player
+    /// bar shows.
     fn set_playback_speed(&mut self, speed: f32) -> Result<bool, String> {
-        if !speed.is_finite() || !(0.5..=4.0).contains(&speed) {
+        let mut speeds = self.state.speeds;
+        if self.state.current_uri().is_some_and(|uri| uri.starts_with("spotify:episode:")) {
+            speeds.episode = speed;
+        } else {
+            speeds.track = speed;
+        }
+        self.set_playback_speeds(speeds)
+    }
+
+    /// Installs both remembered speeds (the shell's restore), or one of them
+    /// (a speed change). Only the current item's kind is audible; the other
+    /// waits for the next item of its kind to load.
+    fn set_playback_speeds(&mut self, speeds: PlaybackSpeeds) -> Result<bool, String> {
+        if [speeds.track, speeds.episode]
+            .iter()
+            .any(|speed| !speed.is_finite() || !(0.5..=4.0).contains(speed))
+        {
             return Err("playback speed must be between 0.5 and 4.0".to_owned());
         }
-        if self.state.playback_speed == speed {
+        if self.state.speeds == speeds {
             return Ok(false);
+        }
+        let speed = speeds.of(self.state.current_uri());
+        if speed == self.state.playback_speed() {
+            self.state.speeds = speeds;
+            return Ok(true);
         }
         // Settle elapsed old-rate time before publishing the request. No
         // decoder command, queue clear, edit rebuild or listening-history
@@ -3226,11 +3296,11 @@ impl Engine {
         if let Some(speed) = crate::audio::audible_speed(self.audio_revision) {
             self.audible_speed = Some(speed);
         } else if self.state.playing && self.current_load_produced_audio {
-            self.audible_speed = Some(self.audible_speed.unwrap_or(self.state.playback_speed));
+            self.audible_speed = Some(self.audible_speed.unwrap_or(self.state.playback_speed()));
         } else {
             self.audible_speed = None;
         }
-        self.state.playback_speed = speed;
+        self.state.speeds = speeds;
         if self.current_needs_load || self.state.current_index.is_none() {
             let position = self.state.position_ms;
             self.preserve_loop_pass_for_position(position);
@@ -4512,7 +4582,8 @@ mod tests {
     use super::{
         AUDIO_BLOCKED_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MAX, AUDIO_PROBE_BACKOFF_MIN,
         AudioSignal, AuthFailure, AuthSignal, ConnectedSession, Engine, LOAD_RETRY_BACKOFF,
-        PRELOAD_WATERMARK_MS, PlaybackHandles, PlaybackState, PlayerSignal, RECONNECT_BACKOFF_MAX,
+        PRELOAD_WATERMARK_MS, PlaybackHandles, PlaybackSpeeds, PlaybackState, PlayerSignal,
+        RECONNECT_BACKOFF_MAX,
         RECONNECT_BACKOFF_MIN, TRACK_CHANGE_BURST_WINDOW, TRACK_CHANGE_MIN_INTERVAL,
         UNAVAILABLE_BURST_WINDOW, UNAVAILABLE_STOP_LIMIT, VOLUME_PERSIST_QUIET,
         audio_unavailable_is_news, automatic_track_eligible, first_automatic_from,
@@ -4934,7 +5005,7 @@ mod tests {
             volume: 50,
             shuffle: false,
             repeat: RepeatMode::Off,
-            playback_speed: 1.0,
+            speeds: PlaybackSpeeds::NORMAL,
             current_index: Some(0),
             queue: vec![TrackRef {
                 duration_ms,
@@ -7964,10 +8035,104 @@ mod tests {
         }
         for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.499, 4.001] {
             assert!(engine.set_playback_speed(invalid).is_err());
-            assert_eq!(engine.state.playback_speed, 1.0);
+            assert_eq!(engine.state.playback_speed(), 1.0);
             assert_eq!(engine.state.position_ms, 25_000);
         }
         assert_eq!(engine.set_playback_speed(1.0), Ok(false));
+    }
+
+    fn episode_ref(id: &str, duration_ms: u32) -> TrackRef {
+        TrackRef {
+            id: id.to_owned(),
+            uri: format!("spotify:episode:{id}"),
+            duration_ms,
+            ..TrackRef::default()
+        }
+    }
+
+    /// Songs and episodes keep their own speed, and the switch happens where
+    /// the engine sees the item change — here at the natural end of a song
+    /// whose next row is an episode, and back at the episode's end. A speed
+    /// change in between edits only the kind that is playing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_natural_boundary_switches_to_the_next_items_speed_and_back() {
+        let (mut engine, _probe) = engine_with_player();
+        engine.state = two_track_state();
+        let song = engine.state.queue[1].clone();
+        engine.state.queue[1] = episode_ref("0123456789ABCDEFGHIJKE", 300_000);
+        engine.state.queue.push(song);
+        engine.state.playing = true;
+        assert_eq!(engine.set_playback_speeds(PlaybackSpeeds { track: 1.0, episode: 1.5 }), Ok(true));
+        assert_eq!(engine.state.playback_speed(), 1.0, "a song plays at the songs' speed");
+
+        note_audio(&mut engine);
+        engine.update_position(engine.state.duration_ms);
+        assert!(engine.on_player_event(PlayerEvent::EndOfTrack {
+            play_request_id: 7, track_id: track_uri(),
+        }));
+        assert_eq!(engine.state.current_index, Some(1));
+        assert!(engine.state.playing);
+        assert_eq!(engine.state.playback_speed(), 1.5, "the episode loads at the episodes' speed");
+        assert_eq!(engine.audible_speed, None, "the episode's audio is configured fresh, at its own rate");
+
+        assert_eq!(engine.set_playback_speed(2.0), Ok(true));
+        assert_eq!(engine.state.speeds, PlaybackSpeeds { track: 1.0, episode: 2.0 });
+
+        let episode = SpotifyUri::from_uri(&engine.state.queue[1].uri).expect("an episode uri");
+        engine.play_request_id = Some(8);
+        note_audio(&mut engine);
+        engine.update_position(engine.state.duration_ms);
+        assert!(engine.on_player_event(PlayerEvent::EndOfTrack {
+            play_request_id: 8, track_id: episode,
+        }));
+        assert_eq!(engine.state.current_index, Some(2));
+        assert_eq!(engine.state.playback_speed(), 1.0, "the next song is back at the songs' speed");
+        engine.shutdown();
+    }
+
+    /// The shell persists both speeds from the state line and hands them back,
+    /// in one command, before it restores the queue. The restored row's kind
+    /// picks its speed at once, with no audio loaded, so the player bar shows
+    /// the right one before anything plays.
+    #[test]
+    fn both_speeds_ride_the_state_line_and_come_back_before_a_restore() {
+        let (mut engine, buffer) = test_engine();
+        engine.state.ready = true;
+        let restore: Command = serde_json::from_value(serde_json::json!({
+            "type": "set_playback_speeds", "track_speed": 1.25, "episode_speed": 1.75,
+        }))
+        .expect("the restore command parses");
+        let Command::SetPlaybackSpeeds { track_speed, episode_speed } = restore else {
+            panic!("parsed as another command");
+        };
+        let speeds = PlaybackSpeeds { track: track_speed, episode: episode_speed };
+        assert_eq!(engine.set_playback_speeds(speeds), Ok(true));
+        assert_eq!(engine.set_playback_speeds(speeds), Ok(false), "the same pair is no change");
+        let song = TrackRef {
+            uri: "spotify:track:1abcdefghijklmnopqrstu".to_owned(),
+            duration_ms: 240_000,
+            ..TrackRef::default()
+        };
+        let queue = vec![song, episode_ref("2abcdefghijklmnopqrstu", 300_000)];
+        assert_eq!(
+            engine.restore_queue(queue, 1, 60_000, String::new(), 0, false, false),
+            Ok(true)
+        );
+        assert_eq!(engine.state.playback_speed(), 1.75);
+
+        engine.emit_state().unwrap();
+        let line = take_line(&buffer);
+        assert_eq!(line["playback_speed"], 1.75);
+        assert_eq!(line["audible_playback_speed"], 1.75);
+        assert_eq!(line["track_speed"], 1.25);
+        assert_eq!(line["episode_speed"], 1.75);
+
+        // Either value out of range refuses the pair and keeps both.
+        for invalid in [f32::NAN, 0.25, 4.5] {
+            assert!(engine.set_playback_speeds(PlaybackSpeeds { track: 1.0, episode: invalid }).is_err());
+            assert!(engine.set_playback_speeds(PlaybackSpeeds { track: invalid, episode: 1.0 }).is_err());
+            assert_eq!(engine.state.speeds, speeds);
+        }
     }
 
     #[test]
@@ -7980,7 +8145,7 @@ mod tests {
         engine.audio_revision = u64::MAX;
         let start = Instant::now();
         engine.position_anchor = Some((10_000, start));
-        engine.state.playback_speed = 4.0;
+        engine.state.speeds.track = 4.0;
         engine.audible_speed = Some(1.0);
         let boundary = start + Duration::from_millis(150);
         assert!(engine.on_audio_signal(AudioSignal::SpeedBoundary {
@@ -8582,7 +8747,7 @@ mod tests {
             let (mut engine, _) = test_engine();
             engine.state = edited_playback_state(100_000, vec![range(10_000, 60_000)], None);
             engine.state.playing = true;
-            engine.state.playback_speed = speed;
+            engine.state.speeds.track = speed;
             note_audio(&mut engine);
             engine.position_anchor = Some((9_500, Instant::now() - Duration::from_secs(2)));
 

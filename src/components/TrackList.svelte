@@ -366,6 +366,10 @@
      stops being a list and becomes a peephole, and scrolling one item at a
      time is worse than covering a little of the row you opened it from. */
   const MENU_MIN_H = 132;
+  /* The menu's width, as `.menu.track-menu` sets it; a submenu hangs its own
+     220px plus a gap to the menu's left. */
+  const MENU_W = 264;
+  const SUBMENU_OFFSET = 228;
 
   /**
    * The band a fixed-position popover may occupy, in WINDOW coordinates.
@@ -454,7 +458,7 @@
     clearTimeout(copyResetTimer);
     menu.open = true;
     menu.anchor = e.currentTarget;
-    menu.x = Math.max(8, Math.min(r.right - 240, window.innerWidth - 248));
+    menu.x = Math.max(8, Math.min(r.right - MENU_W, window.innerWidth - MENU_W - 8));
     menu.top = placed.top;
     menu.bottom = placed.bottom;
     menu.maxH = placed.maxH;
@@ -594,7 +598,7 @@
     const placed = placePopover(e.currentTarget.getBoundingClientRect(), 60 * 6);
     picker.open = true;
     picker.track = menu.track;
-    picker.x = Math.max(8, menu.x - 228);
+    picker.x = Math.max(8, menu.x - SUBMENU_OFFSET);
     picker.top = placed.top;
     picker.bottom = placed.bottom;
     picker.maxH = placed.maxH;
@@ -610,7 +614,7 @@
     const placed = placePopover(e.currentTarget.getBoundingClientRect(), 40 * menuArtists.length);
     artistPicker.open = true;
     artistPicker.artists = menuArtists;
-    artistPicker.x = Math.max(8, menu.x - 228);
+    artistPicker.x = Math.max(8, menu.x - SUBMENU_OFFSET);
     artistPicker.top = placed.top;
     artistPicker.bottom = placed.bottom;
     artistPicker.maxH = placed.maxH;
@@ -1062,48 +1066,50 @@
   <Menu class="track-menu" placement={menu} anchor={menu.anchor} group bind:element={menuEl} label="Track actions" onclose={closeMenus}>
     <div class="menu-scroll" use:scrollbar style:max-height="{menu.maxH}px">
     <button class="menu-item" onclick={() => { menu.open = false; api.addQueue(menu.track, queueSource).catch(() => {}); }}>
-      Add to queue
+      <Icon name="queue-add" size={16} /><span class="menu-label">Add to queue</span>
     </button>
     {#if allowAddToPlaylist && menu.track?.uri?.startsWith("spotify:track:")}
-      <button class="menu-item" onclick={openPicker}>Add to playlist…</button>
+      <button class="menu-item" aria-haspopup="menu" aria-expanded={picker.open} onclick={openPicker}>
+        <Icon name="playlist-add" size={16} /><span class="menu-label">Add to playlist</span>
+        <span class="chev"><Icon name="forward" size={14} /></span>
+      </button>
     {/if}
     {#if personalConnected() && menu.track?.uri?.startsWith("spotify:track:")}
-      <!-- One label whatever the state; the heart says which. Until the index
-           has answered it is pending — drawn, in place, and inert. -->
+      <!-- The label says what the click will do, and the heart what is true
+           now. The state is the shell's membership index, answered in one IPC
+           round trip; until it has answered the item is drawn in place and
+           inert (busy, never disabled, so a focused item keeps its focus). -->
       <button
         class="menu-item"
+        class:liked={menu.liked === true}
         role="menuitemcheckbox"
         aria-checked={menu.liked === true}
         aria-busy={menu.liked === null || menu.likeBusy}
-        disabled={menu.liked === null || menu.likeBusy}
-        title={menu.liked ? "Remove from Liked Songs" : "Save to Liked Songs"}
         onclick={toggleLiked}
       >
-        Liked Songs
-        <span class="mark" class:on={menu.liked === true}><Icon name={menu.liked ? "heart-f" : "heart"} size={15} /></span>
+        <Icon name={menu.liked ? "heart-f" : "heart"} size={16} />
+        <span class="menu-label">{menu.liked ? "Remove from Liked Songs" : "Add to Liked Songs"}</span>
       </button>
     {/if}
     {#if menuLink}
       <!-- The confirmation lives on the item, which is why the menu does not
            close on click: a copy with no feedback is indistinguishable from a
            dead control, and a toast system for one line of text is not worth
-           having. The check is foam — this is a thing you just did. -->
-      <!-- No icon. It was the only item in the menu that had one, so its label
-           started 21px to the right of every other label and the column of text
-           read as broken. The confirmation is the label itself changing, plus
-           the foam colour, which is enough to show the copy happened. -->
+           having. The glyph becomes a foam check — this is a thing you just
+           did. -->
       <button
         class="menu-item"
         class:done={menu.copyState === "copied"}
         class:failed={menu.copyState === "failed"}
         onclick={copyTrackLink}
       >
-        {menu.copyState === "copied" ? "Link copied" : menu.copyState === "failed" ? "Copy failed" : "Copy link"}
+        <Icon name={menu.copyState === "copied" ? "check" : "copy"} size={16} />
+        <span class="menu-label">{menu.copyState === "copied" ? "Link copied" : menu.copyState === "failed" ? "Copy failed" : "Copy link"}</span>
       </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:")}
       <button class="menu-item" onclick={() => { menu.open = false; openCredits(menu.track); }}>
-        View credits
+        <Icon name="credits" size={16} /><span class="menu-label">View credits</span>
       </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:")}
@@ -1114,16 +1120,19 @@
           openTrackEditor(menu.track, playlistId);
         }}
       >
-        Edit playback…
+        <Icon name="scissors" size={16} /><span class="menu-label">Edit playback…</span>
       </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:") && playlistId && menu.editDefined}
       <button
         class="menu-item"
+        role="menuitemcheckbox"
+        aria-checked={menu.editEnabled}
         disabled={menu.editLoading}
         onclick={toggleEditedVersion}
       >
-        <span>Use edited version</span>{#if menu.editEnabled}<span class="edit-check"><Icon name="check" size={14} /></span>{/if}
+        <Icon name="waveform" size={16} /><span class="menu-label">Use edited version</span>
+        {#if menu.editEnabled}<span class="mark edit-check"><Icon name="check" size={14} /></span>{/if}
       </button>
     {/if}
     {#if menu.editError}
@@ -1141,9 +1150,10 @@
         title={SKIP_HELP}
         onclick={toggleRowSkip}
       >
-        {rowSkipped(menu.track)
+        <Icon name={rowSkipped(menu.track) ? "restore" : "skipped"} size={16} />
+        <span class="menu-label">{rowSkipped(menu.track)
           ? "Include in playlist playback"
-          : "Skip during playlist playback"}
+          : "Skip during playlist playback"}</span>
       </button>
     {/if}
     {#if menu.skipError}
@@ -1151,22 +1161,30 @@
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:")}
       <button class="menu-item" onclick={() => { menu.open = false; navigate("radio", menu.track.id); }}>
-        Go to song radio
+        <Icon name="radio" size={16} /><span class="menu-label">Go to song radio</span>
       </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:episode:") && menu.track?.album_id}
-      <button class="menu-item" onclick={() => { menu.open = false; navigate("show", menu.track.album_id); }}>Go to podcast</button>
+      <button class="menu-item" onclick={() => { menu.open = false; navigate("show", menu.track.album_id); }}>
+        <Icon name="podcast" size={16} /><span class="menu-label">Go to podcast</span>
+      </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:") && menu.track?.album_id}
       <button class="menu-item" onclick={() => { menu.open = false; navigate("album", menu.track.album_id); }}>
-        Go to album
+        <Icon name="album" size={16} /><span class="menu-label">Go to album</span>
       </button>
     {/if}
     <!-- One row whatever the track. A collaboration opens a submenu rather than
          printing an extra near-identical line per artist. -->
     {#if menu.track?.uri?.startsWith("spotify:track:") && menuArtists.length}
-      <button class="menu-item" onclick={goToArtist}>
-        {menuArtists.length > 1 ? "Go to artist…" : "Go to artist"}
+      <button
+        class="menu-item"
+        aria-haspopup={menuArtists.length > 1 ? "menu" : undefined}
+        aria-expanded={menuArtists.length > 1 ? artistPicker.open : undefined}
+        onclick={goToArtist}
+      >
+        <Icon name="artist" size={16} /><span class="menu-label">Go to artist</span>
+        {#if menuArtists.length > 1}<span class="chev"><Icon name="forward" size={14} /></span>{/if}
       </button>
     {/if}
     {#if menu.track?.uri?.startsWith("spotify:track:") && playlistId}
@@ -1175,7 +1193,7 @@
         class="menu-item danger"
         onclick={() => { menu.open = false; api.removePlaylistTracks(playlistId, [menu.track.uri]).catch(() => {}); }}
       >
-        Remove from this playlist
+        <Icon name="trash" size={16} /><span class="menu-label">Remove from this playlist</span>
       </button>
     {/if}
     </div>
@@ -1221,23 +1239,19 @@
      three declarations that follow it are the position; the UA's `right: 0`
      would otherwise stretch every menu to the right edge of the window. */
   :global(.menu.track-menu), :global(.menu.track-submenu) { padding: 0; }
-  :global(.menu.track-menu) { width: 240px; min-width: 0; max-width: calc(100vw - 16px); }
+  /* MENU_W, in the script, places it: keep the two equal. */
+  :global(.menu.track-menu) { width: 264px; min-width: 0; max-width: calc(100vw - 16px); }
   .menu-scroll {
     padding: var(--s1);
     overflow-y: auto;
     overscroll-behavior: contain;
   }
   .menu-error {
-    max-width: 216px;
+    max-width: 240px;
     margin: 4px 10px 7px;
     color: var(--rose-ink);
     font-size: var(--t-11);
     line-height: 1.35;
   }
-  .menu-item.done { color: var(--accent); }
-  .menu-item.done :global(.icon) { color: var(--accent); }
-  /* A refused write says so in the app's failure colour, distinct from the
-     accent that means "this one landed". */
-  .menu-item.failed { color: var(--love); }
-  .edit-check { margin-left: auto; color: var(--accent); }
+  .menu-item .edit-check { color: var(--accent); }
 </style>

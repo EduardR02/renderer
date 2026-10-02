@@ -27,10 +27,11 @@
     authorizePersonal, disconnectPersonal,
   } from "../lib/personal.svelte.js";
 
-  /* The redirect the personal app must list, and the one place a person
-     makes that app. Both fixed. */
+  /* The redirect the personal app must list, the one place a person makes
+     that app, and the README's step-by-step guide to it. All fixed. */
   const REDIRECT_URI = "http://127.0.0.1:5589/personal-api/callback";
   const DASHBOARD = "https://developer.spotify.com/dashboard";
+  const GUIDE = "https://github.com/EduardR02/renderer#likes-follows-and-devices";
   let clientId = $state("");
   let clientIdVisible = $state(false);
   const storedClientId = $derived(personal.status?.client_id ?? "");
@@ -173,11 +174,20 @@
     );
   }
 
+  /* Turning Canvas on also turns it on for the account when the account has
+     it off — the canvaz backend withholds every video otherwise — and the
+     local switch goes on either way, so a refusal is said beside it rather
+     than undoing it. Turning it off only hides Canvas here. */
   function updateAnimatedCanvas(enabled) {
     return updateSetting(
       "animatedCanvas",
       enabled,
-      () => api.setAnimatedCanvas(enabled),
+      async () => {
+        let refused = "";
+        if (enabled) await api.enableAccountCanvas().catch((error) => { refused = String(error); });
+        await api.setAnimatedCanvas(enabled);
+        if (refused) throw `Shown here, but Spotify didn't turn Canvas on for your account: ${refused}`;
+      },
       "Could not update animated Canvas.",
     );
   }
@@ -257,13 +267,17 @@
       {/if}
     </div>
 
-    <!-- What the personal app is FOR, in its name. One sentence, the setup as
-         three short steps while it is not done, then only its state. -->
+    <!-- What the personal app is FOR, in its name. One sentence and the
+         README's guide, the setup as three short steps while it is not done,
+         then only its state. The steps and the buttons use the guide's words
+         (Web API, Connect, Allow), so the two read as one set of
+         instructions. -->
     <div class="set-group personal-app">
       <h2>Likes, follows &amp; devices</h2>
       <p class="set-intro">
         Your own free Spotify developer app, for this same account, lets Renderer like songs,
-        follow artists and people, list your saved podcasts and move a Spotify Connect session.
+        follow artists and people, list your saved podcasts and play on your other devices.
+        <button class="link-more inline-link" onclick={() => openUrl(GUIDE).catch(() => {})}>Setup guide</button>
       </p>
       {#if !personalConnected()}
         <ol class="setup">
@@ -274,18 +288,19 @@
           <li>
             <span class="step">2</span>
             <span class="step-copy">
-              Add this redirect URI to it
+              Add this redirect URI
               <span class="uri-chip">
                 <code>{REDIRECT_URI}</code>
                 <button class="btn-round uri-copy" class:on={uriCopied} title={uriCopied ? "Copied" : "Copy redirect URI"} aria-label="Copy redirect URI" onclick={copyRedirect}>
                   <Icon name={uriCopied ? "check" : "copy"} size={13} />
                 </button>
               </span>
+              and tick <strong>Web API</strong>.
             </span>
           </li>
           <li>
             <span class="step">3</span>
-            <span class="step-copy">Paste its Client ID here.</span>
+            <span class="step-copy">Paste its Client ID here, save, then choose <strong>Connect</strong>.</span>
           </li>
         </ol>
       {/if}
@@ -335,8 +350,8 @@
       {#if personalConnected()}
         <div class="set-row">
           <div>
-            <div class="k">Spotify Connect devices</div>
-            <div class="d">Choose where Renderer plays from the player bar: this computer or another Spotify device.</div>
+            <div class="k">Device access</div>
+            <div class="d">Lets the player bar play on your other Spotify devices: a phone, a speaker, another Spotify app.</div>
           </div>
           <div class="set-ctl">
             {#if personalDevicesAuthorized()}
@@ -410,9 +425,9 @@
         <div>
           <div class="k">Animated Canvas</div>
           <div class="d">
-            Show Spotify's looping Canvas videos in the Now playing panel when they are available.
-            Spotify can withhold Canvas per account, so this switch can only turn it off; enable
-            video in Spotify's own settings first.
+            Show Spotify's looping Canvas videos in the Now playing panel. Turning this on also
+            turns Canvas on for your Spotify account, as Spotify's own Videos and Canvas setting
+            does; turning it off only hides Canvas here.
           </div>
           {#if settingErrors.animatedCanvas}<div class="inline-error" role="alert">{settingErrors.animatedCanvas}</div>{/if}
         </div>
@@ -558,6 +573,7 @@
     color: var(--fg-2); font-family: var(--font-number); font-size: var(--t-11); font-weight: var(--w-med);
   }
   .step-copy { min-width: 0; line-height: 1.6; }
+  .step-copy strong { color: var(--fg); font-weight: var(--w-semi); }
   .inline-link { font-size: inherit; color: var(--fg); text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px; }
   .inline-link:hover { text-decoration-color: currentColor; }
   /* The URI in the field's own pressed material, with its copy glyph inside. */

@@ -78,4 +78,28 @@
 <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8.4" y="8.4" width="12.2" height="12.2" rx="2.4"/><path d="M15.6 5.2A2 2 0 0 0 13.6 3.4H5.4a2 2 0 0 0-2 2v8.2a2 2 0 0 0 1.8 2"/></symbol>
 <symbol id="i-sort" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.8 6.4h10M3.8 11.8h7M3.8 17.2h4.4"/><path d="M18 5v14m-3.2-3.2L18 19l3.2-3.2"/></symbol>
 <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19.6 12.4a7.6 7.6 0 1 1-2.3-5.8"/><path d="M19.8 3.6v4.8H15"/></symbol>
+<!-- The rest of the device set, for the device list: same outline weight as
+     computer, phone and speaker above. -->
+<symbol id="i-tablet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.4" y="2.8" width="15.2" height="18.4" rx="2.4"/><path d="M11 17.8h2"/></symbol>
+<symbol id="i-tv" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.6" y="4.4" width="18.8" height="12.6" rx="2"/><path d="M7.4 20.4h9.2"/></symbol>
+<symbol id="i-cast" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.4 8.4V6.6a2 2 0 0 1 2-2h13.2a2 2 0 0 1 2 2v10.8a2 2 0 0 1-2 2h-5.2"/><path d="M3.4 12.8a6.6 6.6 0 0 1 6.6 6.6M3.4 16.4a3 3 0 0 1 3 3"/><circle cx="3.6" cy="19.2" r=".6" fill="currentColor" stroke="none"/></symbol>
+<!-- The action-menu set: every item of a "…" menu leads with one of these,
+     at 16px, so they hold the outline weight of the rest. A "go to" item
+     wears the glyph of where it goes. -->
+<symbol id="i-artist" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8.2" r="3.9"/><path d="M4.6 20.4c.9-3.7 3.9-6 7.4-6s6.5 2.3 7.4 6"/></symbol>
+<symbol id="i-album" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.4"/><circle cx="12" cy="12" r="2.3"/></symbol>
+<symbol id="i-radio" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="1.9" fill="currentColor" stroke="none"/><path d="M8.3 8.3a5.2 5.2 0 0 0 0 7.4M15.7 8.3a5.2 5.2 0 0 1 0 7.4M5.4 5.4a9.3 9.3 0 0 0 0 13.2M18.6 5.4a9.3 9.3 0 0 1 0 13.2"/></symbol>
+<symbol id="i-podcast" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="9" y="3" width="6" height="11.2" rx="3"/><path d="M5.6 11.4a6.4 6.4 0 0 0 12.8 0M12 17.8v3.2"/></symbol>
+<symbol id="i-episode" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><circle cx="12" cy="12" r="8.4"/><path d="M10.3 9v6l4.8-3Z"/></symbol>
+<symbol id="i-credits" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.8" y="3.4" width="14.4" height="17.2" rx="2.4"/><path d="M8.6 8.4h6.8M8.6 12h6.8M8.6 15.6h4"/></symbol>
+<symbol id="i-scissors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6.4" cy="6.6" r="2.6"/><circle cx="6.4" cy="17.4" r="2.6"/><path d="M8.6 8.1 20 17.4M8.6 15.9 20 6.6"/></symbol>
+<symbol id="i-waveform" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 10v4M8 7v10M12 4.5v15M16 8v8M20 10.5v3"/></symbol>
+<symbol id="i-restore" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.4 12.4a7.6 7.6 0 1 0 2.3-5.8"/><path d="M4.2 3.6v4.8H9"/></symbol>
+<symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.4 4.8a2.2 2.2 0 0 1 3.1 0l.7.7a2.2 2.2 0 0 1 0 3.1L9 18.8l-4.4 1 1-4.4L15.4 4.8Z"/><path d="m13.6 6.6 3.8 3.8"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.8 5.2h16.4l-6.3 7.6v5.4l-3.8 2v-7.4L3.8 5.2Z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.4 6.8h15.2M9.6 6.8V4.9c0-.6.5-1.1 1.1-1.1h2.6c.6 0 1.1.5 1.1 1.1v1.9"/><path d="m6.4 6.8.9 12.4c.1 1 .9 1.8 1.9 1.8h5.6c1 0 1.8-.8 1.9-1.8l.9-12.4"/></symbol>
+<!-- The pin again, as an outline: in a menu it stands in a column of
+     outlines at 16px, where the filled 11px mark would be the one heavy
+     shape. -->
+<symbol id="i-pin-line" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8.6 3.4h6.8l-1 5.2 3.4 3.4v1.8H6.2V12l3.4-3.4-1-5.2Z"/><path d="M12 13.8v7"/></symbol>
 </defs></svg>

@@ -1,20 +1,26 @@
 # Renderer
 
-A quiet, music-first Spotify client for Windows and macOS.
+Spotify for Windows and macOS, without the bloat.
 
 I built it because the official desktop app used more CPU than a music player
 has any business using. On my liquid-cooled Ryzen 9 5950X it would push the
 CPU to 80 °C, hotter than all-core benchmarks get it, and every time a song
-started the fans spun up loud enough to hear through open-back headphones. A
-music player sits open all day. It should be silent.
+started the fans spun up loud enough to hear through open-back headphones.
 
-So this one is built around being cheap to run, calm to look at, and quick to
-use, and it leaves out everything that isn't music.
+By now it covers the essentials of the official app, without the bloat,
+and adds some quality-of-life improvements:
+
+- Random shuffle
+- Skip selected playlist tracks during normal playback
+- Playback speed controls
+- Cut out or loop parts of a song
+- Open Spotify links directly in the app
+- Play an artist’s discography continuously
 
 <p align="center">
-  <img src="docs/library.png" alt="A playlist with the album cover in the Now Playing panel" width="900">
-  <br><br>
   <img src="docs/now-playing.png" alt="A playlist with a video Canvas in the Now Playing panel" width="900">
+  <br>
+  <sub>The background takes its color from the playing Canvas or album cover. Close the right panel for a compact, darker layout that keeps the adaptive background.</sub>
 </p>
 
 ## Install
@@ -45,13 +51,10 @@ No audio, metadata or artwork ships with this repository.
 
 ## Features
 
-Mostly a normal client: playlists, albums, artist pages, search, queue,
-credits, radio, and profiles.
-
-The pages only contain the music parts. An artist page has the discography,
-popular tracks, bio, monthly listeners and top cities. No merch, no concert
-tickets, no AI DJ, no home feed. Audio podcasts are there, out of the way;
-video podcasts and audiobooks aren't.
+Playlists, albums, artist pages, search, the queue, credits, radio, profiles and
+audio podcasts. The pages only contain the music parts. An artist page has the
+discography, popular tracks, bio, monthly listeners and top cities. No merch, no
+concert tickets, no AI DJ, no home feed, no video podcasts or audiobooks.
 
 The interface is frosted glass lit by whatever is playing: a still haze taken
 from the song's Canvas or cover. It changes with the song and costs nothing
@@ -59,15 +62,13 @@ while the song plays.
 
 Audio is 320 kbps and gapless. Media keys work when the app isn't focused, and
 it shows up in Windows Quick Settings and on the lock screen. Played songs are
-cached, so replaying them uses no network; podcast episodes are streamed, not
-cached. When the system's audio output changes, playback follows it. It can
-launch at login, minimized if you want.
+cached, so replaying them uses no network. When the system's audio output
+changes, playback follows it. It can launch at login, minimized if you want.
 
 Playlists can be created, renamed, deleted and reordered, and tracks added or
 removed by drag and drop or in bulk by rules (artist, album, title, length),
 with a preview of exactly which entries go. Playlists can be pinned to the top
-of the library, and folders are kept. Settings has an audio cache size limit
-and volume normalisation.
+of the library, and folders are kept.
 
 Some extra things I added because we control playback here:
 
@@ -75,39 +76,40 @@ Some extra things I added because we control playback here:
   or profile) into search, and it opens here instead of the web player.
 - Cut a section out of a song, or loop an exact range. Set per playlist, edited
   in a waveform view.
-- Playback speed from 0.5× to 4×, pitch preserving.
+- Playback speed from 0.5× to 4×.
 - Listening history, kept locally.
 - A mark on songs that are already in the local audio cache.
 
-Canvas works, but only if you have it enabled in the real Spotify app. It's
-an account setting on their servers, not a local one, and their backend returns
-nothing at all while it's off. You still get the album cover, of course.
+Canvas, the short looping video some songs have, is an account setting on
+Spotify's side. Renderer shows it whenever it's on for your account.
 
-### Likes, follows and devices (optional)
+### Likes, follows and devices
 
-The normal sign-in can read Liked Songs and the artists you follow, but can't
-change them. To like songs, follow artists and people, see your saved podcasts,
-and play Renderer on your other Spotify devices, connect your own Spotify
-developer app. It's a second authorization for the same account, not another account.
+Without any setup, Renderer can read your Liked Songs and the artists you
+follow, but can't change them. To like songs, follow artists and people, see
+your saved podcasts, and play on your other devices, connect a Spotify
+developer app of your own. It's free, takes two minutes, and is a second
+authorization for the same account, not another account.
 
-1. Create an app in the [Spotify developer dashboard](https://developer.spotify.com/dashboard)
-   with your Premium account.
-2. Add `http://127.0.0.1:5589/personal-api/callback` as its redirect URI.
-3. Paste the app's Client ID into Settings. Only the Client ID: never the
-   Client Secret.
+1. Open the [Spotify developer dashboard](https://developer.spotify.com/dashboard),
+   log in with your Premium account, and choose **Create app**.
+2. Give it any name and description. Under **Redirect URIs**, add
+   `http://127.0.0.1:5589/personal-api/callback`. Under the APIs you plan to
+   use, tick **Web API**. Accept the terms and save.
+3. Open the app's settings, copy its **Client ID** and paste it into
+   Renderer's Settings. Only the Client ID: never the Client Secret.
+4. Choose **Connect**. Spotify asks you, in the browser, to allow access to
+   your library and follows.
+5. To play on other devices, choose **Allow** next to device access. Spotify
+   asks once more, for permission to see and control your playback.
 
-Once that's connected, allow device access in Settings, and the player bar can
-play your queue on a phone, speaker or another Spotify app. Your queue stays in
-charge there too, and the device's own controls work with it. Editing the queue
-while it plays elsewhere can make the device rebuffer for a moment. **This
-computer** brings playback back. Other devices play Spotify's original audio, so
-playback speed and song edits only apply here.
+The player bar then shows a device button. Your queue stays in charge on the
+other device, and that device's own controls work with it. Editing the queue
+while it plays elsewhere can make it rebuffer for a moment. Other devices play
+Spotify's original audio, so playback speed and song edits only apply on this
+computer.
 
 ## Limitations
-
-This isn't meant to replace the Spotify app. It's a daily player, with enough
-discovery in it that you don't have to leave for that, but there will be things
-you occasionally need the real app for.
 
 Windows and macOS 14 or later only, and you need Spotify Premium.
 
@@ -134,12 +136,10 @@ bun tauri build
 ```
 
 The installer lands in `target/release/bundle/nsis/` on Windows, and the app in
-`target/release/bundle/macos/` on macOS. The build packages the playback engine
-alongside the app. For development, build the engine once with
-`bun run build:engine`, then run `bun tauri dev`.
-
-The checks are `cargo test -p renderer-engine`, `cargo test -p renderer`,
-`bun test` and `bun run build`.
+`target/release/bundle/macos/` on macOS. For development, build the playback
+engine once with `bun run build:engine`, then run `bun tauri dev`. The checks
+are `cargo test -p renderer-engine`, `cargo test -p renderer`, `bun test` and
+`bun run build`.
 
 Publishing a GitHub release runs the [release workflow](../../actions/workflows/macos-build.yml),
 which builds, tests and signs both platforms and attaches the installers and
@@ -147,37 +147,28 @@ the update files.
 
 Your login and caches stay on your computer, under `%LOCALAPPDATA%\SpotifyRenderer`
 on Windows or `~/Library/Application Support/SpotifyRenderer` on macOS. The
-optional developer-app authorization is kept in the system's credential store.
-Neither sign-in gives this project your Spotify password.
-
-### UI harness
-
-`dev/ui-harness.html` runs the interface in a browser. With `?real` it reads
-your actual library from the running app instead of fixture data. Quit the app,
-start `bun run dev --host 127.0.0.1`, run `bun dev/real-app.js`, then open
-`http://127.0.0.1:1420/dev/ui-harness.html?real`. Playback there is
-simulated, and account changes are refused.
-
-That app copy opens a local debugging port that any program on your computer
-can use to control it, so close it when you're done.
+developer-app authorization is kept in the system's credential store. Neither
+sign-in gives this project your Spotify password.
 
 ## How it works
 
 It has to be cheap to run while sitting open all day, so a few things follow
-from that. The playhead is animated with a transform instead of a width, so it
-doesn't force layout on every tick. Long lists are virtualized. While nothing
-plays, the engine does nothing: the sound device is closed and no timers tick.
-The queue only crosses between processes when it actually changes.
-
-The glass doesn't re-blur the window as things move. The haze is rendered once
-per song on the GPU, in a worker, and the panes show a pre-frosted copy of it,
-so nothing is redrawn while the song plays.
+from that. While nothing plays, it does nothing: the sound device is closed and
+no timers tick. The playhead is animated with a transform instead of a width,
+so it doesn't force layout on every tick. Long lists are virtualized. The glass
+doesn't re-blur the window as things move: the haze is rendered once per song
+on the GPU, and the panes show a pre-frosted copy of it.
 
 Two processes. `engine/` wraps [librespot](https://github.com/librespot-org/librespot)
 and handles everything to do with sound. The Tauri shell in `src-tauri/`
 supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
 Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
+
+The audio path has its own resampler. Spotify decodes at 44.1 kHz and most
+Windows devices run at 48 kHz, and the stock path came out about half a percent
+slow and slightly flat. The replacement converts exactly, and tests pin both
+the timing and the quality.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.
@@ -189,29 +180,10 @@ now, but it's already light enough that I'd rather keep it easy to change.
 | `engine/`    | Playback engine: librespot, audio pipeline, browse, history  |
 | `src-tauri/` | Tauri shell: engine supervision, caches, commands            |
 | `src/`       | Svelte 5 frontend                                            |
-| `dev/`       | Scratch harnesses, not part of the build                     |
+| `dev/`       | Development harnesses, not part of the build                 |
 
 `AGENTS.md` has the conventions the code follows, and is a better starting point
 than this file if you want to change something.
-
-### The resampling problem
-
-librespot's rodio backend has a resampling bug that shows up on Windows. Spotify
-decodes at 44.1 kHz and Windows usually runs its output at 48 kHz, so everything gets
-resampled on the way out. rodio does that with linear interpolation, and it also
-rebuilds its converter mid-stream, leaking a fraction of a frame each time it
-does. At the packet sizes Spotify's Vorbis actually produces that came to
-+0.4882% more output frames than there should be, measured offline and then
-again on hardware. Extra frames at a fixed device rate means the audio is
-stretched, so everything plays slightly slow and slightly flat.
-
-Both halves needed replacing. There's a polyphase windowed-sinc resampler that
-tracks position as an exact rational, so the output frame count is determined to
-the frame regardless of where packet boundaries land, and the sink reports the
-device's rate rather than 44.1 kHz, which sends rodio's own converters down their
-pass-through path so they stop resampling the result a second time. Linear
-interpolation measured −15 dB error at 10 kHz; this measures −116 dB. Both
-numbers are pinned by tests.
 
 ## On the code
 

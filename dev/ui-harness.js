@@ -606,6 +606,16 @@ function setCurrent(index, resetPosition = true) {
   const source = findTrack(current.uri);
   playback.duration_ms = source?.duration_ms ?? current.duration_ms ?? 0;
   if (resetPosition) playback.position_ms = 0;
+  applyKindSpeed();
+}
+
+/* As the engine does: songs and episodes keep their own speed, and the
+   current item's kind decides which one plays and shows. */
+const isEpisode = (uri) => String(uri ?? "").startsWith("spotify:episode:");
+function applyKindSpeed() {
+  if (playback.output_device_id) return;
+  playback.playback_speed = isEpisode(playback.current_uri) ? playback.episode_speed : playback.track_speed;
+  playback.audible_playback_speed = playback.playback_speed;
 }
 
 const playback = {
@@ -623,6 +633,8 @@ const playback = {
   shuffle: false,
   repeat: "off",
   playback_speed: 1,
+  track_speed: 1,
+  episode_speed: 1,
   audible_playback_speed: 1,
   current_index: 0,
   current_uri: fixtures.playlistDetail.tracks[0].uri,
@@ -988,6 +1000,9 @@ const mock = {
         settings.animated_canvas = Boolean(args.enabled ?? args.value);
         emit("settings", clone(settings));
         return null;
+      /* The fixture account already has Canvas on: nothing to write. */
+      case "enable_account_canvas":
+        return false;
       /* Pages exactly as the engine does — filter and sort here, return a
          window plus the two counts — so the view is exercised against the
          real contract instead of a fixture that hands it everything. Every
@@ -1137,8 +1152,8 @@ const mock = {
         emitState();
         return null;
       case "set_playback_speed":
-        playback.playback_speed = Number(args.speed ?? 1);
-        playback.audible_playback_speed = playback.playback_speed;
+        playback[isEpisode(playback.current_uri) ? "episode_speed" : "track_speed"] = Number(args.speed ?? 1);
+        applyKindSpeed();
         emitState();
         return null;
       case "play_queue": {

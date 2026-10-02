@@ -5,7 +5,6 @@
     api,
     togglePlay,
     navigate,
-    route,
     positionMs,
     ui,
     setNowPlayingOpen,
@@ -300,6 +299,94 @@
   let heart = $state(null);
   let liking = $state(false);
 
+  /**
+   * The "Saved in" panel opens while the pointer is over the check or the
+   * panel, or the focus is in either, as a CSS :hover/:focus-within pair once
+   * did — but it is a popover now, in the top layer, so the bar's own layer
+   * and edge cannot clip it. It is placed once, above the check, when it
+   * opens. Leaving waits a beat, so the pointer can cross the gap (the panel's
+   * ::after bridges it); Escape shuts it until the pointer or the focus
+   * leaves and comes back.
+   */
+  let savedGroup = $state(null);
+  let savedPanel = $state(null);
+  let savedHover = $state(false);
+  let savedFocus = $state(false);
+  let savedHushed = $state(false);
+  let savedAt = $state({ left: 0, bottom: 0, bridge: 0 });
+  const savedOpen = $derived((savedHover || savedFocus) && !savedHushed);
+
+  /* Clear of the bar, 8px over its top edge, with the bridge reaching back
+     down to the check. */
+  function placeSaved() {
+    const rect = savedMark?.getBoundingClientRect();
+    const bar = savedMark?.closest(".player")?.getBoundingClientRect();
+    if (!rect || !bar) return;
+    const bottom = window.innerHeight - bar.top + 8;
+    savedAt = { left: Math.max(8, rect.left - 8), bottom, bridge: window.innerHeight - bottom - rect.top };
+  }
+
+  $effect(() => {
+    const group = savedGroup;
+    if (!group) return;
+    let leaveTimer = 0;
+    const enter = () => {
+      clearTimeout(leaveTimer);
+      if (!savedHover) placeSaved();
+      savedHover = true;
+    };
+    const leave = () => {
+      clearTimeout(leaveTimer);
+      leaveTimer = setTimeout(() => {
+        savedHover = false;
+        if (!savedFocus) savedHushed = false;
+      }, 120);
+    };
+    const focusIn = () => {
+      if (!savedFocus && !savedHover) placeSaved();
+      savedFocus = true;
+    };
+    const focusOut = (event) => {
+      if (group.contains(event.relatedTarget)) return;
+      savedFocus = false;
+      if (!savedHover) savedHushed = false;
+    };
+    const key = (event) => {
+      if (event.key !== "Escape" || !savedOpen) return;
+      event.preventDefault();
+      event.stopPropagation();
+      savedHushed = true;
+      if (group.contains(document.activeElement)) savedMark?.focus();
+    };
+    const resize = () => savedOpen && placeSaved();
+    group.addEventListener("pointerenter", enter);
+    group.addEventListener("pointerleave", leave);
+    group.addEventListener("focusin", focusIn);
+    group.addEventListener("focusout", focusOut);
+    group.addEventListener("keydown", key);
+    window.addEventListener("resize", resize);
+    return () => {
+      clearTimeout(leaveTimer);
+      group.removeEventListener("pointerenter", enter);
+      group.removeEventListener("pointerleave", leave);
+      group.removeEventListener("focusin", focusIn);
+      group.removeEventListener("focusout", focusOut);
+      group.removeEventListener("keydown", key);
+      window.removeEventListener("resize", resize);
+      savedHover = savedFocus = savedHushed = false;
+    };
+  });
+
+  $effect(() => {
+    const panel = savedPanel;
+    if (!panel) return;
+    if (savedOpen) {
+      if (!panel.matches(":popover-open")) panel.showPopover();
+    } else if (panel.matches(":popover-open")) {
+      panel.hidePopover();
+    }
+  });
+
   /** Likes or unlikes the playing track. Focus follows the mark it becomes,
       so a keyboard like does not drop the caret on the floor. */
   async function like(saved) {
@@ -543,13 +630,30 @@
           <!-- Marks live BESIDE the two-line text block, not inside its first
                line: .p-now centres its children, so the check faces the whole
                title+artists stack instead of hanging off the song name. -->
-          <span class="p-saved">
-            <button class="p-saved-trigger" bind:this={savedMark} aria-label={savedLabel} title={savedLabel}>
+          <span class="p-saved" bind:this={savedGroup}>
+            <button
+              class="p-saved-trigger"
+              bind:this={savedMark}
+              aria-label={savedLabel}
+              aria-expanded={savedOpen}
+              aria-controls="p-saved-panel"
+            >
               <span class="p-saved-mark"><Icon name="check" size={10} /></span>
             </button>
-            <!-- Focusing the check opens its membership panel without needing
-                 to tab into an invisible descendant. -->
-            <span class="p-saved-panel glass-overlay" role="group" aria-label={savedLabel}>
+            <!-- A popover, so it is drawn in the top layer, over the bar's
+                 edge and everything else, while staying next to the check in
+                 the DOM: Tab walks from the check straight into its rows. -->
+            <span
+              id="p-saved-panel"
+              class="p-saved-panel glass-overlay"
+              popover="manual"
+              role="group"
+              aria-label={savedLabel}
+              bind:this={savedPanel}
+              style:left="{savedAt.left}px"
+              style:bottom="{savedAt.bottom}px"
+              style:--bridge="{savedAt.bridge}px"
+            >
               <span class="p-saved-scroll" use:scrollbar>
                 <span class="p-saved-head">Saved in</span>
                 {#each nowSaved.refs as ref (ref.id)}
@@ -745,15 +849,6 @@
       >
         <Icon name="panel" size={18} />
       </button>
-      <!-- The first thing a narrow bar lets go of: the rail has Queue too. -->
-      <button
-        class="btn-round p-queue"
-        class:on={route.name === "queue"}
-        title="Queue"
-        onclick={() => navigate(route.name === "queue" ? "library" : "queue")}
-      >
-        <Icon name="queue" size={18} />
-      </button>
       <div class="p-volume" bind:this={volumeControl}>
         <button
           class="btn-round"
@@ -887,8 +982,8 @@
   /* Saved-in mark: a quiet rose check that opens the list of the user's
      containers holding this track. Rose, not foam, because the mark is a
      membership statement - "this song lives in your playlists" is what is
-     yours. The panel borrows the speed-menu's raised surface; hover or
-     keyboard focus opens it, no JS positioning. */
+     yours. Hover or keyboard focus opens its panel, overlay glass in the
+     top layer, like the speed menu. */
   .p-saved {
     position: relative;
     display: inline-flex;
@@ -925,24 +1020,38 @@
     background: color-mix(in srgb, var(--rose-ink) 82%, #ffffff);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--rose-ink) 22%, transparent);
   }
-  /* Overlay glass (.glass-overlay); the list scrolls inside it, so its
-     overlay bar is laid inside the glass. */
+  /* Overlay glass (.glass-overlay) in the top layer, placed in window
+     coordinates by placeSaved; the list scrolls inside it, so its overlay
+     bar is laid inside the glass. `inset`, `margin`, `border`, `padding` and
+     `overflow` undo the UA's [popover] rule, which centres a popover and
+     clips it — the bridge below hangs outside the box. It eases in and out
+     like the CSS panel it replaced; the exit runs because `display` and the
+     top layer are held for the transition. */
   .p-saved-panel {
-    position: absolute;
-    bottom: calc(100% + 8px);
-    left: -8px;
-    z-index: 20;
+    position: fixed;
+    inset: auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    overflow: visible;
     min-width: 200px;
     max-width: 280px;
     border-radius: var(--r3);
-    opacity: 0;
-    visibility: hidden;
-    transform: translateY(4px);
-    pointer-events: none;
     transition:
       opacity var(--d1) var(--ease),
       transform var(--d1) var(--ease),
-      visibility var(--d1) var(--ease);
+      overlay var(--d1) allow-discrete,
+      display var(--d1) allow-discrete;
+  }
+  .p-saved-panel:not(:popover-open) {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  @starting-style {
+    .p-saved-panel:popover-open {
+      opacity: 0;
+      transform: translateY(4px);
+    }
   }
   .p-saved-scroll {
     display: flex;
@@ -959,17 +1068,10 @@
   .p-saved-panel::after {
     content: "";
     position: absolute;
-    bottom: -8px;
+    bottom: calc(var(--bridge, 8px) * -1);
     left: 0;
     right: 0;
-    height: 8px;
-  }
-  .p-saved:hover .p-saved-panel,
-  .p-saved:focus-within .p-saved-panel {
-    opacity: 1;
-    visibility: visible;
-    transform: translateY(0);
-    pointer-events: auto;
+    height: var(--bridge, 8px);
   }
   .p-saved-head {
     margin-bottom: var(--s2);
