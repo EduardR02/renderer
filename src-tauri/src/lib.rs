@@ -84,6 +84,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::check_for_update,
             commands::play,
+            commands::set_window_visible,
             commands::pause,
             commands::next,
             commands::previous,
@@ -132,7 +133,6 @@ pub fn run() {
             commands::add_playlist_tracks,
             commands::remove_playlist_tracks,
             commands::reorder_playlist_tracks,
-            commands::status,
             commands::login,
             commands::logout,
             commands::set_normalisation,

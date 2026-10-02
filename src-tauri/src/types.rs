@@ -5,6 +5,8 @@
 //! so the engine's line-JSON state and browse messages deserialize straight
 //! into these types.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use renderer_engine::protocol::{
@@ -77,11 +79,9 @@ pub struct Track {
     /// as measured by the engine at browse time.
     ///
     /// This one field is EPHEMERAL where every other field here is durable, so
-    /// it must not survive `playlist_tracks_cache.json`: an audio cache that
-    /// has been cleared or pruned since the file was written would otherwise
-    /// keep showing download marks for tracks that are no longer on disk. It is
-    /// cleared on the way in, next to `align_artist_ids`, rather than stripped
-    /// on the way out — the same repair-on-load idiom, in the same loop.
+    /// it is never written to `playlist_tracks_cache.json`: an audio cache
+    /// that has been cleared or pruned since the file was written would
+    /// otherwise show download marks for tracks that are no longer on disk.
     pub cached: bool,
     /// Compact queue source context used when a play becomes a local history
     /// row. It is intentionally ephemeral metadata, not part of the row.
@@ -391,20 +391,6 @@ pub fn align_artist_ids(track: &mut Track) {
             .artist_ids
             .resize(track.artist_names.len(), String::new());
     }
-}
-
-/// Forgets a cached-audio mark restored from disk. See [`Track::cached`]: the
-/// audio cache and the playlist-track cache are two different files with two
-/// different lifetimes, and only the engine, measuring the audio cache now,
-/// can answer this. Anything read back off disk is a claim about a past state
-/// of a directory this file does not own.
-///
-/// Queue edit snapshots are equally ephemeral here: only the engine may
-/// resolve one from a playlist context when constructing a future queue.
-pub fn forget_cached_audio(track: &mut Track) {
-    track.cached = false;
-    track.effective_edit = None;
-    track.context.clear();
 }
 
 /// A playlist opened for browsing: playlist metadata plus its tracks.
@@ -965,8 +951,8 @@ impl ProfileDetail {
     }
 }
 
-/// The rootlist's folder order and hierarchy, with the standard playlist
-/// conversion applied at every depth.
+/// The rootlist's folder order and hierarchy. A playlist is named by id: its
+/// record lives once, in the library list.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LibraryNodeDetail {
@@ -975,21 +961,26 @@ pub enum LibraryNodeDetail {
         name: String,
         children: Vec<LibraryNodeDetail>,
     },
-    Playlist { playlist: Playlist },
+    Playlist { id: String },
 }
 
-impl From<LibraryNode> for LibraryNodeDetail {
-    fn from(node: LibraryNode) -> Self {
-        match node {
+impl LibraryNodeDetail {
+    /// Splits the engine's rootlist into its hierarchy and its playlists, the
+    /// latter in rootlist order with the standard conversion applied.
+    pub fn split(nodes: Vec<LibraryNode>, playlists: &mut Vec<Playlist>) -> Vec<Self> {
+        nodes.into_iter().map(|node| match node {
             LibraryNode::Folder { id, name, children } => Self::Folder {
                 id,
                 name,
-                children: children.into_iter().map(Self::from).collect(),
+                children: Self::split(children, playlists),
             },
-            LibraryNode::Playlist { playlist } => Self::Playlist {
-                playlist: Playlist::from(&playlist),
-            },
-        }
+            LibraryNode::Playlist { playlist } => {
+                let playlist = Playlist::from(&playlist);
+                let id = playlist.id.clone();
+                playlists.push(playlist);
+                Self::Playlist { id }
+            }
+        }).collect()
     }
 }
 
@@ -1175,7 +1166,10 @@ pub struct PlaybackState {
     #[serde(deserialize_with = "string_or_default")]
     pub current_uri: String,
     pub context: String,
-    pub queue: Vec<Track>,
+    /// Shared: the delta base, the retained state, every line subscriber and
+    /// `AppState` each hold the same rows, so passing a state on copies a
+    /// pointer. Writers replace the rows, or copy on write (`Arc::make_mut`).
+    pub queue: Arc<[Track]>,
     /// Generation of the canonical queue rows. Omission retains those rows;
     /// an explicit empty array clears them. Zero means an unnamed snapshot.
     #[serde(default)]
@@ -1221,7 +1215,7 @@ impl Default for PlaybackState {
             current_index: None,
             current_uri: String::new(),
             context: String::new(),
-            queue: Vec::new(),
+            queue: Arc::default(),
             queue_revision: 0,
             order_revision: 0,
             upcoming: Vec::new(),
@@ -1309,7 +1303,7 @@ mod tests {
 
     #[test]
     fn compact_events_preserve_plan_and_current_context_without_queue_rows() {
-        let state = PlaybackState { queue: vec![Track { id: "song".into(), ..Track::default() }],
+        let state = PlaybackState { queue: vec![Track { id: "song".into(), ..Track::default() }].into(),
             current_index: Some(0), context: "playlist:p".into(), queue_revision: 17,
             upcoming: vec![3, 2], playing: true, ..PlaybackState::default() };
         let compact = serde_json::to_value(PlaybackEvent::new(&state, false, true)).unwrap();
@@ -1477,7 +1471,8 @@ mod tests {
         assert_eq!(profile.playlists[0].description, "Mixed tapes");
         assert_eq!(profile.playlists[0].cover_url, "cover");
 
-        let node = LibraryNodeDetail::from(LibraryNode::Folder {
+        let mut playlists = Vec::new();
+        let tree = LibraryNodeDetail::split(vec![LibraryNode::Folder {
             id: "parent".into(),
             name: "Archive".into(),
             children: vec![LibraryNode::Folder {
@@ -1485,13 +1480,14 @@ mod tests {
                 name: "2026".into(),
                 children: vec![LibraryNode::Playlist { playlist }],
             }],
-        });
-        let json = serde_json::to_value(node).unwrap();
+        }], &mut playlists);
+        let json = serde_json::to_value(&tree[0]).unwrap();
         assert_eq!(json["kind"], "folder");
         assert_eq!(json["children"][0]["kind"], "folder");
-        assert_eq!(json["children"][0]["children"][0]["kind"], "playlist");
-        assert_eq!(json["children"][0]["children"][0]["playlist"]["owner"], "DJ Name");
-        assert_eq!(json["children"][0]["children"][0]["playlist"]["tracks_total"], 12);
+        assert_eq!(json["children"][0]["children"][0], serde_json::json!({"kind": "playlist", "id": "mix"}));
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].owner, "DJ Name");
+        assert_eq!(playlists[0].tracks_total, 12);
     }
 
     #[test]

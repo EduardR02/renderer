@@ -5,7 +5,7 @@ globalThis.window = { __TAURI_INTERNALS__: { invoke: () => new Promise(() => {})
 const { library, setLibrary, promotePlaylist, libraryRailEntries } = await import("./state.svelte.js");
 
 const playlist = (id, last_activity = null, name = id) => ({ id, name, last_activity, last_played: null });
-const leaf = (row) => ({ kind: "playlist", playlist: row });
+const leaf = (row) => ({ kind: "playlist", id: row.id });
 const folder = (id, children) => ({ kind: "folder", id, name: id, children });
 const ids = (entries) => entries.map((entry) => entry.kind === "folder" ? `folder:${entry.id}` : entry.playlist.id);
 

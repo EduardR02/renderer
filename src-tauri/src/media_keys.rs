@@ -344,7 +344,6 @@ pub fn update_disconnected() {
     }
 }
 
-
 fn track_duration(compiled_ms: u32, source_ms: u32) -> u32 {
     if compiled_ms > 0 { compiled_ms } else { source_ms }
 }

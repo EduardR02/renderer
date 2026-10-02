@@ -4,7 +4,7 @@ import { applyCacheMarks } from "./cache-marks.js";
 // Match the existing playback-state tests: these assertions concern row
 // identity and metadata transitions, not Svelte rendering.
 globalThis.$state = (value) => value;
-const { applyPlayback, playback, detail, api, clearCache, watchCacheMarks } = await import("./state.svelte.js");
+const { applyPlayback, playback, detail, search, api, clearCache, watchCacheMarks, loadCataloguePage } = await import("./state.svelte.js");
 
 const track = (id, cached = false) => ({ id, uri: `spotify:track:${id}`, cached });
 
@@ -102,5 +102,35 @@ test("only a successful audio-cache wipe unmarks all open surfaces in place", as
   } finally {
     api.clearCache = original;
     off();
+  }
+});
+
+test("search songs and kept catalogue pages take live marks, and a wipe clears them without a refetch", async () => {
+  reset();
+  const browse = api.browseArtistCatalogue;
+  const wipe = api.clearCache;
+  let fetches = 0;
+  try {
+    api.browseArtistCatalogue = async () => {
+      fetches += 1;
+      return { releases: [{ id: "album", tracks: [track("song"), track("other")] }], total: 1, next_offset: null };
+    };
+    api.clearCache = async () => ({ audio: { files: 0, bytes: 0 }, covers: null });
+    search.results = { tracks: [track("song"), track("hit")] };
+    const page = await loadCataloguePage("artist-marks", ["albums"], 0, 4);
+
+    applyPlayback({ cached_ids: ["song", "hit"] });
+    expect(search.results.tracks.map((row) => row.cached)).toEqual([true, true]);
+    expect(page.releases[0].tracks.map((row) => row.cached)).toEqual([true, false]);
+
+    await clearCache("audio");
+    expect(search.results.tracks.map((row) => row.cached)).toEqual([false, false]);
+    expect(await loadCataloguePage("artist-marks", ["albums"], 0, 4)).toBe(page);
+    expect(page.releases[0].tracks[0].cached).toBe(false);
+    expect(fetches).toBe(1);
+  } finally {
+    api.browseArtistCatalogue = browse;
+    api.clearCache = wipe;
+    search.results = null;
   }
 });

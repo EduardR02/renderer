@@ -119,12 +119,12 @@ fixtures.profile = {
 };
 fixtures.playlistTree = [
   { kind: "folder", id: "f1", name: "Trips", children: [
-    { kind: "playlist", playlist: fixtures.playlists[0] },
+    { kind: "playlist", id: fixtures.playlists[0].id },
     { kind: "folder", id: "f2", name: "Late drives", children: [
-      { kind: "playlist", playlist: fixtures.playlists[2] },
+      { kind: "playlist", id: fixtures.playlists[2].id },
     ] },
   ] },
-  { kind: "playlist", playlist: fixtures.playlists[1] },
+  { kind: "playlist", id: fixtures.playlists[1].id },
 ];
 fixtures.playlistDetail = {
   id: "p1",

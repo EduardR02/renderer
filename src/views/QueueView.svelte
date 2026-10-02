@@ -5,6 +5,7 @@
   import ArtistLinks from "../components/ArtistLinks.svelte";
   import { formatTime, formatTotal } from "../lib/time.js";
   import { observeStuck } from "../lib/sticky.js";
+  import { rowWindow } from "../lib/virtual.js";
   const queue = $derived(playback.queue);
 
   /* Two index spaces live in this file. `qi` is a queue index — the only thing
@@ -90,12 +91,8 @@
 
   function measure(scroller) {
     if (!bodyEl || !scroller) return;
-    const len = rows.length;
-    // Layout is clean during scroll, so these reads are cheap and — unlike a
-    // cached offset — stay correct when the header above the list changes size.
-    const above = scroller.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
-    const f = Math.max(0, Math.floor(above / ROW_H) - OVERSCAN);
-    const l = Math.min(len, Math.ceil((above + scroller.clientHeight) / ROW_H) + OVERSCAN);
+    // The window arithmetic is shared with the track table and the history.
+    const { first: f, last: l } = rowWindow(bodyEl, scroller, ROW_H, OVERSCAN, rows.length);
     if (f === curFirst && l === curLast) return;
     curFirst = f;
     curLast = l;

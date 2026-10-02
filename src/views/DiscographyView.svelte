@@ -135,7 +135,11 @@
      the first page of the new selection. */
   $effect(() => paging.reset());
 
-  $effect(() => sentinelLoader(sentinel, () => paging.loadNext()));
+  /* Re-attached per page: a footer still in reach loads the next one. */
+  $effect(() => {
+    paging.releases.length;
+    return sentinelLoader(sentinel, () => paging.loadNext());
+  });
 
   /* The control row is type on the page until releases pass under it. */
   let controlSentinel = $state(null);

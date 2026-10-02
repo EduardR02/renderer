@@ -8,6 +8,7 @@
 //! The router keeps an occurrence cursor, never a second durable queue.
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,11 +33,16 @@ const LOW_WATER: usize = 10;
 /// Spotify can keep reporting the previous item for a few seconds after a
 /// command; until then a disagreeing reading is retried, not believed.
 const GRACE: Duration = Duration::from_secs(8);
-const ACTIVE_POLL: Duration = Duration::from_secs(4);
-const PAUSED_POLL: Duration = Duration::from_secs(20);
+/// While the window is visible the device is read this often, playing or paused.
+const VISIBLE_POLL: Duration = Duration::from_secs(4);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A start Spotify has not accepted by then is dropped: the selection waits
+/// for Play instead of starting long after it was made.
+const START_DEADLINE: Duration = Duration::from_secs(90);
 /// The last window entry counts as finished this close to its projected end.
 const END_SLACK_MS: u32 = 1500;
+/// A reading this close to the projected playhead is no news.
+const DRIFT_MS: u32 = 1500;
 /// Revisions cross the JavaScript bridge as exactly representable integers.
 const MAX_REVISION: u64 = (1 << 53) - 1;
 const LOCAL_ONLY: &str = "Playback speed and track-editor previews require This computer; Spotify devices play original audio";
@@ -110,6 +116,9 @@ struct Window {
     at: usize,
     /// A paused edit changed the order; the next Play sends it.
     stale: bool,
+    /// A newer selection's start expired: entries that name no row are shown
+    /// as staged from now on, never restarted.
+    expired: bool,
 }
 
 /// What the router's own last command should make Spotify report.
@@ -126,6 +135,24 @@ struct Pending {
 struct StartIntent {
     current: usize,
     position_ms: u32,
+    /// When the selection was made; retries keep it, see [`START_DEADLINE`].
+    since: Instant,
+}
+
+/// What the webview and the media session were last shown, so a reading that
+/// only confirms it publishes nothing.
+struct Shown {
+    playing: bool,
+    volume: u8,
+    shuffle: bool,
+    repeat: String,
+    error: String,
+    /// The playhead shown, and when.
+    position_ms: u32,
+    at: Instant,
+    /// Index, URI, duration and device name; a transport-only publish leaves
+    /// them as they were.
+    row: Option<(Option<usize>, String, u32, String)>,
 }
 
 struct Remote {
@@ -145,12 +172,16 @@ struct Remote {
     anchored: Instant,
     published_queue: Option<u64>,
     published_order: Option<u64>,
+    shown: Option<Shown>,
     polling: bool,
     pending: Option<Pending>,
     start_intent: Option<StartIntent>,
     failures: u32,
     repeat_dirty: bool,
     pause_dirty: bool,
+    /// The window was looked at again: read the device now, Spotify's own
+    /// queue included.
+    refresh: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -187,12 +218,14 @@ impl Remote {
             anchored: Instant::now(),
             published_queue: None,
             published_order: None,
+            shown: None,
             polling: false,
             pending: None,
             start_intent: None,
             failures: 0,
             repeat_dirty: false,
             pause_dirty: false,
+            refresh: false,
         }
     }
 
@@ -205,6 +238,38 @@ impl Remote {
     fn rebase(&mut self) {
         self.state.position_ms = self.position();
         self.anchored = Instant::now();
+    }
+
+    /// Records a publish; `full` when it carried the row fields too.
+    fn record_shown(&mut self, full: bool) {
+        let state = &self.state;
+        let row = if full {
+            Some((state.current_index, state.current_uri.clone(), state.duration_ms, state.output_device_name.clone()))
+        } else {
+            self.shown.take().and_then(|shown| shown.row)
+        };
+        self.shown = Some(Shown { playing: state.playing, volume: state.volume, shuffle: state.shuffle, repeat: state.repeat.clone(),
+            error: state.error.clone(), position_ms: state.position_ms, at: self.anchored, row });
+    }
+
+    /// Whether everything last shown still holds: the same rows, row and
+    /// settings, and a playhead where the shown one projects.
+    fn still_shown(&self) -> bool {
+        let Some(shown) = &self.shown else { return false; };
+        let state = &self.state;
+        shown.row.as_ref().is_some_and(|(index, uri, duration, device)| *index == state.current_index
+            && *uri == state.current_uri && *duration == state.duration_ms && *device == state.output_device_name)
+            && self.published_queue == Some(state.queue_revision) && self.published_order == Some(state.order_revision)
+            && shown.playing == state.playing && shown.volume == state.volume && shown.shuffle == state.shuffle
+            && shown.repeat == state.repeat && shown.error == state.error
+            && project(shown.position_ms, shown.playing, state.duration_ms, shown.at.elapsed()).abs_diff(self.position()) <= DRIFT_MS
+    }
+
+    /// The rows after the device's row that Spotify can play, as many as fit.
+    /// Under sequential repeat the lap is cycled to fill them, so a short
+    /// queue does not need a new window, and a rebuffer, at every track.
+    fn window_tail(&self, order: &[usize]) -> Vec<usize> {
+        window_tail(&self.state.queue, order, !self.state.shuffle && self.state.repeat == "context")
     }
 
     /// Spotify plays the window in order; only repeat-one is its own job.
@@ -238,7 +303,9 @@ impl Remote {
 
     fn adopt_engine(&mut self, view: EngineView) {
         if let Some(engine) = view.state {
-            // An unchanged revision names rows already held (and an engine
+            // An unchanged revision names rows the view already holds. An
+            // unnamed (zero) revision, or a view of the phone's own rows,
+            // takes the engine's rows.
             if engine.queue_revision == 0 || engine.queue_revision != self.engine_revision || self.kind() == Kind::Foreign {
                 self.state.queue = engine.queue;
                 self.state.queue_revision = next_revision(self.state.queue_revision);
@@ -285,8 +352,8 @@ impl Remote {
         let mut rows = Vec::with_capacity(queue.len() + offset);
         rows.extend(current);
         rows.extend(queue.iter().filter_map(|item| track_from_player(item).ok()));
-        if self.state.queue != rows {
-            self.state.queue = rows;
+        if *self.state.queue != *rows {
+            self.state.queue = rows.into();
             self.state.queue_revision = next_revision(self.state.queue_revision);
         }
         self.show_row((offset == 1).then_some(0));
@@ -345,10 +412,16 @@ impl PlaybackRouter {
         self.core.run(&self.host(app), action).await
     }
 
-    /// Re-read the engine's authoritative order after eligibility metadata changes.
-    pub async fn eligibility_changed(&self, app: &AppHandle) -> Result<(), String> {
-        self.core.eligibility_changed(&self.host(app)).await
+    /// Re-read the engine's authoritative order after eligibility metadata
+    /// changes. A failed Spotify write is reported here and retried from a
+    /// stale window; it never makes the saved change look failed.
+    pub async fn eligibility_changed(&self, app: &AppHandle) {
+        self.core.eligibility_changed(&self.host(app)).await;
     }
+
+    /// The watcher reads a Spotify device regularly only while the window is
+    /// visible; `refresh` reads it at once.
+    pub fn set_visible(&self, visible: bool, refresh: bool) { self.core.set_visible(visible, refresh); }
 
     pub async fn watch(self: Arc<Self>, app: AppHandle) {
         let host = self.host(&app);
@@ -356,11 +429,18 @@ impl PlaybackRouter {
     }
 }
 
-#[derive(Default)]
 struct Core {
     operation: AsyncMutex<()>,
     remote: Mutex<Option<Remote>>,
     changed: Notify,
+    /// Whether the window can be seen; it decides how often a device is read.
+    visible: AtomicBool,
+}
+
+impl Default for Core {
+    fn default() -> Self {
+        Self { operation: AsyncMutex::new(()), remote: Mutex::new(None), changed: Notify::new(), visible: AtomicBool::new(true) }
+    }
 }
 
 impl Core {
@@ -382,6 +462,7 @@ impl Core {
         remote.published_queue = Some(remote.state.queue_revision);
         remote.published_order = Some(remote.state.order_revision);
         host.media(&remote.state);
+        remote.record_shown(true);
     }
 
     /// Transport-only changes must not serialize a long queue or its order.
@@ -393,6 +474,24 @@ impl Core {
         host.emit("state", json!({ "playing": state.playing, "position_ms": state.position_ms, "volume": state.volume,
             "shuffle": state.shuffle, "repeat": state.repeat, "error": state.error }));
         host.media(state);
+        remote.record_shown(false);
+    }
+
+    /// A reading publishes only what it changed: a confirmed playhead is no
+    /// news to the webview or the media session.
+    fn publish_changed<H: Host>(&self, host: &H) {
+        if self.remote.lock().as_ref().is_some_and(|remote| !remote.still_shown()) { self.publish(host); }
+    }
+
+    fn set_visible(&self, visible: bool, refresh: bool) {
+        let was = self.visible.swap(visible, Ordering::Relaxed);
+        // Coming back into view reads the device at once: a hidden, paused
+        // window read nothing meanwhile.
+        let refresh = visible && (refresh || !was);
+        if refresh {
+            if let Some(remote) = self.remote.lock().as_mut() { remote.refresh = true; }
+        }
+        if refresh || was != visible { self.changed.notify_one(); }
     }
 
     fn report_error<H: Host>(&self, host: &H, error: &str) {
@@ -603,7 +702,8 @@ impl Core {
             remote.start_intent = None;
             remote.rebase();
             remote.state.playing = false;
-            if kind != Kind::Prepared { remote.expect(None, Some(false)); }
+            // A staged queue with its start cancelled has nothing left to watch.
+            if kind != Kind::Prepared { remote.expect(None, Some(false)); } else { remote.polling = remote.pause_dirty; }
         }
         self.publish_transport(host);
         Ok(())
@@ -813,7 +913,7 @@ impl Core {
             remote.set_order(remote.plan.clone());
             remote.anchor
         };
-        self.publish(host);
+        // Either way publishes once, with the state Spotify's answer settles.
         match current {
             Some(current) => self.start(host, current, 0).await,
             None => self.finish(host).await,
@@ -848,15 +948,21 @@ impl Core {
         Ok(guard.as_ref().ok_or(RELEASED)?.order_from(current, cut).unwrap_or_default())
     }
 
-    /// Starts the engine's order on the device at `current`. Spotify's own
-    /// shuffle and repeat go out of the way first unless the router already
-    /// owns the device.
+    /// Starts the engine's order on the device at `current`.
     async fn start<H: Host>(&self, host: &H, current: usize, position_ms: u32) -> Result<(), String> {
+        self.start_from(host, current, position_ms, Instant::now()).await
+    }
+
+    /// Starts, or retries, a selection made at `since`. It publishes once,
+    /// when Spotify has answered: playing, or the staged row with the intent
+    /// kept for retry. A play button that showed paused while the request was
+    /// out would flicker on every start.
+    async fn start_from<H: Host>(&self, host: &H, current: usize, position_ms: u32, since: Instant) -> Result<(), String> {
         {
             let mut guard = self.remote.lock();
             let remote = guard.as_mut().ok_or(RELEASED)?;
             validate_remote_track(remote.state.queue.get(current).ok_or("queue index is out of range")?)?;
-            remote.start_intent = Some(StartIntent { current, position_ms });
+            remote.start_intent = Some(StartIntent { current, position_ms, since });
             remote.pending = None;
             remote.show_row(Some(current));
             remote.state.position_ms = position_ms;
@@ -865,7 +971,14 @@ impl Core {
             remote.polling = true;
             if let Mode::Owned(window) = &mut remote.mode { window.stale = true; }
         }
+        let result = self.send_start(host, current, position_ms).await;
         self.publish(host);
+        result
+    }
+
+    /// Spotify's own shuffle and repeat go out of the way first unless the
+    /// router already owns the device.
+    async fn send_start<H: Host>(&self, host: &H, current: usize, position_ms: u32) -> Result<(), String> {
         if self.remote.lock().as_ref().is_some_and(|remote| remote.anchor != Some(current)) {
             self.reanchor(host, current, position_ms).await?;
         }
@@ -878,18 +991,15 @@ impl Core {
                 remote.device_path("shuffle", &[("state", "false".into())]),
                 remote.device_path("repeat", &[("state", remote.spotify_repeat().into())]),
             ));
-            let tail = window_tail(&remote.state.queue, &order);
+            let tail = remote.window_tail(&order);
             remote.set_order(order);
             (configure, tail)
         };
-        self.publish(host);
         if let Some((shuffle, repeat)) = configure {
             host.spotify(Method::PUT, shuffle?, None).await?;
             host.spotify(Method::PUT, repeat?, None).await?;
         }
-        self.send_window(host, current, tail, position_ms).await?;
-        self.publish(host);
-        Ok(())
+        self.send_window(host, current, tail, position_ms).await
     }
 
     /// Hands Spotify the device's row followed by `tail`, resuming at
@@ -912,6 +1022,7 @@ impl Core {
             uris,
             at: 0,
             stale: false,
+            expired: false,
         });
         remote.show_row(Some(current));
         remote.state.playing = true;
@@ -1006,10 +1117,10 @@ impl Core {
         self.settle(host, current, order).await
     }
 
-    async fn eligibility_changed<H: Host>(&self, host: &H) -> Result<(), String> {
+    async fn eligibility_changed<H: Host>(&self, host: &H) {
         let _operation = self.operation.lock().await;
         let kind = self.remote.lock().as_ref().map(Remote::kind);
-        if !matches!(kind, Some(Kind::Prepared | Kind::Owned)) { return Ok(()); }
+        if !matches!(kind, Some(Kind::Prepared | Kind::Owned)) { return; }
         let result: Result<(), String> = async {
             let view = host.engine(None).await?;
             let current = {
@@ -1024,9 +1135,13 @@ impl Core {
             }
             Ok(())
         }.await;
-        if let Err(error) = &result { self.report_error(host, error); }
+        if let Err(error) = &result {
+            // The engine kept the change: a stale window sends it on the next
+            // reconciliation, or on Play.
+            if let Some(Mode::Owned(window)) = self.remote.lock().as_mut().map(|remote| &mut remote.mode) { window.stale = true; }
+            self.report_error(host, error);
+        }
         self.changed.notify_one();
-        result
     }
 
     /// Publish canonical edits even if the Spotify write fails. A stale window
@@ -1035,7 +1150,7 @@ impl Core {
         let send = {
             let mut guard = self.remote.lock();
             let remote = guard.as_mut().ok_or(RELEASED)?;
-            let tail = window_tail(&remote.state.queue, &order);
+            let tail = remote.window_tail(&order);
             let playing = remote.state.playing;
             let position_ms = remote.position();
             remote.set_order(order);
@@ -1047,10 +1162,10 @@ impl Core {
                 _ => None,
             }
         };
-        self.publish(host);
+        self.publish_changed(host);
         if let Some((tail, position_ms)) = send {
             self.send_window(host, current, tail, position_ms).await?;
-            self.publish(host);
+            self.publish_changed(host);
         }
         Ok(())
     }
@@ -1147,11 +1262,22 @@ impl Core {
         self.apply_pause(host).await?;
         self.apply_repeat(host).await?;
         let intent = self.remote.lock().as_ref().and_then(|remote| remote.start_intent.as_ref()
-            .map(|intent| (intent.current, intent.position_ms)));
-        if let Some((current, position_ms)) = intent {
-            return self.start(host, current, position_ms).await;
+            .map(|intent| (intent.current, intent.position_ms, intent.since)));
+        if let Some((current, position_ms, since)) = intent {
+            if since.elapsed() < START_DEADLINE { return self.start_from(host, current, position_ms, since).await; }
+            self.expire_start(host);
         }
-        if self.remote.lock().as_ref().is_some_and(|remote| remote.kind() == Kind::Prepared) { return Ok(()); }
+        {
+            let mut guard = self.remote.lock();
+            let Some(remote) = guard.as_mut() else { return Ok(()); };
+            if remote.kind() == Kind::Prepared {
+                // Nothing plays there for this queue until Play: nothing to watch.
+                remote.polling = false;
+                remote.failures = 0;
+                remote.refresh = false;
+                return Ok(());
+            }
+        }
         let player = host.spotify(Method::GET, "me/player?additional_types=track,episode".into(), None).await?
             .map(serde_json::from_value::<PlayerState>).transpose()
             .map_err(|_| "Spotify returned an invalid playback state".to_owned())?;
@@ -1161,7 +1287,7 @@ impl Core {
         if player.as_ref().is_some_and(|player| player.device.is_restricted) {
             return Err("Spotify does not allow controlling this device".into());
         }
-        let (kind, commanded) = {
+        let (kind, commanded, refresh) = {
             let mut guard = self.remote.lock();
             let Some(remote) = guard.as_mut() else { return Ok(()); };
             let repeat = (remote.kind() == Kind::Owned).then(|| remote.spotify_repeat());
@@ -1172,19 +1298,35 @@ impl Core {
                     return Ok(());
                 }
             }
-            let commanded = remote.pending.is_some();
-            remote.pending = None;
-            (remote.kind(), commanded)
+            let commanded = remote.pending.take().is_some();
+            (remote.kind(), commanded, std::mem::take(&mut remote.refresh))
         };
         let result = match kind {
             Kind::Owned => self.observe_owned(host, player, !commanded).await,
-            Kind::Foreign => self.observe_foreign(host, player).await,
+            Kind::Foreign => self.observe_foreign(host, player, refresh).await,
             Kind::Prepared => Ok(()),
         };
         if result.is_ok() {
             if let Some(remote) = self.remote.lock().as_mut() { remote.failures = 0; }
         }
         result
+    }
+
+    /// A start Spotify never accepted is dropped once it is old: the selection
+    /// stays staged and waits for Play instead of starting long after it was
+    /// made, and the device's obsolete entries are only shown from now on.
+    fn expire_start<H: Host>(&self, host: &H) {
+        if let Some(remote) = self.remote.lock().as_mut() {
+            remote.start_intent = None;
+            if let Mode::Owned(window) = &mut remote.mode {
+                window.stale = true;
+                window.expired = true;
+            } else {
+                // The phone's own session was never replaced.
+                remote.mode = Mode::Prepared;
+            }
+        }
+        self.publish_changed(host);
     }
 
     async fn observe_owned<H: Host>(&self, host: &H, player: Option<PlayerState>, infer_transition: bool) -> Result<(), String> {
@@ -1195,20 +1337,22 @@ impl Core {
             /// autoplay past the last entry): the order goes on after this row.
             Resume(Option<usize>),
             Elsewhere,
-            /// A paused old occurrence must not replace a newly staged selection.
+            /// An old occurrence must not replace a newly staged selection:
+            /// one the device is paused on, or any after a start expired.
             Staged,
             /// The phone resumed an obsolete removed row: play the staged row,
             /// not the row after it.
             Start(usize),
         }
         let Some(player) = player else {
-            // The device dropped its session: show it stopped, keep watching slowly.
+            // The device dropped its session: show it stopped. Play starts the
+            // window again; until then only a visible window keeps reading.
             if let Some(remote) = self.remote.lock().as_mut() {
                 remote.rebase();
                 remote.state.playing = false;
                 remote.state.error.clear();
             }
-            self.publish_transport(host);
+            self.publish_changed(host);
             return Ok(());
         };
         let seen = {
@@ -1233,8 +1377,8 @@ impl Core {
                 // Spotify's own shuffle or repeat reorders what it holds: that is
                 // the phone taking over, not the window playing.
                 Some(_) if !plan_kept => Seen::Elsewhere,
-                Some(j) if !player.is_playing && window.stale
-                    && (window.rows[j].is_none() || window.rows[j] != remote.state.current_index) => {
+                Some(j) if (window.expired && window.rows[j].is_none()) || (!player.is_playing && window.stale
+                    && (window.rows[j].is_none() || window.rows[j] != remote.state.current_index)) => {
                     remote.state.volume = player.device.volume_percent.unwrap_or(remote.state.volume);
                     remote.supports_volume = player.device.supports_volume;
                     Seen::Staged
@@ -1271,7 +1415,7 @@ impl Core {
             }
         };
         match seen {
-            Seen::Staged => { self.publish_transport(host); Ok(()) }
+            Seen::Staged => { self.publish_changed(host); Ok(()) }
             Seen::Start(current) => self.start(host, current, 0).await,
             Seen::Row(row) => {
                 if self.remote.lock().as_ref().is_some_and(|remote| remote.anchor != Some(row)) {
@@ -1304,12 +1448,22 @@ impl Core {
         }
     }
 
-    async fn observe_foreign<H: Host>(&self, host: &H, player: Option<PlayerState>) -> Result<(), String> {
-        // A foreign queue is read only on the slow reconciliation schedule.
-        // Keeping old rows on failure avoids silently deleting queued entries.
-        let queue = if player.as_ref().is_some_and(|player| player.item.is_some()) {
-            self.spotify_queue(host).await?
-        } else { Vec::new() };
+    /// `refresh` when the window was just looked at again.
+    async fn observe_foreign<H: Host>(&self, host: &H, player: Option<PlayerState>, refresh: bool) -> Result<(), String> {
+        // Spotify's own queue is read only when the item changes or the window
+        // is looked at again. A failed read keeps the rows shown rather than
+        // silently deleting queued entries.
+        let item = player.as_ref().filter(|player| player.item.is_some()).map(item_uri);
+        let read = item.is_some_and(|uri| refresh || self.remote.lock().as_ref().is_some_and(|remote| remote.state.current_uri != uri));
+        let queue = if read {
+            match self.spotify_queue(host).await {
+                Ok(queue) => Some(queue),
+                Err(error) => {
+                    if let Some(remote) = self.remote.lock().as_mut() { remote.refresh |= refresh; }
+                    return Err(error);
+                }
+            }
+        } else { None };
         if let Some(remote) = self.remote.lock().as_mut() {
             match &player {
                 Some(player) => {
@@ -1323,15 +1477,21 @@ impl Core {
                     remote.state.error.clear();
                 }
             }
-            remote.show_foreign(player.as_ref(), &queue);
+            match (&queue, item) {
+                (Some(queue), _) => remote.show_foreign(player.as_ref(), queue),
+                (None, None) => remote.show_foreign(player.as_ref(), &[]),
+                // The same item: the rows shown stand.
+                (None, Some(_)) => {}
+            }
         }
-        self.publish(host);
+        self.publish_changed(host);
         Ok(())
     }
 
     async fn watch<H: Host>(&self, host: &H) {
         loop {
-            let delay = self.remote.lock().as_ref().filter(|remote| remote.polling).map(reconcile_delay);
+            let visible = self.visible.load(Ordering::Relaxed);
+            let delay = self.remote.lock().as_ref().filter(|remote| remote.polling).and_then(|remote| reconcile_delay(remote, visible));
             let Some(delay) = delay else { self.changed.notified().await; continue; };
             tokio::select! {
                 _ = self.changed.notified() => continue,
@@ -1360,16 +1520,22 @@ impl Core {
     }
 }
 
-/// Confirm commands quickly with bounded retries, observe healthy selected
-/// devices regularly, and check earlier at the projected track boundary.
-fn reconcile_delay(remote: &Remote) -> Duration {
-    if remote.failures > 0 { return Duration::from_secs(1 << remote.failures.min(6)).min(MAX_BACKOFF); }
-    if let Some(pending) = &remote.pending { return Duration::from_millis(750 << pending.retries.min(3)); }
-    if remote.start_intent.is_some() || remote.repeat_dirty || remote.pause_dirty { return Duration::from_millis(750); }
-    if !remote.state.playing { return PAUSED_POLL; }
-    if remote.state.duration_ms == 0 { return ACTIVE_POLL; }
-    let remaining = remote.state.duration_ms.saturating_sub(remote.position());
-    Duration::from_millis(u64::from(remaining) + 750).min(ACTIVE_POLL)
+/// When the watcher next reads the device; `None` waits for a change.
+/// Commands are confirmed quickly with bounded retries. A visible window
+/// reads the device regularly, playing or paused, and at the projected track
+/// end. Hidden, only an owned window that plays is read, at its track end: it
+/// must be extended, continue its repeat lap or stop autoplay, and the media
+/// flyout and keys must stay right. Anything else hidden does no work.
+fn reconcile_delay(remote: &Remote, visible: bool) -> Option<Duration> {
+    if remote.failures > 0 { return Some(Duration::from_secs(1 << remote.failures.min(6)).min(MAX_BACKOFF)); }
+    if let Some(pending) = &remote.pending { return Some(Duration::from_millis(750 << pending.retries.min(3))); }
+    if remote.start_intent.is_some() || remote.repeat_dirty || remote.pause_dirty { return Some(Duration::from_millis(750)); }
+    if remote.refresh { return Some(Duration::ZERO); }
+    let track_end = (remote.state.playing && remote.state.duration_ms > 0).then(|| {
+        Duration::from_millis(u64::from(remote.state.duration_ms.saturating_sub(remote.position())) + 750)
+    });
+    if visible { return Some(track_end.map_or(VISIBLE_POLL, |end| end.min(VISIBLE_POLL))); }
+    track_end.filter(|_| remote.kind() == Kind::Owned)
 }
 
 /// The engine's order from the device's row `current`, derived from the
@@ -1397,9 +1563,11 @@ fn order_from(anchor: Option<usize>, plan: &[usize], shuffle: bool, repeat: &str
     Some(anchor.into_iter().chain(plan.iter().copied()).filter(|row| after(*row)).collect())
 }
 
-/// The rows after the device's row that Spotify can play, as many as fit.
-fn window_tail(rows: &[Track], order: &[usize]) -> Vec<usize> {
-    order.iter().copied().filter(|row| rows.get(*row).is_some_and(remote_playable)).take(WINDOW - 1).collect()
+/// The rows after the device's row that Spotify can play, as many as fit;
+/// `cycle` repeats the order (one lap) until they do.
+fn window_tail(rows: &[Track], order: &[usize], cycle: bool) -> Vec<usize> {
+    let playable = order.iter().copied().filter(|row| rows.get(*row).is_some_and(remote_playable));
+    if cycle { playable.cycle().take(WINDOW - 1).collect() } else { playable.take(WINDOW - 1).collect() }
 }
 
 /// Whether Spotify's remaining entries fall short of `tail`: a different
@@ -1414,8 +1582,12 @@ fn window_differs(window: &Window, current: usize, tail: &[usize]) -> bool {
 fn next_revision(revision: u64) -> u64 { revision % MAX_REVISION + 1 }
 
 fn projected_position(state: &PlaybackState, elapsed: Duration) -> u32 {
-    let position = if state.playing { state.position_ms.saturating_add(elapsed.as_millis().min(u32::MAX as u128) as u32) } else { state.position_ms };
-    if state.duration_ms == 0 { position } else { position.min(state.duration_ms) }
+    project(state.position_ms, state.playing, state.duration_ms, elapsed)
+}
+
+fn project(position_ms: u32, playing: bool, duration_ms: u32, elapsed: Duration) -> u32 {
+    let position = if playing { position_ms.saturating_add(elapsed.as_millis().min(u32::MAX as u128) as u32) } else { position_ms };
+    if duration_ms == 0 { position } else { position.min(duration_ms) }
 }
 
 fn item_uri(player: &PlayerState) -> &str {
@@ -1666,7 +1838,7 @@ mod tests {
             upcoming
         }
         fn state(&self) -> PlaybackState {
-            PlaybackState { queue: self.rows.clone(), current_index: self.current, queue_revision: self.revision, repeat: self.repeat.clone(),
+            PlaybackState { queue: self.rows.as_slice().into(), current_index: self.current, queue_revision: self.revision, repeat: self.repeat.clone(),
                 upcoming: self.upcoming(), playing: self.playing, position_ms: self.position_ms, auth_state: "ready".into(), ready: true,
                 current_uri: self.current.map(|row| self.rows[row].uri.clone()).unwrap_or_default(), duration_ms: 100_000, ..PlaybackState::default() }
         }
@@ -1856,7 +2028,7 @@ mod tests {
             }
             host.spotify.lock().log.clear();
             host.engine.lock().excluded.insert("t1".into());
-            core.eligibility_changed(&host).await.unwrap();
+            core.eligibility_changed(&host).await;
             let state = core.snapshot().unwrap();
             assert_eq!(state.current_uri, "spotify:track:t0");
             assert_eq!(state.playing, !paused);
@@ -1896,20 +2068,31 @@ mod tests {
     }
 
     #[test]
-    fn selected_device_observation_latency_remains_bounded_while_playing_or_paused() {
+    fn a_visible_window_reads_regularly_and_a_hidden_one_only_at_an_owned_track_end() {
+        let window = Window { rows: vec![Some(0)], uris: vec!["spotify:track:t0".into()], at: 0, stale: false, expired: false };
         let mut remote = Remote::new(PlaybackState { playing: true, position_ms: 20000, duration_ms: 100000, ..PlaybackState::default() }, true);
-        assert!(reconcile_delay(&remote) <= Duration::from_secs(4));
+        remote.mode = Mode::Owned(window);
+        assert_eq!(reconcile_delay(&remote, true), Some(VISIBLE_POLL));
+        let hidden = reconcile_delay(&remote, false).unwrap();
+        assert!((Duration::from_millis(80_000)..=Duration::from_millis(80_750)).contains(&hidden), "only the track end: {hidden:?}");
         remote.state.position_ms = 99000;
-        assert!(reconcile_delay(&remote) <= Duration::from_millis(1750));
+        assert!(reconcile_delay(&remote, true).unwrap() <= Duration::from_millis(1750));
+        assert!(reconcile_delay(&remote, false).unwrap() <= Duration::from_millis(1750));
+
         remote.state.playing = false;
-        for _ in 0..20 {
-            assert!(reconcile_delay(&remote) <= Duration::from_secs(20));
-            remote.adopt_transport(&serde_json::from_value(reading("spotify:track:t0", false, 1000)).unwrap());
-        }
+        assert_eq!(reconcile_delay(&remote, true), Some(VISIBLE_POLL), "paused, but looked at");
+        assert_eq!(reconcile_delay(&remote, false), None, "hidden and paused does no work");
+        remote.mode = Mode::Foreign;
+        remote.state.playing = true;
+        assert_eq!(reconcile_delay(&remote, false), None, "the phone's own session is not watched while hidden");
+        assert!(reconcile_delay(&remote, true).unwrap() <= VISIBLE_POLL);
+
+        remote.refresh = true;
+        assert_eq!(reconcile_delay(&remote, false), Some(Duration::ZERO));
         remote.expect(None, Some(true));
-        assert!(reconcile_delay(&remote) <= Duration::from_millis(750));
+        assert_eq!(reconcile_delay(&remote, false), Some(Duration::from_millis(750)), "a command is confirmed even while hidden");
         remote.pending.as_mut().unwrap().retries = 100;
-        assert!(reconcile_delay(&remote) <= Duration::from_secs(6));
+        assert_eq!(reconcile_delay(&remote, false), Some(Duration::from_secs(6)));
     }
 
     #[tokio::test]
@@ -2169,10 +2352,10 @@ mod tests {
             assert_eq!(remote.kind(), Kind::Owned);
             assert_eq!(remote.failures, 1);
             assert!(remote.state.error.is_empty(), "one failure is not worth a message");
-            assert_eq!(reconcile_delay(remote), Duration::from_secs(2));
+            assert_eq!(reconcile_delay(remote, true), Some(Duration::from_secs(2)));
         });
         core.reconcile(&host).await;
-        assert_eq!(remote(&core, |remote| reconcile_delay(remote)), Duration::from_secs(4));
+        assert_eq!(remote(&core, |remote| reconcile_delay(remote, false)), Some(Duration::from_secs(4)));
         core.reconcile(&host).await;
         remote(&core, |remote| {
             assert_eq!(remote.failures, 0);
@@ -2324,7 +2507,7 @@ mod tests {
 
     #[test]
     fn a_window_is_resent_only_when_spotify_holds_the_wrong_order_or_too_little() {
-        let window = |rows: &[usize], at: usize| Window { rows: rows.iter().copied().map(Some).collect(), uris: Vec::new(), at, stale: false };
+        let window = |rows: &[usize], at: usize| Window { rows: rows.iter().copied().map(Some).collect(), uris: Vec::new(), at, stale: false, expired: false };
         let long: Vec<usize> = (1..=20).collect();
         assert!(!window_differs(&window(&(0..=20).collect::<Vec<_>>(), 0), 0, &long));
         assert!(window_differs(&window(&(0..=20).collect::<Vec<_>>(), 0), 1, &long), "another row plays");
@@ -2351,7 +2534,6 @@ mod tests {
         assert_eq!(projected_position(&state, Duration::from_secs(2)), 92000);
     }
 
-
     #[test]
     fn the_phones_own_items_are_shown_with_their_details_and_duplicates() {
         let player: PlayerState = serde_json::from_value(json!({
@@ -2360,7 +2542,7 @@ mod tests {
         })).unwrap();
         let queue = vec![json!({"id":"a", "uri":"spotify:track:a", "name":"a", "duration_ms":100000}),
             json!({"id":"a", "uri":"spotify:track:a", "name":"a", "duration_ms":100000})];
-        let mut remote = Remote::new(PlaybackState { queue: vec![track("old")], current_index: Some(0), queue_revision: 7, ..PlaybackState::default() }, true);
+        let mut remote = Remote::new(PlaybackState { queue: vec![track("old")].into(), current_index: Some(0), queue_revision: 7, ..PlaybackState::default() }, true);
         remote.show_foreign(Some(&player), &queue);
         assert_eq!(remote.state.current_uri, "spotify:episode:episode");
         assert_eq!(remote.state.queue[0].artist_names, vec!["Publisher"]);
@@ -2371,5 +2553,152 @@ mod tests {
         remote.show_foreign(None, &[]);
         assert_eq!(remote.state.current_index, None);
         assert_eq!(remote.state.current_uri, "");
+    }
+
+    /// When the watcher would next read the device, as `watch` decides it.
+    fn next_read(core: &Core) -> Option<Duration> {
+        let visible = core.visible.load(Ordering::Relaxed);
+        core.remote.lock().as_ref().filter(|remote| remote.polling).and_then(|remote| reconcile_delay(remote, visible))
+    }
+
+    #[tokio::test]
+    async fn hiding_a_paused_window_stops_reading_and_showing_it_again_reads_at_once() {
+        let (core, host) = owned(3).await;
+        core.run(&host, Action::Pause).await.unwrap();
+        host.spotify.lock().player = Some(reading("spotify:track:t0", false, 1000));
+        core.sync(&host).await.unwrap();
+        assert_eq!(next_read(&core), Some(VISIBLE_POLL));
+        core.set_visible(false, false);
+        assert_eq!(next_read(&core), None, "hidden and paused does no work");
+        core.set_visible(true, false);
+        assert_eq!(next_read(&core), Some(Duration::ZERO), "coming back into view reads at once");
+        core.sync(&host).await.unwrap();
+        assert_eq!(next_read(&core), Some(VISIBLE_POLL));
+        core.set_visible(true, true);
+        assert_eq!(next_read(&core), Some(Duration::ZERO), "focus reads at once");
+        core.sync(&host).await.unwrap();
+
+        // Hidden and playing, only the track end is read.
+        core.set_visible(false, false);
+        core.run(&host, Action::Play).await.unwrap();
+        assert_eq!(next_read(&core), Some(Duration::from_millis(750)), "the command is confirmed");
+        host.spotify.lock().player = Some(reading("spotify:track:t0", true, 40_000));
+        core.sync(&host).await.unwrap();
+        let end = next_read(&core).unwrap();
+        assert!((Duration::from_millis(60_000)..=Duration::from_millis(60_750)).contains(&end), "{end:?}");
+    }
+
+    #[tokio::test]
+    async fn the_phones_queue_is_read_only_for_a_new_item_or_a_fresh_look() {
+        let (core, host) = owned(2).await;
+        host.spotify.lock().player = Some(reading("spotify:track:phone", true, 30_000));
+        core.sync(&host).await.unwrap();
+        assert_eq!(remote(&core, |remote| remote.kind()), Kind::Foreign);
+        assert_eq!(host.spotify.lock().reads_of("me/player/queue"), 1);
+        for _ in 0..3 { core.sync(&host).await.unwrap(); }
+        assert_eq!(host.spotify.lock().reads_of("me/player/queue"), 1, "the same item keeps its rows");
+        core.set_visible(true, true);
+        core.sync(&host).await.unwrap();
+        assert_eq!(host.spotify.lock().reads_of("me/player/queue"), 2, "a fresh look reads it");
+        host.spotify.lock().player = Some(reading("spotify:track:other", true, 100));
+        core.sync(&host).await.unwrap();
+        assert_eq!(host.spotify.lock().reads_of("me/player/queue"), 3, "a new item reads it");
+        assert_eq!(core.snapshot().unwrap().current_uri, "spotify:track:other");
+    }
+
+    #[tokio::test]
+    async fn a_reading_that_confirms_what_is_shown_publishes_nothing() {
+        let (core, host) = owned(3).await;
+        host.events.lock().clear();
+        for _ in 0..3 { core.sync(&host).await.unwrap(); }
+        assert!(host.events.lock().is_empty(), "the playhead moved as projected");
+        host.spotify.lock().player.as_mut().unwrap()["device"]["volume_percent"] = json!(60);
+        core.sync(&host).await.unwrap();
+        assert_eq!(host.events.lock().len(), 1);
+        // A seek on the phone moves the playhead away from its projection.
+        host.spotify.lock().player.as_mut().unwrap()["progress_ms"] = json!(50_000);
+        core.sync(&host).await.unwrap();
+        let events = host.events.lock();
+        assert_eq!(events.len(), 2);
+        assert!(events[1]["position_ms"].as_u64().unwrap() >= 50_000);
+    }
+
+    #[tokio::test]
+    async fn an_expired_start_waits_for_play_instead_of_starting_late() {
+        let (core, host) = owned(2).await;
+        host.spotify.lock().write_failures.push_back(502);
+        assert!(core.run(&host, Action::Queue(vec![track("new0"), track("new1")], 0, String::new(), false)).await.is_err());
+        remote(&core, |remote| remote.start_intent.as_mut().unwrap().since -= START_DEADLINE);
+        // Spotify answers again, and the speaker still plays the old window.
+        host.spotify.lock().log.clear();
+        for _ in 0..3 { core.reconcile(&host).await; }
+        assert!(host.spotify.lock().writes().is_empty(), "nothing starts long after it was chosen");
+        let state = core.snapshot().unwrap();
+        assert_eq!(state.current_uri, "spotify:track:new0");
+        assert!(!state.playing);
+        remote(&core, |remote| {
+            assert!(remote.start_intent.is_none());
+            assert!(matches!(&remote.mode, Mode::Owned(window) if window.stale && window.expired));
+        });
+        core.run(&host, Action::Play).await.unwrap();
+        assert_eq!(uris(&host.spotify.lock().last_play().unwrap()), ["spotify:track:new0", "spotify:track:new1"]);
+    }
+
+    #[tokio::test]
+    async fn under_repeat_a_short_queue_fills_the_window_with_laps() {
+        let (core, host) = fixture(3, true).await;
+        host.engine.lock().repeat = "context".into();
+        core.select(&host, Some("phone".into())).await.unwrap();
+        let play = host.spotify.lock().last_play().unwrap();
+        let sent = uris(&play);
+        assert_eq!(sent.len(), WINDOW);
+        assert_eq!(sent[..5], ["spotify:track:t0", "spotify:track:t1", "spotify:track:t2", "spotify:track:t0", "spotify:track:t1"]);
+        host.spotify.lock().player = Some(reading("spotify:track:t0", true, 1000));
+        core.sync(&host).await.unwrap();
+        for (row, uri) in [(1, "spotify:track:t1"), (2, "spotify:track:t2"), (0, "spotify:track:t0")] {
+            host.spotify.lock().player = Some(reading(uri, true, 500));
+            core.sync(&host).await.unwrap();
+            assert_eq!(core.snapshot().unwrap().current_index, Some(row));
+        }
+        let plays = host.spotify.lock().log.iter().filter(|(method, path, _)| method == "PUT" && path.starts_with("me/player/play?")).count();
+        assert_eq!(plays, 1, "the device plays its laps without a new window");
+    }
+
+    #[tokio::test]
+    async fn a_remote_start_publishes_once_with_what_spotify_answered() {
+        let (core, host) = owned(3).await;
+        host.events.lock().clear();
+        core.run(&host, Action::Index(2)).await.unwrap();
+        core.run(&host, Action::Queue(vec![track("a"), track("b")], 1, String::new(), false)).await.unwrap();
+        let events = host.events.lock();
+        assert_eq!(events.len(), 2, "one publish per start");
+        assert!(events.iter().all(|event| event["playing"] == json!(true)), "the play button never flickers to paused");
+        assert_eq!(events[1]["current_uri"], "spotify:track:b");
+    }
+
+    #[tokio::test]
+    async fn pausing_a_failed_staged_start_settles_to_no_work() {
+        let (core, host) = fixture(3, false).await;
+        core.select(&host, Some("phone".into())).await.unwrap();
+        host.spotify.lock().write_failures.extend([502, 502]);
+        assert!(core.run(&host, Action::Play).await.is_err());
+        core.reconcile(&host).await;
+        assert!(remote(&core, |remote| remote.failures) > 0);
+        core.run(&host, Action::Pause).await.unwrap();
+        assert_eq!(remote(&core, |remote| remote.kind()), Kind::Prepared);
+        assert_eq!(next_read(&core), None, "nothing is left to watch");
+    }
+
+    #[tokio::test]
+    async fn a_failed_window_write_after_an_exclusion_is_reported_and_retried() {
+        let (core, host) = owned(3).await;
+        host.spotify.lock().write_failures.push_back(502);
+        host.engine.lock().excluded.insert("t1".into());
+        core.eligibility_changed(&host).await;
+        assert!(!core.snapshot().unwrap().error.is_empty());
+        assert!(remote(&core, |remote| matches!(&remote.mode, Mode::Owned(window) if window.stale)));
+        core.reconcile(&host).await;
+        assert_eq!(uris(&host.spotify.lock().last_play().unwrap()), ["spotify:track:t0", "spotify:track:t2"]);
+        assert!(core.snapshot().unwrap().error.is_empty());
     }
 }

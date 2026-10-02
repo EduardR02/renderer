@@ -2124,7 +2124,7 @@ fn rootlist_nodes(contents: &serde_json::Value) -> Result<Vec<LibraryNode>, Stri
             continue;
         };
         let raw_item = RootlistItemJson { uri: Some(uri.to_owned()) };
-        let raw_meta: RootlistMetaItemJson = serde_json::from_value(meta.clone())
+        let raw_meta = RootlistMetaItemJson::deserialize(meta)
             .map_err(|error| format!("invalid rootlist item metadata: {error}"))?;
         let node = if let Some(playlist) = playlist_ref_from_rootlist(&raw_item, &raw_meta) {
             LibraryNode::Playlist { playlist }

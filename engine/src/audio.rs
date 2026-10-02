@@ -101,11 +101,19 @@ pub enum AudioSignal {
     OutputStalled {
         revision: u64,
     },
+    /// The decoder handed the sink a packet it cannot play (a partial frame,
+    /// or no PCM at all). librespot turns the write error into a silent pause,
+    /// so this is how the engine learns that the track, not the device, failed.
+    DecodeFailed {
+        revision: u64,
+    },
 }
 
-/// Hands one signal to the engine. Called from the player thread and from the
-/// audio callback, both of which own no engine state: the lock is only ever
-/// held for the send itself, and a signal nobody is listening for is dropped.
+/// Hands one signal to the engine. Called from the player thread (and the
+/// device error callback), never from the realtime data callback: what that
+/// callback reaches is recorded in atomics or ring state and reported by the
+/// producer. The lock is only ever held for the send itself, and a signal
+/// nobody is listening for is dropped.
 fn signal(signal: AudioSignal) {
     let sender = AUDIO_SIGNAL_SENDER
         .lock()
@@ -200,11 +208,13 @@ fn set_customization(
     }
 
     if discontinuous {
-        if let Some(ring) = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade() {
-            ring.clear();
-        }
+        // Read the user-pause intent as the clear ends it: librespot's own
+        // stop inside a playing seek also clears `running`, so a second quick
+        // seek must not mistake that stop for a pause.
+        let user_paused = LIVE_RING.lock().expect(LIVE_RING_POISON_MSG).upgrade()
+            .is_some_and(|ring| ring.clear());
         if let Some(output) = output {
-            output.discard_if_paused();
+            output.discard_if_paused(user_paused);
         }
     }
 
@@ -332,7 +342,6 @@ fn write_ahead_samples(rate: u32) -> usize {
     rate as usize * NUM_CHANNELS as usize * WRITE_AHEAD_MS / 1000
 }
 
-
 /// Audio handed from the player thread to the audio callback.
 ///
 /// The producer pushes processed packets with bounded backpressure. The
@@ -359,13 +368,21 @@ struct SampleRing {
 #[derive(Default)]
 struct RingPacket {
     samples: Vec<f32>,
-    loop_to_ms: Option<u32>,
+    /// Nonzero on the packet that ends a loop pass. The callback acknowledges
+    /// it once played through; see [`RingState::marker`].
+    boundary_id: u64,
+    timing: Option<PacketTiming>,
+}
+
+/// A queued loop marker the engine has not been told about yet.
+#[derive(Clone, Copy)]
+struct LoopMarker {
+    boundary_id: u64,
+    position_ms: u32,
     /// The customization revision that produced the marker. A packet can
     /// outlive a seek/track change, so reading the current global revision at
     /// delivery time would incorrectly retag stale audio as current.
-    loop_revision: u64,
-    boundary_id: u64,
-    timing: Option<PacketTiming>,
+    revision: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -389,6 +406,13 @@ struct RingState {
     queued_samples: usize,
     next_boundary_id: u64,
     consumed_boundary_id: u64,
+    /// The newest marker queued and not yet reported. The producer waits for
+    /// the callback to play through it and then reports it itself, so the
+    /// realtime thread never takes the signal lock or sends on a channel.
+    marker: Option<LoopMarker>,
+    /// A rate the callback has just started playing, for the producer's next
+    /// push to report on the same terms.
+    speed_boundary: Option<AudioSignal>,
     timeline_revision: u64,
     timeline_ms: f64,
     audible: Option<AudibleClock>,
@@ -404,6 +428,8 @@ impl SampleRing {
                 queued_samples: 0,
                 next_boundary_id: 0,
                 consumed_boundary_id: 0,
+                marker: None,
+                speed_boundary: None,
                 timeline_revision: 0,
                 timeline_ms: 0.0,
                 audible: None,
@@ -489,9 +515,11 @@ impl SampleRing {
                 return Ok(());
             }
         }
-        let boundary_id = if loop_to_ms.is_some() {
+        let boundary_id = if let Some(position_ms) = loop_to_ms {
             state.next_boundary_id = state.next_boundary_id.wrapping_add(1);
-            state.next_boundary_id
+            let boundary_id = state.next_boundary_id;
+            state.marker = Some(LoopMarker { boundary_id, position_ms, revision: loop_revision });
+            boundary_id
         } else {
             0
         };
@@ -514,21 +542,56 @@ impl SampleRing {
         state.queued_samples += samples.len();
         state.packets.push_back(RingPacket {
             samples,
-            loop_to_ms,
-            loop_revision,
             boundary_id,
             timing,
         });
+        self.settle(state, deadline)
+    }
 
-        // A loop marker is flow control, not a notification attached to an
-        // otherwise ordinary packet. Hold the decoder here until the audio
-        // callback reaches it; this bounds decode/network run-ahead even when
-        // every packet beyond the loop is filtered to empty.
-        while boundary_id != 0
-            && state.consumed_boundary_id < boundary_id
-            && self.generation.load(Ordering::Acquire) == generation
-            && !self.retaining_pause.load(Ordering::Acquire)
-        {
+    /// Reports what the callback has reached since the producer last looked,
+    /// and holds the producer at an outstanding loop marker until the callback
+    /// has played through it.
+    ///
+    /// A loop marker is flow control, not a notification attached to an
+    /// otherwise ordinary packet: holding the decoder here bounds
+    /// decode/network run-ahead even when every packet beyond the loop is
+    /// filtered to empty, and it is what lets this thread, not the realtime
+    /// one, report the boundary the moment it is heard. A clear drops the
+    /// marker with its audio. A user pause releases the producer with the
+    /// marker still outstanding; the resuming [`OutputSink::start`] settles it.
+    fn settle<'a>(
+        &'a self,
+        mut state: std::sync::MutexGuard<'a, RingState>,
+        deadline: Instant,
+    ) -> Result<(), ()> {
+        loop {
+            let speed = state.speed_boundary.take();
+            let reached = state.marker
+                .filter(|marker| state.consumed_boundary_id >= marker.boundary_id);
+            if reached.is_some() {
+                state.marker = None;
+            }
+            let hold = state.marker.is_some() && !self.retaining_pause.load(Ordering::Acquire);
+            if speed.is_some() || reached.is_some() {
+                drop(state);
+                if let Some(speed) = speed {
+                    signal(speed);
+                }
+                if let Some(marker) = reached {
+                    signal(AudioSignal::LoopBoundary {
+                        position_ms: marker.position_ms,
+                        revision: marker.revision,
+                    });
+                }
+                if !hold {
+                    return Ok(());
+                }
+                state = self.lock();
+                continue;
+            }
+            if !hold {
+                return Ok(());
+            }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(());
             };
@@ -538,7 +601,6 @@ impl SampleRing {
                 .unwrap_or_else(PoisonError::into_inner);
             state = guard;
         }
-        Ok(())
     }
 
     /// Takes the next packet, or `None` when the producer has fallen behind.
@@ -546,26 +608,24 @@ impl SampleRing {
         let mut state = self.lock();
         let packet = state.packets.pop_front()?;
         state.queued_samples -= packet.samples.len();
-        let speed_change = packet.timing.and_then(|timing| {
+        if let Some(timing) = packet.timing {
             let previous = state.audible;
             let at = Instant::now();
             state.audible = Some(AudibleClock { timing, at });
-            previous.is_none_or(|previous| previous.timing.revision != timing.revision
+            if previous.is_none_or(|previous| previous.timing.revision != timing.revision
                 || previous.timing.speed != timing.speed)
-                .then_some(AudioSignal::SpeedBoundary {
+            {
+                state.speed_boundary = Some(AudioSignal::SpeedBoundary {
                     speed: timing.speed,
                     revision: timing.revision,
                     at,
-                })
-        });
-        drop(state);
-        if let Some(change) = speed_change {
-            signal(change);
+                });
+            }
         }
+        drop(state);
         self.space_freed.notify_one();
         Some(packet)
     }
-
 
     fn acknowledge_boundary(&self, boundary_id: u64) {
         if boundary_id == 0 {
@@ -647,20 +707,24 @@ impl SampleRing {
     }
 
     /// Drops every queued packet and tells [`LiveSource`] to drop the one it
-    /// holds. Non-blocking: this is what makes `stop()` instant.
-    fn clear(&self) {
+    /// holds. Non-blocking: this is what makes `stop()` instant. Returns
+    /// whether this ended a user pause's retention.
+    fn clear(&self) -> bool {
         let mut state = self.lock();
         state.packets.clear();
         state.queued_samples = 0;
         state.consumed_boundary_id = state.next_boundary_id;
+        state.marker = None;
+        state.speed_boundary = None;
         state.audible = None;
         state.paused_elapsed_ms = None;
-        self.retaining_pause.store(false, Ordering::Release);
+        let retained = self.retaining_pause.swap(false, Ordering::AcqRel);
         state.timeline_ms = 0.0;
         state.timeline_revision = 0;
         self.generation.fetch_add(1, Ordering::Release);
         drop(state);
         self.space_freed.notify_all();
+        retained
     }
 }
 
@@ -700,7 +764,6 @@ pub fn pause_output() {
         ring.pause_at(Instant::now());
     }
 }
-
 
 /// Callback proof remains valid after pause, even if no later write reports it.
 pub fn output_is_ready(revision: u64) -> bool {
@@ -780,15 +843,8 @@ impl Iterator for LiveSource {
         }
 
         while self.pos == self.packet.samples.len() {
-            if let Some(position_ms) = self.packet.loop_to_ms.take() {
-                let revision = self.packet.loop_revision;
-                signal(AudioSignal::LoopBoundary {
-                    position_ms,
-                    revision,
-                });
-                let boundary_id = std::mem::take(&mut self.packet.boundary_id);
-                self.ring.acknowledge_boundary(boundary_id);
-            }
+            // The loop pass is now heard; the waiting producer reports it.
+            self.ring.acknowledge_boundary(std::mem::take(&mut self.packet.boundary_id));
             match self.ring.pop() {
                 Some(packet) => {
                     self.packet = packet;
@@ -889,16 +945,16 @@ impl OutputControl {
         }
     }
 
-    fn discard_if_paused(&self) {
+    fn discard_if_paused(&self, user_paused: bool) {
         let mut stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
-        if !self.status.running.load(Ordering::Acquire) {
-            // A paused seek/load invalidates the WASAPI buffer too, not just
-            // the callback cursor. The next start opens a fresh native stream.
+        if user_paused && !self.status.running.load(Ordering::Acquire) {
+            // A seek/load during a user pause invalidates the WASAPI buffer
+            // too, not just the callback cursor. The next start opens a fresh
+            // native stream.
             stream.take();
         }
     }
 }
-
 
 /// Clears one live-pipeline entry, but only while it still names this sink. A
 /// sink outlived by its replacement must not deregister the pipeline that has
@@ -1357,6 +1413,14 @@ impl Sink for OutputSink {
             }
         }
         drop(stream);
+        // A pause can release the producer before the callback reached a loop
+        // marker, and the decoder may have nothing left to write after it, so
+        // the resumed stream's arrival there is reported from here.
+        if !self.output.status.failed.load(Ordering::Acquire)
+            && self.ring.settle(self.ring.lock(), Instant::now() + WRITE_DRAIN_TIMEOUT).is_err()
+        {
+            signal(AudioSignal::OutputStalled { revision });
+        }
         let _ = self.drain_deferred();
         Ok(())
     }
@@ -1364,9 +1428,9 @@ impl Sink for OutputSink {
     /// Stops callbacks and keeps the native stream. librespot stops the sink
     /// inside every seek (pause → seek → play) and at a loop pass, so dropping
     /// the stream here reopened the device on each of them. A discontinuity
-    /// while paused is the one case whose submitted device buffer must not be
-    /// heard on resume, and the customization reset already drops the stream
-    /// for exactly that case (see [`OutputControl::discard_if_paused`]).
+    /// during a user pause is the one case whose submitted device buffer must
+    /// not be heard on resume, and the customization reset already drops the
+    /// stream for exactly that case (see [`OutputControl::discard_if_paused`]).
     fn stop(&mut self) -> SinkResult<()> {
         self.output.pause();
         let retaining = self.ring.retaining_pause.load(Ordering::Acquire);
@@ -1378,20 +1442,25 @@ impl Sink for OutputSink {
     }
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         let ring_generation = self.ring.generation.load(Ordering::Acquire);
-        let samples = packet
-            .samples()
-            .map_err(|error| SinkError::OnWrite(error.to_string()))?;
+        let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
+        // librespot answers every write error with a pause it reports as an
+        // ordinary one, so each error also tells the engine its cause: an
+        // unplayable packet fails the track, a dead device the output.
+        let unplayable = |message: String| {
+            signal(AudioSignal::DecodeFailed { revision });
+            SinkError::OnWrite(message)
+        };
+        let samples = packet.samples().map_err(|error| unplayable(error.to_string()))?;
 
         // A partial frame would shift the interleave for everything after it
         // and swap the channels, so refuse it rather than corrupt the stream.
         if !samples.len().is_multiple_of(NUM_CHANNELS as usize) {
-            return Err(SinkError::OnWrite(format!(
+            return Err(unplayable(format!(
                 "decoder produced a partial frame: {} samples is not a multiple of {NUM_CHANNELS}",
                 samples.len()
             )));
         }
 
-        let revision = CUSTOMIZATION_REVISION.load(Ordering::Acquire);
         if self.output.status.failed.load(Ordering::Acquire) {
             signal(AudioSignal::OutputStalled { revision });
             let error = self.output.error.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1960,11 +2029,14 @@ mod tests {
             vec![0.0; 2 * tenth], None, 1.0).unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
-        let seek = configure_customization_at_loop_pass(None, 1.0, 30_000, 1);
+        configure_customization_at_loop_pass(None, 1.0, 30_000, 1);
         sink.stop().unwrap();
+        // A second seek lands while librespot is still between the first
+        // one's stop and start: not a user pause either.
+        let seek = configure_customization_at_loop_pass(None, 1.0, 40_000, 1);
         sink.start().unwrap();
         assert_eq!(sink.output.status.attempt.load(Ordering::Acquire), opened,
-            "a seek while playing must not reopen the device");
+            "quick seeks while playing must not reopen the device");
         assert!(sink.output.stream.lock().unwrap_or_else(PoisonError::into_inner).is_some());
         let before = sink.output.status.callbacks.load(Ordering::Relaxed);
         sink.queue(sink.ring.generation.load(Ordering::Acquire), seek,
@@ -2080,7 +2152,6 @@ mod tests {
         release_live(&LIVE_RING, &playing, LIVE_RING_POISON_MSG);
     }
 
-
     #[test]
     fn exact_one_customization_returns_the_converter_packet_without_stretcher_or_copy() {
         let _guard = customization_guard();
@@ -2159,13 +2230,6 @@ mod tests {
     #[test]
     fn ordinary_gapless_tracks_keep_resampler_history_and_rational_phase() {
         let _guard = customization_guard();
-        let revision = configure_customization_at_loop_pass(None, 1.0, 0, 1);
-        let mut processing = AudioProcessing {
-            resampler: Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16),
-            pipeline_revision: revision.wrapping_sub(1), pipeline: None,
-            speed: 1.0, output_rate: OUT_RATE,
-        };
-        processing.synchronize_pipeline(revision);
         let samples: Vec<_> = (0..6_617 * NUM_CHANNELS as usize)
             .map(|index| (index as f32 * 0.03).sin()).collect();
         let mut reference = Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16).unwrap();
@@ -2173,20 +2237,37 @@ mod tests {
         reference.process(&samples, &mut expected);
         reference.finish(&mut expected);
         let split = 4_411 * NUM_CHANNELS as usize;
-        let mut pipeline_scratch = Vec::new();
-        let mut resampler_scratch = Vec::new();
-        let (mut output, marker) = processing.render_packet(samples[..split].to_vec(),
-            &mut pipeline_scratch, &mut resampler_scratch);
-        assert_eq!(marker, None);
-        let revision = configure_customization_after_natural_boundary(None, 1.0, 0);
-        processing.synchronize_pipeline(revision);
-        let (tail, marker) = processing.render_packet(samples[split..].to_vec(),
-            &mut pipeline_scratch, &mut resampler_scratch);
-        assert_eq!(marker, None);
-        output.extend(tail);
-        processing.resampler.as_mut().unwrap().finish(&mut output);
-        assert_eq!(output, expected,
-            "a natural boundary must sound exactly like one uninterrupted resampled stream");
+        // Engine tests drive the same process-wide customization without this
+        // guard. A run one of their discontinuities lands in is repeated, not
+        // judged: the sticky flag it leaves would reset the resampler here.
+        for _ in 0..100 {
+            let revision = configure_customization_at_loop_pass(None, 1.0, 0, 1);
+            let mut processing = AudioProcessing {
+                resampler: Resampler::new(SAMPLE_RATE, OUT_RATE, NUM_CHANNELS as u16),
+                pipeline_revision: revision.wrapping_sub(1), pipeline: None,
+                speed: 1.0, output_rate: OUT_RATE,
+            };
+            processing.synchronize_pipeline(revision);
+            let mut pipeline_scratch = Vec::new();
+            let mut resampler_scratch = Vec::new();
+            let (mut output, marker) = processing.render_packet(samples[..split].to_vec(),
+                &mut pipeline_scratch, &mut resampler_scratch);
+            assert_eq!(marker, None);
+            let natural = configure_customization_after_natural_boundary(None, 1.0, 0);
+            processing.synchronize_pipeline(natural);
+            if natural != revision.wrapping_add(1) || customization_revision() != natural {
+                continue;
+            }
+            let (tail, marker) = processing.render_packet(samples[split..].to_vec(),
+                &mut pipeline_scratch, &mut resampler_scratch);
+            assert_eq!(marker, None);
+            output.extend(tail);
+            processing.resampler.as_mut().unwrap().finish(&mut output);
+            assert_eq!(output, expected,
+                "a natural boundary must sound exactly like one uninterrupted resampled stream");
+            return;
+        }
+        panic!("every run was interleaved with another customization");
     }
 
     #[test]
@@ -2283,6 +2364,9 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(ring.pop().unwrap().samples, vec![1.0, -1.0]);
         assert_eq!(ring.pop().unwrap().samples, vec![2.0, -2.0]);
+        // The intent a seek's device-buffer discard is decided on.
+        assert!(ring.clear(), "a discontinuity reports the user pause it ends");
+        assert!(!ring.clear(), "and nothing once it has ended");
     }
 
     /// Natural gapless setup must preserve the outgoing queue, while every
@@ -2379,6 +2463,7 @@ mod tests {
 
     #[test]
     fn loop_marker_blocks_the_decoder_until_it_is_audible() {
+        let _guard = customization_guard();
         let ring = test_ring();
         let producer_ring = Arc::clone(&ring);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -2402,6 +2487,48 @@ mod tests {
             .recv_timeout(Duration::from_millis(100))
             .expect("audible boundary releases decoder backpressure");
         producer.join().unwrap();
+    }
+
+    /// A pause releases the decoder before the callback reaches a queued loop
+    /// marker. The marker must still be reported once the resumed callback
+    /// plays through it, by the producer side, never by the callback.
+    #[test]
+    fn a_marker_outstanding_across_a_pause_is_reported_once_heard() {
+        let _guard = customization_guard();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        install_signal_sender(sender);
+        let mut boundaries = move || {
+            let mut found = Vec::new();
+            while let Ok(signal) = receiver.try_recv() {
+                if let AudioSignal::LoopBoundary { position_ms, revision: 0xA11CE } = signal {
+                    found.push(position_ms);
+                }
+            }
+            found
+        };
+        let ring = test_ring();
+        let producer_ring = Arc::clone(&ring);
+        let producer = std::thread::spawn(move || {
+            producer_ring.push_marked(packet(4), Some(900), 0xA11CE, Duration::from_secs(1)).unwrap();
+        });
+        while ring.lock().next_boundary_id == 0 {
+            std::thread::yield_now();
+        }
+        ring.pause_at(Instant::now());
+        producer.join().unwrap();
+        assert!(boundaries().is_empty(), "nothing has heard the marker yet");
+
+        ring.resume_at(Instant::now());
+        let mut source = LiveSource::new(Arc::clone(&ring));
+        for _ in 0..5 {
+            source.next();
+        }
+        assert!(boundaries().is_empty(), "the callback itself sends nothing");
+        ring.settle(ring.lock(), Instant::now() + Duration::from_secs(1)).unwrap();
+        assert_eq!(boundaries(), [900]);
+        ring.settle(ring.lock(), Instant::now() + Duration::from_secs(1)).unwrap();
+        assert!(boundaries().is_empty(), "a marker is reported once");
+        *AUDIO_SIGNAL_SENDER.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// The gain curve must mirror librespot's `Cubic(60)` volume

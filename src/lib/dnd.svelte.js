@@ -93,7 +93,6 @@ let layer = null; // #drag-layer, created once per activation
 let rafId = 0;
 let lastFrame = 0;
 let scrollers = []; // scrollable elements resolved once per drag
-let cleanupTimer = 0;
 
 /**
  * A row was pressed. Nothing visible happens until the pointer travels past
@@ -479,7 +478,8 @@ function pulse(rowEl) {
  * front of the user, and the pill unfolds back into the row's footprint on
  * the way (same clock as the compression, run backwards). A committed drop
  * dissolves in place: the real row is already where the ghost was, so
- * flying it anywhere would be a lie.
+ * flying it anywhere would be a lie. Each ghost owns its removal, so a quick
+ * second drag cannot strand the first one in the page.
  */
 function retireGhost(mode) {
   if (!ghostWrap) return;
@@ -487,7 +487,6 @@ function retireGhost(mode) {
   const pill = pillEl;
   ghostWrap = null;
   pillEl = null;
-  clearTimeout(cleanupTimer);
 
   if (mode === "return" && originRect) {
     /* The inline transition list must carry width itself: writing it replaces
@@ -505,11 +504,11 @@ function retireGhost(mode) {
       pill.style.marginTop = "0px";
     }
     wrap.style.opacity = "0.55";
-    cleanupTimer = setTimeout(() => wrap.remove(), 240);
+    setTimeout(() => wrap.remove(), 240);
   } else {
     wrap.style.transition = "opacity 130ms linear";
     wrap.style.opacity = "0";
-    cleanupTimer = setTimeout(() => wrap.remove(), 150);
+    setTimeout(() => wrap.remove(), 150);
   }
 }
 

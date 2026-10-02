@@ -159,7 +159,7 @@ impl RestoreSnapshot {
 
     fn from_playback(state: &PlaybackState, resume_playing: bool) -> Self {
         Self {
-            queue: state.queue.clone(),
+            queue: state.queue.to_vec(),
             current_index: state.current_index,
             position_ms: state.position_ms,
             volume: state.volume,
@@ -237,7 +237,7 @@ impl RestoreSnapshot {
 
     fn durable(&self) -> PlaybackSnapshot {
         let mut state = PlaybackState::default();
-        state.queue = self.queue.clone();
+        state.queue = self.queue.as_slice().into();
         state.current_index = self.current_index;
         state.position_ms = self.position_ms;
         state.volume = self.volume;
@@ -536,7 +536,7 @@ enum DeltaAdoption {
     /// The payload omitted its rows and the base names the revision they
     /// belong to.
     Fill {
-        queue: Vec<Track>,
+        queue: Arc<[Track]>,
         upcoming: Vec<usize>,
     },
     /// The payload omitted rows for a revision nothing retained.
@@ -553,7 +553,9 @@ struct DeltaBase {
     /// has carried any.
     revision: Option<u64>,
     order_revision: Option<u64>,
-    queue: Vec<Track>,
+    /// The same rows the state that carried them holds; filling a payload
+    /// from here copies a pointer.
+    queue: Arc<[Track]>,
     upcoming: Vec<usize>,
     /// Positive file marks survive omitted arrays and queue replacement.
     cached_ids: HashSet<String>,
@@ -577,9 +579,7 @@ impl DeltaBase {
             }
         }
         if !sent_queue && new_marks {
-            for track in &mut self.queue {
-                track.cached |= self.cached_ids.contains(&track.id);
-            }
+            mark_cached_rows(&mut self.queue, &self.cached_ids);
         }
         if !sent_queue && (state.queue_revision == 0 || self.revision != Some(state.queue_revision)) {
             return DeltaAdoption::Unresolvable { revision: state.queue_revision };
@@ -589,8 +589,8 @@ impl DeltaBase {
         }
         if sent_queue {
             self.revision = (state.queue_revision != 0).then_some(state.queue_revision);
-            self.queue.clone_from(&state.queue);
-            for track in &state.queue {
+            self.queue = Arc::clone(&state.queue);
+            for track in state.queue.iter() {
                 if track.cached && !self.cached_ids.contains(&track.id) {
                     self.cached_ids.insert(track.id.clone());
                 }
@@ -600,18 +600,10 @@ impl DeltaBase {
             self.order_revision = (state.order_revision != 0).then_some(state.order_revision);
             self.upcoming.clone_from(&state.upcoming);
         }
-        let mut marked_rows = false;
-        if sent_queue {
-            for track in &mut self.queue {
-                if !track.cached && self.cached_ids.contains(&track.id) {
-                    track.cached = true;
-                    marked_rows = true;
-                }
-            }
-        }
+        let marked_rows = sent_queue && mark_cached_rows(&mut self.queue, &self.cached_ids);
         self.resynced = None;
         if sent_queue && sent_order && !marked_rows { DeltaAdoption::AsSent }
-        else { DeltaAdoption::Fill { queue: self.queue.clone(), upcoming: self.upcoming.clone() } }
+        else { DeltaAdoption::Fill { queue: Arc::clone(&self.queue), upcoming: self.upcoming.clone() } }
     }
 
     /// Records that the missing rows of `revision` are being re-requested,
@@ -622,6 +614,27 @@ impl DeltaBase {
         }
         self.resynced = Some(revision);
         true
+    }
+}
+
+/// Sets the download mark on the rows `cached_ids` names, copying shared rows
+/// only when one actually changes. Reports whether any did.
+fn mark_cached_rows(rows: &mut Arc<[Track]>, cached_ids: &HashSet<String>) -> bool {
+    if !rows.iter().any(|track| !track.cached && cached_ids.contains(&track.id)) {
+        return false;
+    }
+    for track in Arc::make_mut(rows) {
+        track.cached |= cached_ids.contains(&track.id);
+    }
+    true
+}
+
+/// Clears every download mark, copying shared rows only when one is set.
+pub fn unmark_cached_rows(rows: &mut Arc<[Track]>) {
+    if rows.iter().any(|track| track.cached) {
+        for track in Arc::make_mut(rows) {
+            track.cached = false;
+        }
     }
 }
 
@@ -1752,14 +1765,10 @@ impl EngineClient {
     pub fn clear_cache_marks(&self) {
         let mut base = self.delta_base.lock();
         base.cached_ids.clear();
-        for track in &mut base.queue {
-            track.cached = false;
-        }
+        unmark_cached_rows(&mut base.queue);
         if let Some(state) = self.last_state.lock().as_mut() {
             state.cached_ids = None;
-            for track in &mut state.queue {
-                track.cached = false;
-            }
+            unmark_cached_rows(&mut state.queue);
         }
     }
 
@@ -2369,7 +2378,7 @@ mod tests {
     fn exit_waits_for_final_flush_and_freezes_the_snapshot_before_writer_acknowledgement() {
         let initial = PlaybackState { auth_state: "ready".into(), position_ms: 12_345,
             current_index: Some(0), current_uri: "spotify:track:a".into(),
-            queue: vec![Track { id: "a".into(), uri: "spotify:track:a".into(), ..Track::default() }],
+            queue: vec![Track { id: "a".into(), uri: "spotify:track:a".into(), ..Track::default() }].into(),
             ..PlaybackState::default() };
         let mut client = client_with_last_state(initial);
         let (persist_tx, persist_rx) = mpsc::sync_channel(1);
@@ -2410,7 +2419,7 @@ mod tests {
     #[test]
     fn cached_deltas_mark_retained_and_later_rows_without_replacing_queue_identity() {
         let initial = PlaybackState { auth_state: "ready".into(), queue_revision: 11, order_revision: 21,
-            queue: vec![Track { id: "a".into(), ..Track::default() }], ..PlaybackState::default() };
+            queue: vec![Track { id: "a".into(), ..Track::default() }].into(), ..PlaybackState::default() };
         let client = client_with_last_state(initial.clone());
         let Some(Line::State { state: delta, rows }) = parse_line(json!({
             "type": "state", "auth_state": "ready", "queue_revision": 11, "order_revision": 21,
@@ -2422,7 +2431,7 @@ mod tests {
         let event = serde_json::to_value(crate::types::PlaybackEvent::new(&marked, false, false)).unwrap();
         assert!(event.get("queue").is_none());
         assert_eq!(event["cached_ids"], json!(["a", "detail-only"]));
-        client.on_state(&PlaybackState { cached_ids: Some(Vec::new()), queue: Vec::new(), ..initial.clone() },
+        client.on_state(&PlaybackState { cached_ids: Some(Vec::new()), queue: Vec::new().into(), ..initial.clone() },
             PayloadRows::Omitted);
         assert!(client.current_state().unwrap().queue[0].cached);
         for raw in [Value::Null, json!(false), json!({})] {
@@ -2434,11 +2443,11 @@ mod tests {
             assert!(client.current_state().unwrap().queue[0].cached);
         }
         client.on_state(&PlaybackState { queue_revision: 12, order_revision: 22,
-            queue: vec![Track { id: "detail-only".into(), ..Track::default() }], ..initial.clone() },
+            queue: vec![Track { id: "detail-only".into(), ..Track::default() }].into(), ..initial.clone() },
             PayloadRows::Sent);
         assert!(client.current_state().unwrap().queue[0].cached);
         client.clear_cache_marks();
-        client.on_state(&PlaybackState { queue: Vec::new(), queue_revision: 12, order_revision: 22, ..initial },
+        client.on_state(&PlaybackState { queue: Vec::new().into(), queue_revision: 12, order_revision: 22, ..initial },
             PayloadRows::Omitted);
         assert!(!client.current_state().unwrap().queue[0].cached);
     }
@@ -2446,16 +2455,16 @@ mod tests {
     #[test]
     fn unresolved_queue_delta_still_delivers_off_queue_cache_additions() {
         let initial = PlaybackState { auth_state: "ready".into(), queue_revision: 1, order_revision: 1,
-            queue: vec![Track { id: "a".into(), ..Track::default() }], ..PlaybackState::default() };
+            queue: vec![Track { id: "a".into(), ..Track::default() }].into(), ..PlaybackState::default() };
         let client = client_with_last_state(initial.clone());
         let mut events = client.subscribe_lines();
         client.on_state(&PlaybackState { queue_revision: 2, cached_ids: Some(vec!["detail-only".into()]),
-            queue: Vec::new(), ..initial.clone() }, PayloadRows::Omitted);
+            queue: Vec::new().into(), ..initial.clone() }, PayloadRows::Omitted);
         assert_eq!(client.current_state().unwrap().queue, initial.queue);
         let StateLine::CachedIds(ids) = events.try_recv().unwrap() else { panic!("cache marks were held behind queue") };
         assert_eq!(ids, ["detail-only"]);
         client.on_state(&PlaybackState { queue_revision: 2, order_revision: 2,
-            queue: vec![Track { id: "detail-only".into(), ..Track::default() }], ..initial },
+            queue: vec![Track { id: "detail-only".into(), ..Track::default() }].into(), ..initial },
             PayloadRows::Sent);
         assert!(client.current_state().unwrap().queue[0].cached);
     }
@@ -2465,20 +2474,20 @@ mod tests {
             Track { id: "same".into(), uri: "spotify:track:same".into(), ..Track::default() },
             Track { id: "same".into(), uri: "spotify:track:same".into(), ..Track::default() },
         ];
-        let initial = PlaybackState { auth_state: "ready".into(), queue: rows.clone(),
+        let initial = PlaybackState { auth_state: "ready".into(), queue: rows.clone().into(),
             queue_revision: 11, order_revision: 21, upcoming: vec![1], current_index: Some(0), ..PlaybackState::default() };
         let client = client_with_last_state(initial.clone());
-        let update = PlaybackState { queue: Vec::new(), upcoming: Vec::new(), order_revision: 22,
+        let update = PlaybackState { queue: Vec::new().into(), upcoming: Vec::new(), order_revision: 22,
             current_index: Some(1), position_ms: 500, ..initial };
         client.on_state(&update, PayloadRows::OrderOnly);
         let state = client.current_state().unwrap();
-        assert_eq!(state.queue, rows);
+        assert_eq!(*state.queue, rows[..]);
         assert_eq!(state.current_index, Some(1));
         assert!(state.upcoming.is_empty());
-        let heartbeat = PlaybackState { queue: Vec::new(), position_ms: 1000, ..state };
+        let heartbeat = PlaybackState { queue: Vec::new().into(), position_ms: 1000, ..state };
         client.on_state(&heartbeat, PayloadRows::Omitted);
         let state = client.current_state().unwrap();
-        assert_eq!(state.queue, rows);
+        assert_eq!(*state.queue, rows[..]);
         assert!(state.upcoming.is_empty());
         assert_eq!(state.position_ms, 1000);
     }
@@ -2670,7 +2679,7 @@ mod tests {
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         state.current_index = Some(0);
         state.position_ms = 30_000;
         let written = persisted(PlaybackSnapshot::from_playback(&state), 7);
@@ -2683,7 +2692,7 @@ mod tests {
         // The persisted queue strips the session-live download mark, so a
         // row that only gained a `cached` flag is still the same snapshot.
         let mut marked = state.clone();
-        marked.queue[0].cached = true;
+        Arc::make_mut(&mut marked.queue)[0].cached = true;
         assert!(
             !written.differs_structurally_from(&marked, 8),
             "a download mark alone is not worth a write"
@@ -2697,11 +2706,11 @@ mod tests {
         // entirely, which is only sound because every install of a queue
         // bumps the generation it is compared under.
         let mut edited = state.clone();
-        edited.queue.push(Track {
+        edited.queue = edited.queue.iter().cloned().chain([Track {
             uri: "spotify:track:0VjIjW4GlUZAMYd2vXMi3b".to_owned(),
             duration_ms: 200_000,
             ..Track::default()
-        });
+        }]).collect();
         assert!(
             !written.differs_structurally_from(&edited, 7),
             "the same generation cannot have replaced the queue"
@@ -2761,7 +2770,7 @@ mod tests {
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         state.current_index = Some(0);
         state.position_ms = 30_000;
         let client = client_with_last_state(state.clone());
@@ -2815,11 +2824,11 @@ mod tests {
         // though its playhead happens to match what was last written.
         let mut edited = state.clone();
         edited.queue_revision = state.queue_revision + 1;
-        edited.queue.push(Track {
+        edited.queue = edited.queue.iter().cloned().chain([Track {
             uri: "spotify:track:0VjIjW4GlUZAMYd2vXMi3b".to_owned(),
             duration_ms: 200_000,
             ..Track::default()
-        });
+        }]).collect();
         client.on_state(&edited, PayloadRows::Sent);
         match client.due_write(Some(&written)).write {
             Some(PersistWrite::Snapshot(snapshot)) => {
@@ -2846,7 +2855,7 @@ mod tests {
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         state.upcoming = vec![7];
         let client = client_with_last_state(state.clone());
         let mut lines = client.subscribe_lines();
@@ -2862,10 +2871,13 @@ mod tests {
 
         let retained = client.last_state.lock().clone().expect("state retained");
         assert_eq!(retained.queue, state.queue, "the omitted queue is the held one");
+        assert!(Arc::ptr_eq(&retained.queue, &client.delta_base.lock().queue),
+            "filling an omitted queue copies a pointer, not the rows");
         assert_eq!(retained.upcoming, state.upcoming);
         assert_eq!(retained.position_ms, 12_000, "the scalars still move");
         match lines.try_recv().expect("state fanned out") {
-            StateLine::State(fanned) => assert_eq!(fanned.queue, state.queue),
+            StateLine::State(fanned) => assert!(Arc::ptr_eq(&fanned.queue, &retained.queue),
+                "and so does every subscriber's copy"),
             StateLine::Position(_) => panic!("a full state does not arrive on the position lane"),
             StateLine::Volume(_) => panic!("nor the volume lane"),
             StateLine::CachedIds(_) => panic!("the full state carries its cache marks"),
@@ -2878,7 +2890,7 @@ mod tests {
         let mut emptied = state.clone();
         emptied.queue_revision = 42;
         emptied.order_revision = 42;
-        emptied.queue = Vec::new();
+        emptied.queue = Vec::new().into();
         emptied.current_index = None;
         emptied.upcoming = Vec::new();
         client.on_state(&emptied, PayloadRows::Sent);
@@ -2910,7 +2922,7 @@ mod tests {
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         previous.current_index = Some(0);
         previous.position_ms = 42_000;
         let client = client_with_last_state(previous.clone());
@@ -2937,7 +2949,7 @@ mod tests {
         // `Play` follows without touching the queue: no rows on the wire.
         let mut playing = restored.clone();
         playing.playing = true;
-        playing.queue = Vec::new();
+        playing.queue = Vec::new().into();
         playing.upcoming = Vec::new();
         client.on_state(&playing, PayloadRows::Omitted);
 
@@ -2980,7 +2992,7 @@ mod tests {
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         real.current_index = Some(0);
         let client = client_with_last_state(real.clone());
         let mut lines = client.subscribe_lines();
@@ -2994,14 +3006,14 @@ mod tests {
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
             duration_ms: 200_000,
             ..Track::default()
-        }];
+        }].into();
         client.on_state(&preview, PayloadRows::Sent);
         let _ = lines.try_recv().expect("the preview state fans out");
 
         // A transport change inside the draft: same revision, no rows.
         let mut paused = preview.clone();
         paused.playing = false;
-        paused.queue = Vec::new();
+        paused.queue = Vec::new().into();
         paused.upcoming = Vec::new();
         client.on_state(&paused, PayloadRows::Omitted);
 
@@ -3037,7 +3049,7 @@ mod tests {
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         let client = client_with_last_state(first);
 
         let mut second = PlaybackState::default();
@@ -3048,7 +3060,7 @@ mod tests {
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
             duration_ms: 200_000,
             ..Track::default()
-        }];
+        }].into();
         client.on_state(&second, PayloadRows::Sent);
 
         let retained = client.last_state.lock().clone().expect("state retained");
@@ -3359,7 +3371,7 @@ mod tests {
     fn position_heartbeats_freshen_the_last_state_scalars_in_place() {
         let mut state = PlaybackState::default();
         state.auth_state = "ready".to_owned();
-        state.queue = vec![Track::default(); 3];
+        state.queue = vec![Track::default(); 3].into();
         let client = client_with_last_state(state);
         let queue_ptr = client.last_state.lock().as_ref().unwrap().queue.as_ptr();
 
@@ -3403,9 +3415,13 @@ mod tests {
         state.auth_state = "ready".to_owned();
         state.volume = 50;
         state.position_ms = 12_000;
-        state.queue = vec![Track::default(); 3];
+        state.queue = vec![Track::default(); 3].into();
         let client = client_with_last_state(state);
         let queue_ptr = client.last_state.lock().as_ref().unwrap().queue.as_ptr();
+        // Subscribe before the send: broadcast messages sent with no active
+        // receiver are dropped, exactly like the production flow where
+        // consume_states subscribes before the engine produces lines.
+        let mut receiver = client.subscribe_lines();
 
         let Some(Line::Volume(volume)) = parse_line(serde_json::json!({
             "type": "volume",
@@ -3427,6 +3443,13 @@ mod tests {
             queue_ptr,
             "a volume step must never clone the queue"
         );
+        match receiver.try_recv().expect("volume fanned out") {
+            StateLine::Volume(fanned) => assert_eq!(fanned, 31),
+            StateLine::State(_) => panic!("a volume step must not arrive as a full state"),
+            StateLine::Position(_) => panic!("nor as a position heartbeat"),
+            StateLine::CachedIds(_) => panic!("nor as cache marks"),
+            StateLine::Disconnected => panic!("the volume path must stay connected"),
+        }
     }
 
     #[test]
@@ -3443,13 +3466,13 @@ mod tests {
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         let client = client_with_last_state(normal.clone());
 
         let mut preview = normal.clone();
         preview.preview = true;
         preview.position_ms = 80_000;
-        preview.queue[0].id = "draft-track".to_owned();
+        Arc::make_mut(&mut preview.queue)[0].id = "draft-track".to_owned();
         // A draft that changed rows carries a new queue revision, exactly as
         // the engine emits it: it is the payload that proves the editor can
         // never speak for the retained queue.
@@ -3483,7 +3506,7 @@ mod tests {
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         let client = client_with_last_state(real);
 
         assert!(client.capture_preview_restore(17));
@@ -3507,7 +3530,7 @@ mod tests {
     async fn stale_preview_restore_is_a_noop_for_the_current_lease() {
         let mut real = PlaybackState::default();
         real.auth_state = "ready".to_owned();
-        real.queue = vec![Track::default()];
+        real.queue = vec![Track::default()].into();
         let client = client_with_last_state(real);
 
         assert!(client.capture_preview_restore(17));
@@ -3524,7 +3547,7 @@ mod tests {
     async fn preview_restore_request_error_retains_lease_for_reconciliation() {
         let mut real = PlaybackState::default();
         real.auth_state = "ready".to_owned();
-        real.queue = vec![Track::default()];
+        real.queue = vec![Track::default()].into();
         let client = client_with_last_state(real);
 
         assert!(client.capture_preview_restore(17));
@@ -3543,7 +3566,7 @@ mod tests {
     fn preview_true_to_false_clears_only_an_authoritatively_active_lease() {
         let mut real = PlaybackState::default();
         real.auth_state = "ready".to_owned();
-        real.queue = vec![Track::default()];
+        real.queue = vec![Track::default()].into();
         let client = client_with_last_state(real.clone());
         assert!(client.capture_preview_restore(17));
 
@@ -3573,7 +3596,7 @@ mod tests {
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         previous.current_index = Some(0);
         previous.position_ms = 42_000;
         previous.volume = 37;
@@ -3719,7 +3742,7 @@ mod tests {
         state.queue = vec![Track {
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
             ..Track::default()
-        }];
+        }].into();
         state.current_index = Some(0);
         state.playing = true;
         assert!(RestoreSnapshot::from_playback(&state, state.playing).resume_playing);
@@ -3736,7 +3759,7 @@ mod tests {
             duration_ms: 240_000,
             cached: true,
             ..Track::default()
-        }];
+        }].into();
         state.current_index = Some(0);
 
         // Both constructors funnel through `normalized`: a live crash-recovery
@@ -3763,7 +3786,7 @@ mod tests {
             effective_edit: None,
             context: "playlist:abc".to_owned(),
             ..Track::default()
-        }];
+        }].into();
         snapshot_state.current_index = Some(0);
         let restore = RestoreSnapshot::from_playback(&snapshot_state, false);
 
@@ -3775,7 +3798,7 @@ mod tests {
             duration_ms: 240_000,
             cached: false,
             ..Track::default()
-        }];
+        }].into();
         restored.current_index = Some(0);
 
         assert!(
@@ -3784,7 +3807,7 @@ mod tests {
         );
 
         // Identity still matters: a different queue is not "restored".
-        restored.queue[0].id = "zzzzzzzzzzzzzzzzzzzzzz".to_owned();
+        Arc::make_mut(&mut restored.queue)[0].id = "zzzzzzzzzzzzzzzzzzzzzz".to_owned();
         assert!(!restore.matches(&restored));
     }
 
@@ -3797,7 +3820,7 @@ mod tests {
             uri: "spotify:track:0123456789ABCDEFGHIJKL".to_owned(),
             duration_ms: 240_000,
             ..Track::default()
-        }];
+        }].into();
         snapshot_state.current_index = Some(0);
         snapshot_state.position_ms = 200_000;
         let restore = RestoreSnapshot::from_playback(&snapshot_state, false);

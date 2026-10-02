@@ -1,5 +1,6 @@
 import { untrack } from "svelte";
-import { loadCataloguePage } from "./state.svelte.js";
+import { loadCataloguePage, watchCacheMarks } from "./state.svelte.js";
+import { applyCacheMarks } from "./cache-marks.js";
 
 /**
  * What the artist page's shelf and the discography reader agree on.
@@ -131,6 +132,11 @@ export function createCataloguePaging({
     queueMicrotask(() => loadNext(key, expected));
   }
 
+  /* Download marks reach the songs already on screen, in place. */
+  $effect(() => watchCacheMarks((ids) => {
+    for (const release of releases) applyCacheMarks(release.tracks, ids);
+  }));
+
   return {
     get releases() { return releases; },
     get nextOffset() { return nextOffset; },
@@ -144,18 +150,21 @@ export function createCataloguePaging({
 
 /**
  * The footer sentinel both paged catalogues share: one bounded page opens the
- * view, further pages load only when real scrolling brings the footer within
- * 400px; each view also keeps its button as the keyboard fallback. Returns the
- * detach function so a view can wrap it in `$effect(() => …)`.
+ * view, and a further page loads whenever the footer comes within 400px of the
+ * pane's bottom; each view also keeps its button as the keyboard fallback.
+ * Observing reports the footer at once, so one already in reach at mount loads
+ * without a scroll. A footer that stays in reach while a page lands above it
+ * reports nothing new, so a view re-attaches per page: `$effect(() => {
+ * paging.releases.length; return sentinelLoader(…); })`. Returns the detach
+ * function.
  */
 export function sentinelLoader(node, load) {
   if (!node) return;
-  const scroller = node.closest(".scroll");
-  if (!scroller) return;
-  const onScroll = () => {
-    const remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-    if (remaining <= 400) load();
-  };
-  scroller.addEventListener("scroll", onScroll, { passive: true });
-  return () => scroller.removeEventListener("scroll", onScroll);
+  const root = node.closest(".scroll");
+  if (!root) return;
+  const observer = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) load();
+  }, { root, rootMargin: "0px 0px 400px 0px" });
+  observer.observe(node);
+  return () => observer.disconnect();
 }

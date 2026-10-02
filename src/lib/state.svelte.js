@@ -655,6 +655,12 @@ function propagateCacheMarks(ids) {
     applyCacheMarks(view?.tracks, ids);
     applyCacheMarks(view?.top_tracks, ids);
   }
+  applyCacheMarks(search.results?.tracks, ids);
+  // Kept pages are shown again as they are, so they carry the marks too.
+  for (const page of cataloguePageCache.values()) {
+    for (const release of page?.releases ?? []) applyCacheMarks(release?.tracks, ids);
+  }
+  applyCacheMarks(likedFirstPage?.page?.tracks, ids);
   for (const listener of cacheMarkListeners) listener(ids);
 }
 
@@ -1807,7 +1813,6 @@ export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "",
     const id = playlist?.id;
     if (!id || seen.has(id)) return null;
     seen.add(id);
-    playlist = byId.get(id) ?? playlist;
     if (!matches(playlist)) return null;
     const row = { kind: "playlist", playlist, rank: rank.get(id) ?? Infinity };
     if (pinned.has(id)) {
@@ -1829,7 +1834,8 @@ export function libraryRailEntries(playlists, tree, pinnedIds = [], filter = "",
         for (const child of children) folder.rank = Math.min(folder.rank, child.rank);
         rows.push(folder);
       } else if (node.kind === "playlist") {
-        const row = playlistRow(node.playlist);
+        // The tree names a playlist; its row lives once, in the library.
+        const row = playlistRow(byId.get(node.id));
         if (row) rows.push(row);
       }
     }
@@ -2027,16 +2033,13 @@ function browseLikedFirstPage() {
  * Drops the cached page and the walk in flight, so the next reader pays for a
  * fresh one from the account that is current now.
  *
- * Membership and account changes invalidate the collection; an explicit
- * audio-cache clear invalidates its downloaded marks. The next browse must
- * answer from the current account and cache, not a stale first page.
+ * Membership and account changes invalidate the collection. The next browse
+ * must answer from the current account, not a stale first page.
  */
 function invalidateLikedFirstPage() {
   likedFirstPage = null;
   likedFirstPagePending = null;
 }
-
-export const libraryChanges = $state({ savedTracks: 0 });
 
 const savedTracksListeners = new Set();
 export function watchSavedTracks(listener) {
@@ -2047,7 +2050,6 @@ export function watchSavedTracks(listener) {
 /** Invalidate future first-page reads and notify mounted collections in place. */
 export function savedTracksChanged(change = null) {
   invalidateLikedFirstPage();
-  libraryChanges.savedTracks++;
   for (const listener of savedTracksListeners) listener(change);
 }
 
@@ -2110,12 +2112,9 @@ export function refreshCacheStats() {
 
 export async function clearCache(kind) {
   const payload = await api.clearCache(kind);
-  // A successful explicit wipe is the only cache message that unsets marks.
-  if (kind === "audio") {
-    propagateCacheMarks(null);
-    invalidateLikedFirstPage();
-    cataloguePageCache.clear();
-  }
+  // A successful explicit wipe is the only cache message that unsets marks,
+  // and it unsets them in place: kept pages need no second fetch.
+  if (kind === "audio") propagateCacheMarks(null);
   cacheStats.audio = payload?.audio ?? null;
   cacheStats.covers = payload?.covers ?? null;
   cacheStats.updatedAt = Date.now();
@@ -2217,6 +2216,7 @@ export const api = {
   },
   play: () => requestPlaying(true),
   pause: () => requestPlaying(false),
+  setWindowVisible: (visible, refresh = false) => invoke("set_window_visible", { visible, refresh }),
   next: async () => {
     if (lazyQueue.source && playback.current_index >= playback.queue.length - 1) {
       await backfillLazyQueue(true);

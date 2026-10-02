@@ -47,9 +47,12 @@
     playError = "";
   });
 
-  /* Further pages load only when real scrolling reaches the footer; the
-     button remains the keyboard fallback. */
-  $effect(() => sentinelLoader(sentinel, () => paging.loadNext()));
+  /* Further pages load when the footer comes within reach, checked again as
+     each page lands; the button remains the keyboard fallback. */
+  $effect(() => {
+    paging.releases.length;
+    return sentinelLoader(sentinel, () => paging.loadNext());
+  });
   async function playRelease(id) {
     if (busy.id) return;
     const artistId = artist?.id;

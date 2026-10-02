@@ -12,7 +12,7 @@
     nowSaved,
     lookupSavedIn,
   } from "../lib/state.svelte.js";
-  import { library, session } from "../lib/state.svelte.js";
+  import { session } from "../lib/state.svelte.js";
   import { personalConnected, watchPersonal, setLiked } from "../lib/personal.svelte.js";
   import Icon from "./Icon.svelte";
   import Cover from "./Cover.svelte";
@@ -292,13 +292,10 @@
   });
 
   /* Saved ANYWHERE — Liked Songs or a playlist of your own — is the check;
-     saved nowhere is the heart outline. Both answered by the shell's index. */
-  const savedRefs = $derived.by(() => {
-    const owned = new Set(library.filter((item) => item.owner_id === session.username).map((item) => item.id));
-    return nowSaved.refs.filter((ref) => ref.id === "liked" || owned.has(ref.id));
-  });
-  const inLiked = $derived(savedRefs.some((ref) => ref.id === "liked"));
-  const savedLabel = $derived(`Saved in ${savedRefs.map((ref) => ref.name).join(", ")}`);
+     saved nowhere is the heart outline. Both answered by the shell's index,
+     which holds only Liked Songs and playlists you own. */
+  const inLiked = $derived(nowSaved.refs.some((ref) => ref.id === "liked"));
+  const savedLabel = $derived(`Saved in ${nowSaved.refs.map((ref) => ref.name).join(", ")}`);
   let savedMark = $state(null);
   let heart = $state(null);
   let liking = $state(false);
@@ -319,7 +316,7 @@
     }
     if (!hadFocus || uri !== currentUri) return;
     await tick();
-    (savedRefs.length ? savedMark : heart)?.focus();
+    (nowSaved.refs.length ? savedMark : heart)?.focus();
   }
 
   function openSaved(id) {
@@ -542,7 +539,7 @@
             />
           {/if}
         </span>
-        {#if savedRefs.length}
+        {#if nowSaved.refs.length}
           <!-- Marks live BESIDE the two-line text block, not inside its first
                line: .p-now centres its children, so the check faces the whole
                title+artists stack instead of hanging off the song name. -->
@@ -555,7 +552,7 @@
             <span class="p-saved-panel glass-overlay" role="group" aria-label={savedLabel}>
               <span class="p-saved-scroll" use:scrollbar>
                 <span class="p-saved-head">Saved in</span>
-                {#each savedRefs as ref (ref.id)}
+                {#each nowSaved.refs as ref (ref.id)}
                   <button
                     class="p-saved-row"
                     title="Open {ref.name}"

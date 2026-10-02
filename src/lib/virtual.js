@@ -2,18 +2,18 @@
  * The index range a fixed-row list has to render, given where its body sits in
  * the shared pane scroller.
  *
- * Both long lists in the app — the track table and the listening history — are
- * windowed the same way and for the same reason: a body of the full height,
- * with only the rows near the viewport actually in the DOM, translated into
- * place. Neither of them is its own scroller (the pane's `.scroll` is), so the
- * offset has to be measured rather than read off a local `scrollTop`, and it is
- * measured from rects rather than cached because the header above the list
- * changes height as a page loads.
+ * The long lists in the app — the track table, the queue and the listening
+ * history — are windowed the same way and for the same reason: a body of the
+ * full height, with only the rows near the viewport actually in the DOM,
+ * translated into place. None is its own scroller (the pane's `.scroll` is), so
+ * the offset has to be measured rather than read off a local `scrollTop`, and
+ * it is measured from rects rather than cached because the header above the
+ * list changes height as a page loads.
  *
- * Only the arithmetic is shared. The two lists differ in what a new range
- * *means* — the table resets its window when the playlist changes identity, the
- * history asks the engine for the pages the range lands in — and that belongs
- * with the list, not here.
+ * Only the arithmetic is shared. The lists differ in what a new range *means* —
+ * the table resets its window when the playlist changes identity, the queue
+ * keeps it through its own edits, the history asks the engine for the pages
+ * the range lands in — and that belongs with the list, not here.
  *
  * @param body      the full-height element the rows are positioned inside
  * @param scroller  the scrolling ancestor

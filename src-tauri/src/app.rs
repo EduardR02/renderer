@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use renderer_engine::protocol::normalize_canonical_playlist_description;
 
 use crate::types::{
-    align_artist_ids, cover_urls_from_tracks, forget_cached_audio, CacheStats, CacheUsage,
+    align_artist_ids, cover_urls_from_tracks, CacheStats, CacheUsage,
     LibraryNodeDetail, PlaybackState, Playlist, PlaylistDetail, Track,
 };
 
@@ -86,7 +86,7 @@ pub struct PlaybackSnapshot {
 
 impl PlaybackSnapshot {
     pub fn from_playback(state: &PlaybackState) -> Self {
-        let mut queue = state.queue.clone();
+        let mut queue = state.queue.to_vec();
         // Download marks are session-live truth, derived from the audio cache
         // by the heartbeat and by browses. A persisted snapshot must not carry
         // them: the cache prunes on its own schedule, so a stored mark is a
@@ -346,6 +346,8 @@ pub struct PlaylistTracksEntry {
     pub fetched_at: Option<i64>,
     /// Playlist4 revision hex; the Web API snapshot id.
     pub revision: String,
+    /// Stored without their session-live fields; see [`StoredTrack`].
+    #[serde(serialize_with = "store_tracks")]
     pub tracks: Vec<Track>,
     /// Playlist-local tracks skipped by automatic playback.
     ///
@@ -416,7 +418,6 @@ pub fn update_app_settings(change: impl FnOnce(&mut AppSettings)) -> Result<AppS
     *guard = next.clone();
     Ok(next)
 }
-
 
 fn playback_state_path(dir: &Path) -> PathBuf {
     dir.join("playback_state.json")
@@ -607,6 +608,42 @@ struct PlaylistTracksCacheRef<'a> {
     playlists: &'a [PlaylistTracksEntry],
 }
 
+/// A track as `playlist_tracks_cache.json` stores it: its durable fields only.
+/// The download mark is about the audio cache, which this file knows nothing
+/// about and which may be pruned or cleared at any time; queue contexts and
+/// edit snapshots belong to one queue. Read back, they take their defaults.
+#[derive(PartialEq, Serialize)]
+struct StoredTrack<'a> {
+    id: &'a str,
+    uri: &'a str,
+    name: &'a str,
+    artist_names: &'a [String],
+    artist_ids: &'a [String],
+    artist_id: &'a str,
+    album_id: &'a str,
+    album_name: &'a str,
+    cover_url: &'a str,
+    duration_ms: u32,
+    play_count: Option<u64>,
+    added_at: Option<i64>,
+    unavailable: bool,
+    unavailable_reason: Option<&'a str>,
+}
+
+impl<'a> From<&'a Track> for StoredTrack<'a> {
+    fn from(track: &'a Track) -> Self {
+        // Exhaustive, so that a new field has to choose a side.
+        let Track { id, uri, name, artist_names, artist_ids, artist_id, album_id, album_name, cover_url, duration_ms,
+            play_count, added_at, unavailable, unavailable_reason, cached: _, context: _, effective_edit: _ } = track;
+        Self { id, uri, name, artist_names, artist_ids, artist_id, album_id, album_name, cover_url, duration_ms: *duration_ms,
+            play_count: *play_count, added_at: *added_at, unavailable: *unavailable, unavailable_reason: unavailable_reason.as_deref() }
+    }
+}
+
+fn store_tracks<S: serde::Serializer>(tracks: &[Track], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(tracks.iter().map(StoredTrack::from))
+}
+
 pub fn load_tracks_cache(dir: &Path) -> Vec<PlaylistTracksEntry> {
     let bytes = match std::fs::read(dir.join("playlist_tracks_cache.json")) {
         Ok(bytes) => bytes,
@@ -620,10 +657,6 @@ pub fn load_tracks_cache(dir: &Path) -> Vec<PlaylistTracksEntry> {
             for entry in &mut cache.playlists {
                 for track in &mut entry.tracks {
                     align_artist_ids(track);
-                    // The download mark is about the AUDIO cache, whose
-                    // contents this file knows nothing about — it may have been
-                    // pruned or cleared since. Only a live browse can answer it.
-                    forget_cached_audio(track);
                 }
             }
             cache.playlists
@@ -680,8 +713,9 @@ pub fn write_tracks_cache_bytes(dir: &Path, bytes: &[u8]) {
 /// The comparison keeps an open from rewriting the whole rebuildable cache
 /// to store what it already holds. `fetched_at` is deliberately
 /// not part of it: nothing reads that field back, and counting it would make
-/// every browse a change. Moving an unchanged entry to the front is not worth
-/// a write either; the next real change persists the list in this order.
+/// every browse a change. Nor are the fields the file never stores, such as
+/// download marks. Moving an unchanged entry to the front is not worth a
+/// write either; the next real change persists the list in this order.
 pub fn upsert_tracks_cache(
     entries: &mut Vec<PlaylistTracksEntry>,
     entry: PlaylistTracksEntry,
@@ -691,7 +725,7 @@ pub fn upsert_tracks_cache(
         .find(|existing| existing.id == entry.id)
         .is_none_or(|existing| {
             existing.revision != entry.revision
-                || existing.tracks != entry.tracks
+                || !existing.tracks.iter().map(StoredTrack::from).eq(entry.tracks.iter().map(StoredTrack::from))
                 || existing.excluded_track_ids != entry.excluded_track_ids
         });
     entries.retain(|existing| existing.id != entry.id);
@@ -1142,7 +1176,6 @@ fn write_bytes_atomic_result(path: PathBuf, bytes: &[u8]) -> Result<(), String> 
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1180,13 +1213,12 @@ mod tests {
         assert_eq!(state.memberships[0].uris, HashSet::from([b]));
     }
 
-
     #[test]
     fn folder_tree_survives_cache_replacement_and_deleted_playlists_stay_deleted() {
         let dir = std::env::temp_dir().join(format!("renderer-tree-{}-{}", std::process::id(), now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         let folder = |children| LibraryNodeDetail::Folder { id: "folder".into(), name: "Music".into(), children };
-        let node = |id| LibraryNodeDetail::Playlist { playlist: playlist(id) };
+        let node = |id: &str| LibraryNodeDetail::Playlist { id: id.into() };
         let first = PlaylistListCache { version: 1, fetched_at: Some(1), me_id: "me".into(),
             playlists: vec![playlist("a"), playlist("b")], playlist_tree: vec![folder(vec![node("a"), node("b")])] };
         save_playlist_list(&dir, &first);
@@ -1199,7 +1231,6 @@ mod tests {
         assert_eq!(loaded.playlist_tree, refreshed.playlist_tree);
         let _ = std::fs::remove_dir_all(dir);
     }
-
 
     #[test]
     fn app_settings_missing_startup_fields_use_safe_defaults() {
@@ -1272,7 +1303,6 @@ mod tests {
         // Playlist entries are never touched.
         assert!(entries.iter().find(|entry| entry.id == "p1").unwrap().contains("spotify:track:a"));
     }
-
 
     #[test]
     fn membership_round_trips_through_the_disk_format() {
@@ -2221,27 +2251,29 @@ mod tests {
     }
 
     /// The audio cache can be cleared or pruned between two runs of the app,
-    /// and this file would not know. A download mark read back off disk is a
-    /// claim about a directory this cache does not own, so it is dropped.
+    /// and this file would not know. A download mark on disk would be a claim
+    /// about a directory this cache does not own, so it is never written, and
+    /// a browse that only changed marks owes the file nothing.
     #[test]
-    fn a_tracks_cache_never_restores_a_download_mark() {
+    fn a_tracks_cache_never_stores_a_download_mark() {
         let dir = std::env::temp_dir().join(format!("renderer-cached-{}", now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
-        let entries = vec![PlaylistTracksEntry {
+        let entry = |cached| PlaylistTracksEntry {
             id: "p1".into(),
             fetched_at: Some(42),
             revision: "rev".into(),
-            tracks: vec![Track {
-                cached: true,
-                ..track("t")
-            }],
+            tracks: vec![Track { cached, context: "playlist:p1".into(), ..track("t") }],
             excluded_track_ids: Vec::new(),
-        }];
+        };
+        let mut entries = vec![entry(true)];
         save_tracks_cache(&dir, &entries);
-        assert!(
-            !load_tracks_cache(&dir)[0].tracks[0].cached,
-            "only a live browse may claim a track is on disk"
-        );
+        let bytes = std::fs::read(dir.join("playlist_tracks_cache.json")).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let track = &stored["playlists"][0]["tracks"][0];
+        assert_eq!(track["id"], "t");
+        assert!(track.get("cached").is_none() && track.get("context").is_none(), "{track}");
+        assert!(!load_tracks_cache(&dir)[0].tracks[0].cached, "only a live browse may claim a track is on disk");
+        assert!(!upsert_tracks_cache(&mut entries, entry(false)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

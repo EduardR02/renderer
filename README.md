@@ -57,23 +57,17 @@ The interface is frosted glass lit by whatever is playing: a still haze taken
 from the song's Canvas or cover. It changes with the song and costs nothing
 while the song plays.
 
-Local audio is 320 kbps and gapless. Media keys work when the app isn't focused,
-and it shows up in Windows Quick Settings and on the lock screen. Played songs
-are cached, so replaying them uses no network; podcast episodes stream through
-temporary seekable files instead. The sound-device stream opens on Play, stops
-when paused or finished, and follows system output changes. It can launch at
-login, minimized if you want.
-
-An idle-session reconnect keeps the latest selected track; Pause cancels automatic
-resumption. Audio-device and normalization handovers capture the current playhead
-and preserve an ongoing finite loop, rather than starting its repeat count again.
+Audio is 320 kbps and gapless. Media keys work when the app isn't focused, and
+it shows up in Windows Quick Settings and on the lock screen. Played songs are
+cached, so replaying them uses no network; podcast episodes are streamed, not
+cached. When the system's audio output changes, playback follows it. It can
+launch at login, minimized if you want.
 
 Playlists can be created, renamed, deleted and reordered, and tracks added or
 removed by drag and drop or in bulk by rules (artist, album, title, length),
 with a preview of exactly which entries go. Playlists can be pinned to the top
-of the library, and their folder tree restores from disk before refreshing.
-Likes update the open Liked Songs list without losing loaded pages or scroll
-position. Settings has an audio cache size limit and volume normalisation.
+of the library, and folders are kept. Settings has an audio cache size limit
+and volume normalisation.
 
 Some extra things I added because we control playback here:
 
@@ -89,9 +83,6 @@ Canvas works, but only if you have it enabled in the real Spotify app. It's
 an account setting on their servers, not a local one, and their backend returns
 nothing at all while it's off. You still get the album cover, of course.
 
-Podcast lists are virtualized, with title and description search across the
-loaded show. Play follows the displayed order and skips unavailable episodes.
-
 ### Likes, follows and devices (optional)
 
 The normal sign-in can read Liked Songs and the artists you follow, but can't
@@ -105,28 +96,12 @@ developer app. It's a second authorization for the same account, not another acc
 3. Paste the app's Client ID into Settings. Only the Client ID: never the
    Client Secret.
 
-Allow Spotify Connect access in Settings, then choose an output from the player
-bar. Renderer pauses local audio before starting the selected phone, speaker
-or Spotify app. The engine queue remains canonical: Spotify plays bounded
-windows in its order, including the device's own Next button. Queue edits keep
-the current song and position, but replacing or extending a window can rebuffer;
-Spotify offers no atomic queue replacement or gapless guarantee for those
-requests. Controls write immediately; background reconciliation checks a selected
-device every four seconds while playing and every twenty seconds while paused,
-with earlier track-boundary checks and fast command confirmation. No remote poll
-runs for **This computer**. Failed queue replacements retain the requested queue
-for retry without interpreting old Spotify rows as its new occurrences. Removing
-the paused current row stages its replacement until Play or a device-side resume.
-**This computer** pauses the remote output and returns to the same local queue,
-order and cursor, paused. If another Spotify client started its own queue, Renderer
-shows it without replacing the local queue.
-
-Spotify devices play Spotify's original audio: Renderer's playback speed and
-track-editor previews require **This computer**. Device availability, Spotify
-permissions, Premium and developer-app restrictions still apply. Failed remote
-commands remain visible and do not silently start local audio. If the old device
-cannot be paused when returning, Renderer still unlocks the output selector and
-stays paused; stop that device in Spotify before resuming locally.
+Once that's connected, allow device access in Settings, and the player bar can
+play your queue on a phone, speaker or another Spotify app. Your queue stays in
+charge there too, and the device's own controls work with it. Editing the queue
+while it plays elsewhere can make the device rebuffer for a moment. **This
+computer** brings playback back. Other devices play Spotify's original audio, so
+playback speed and song edits only apply here.
 
 ## Limitations
 
@@ -190,15 +165,9 @@ can use to control it, so close it when you're done.
 
 It has to be cheap to run while sitting open all day, so a few things follow
 from that. The playhead is animated with a transform instead of a width, so it
-doesn't force layout on every tick. Long lists are virtualized. Idle engine work
-is deadline-driven, with system notifications for output-device changes. Queue
-rows and upcoming order cross process boundaries only when their independent
-revisions change; omission retains the existing arrays, an empty array clears
-them. Cover URLs fetch missing artwork directly into a rebuildable disk cache.
-Download marks are additive ID deltas independent of those revisions, including
-songs visible outside the queue; only an explicit audio-cache clear removes them.
-Card glow colours are measured on hover or focus; the artist pick waits until
-visible.
+doesn't force layout on every tick. Long lists are virtualized. While nothing
+plays, the engine does nothing: the sound device is closed and no timers tick.
+The queue only crosses between processes when it actually changes.
 
 The glass doesn't re-blur the window as things move. The haze is rendered once
 per song on the GPU, in a worker, and the panes show a pre-frosted copy of it,
@@ -209,11 +178,6 @@ and handles everything to do with sound. The Tauri shell in `src-tauri/`
 supervises it, holds the caches, and serves a Svelte 5 frontend from `src/`.
 Audio being in its own process means the interface can't interrupt playback, and
 if the engine dies the shell restarts it and puts the queue back.
-
-The shell waits for its final playback-state flush on normal exit and before a
-Windows updater launches its installer and exits the process. Library refreshes
-use supplied playlist revisions, revalidating bare membership IDs when the
-revision is unknown. A successful Like or Unlike fences older Liked Songs reads.
 
 Tauri and a web frontend are an odd pick for this. I used them because the UI
 needed the most iteration and HTML and CSS were much faster to work in.

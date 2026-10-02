@@ -259,15 +259,25 @@
      client burns CPU at idle — so gate it on focus as well as on playback.
      A class beats a JS ticker: the compositor stops on its own and nothing
      re-enters the main thread. */
+  /* The same signal paces a Spotify device: the shell reads one regularly only
+     while the window can be seen, and focus reads it at once. The mount call
+     covers a window that starts minimized. */
   $effect(() => {
     ui.windowFocused = document.hasFocus();
-    const on = () => (ui.windowFocused = true);
+    const visibility = () => api.setWindowVisible(!document.hidden).catch(() => {});
+    const on = () => {
+      ui.windowFocused = true;
+      api.setWindowVisible(true, true).catch(() => {});
+    };
     const off = () => (ui.windowFocused = false);
+    visibility();
     window.addEventListener("focus", on);
     window.addEventListener("blur", off);
+    document.addEventListener("visibilitychange", visibility);
     return () => {
       window.removeEventListener("focus", on);
       window.removeEventListener("blur", off);
+      document.removeEventListener("visibilitychange", visibility);
     };
   });
 

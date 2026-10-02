@@ -1,5 +1,6 @@
 <script>
-  import { route, search, api, focusSearch } from "../lib/state.svelte.js";
+  import { route, search, api, focusSearch, watchCacheMarks } from "../lib/state.svelte.js";
+  import { applyCacheMarks } from "../lib/cache-marks.js";
   import TrackList from "../components/TrackList.svelte";
   import Icon from "../components/Icon.svelte";
 
@@ -31,6 +32,9 @@
         if (requested === q) loading = false;
       });
   });
+
+  /* Download marks reach these songs in place. */
+  $effect(() => watchCacheMarks((ids) => applyCacheMarks(tracks, ids)));
 
   function playFrom(index) {
     if (tracks.length) api.playQueue(tracks, index, "search").catch(() => {});
