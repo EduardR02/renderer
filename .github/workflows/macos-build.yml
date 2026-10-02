@@ -25,8 +25,12 @@ jobs:
         run: |
           bun -e 'const v = require("./package.json").version; const tag = process.env.RELEASE_TAG.replace(/^v/, ""); if (v !== tag || require("./src-tauri/tauri.conf.json").version !== tag) throw Error(`Release tag ${tag} must match app version ${v}`)'
       - name: Test frontend, engine and shell
+        # The shell compiles against the built frontend and bundles the
+        # release engine, so both must exist before its tests build.
         run: |
           bun test
+          bun run build
+          bun run build:engine
           cargo test -p renderer-engine
           cargo test -p renderer
       - name: Build and sign macOS app and updater archive
