@@ -1,11 +1,12 @@
 <script>
-  import { personalApi, personalDevicesAuthorized, watchPersonal } from "../lib/personal.svelte.js";
+  import { personalApi, personalDevicesActive, watchPersonal } from "../lib/personal.svelte.js";
   import { api, playback } from "../lib/state.svelte.js";
   import Icon from "./Icon.svelte";
   import Menu from "./Menu.svelte";
 
   // Discovery is demand-only; selected-output sync belongs to the native
-  // playback router and remains active when this menu closes.
+  // playback router and remains active when this menu closes. With devices
+  // turned off in Settings there is no button and nothing here runs.
   let open = $state(false);
   let button = $state(null);
   let devices = $state([]);
@@ -15,18 +16,18 @@
   let generation = 0;
 
   $effect(() => watchPersonal());
-  const authorized = $derived(personalDevicesAuthorized());
+  const active = $derived(personalDevicesActive());
   const remote = $derived(playback.output_device_id);
   const remoteName = $derived(playback.output_device_name);
   $effect(() => {
-    if (authorized) return;
+    if (active) return;
     generation++;
     open = false;
     devices = [];
   });
 
   async function refresh() {
-    if (!open || loading || !personalDevicesAuthorized()) return;
+    if (!open || loading || !personalDevicesActive()) return;
     const current = generation;
     loading = true;
     error = "";
@@ -105,7 +106,7 @@
   </button>
 {/snippet}
 
-{#if authorized || remote}
+{#if active || remote}
   <button
     class="btn-round device-btn"
     class:on={!!remote}
@@ -128,7 +129,7 @@
             class:spinning={loading}
             title="Refresh devices"
             aria-label="Refresh devices"
-            disabled={loading || !authorized}
+            disabled={loading || !active}
             onclick={refresh}
           >
             <Icon name="refresh" size={15} />
@@ -146,7 +147,7 @@
           {@const [glyph, label] = kind(device.type)}
           {@render row(
             device.name, glyph, label, remote === device.id, transferring === device.id,
-            !authorized || !device.id || device.is_restricted,
+            !active || !device.id || device.is_restricted,
             device.is_restricted ? `${device.name} can't be controlled` : remote === device.id ? `Renderer is playing on ${device.name}` : `Play on ${device.name}`,
             () => select(device),
           )}

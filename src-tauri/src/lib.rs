@@ -152,6 +152,7 @@ pub fn run() {
             commands::set_launch_at_login,
             commands::set_start_minimized,
             commands::set_animated_canvas,
+            commands::set_devices_enabled,
             commands::enable_account_canvas,
             commands::touch_playlist,
             commands::touch_playlist_activity,
@@ -190,7 +191,7 @@ pub fn run() {
             // Spawn the playback engine and keep it alive across crashes.
             let client = EngineClient::start();
             app.manage(client.clone());
-            let router = playback_router::PlaybackRouter::new(client.clone(), personal);
+            let router = playback_router::PlaybackRouter::new(client.clone(), personal, startup_settings.devices_enabled);
             app.manage(router.clone());
             let output_app = app.handle().clone();
             tauri::async_runtime::spawn(async move { router.watch(output_app).await });

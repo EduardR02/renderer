@@ -49,6 +49,7 @@ const LOCAL_ONLY: &str = "Playback speed and track-editor previews require This 
 const FOREIGN_QUEUE: &str = "This queue belongs to the Spotify app on that device; edit it there, or play something from here";
 const MOVED_AWAY: &str = "Spotify playback moved away from the selected device; reselect a device or This computer";
 const RELEASED: &str = "The selected output was released";
+const DEVICES_OFF: &str = "Spotify devices are turned off in Settings";
 
 pub enum Action {
     Play, Pause, Next, Previous, Seek(u32), Volume(u8), Shuffle(bool), Repeat(String), Speed(f32),
@@ -385,8 +386,10 @@ pub struct PlaybackRouter {
 }
 
 impl PlaybackRouter {
-    pub fn new(client: Arc<EngineClient>, personal: Arc<PersonalApi>) -> Arc<Self> {
-        Arc::new(Self { client, personal, core: Core::default() })
+    pub fn new(client: Arc<EngineClient>, personal: Arc<PersonalApi>, devices_enabled: bool) -> Arc<Self> {
+        let core = Core::default();
+        core.enabled.store(devices_enabled, Ordering::Relaxed);
+        Arc::new(Self { client, personal, core })
     }
 
     fn host<'a>(&'a self, app: &'a AppHandle) -> AppHost<'a> {
@@ -394,6 +397,16 @@ impl PlaybackRouter {
     }
 
     pub fn is_remote(&self) -> bool { self.core.remote.lock().is_some() }
+
+    /// Whether Spotify devices are on (Settings). Off, the router serves only
+    /// This computer and nothing in it wakes.
+    pub fn devices_enabled(&self) -> bool { self.core.enabled.load(Ordering::Relaxed) }
+
+    /// Turning devices off first brings playback on a device back here,
+    /// paused, through the one hand-back path; the grant is left alone.
+    pub async fn set_devices_enabled(&self, app: &AppHandle, enabled: bool) {
+        self.core.set_enabled(&self.host(app), enabled).await;
+    }
 
     pub fn snapshot(&self) -> Option<PlaybackState> { self.core.snapshot() }
 
@@ -435,11 +448,16 @@ struct Core {
     changed: Notify,
     /// Whether the window can be seen; it decides how often a device is read.
     visible: AtomicBool,
+    /// Whether Spotify devices are on at all.
+    enabled: AtomicBool,
 }
 
 impl Default for Core {
     fn default() -> Self {
-        Self { operation: AsyncMutex::new(()), remote: Mutex::new(None), changed: Notify::new(), visible: AtomicBool::new(true) }
+        Self {
+            operation: AsyncMutex::new(()), remote: Mutex::new(None), changed: Notify::new(),
+            visible: AtomicBool::new(true), enabled: AtomicBool::new(true),
+        }
     }
 }
 
@@ -485,6 +503,8 @@ impl Core {
 
     fn set_visible(&self, visible: bool, refresh: bool) {
         let was = self.visible.swap(visible, Ordering::Relaxed);
+        // With devices off there is no device to read and nothing to wake.
+        if !self.enabled.load(Ordering::Relaxed) { return; }
         // Coming back into view reads the device at once: a hidden, paused
         // window read nothing meanwhile.
         let refresh = visible && (refresh || !was);
@@ -495,10 +515,14 @@ impl Core {
     }
 
     fn report_error<H: Host>(&self, host: &H, error: &str) {
-        if let Some(remote) = self.remote.lock().as_mut() { remote.state.error = error.to_owned(); }
+        let remote = match self.remote.lock().as_mut() {
+            Some(remote) => { remote.state.error = error.to_owned(); true }
+            None => false,
+        };
         host.emit("playback-action-error", error);
         self.publish_transport(host);
-        self.changed.notify_one();
+        // Only a device's watcher has anything to reconsider.
+        if remote { self.changed.notify_one(); }
     }
 
     fn suspend<H: Host>(&self, host: &H, error: &str) {
@@ -515,7 +539,8 @@ impl Core {
         let _operation = self.operation.lock().await;
         let result = self.select_locked(host, device_id).await;
         if let Err(error) = &result { self.report_error(host, error); }
-        self.changed.notify_one();
+        // The watcher plans only for a device; a hand-back already woke it.
+        if self.remote.lock().is_some() { self.changed.notify_one(); }
         result
     }
 
@@ -523,6 +548,7 @@ impl Core {
         let Some(device_id) = device_id.filter(|id| !id.is_empty()) else {
             return self.return_local(host).await;
         };
+        if !self.enabled.load(Ordering::Relaxed) { return Err(DEVICES_OFF.into()); }
         player_path(&device_id, "play", &[])?;
         let selected = self.remote.lock().as_ref().map(|remote| (remote.state.output_device_id == device_id, remote.kind(), remote.state.playing));
         if let Some((true, kind, _)) = selected {
@@ -609,6 +635,15 @@ impl Core {
 
     async fn disconnect<H: Host>(&self, host: &H) {
         let _operation = self.operation.lock().await;
+        if let Err(error) = self.return_local(host).await { self.report_error(host, &error); }
+    }
+
+    /// Off is set before the hand-back, under the same operation lock, so no
+    /// selection can slip in between; the hand-back itself is `disconnect`'s.
+    async fn set_enabled<H: Host>(&self, host: &H, enabled: bool) {
+        let _operation = self.operation.lock().await;
+        self.enabled.store(enabled, Ordering::Relaxed);
+        if enabled { return; }
         if let Err(error) = self.return_local(host).await { self.report_error(host, &error); }
     }
 
@@ -2204,6 +2239,42 @@ mod tests {
         core.select(&host, None).await.unwrap();
         assert_eq!(host.engine.lock().rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["t0", "t1", "newer"]);
         assert_eq!(host.engine.lock().current, Some(0));
+    }
+
+    /// Whether anything has woken the watcher since the last look.
+    async fn woken(core: &Core) -> bool {
+        tokio::time::timeout(Duration::from_millis(20), core.changed.notified()).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn devices_off_hands_playback_back_then_nothing_wakes_and_on_needs_no_new_grant() {
+        let (core, host) = owned(3).await;
+        woken(&core).await;
+        core.set_enabled(&host, false).await;
+        // The one hand-back path: the device is paused, and the engine takes
+        // its row here, paused.
+        assert_eq!(host.spotify.lock().writes(), ["PUT me/player/pause?device_id=phone"]);
+        assert!(core.snapshot().is_none());
+        assert!(!host.engine.lock().playing);
+        assert_eq!(host.engine.lock().current, Some(0));
+        woken(&core).await;
+        host.spotify.lock().log.clear();
+
+        // Off: a selection is refused before any request, the window's
+        // visibility wakes nothing, local playback reaches no device, and the
+        // watcher is never woken.
+        assert_eq!(core.select(&host, Some("phone".into())).await.unwrap_err(), DEVICES_OFF);
+        core.set_visible(false, false);
+        core.set_visible(true, true);
+        core.run(&host, Action::Play).await.unwrap();
+        assert!(host.spotify.lock().log.is_empty());
+        assert!(!woken(&core).await);
+
+        // On again is instant: the same grant serves the next selection.
+        core.set_enabled(&host, true).await;
+        core.select(&host, Some("phone".into())).await.unwrap();
+        assert!(core.snapshot().is_some());
+        assert!(woken(&core).await);
     }
 
     #[tokio::test]

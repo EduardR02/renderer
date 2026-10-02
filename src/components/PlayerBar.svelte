@@ -921,9 +921,9 @@
       color var(--d1) var(--ease),
       background-color var(--d1) var(--ease);
   }
-  .p-speed:hover { color: var(--fg); background: var(--hover-2); }
+  .p-speed:hover:not(:disabled) { color: var(--fg); background: var(--hover-2); }
   .p-speed[aria-expanded="true"] { color: var(--fg); background: var(--hover-2); }
-  .p-speed.on { color: var(--accent); }
+  .p-speed.on, .p-speed.on:hover:not(:disabled) { color: var(--accent); }
   .p-speed.on::after {
     content: ""; position: absolute; bottom: 1px; left: 50%; margin-left: -1.5px;
     width: 3px; height: 3px; border-radius: 50%; background: var(--accent);
@@ -1101,7 +1101,7 @@
       color var(--d1) var(--ease),
       background var(--d1) var(--ease);
   }
-  .p-saved-row:hover {
+  .p-saved-row:hover:not(:disabled) {
     background: rgba(255, 255, 255, 0.08);
     color: var(--fg);
   }
@@ -1129,7 +1129,7 @@
 
   .p-saved-sep { height: 1px; margin: var(--s2) 0 var(--s1); background: rgba(255, 255, 255, 0.08); }
   .p-saved-row.p-saved-remove { color: var(--fg-2); }
-  .p-saved-row.p-saved-remove:hover { color: var(--fg); }
+  .p-saved-row.p-saved-remove:hover:not(:disabled) { color: var(--fg); }
 
   .p-seek-slider {
     position: relative;

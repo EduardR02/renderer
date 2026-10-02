@@ -767,7 +767,7 @@
         {:else}<p class="empty-range">No loop. Use Add loop or press L to create one.</p>{/if}
       </section>
 
-      {#if playlistId}<label class="enable-row"><input class="enable-check" type="checkbox" checked={enabled} disabled={!ready || saving || !definitionExists} onchange={(event) => setEnabled(event.currentTarget.checked)} /><span><strong>Use edited version in this playlist</strong><small>Other playlists play the original.</small></span></label>{/if}
+      {#if playlistId}<label class="enable-row"><input class="set-check enable-check" type="checkbox" checked={enabled} disabled={!ready || saving || !definitionExists} onchange={(event) => setEnabled(event.currentTarget.checked)} /><span><strong>Use edited version in this playlist</strong><small>Other playlists play the original.</small></span></label>{/if}
       {#if actionError}<p class="edit-error" role="alert">{actionError}</p>{/if}
       {#if validation.firstError}<p class="edit-error" role="alert">Fix the highlighted range before saving.</p>{/if}
       <footer class="edit-footer">
@@ -939,11 +939,10 @@
 .enable-row span { display: grid; gap: 2px; }
 .enable-row strong { font-weight: var(--w-semi); }
 .enable-row small { color: var(--fg-2); font-size: var(--t-11); }
-.enable-check {
-  width: 16px; height: 16px; margin: 2px 0 0; flex: none;
-  accent-color: var(--accent); cursor: pointer;
-}
-.enable-check:disabled { cursor: default; }
+/* The app's one checkbox (.set-check, in the markup), on the title's line.
+   Gated, the whole row steps back, so the box does not dim a second time. */
+.enable-check { margin-top: 1px; flex: none; }
+.enable-check:disabled { opacity: 1; }
 .edit-error { margin: 0 var(--s6) var(--s3); color: var(--love); font-size: var(--t-12); }
 .edit-footer {
   position: sticky; z-index: 8; bottom: 0; display: flex; align-items: center;

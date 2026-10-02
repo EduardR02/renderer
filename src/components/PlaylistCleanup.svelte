@@ -665,6 +665,7 @@
                            because the row's own text is not part of a label. -->
                       <td class="cleanup-keep">
                         <input
+                          class="set-check"
                           type="checkbox"
                           checked={!row.kept}
                           disabled={locked}
@@ -959,26 +960,9 @@
      at the dialog's own text edge, ahead of the row number. */
   .cleanup-col-keep { width: 28px; }
 
-  /* The app's one checkbox, borrowed whole from Settings (.set-check): an
-     appearance-none plate the tokens can reach, which is the only reason a
-     native control belongs on this sheet. */
-  .cleanup-keep input {
-    appearance: none;
-    display: grid; place-items: center;
-    width: 16px; height: 16px; margin: 0;
-    border: 1px solid var(--line-2); border-radius: var(--r1);
-    background: var(--raise-1); cursor: pointer;
-    transition: background-color var(--d1) var(--ease), border-color var(--d1) var(--ease);
-  }
-  .cleanup-keep input:hover:enabled { border-color: var(--fg-3); }
-  .cleanup-keep input:checked { background: var(--accent); border-color: var(--accent); }
-  .cleanup-keep input:checked::before {
-    content: "";
-    width: 10px; height: 10px;
-    background: var(--accent-ink);
-    clip-path: polygon(13% 50%, 0 63%, 37% 100%, 100% 16%, 87% 3%, 37% 72%);
-  }
-  .cleanup-keep input:disabled { cursor: default; opacity: 0.45; }
+  /* The app's one checkbox (.set-check, in the markup), a step smaller to
+     sit in a table row. */
+  .cleanup-keep .set-check { width: 16px; height: 16px; }
   /* A column head sits over its values, and both of these are right-aligned.
      The first one is the tick head, which holds only screen-reader text. */
   .cleanup-results th:first-child, .cleanup-results th:last-child { text-align: right; }

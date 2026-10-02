@@ -923,8 +923,10 @@ const mock = {
         return null;
       }
       case "personal_api_devices":
+        if (!settings.devices_enabled) throw new Error("Spotify devices are turned off in Settings");
         return clone(outputDevices);
       case "select_output": {
+        if (args.deviceId && !settings.devices_enabled) throw new Error("Spotify devices are turned off in Settings");
         const device = args.deviceId ? outputDevices.find((device) => device.id === args.deviceId) : null;
         if (args.deviceId && (!device || device.is_restricted || !personalStatus.devices_authorized)) {
           throw new Error("Spotify device is unavailable or unauthorized");
@@ -1001,6 +1003,16 @@ const mock = {
         settings.animated_canvas = Boolean(args.enabled ?? args.value);
         emit("settings", clone(settings));
         return null;
+      /* As the shell does: off brings playback on a device back here, paused. */
+      case "set_devices_enabled":
+        settings.devices_enabled = Boolean(args.enabled);
+        if (!settings.devices_enabled && playback.output_device_id) {
+          playback.output_device_id = "";
+          playback.output_device_name = "";
+          playback.playing = false;
+          emitState();
+        }
+        return clone(settings);
       /* The fixture account already has Canvas on: nothing to write. */
       case "enable_account_canvas":
         return false;
@@ -1276,7 +1288,7 @@ window.__TAURI_INTERNALS__ = {
   },
 };
 
-const settings = { animated_canvas: true };
+const settings = { animated_canvas: true, devices_enabled: true };
 window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
   unregisterListener: (event, eventId, handlerId) => unregisterListener(event, eventId, handlerId),
 };

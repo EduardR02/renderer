@@ -219,7 +219,7 @@ export function setNowPlayingOpen(open) {
 }
 
 /** The single settings snapshot, hydrated by bootstrap and mutation replies. */
-export const appSettings = $state({ animated_canvas: true });
+export const appSettings = $state({ animated_canvas: true, devices_enabled: true });
 export const settingsState = $state({ loaded: false });
 
 /**
@@ -2365,6 +2365,10 @@ export const api = {
   setStartMinimized: (enabled) => mutateAppSettings("set_start_minimized", { enabled: !!enabled }),
   setAnimatedCanvas: (enabled) =>
     mutateAppSettings("set_animated_canvas", { enabled: !!enabled }),
+  /* Spotify devices on or off, locally; off brings playback on a device back
+     here, paused, first. */
+  setDevicesEnabled: (enabled) =>
+    mutateAppSettings("set_devices_enabled", { enabled: !!enabled }),
   /* Canvas is an account preference on Spotify's side; this turns it on there
      when it is off. Resolves to whether anything was written. */
   enableAccountCanvas: () => invoke("enable_account_canvas"),

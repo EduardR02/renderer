@@ -878,7 +878,12 @@ pub async fn personal_api_saved_shows(
 }
 
 #[tauri::command]
-pub async fn personal_api_devices(app: AppHandle, personal: State<'_, Arc<PersonalApi>>) -> Result<Vec<PersonalDevice>, String> {
+pub async fn personal_api_devices(
+    app: AppHandle,
+    personal: State<'_, Arc<PersonalApi>>,
+    router: State<'_, Arc<PlaybackRouter>>,
+) -> Result<Vec<PersonalDevice>, String> {
+    if !router.devices_enabled() { return Err("Spotify devices are turned off in Settings".to_owned()); }
     personal.devices(&app).await
 }
 
@@ -1086,6 +1091,20 @@ pub fn set_start_minimized(enabled: bool) -> Result<AppSettings, String> {
 #[tauri::command]
 pub fn set_animated_canvas(enabled: bool) -> Result<AppSettings, String> {
     update_app_settings(|settings| settings.animated_canvas = enabled)
+}
+
+/// Spotify devices on or off, locally: the grant stays. Saved first, so a
+/// failed write changes nothing; then the router follows, and off brings
+/// playback on a device back here, paused, before it goes quiet.
+#[tauri::command]
+pub async fn set_devices_enabled(
+    app: AppHandle,
+    router: State<'_, Arc<PlaybackRouter>>,
+    enabled: bool,
+) -> Result<AppSettings, String> {
+    let settings = update_app_settings(|settings| settings.devices_enabled = enabled)?;
+    router.set_devices_enabled(&app, enabled).await;
+    Ok(settings)
 }
 
 /// File count and total bytes of the audio cache and the cover cache.

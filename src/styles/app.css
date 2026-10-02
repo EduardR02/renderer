@@ -23,10 +23,10 @@
   --bg-0:   #080808;  /* window ground: gutters only                     */
   --bg-nav: #0e0e0e;  /* CHROME: sidebar, player bar, now-playing rail   */
   --bg-1:   #121212;  /* CONTENT: the pane, the brightest large plane    */
-  /* A modal is lifted by its border and its shadow, not by luminance: at a
-     raised grey it became the brightest thing on screen and read as a card. */
+  /* Every popup where glass is refused. Lifted by its border and its shadow,
+     not by luminance: at a raised grey it read as a card. */
   --bg-sheet: #131313;
-  --bg-2:   #1c1c1c;  /* raised: menus, inputs, chips, skeletons         */
+  --bg-2:   #1c1c1c;  /* raised: a cover's fallback box, skeletons      */
   --bg-3:   #242424;  /* hover                                           */
   --bg-4:   #2e2e2e;  /* pressed / selected                              */
 
@@ -288,13 +288,23 @@
      frost's brightness() does the darkening and the tint stays thin, so
      the glass takes its colour from what is really behind it rather than
      from paint; glass.test.js holds the type over white frosted by it.
+
+     THE OVERLAY — every popup: menus and submenus, the device list, Saved
+     in, the speed menu, listboxes, tooltips, dialogs. A plain brightness()
+     has to take white down to a grey the type can stand on, and it takes
+     everything else down by the same factor: at 0.24 the pane under a menu
+     went to black and the menu read as an opaque dark card. So the overlay
+     frost is a CEILING instead of a dimmer. The chain clamps between its
+     steps, and a gain past 1 followed by its cut is `min(0.7 × colour,
+     0.2)` per channel: what is dark behind a popup — the pane, the haze,
+     the rows — shows through at most of its own light and in its own
+     colour, softly; only what is brighter than the ceiling (a white cover,
+     a bright Canvas frame) is held at it. The type is held against that
+     ceiling, never against the typical frame (glass.test.js).
      ===================================================================== */
   --frost-plane:   blur(12px) saturate(1.45) brightness(0.7);
   --frost-strip:   blur(20px) saturate(1.7) brightness(0.9);
-  --frost-overlay: blur(32px) saturate(1.8) brightness(0.24);
-  /* A modal sheet frosts its own dimmed page (--dim-modal), never bare
-     content, so it can be much thinner glass than a menu. */
-  --frost-sheet:   blur(28px) saturate(1.6) brightness(0.7);
+  --frost-overlay: blur(20px) saturate(1.8) brightness(3.5) brightness(0.2);
   /* The details over the Canvas: re-frosted every frame of the video. */
   --frost-video:   blur(32px) saturate(1.6) brightness(0.21);
   /* Small: a plate sits over a playing video and is re-frosted every frame. */
@@ -302,13 +312,13 @@
   --tint-chrome:   rgb(10 11 14 / 0.36);
   --tint-pane:     rgb(11 12 15 / 0.38);
   --tint-strip:    rgb(13 14 17 / 0.62);
-  /* Light, not shade: the frost has already darkened what is behind, and a
-     thin grey over it is what lifts a menu off the dark pane as a pane of
-     its own rather than a hole in it. */
-  --tint-overlay:  rgb(36 38 44 / 0.22);
-  --tint-sheet:    rgb(19 20 24 / 0.5);
+  /* Light, not shade: the ceiling has already held what is bright, and a
+     breath of light over it is what lifts a popup off the dark pane as a
+     pane of its own rather than a hole in it. */
+  --tint-overlay:  rgb(255 255 255 / 0.03);
   --tint-video:    rgb(10 11 14 / 0.18);
-  --dim-modal:     rgb(4 5 7 / 0.5);
+  /* A modal's page steps back under it; the sheet frosts that page. */
+  --dim-modal:     rgb(4 5 7 / 0.36);
   /* A plate over the Canvas thickens with the brightness under it
      (NowPlayingPanel sets --plate-a); this is its floor. */
   --tint-plate:    rgb(9 9 11 / var(--plate-a, 0.42));
@@ -458,35 +468,35 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   box-shadow: var(--lift-raised);
 }
 /* An overlay is the planes' glass lifted off them: the same sheen and rim,
-   over a frost of whatever it floats on. That can be a white cover, so the
-   frost is a heavy one that darkens as it blurs (--frost-overlay), and its
-   colour is the colour of what is really behind it — the pane, the rows,
-   the haze through them — not a tone painted into it. */
+   over a live frost of whatever it floats on, which keeps that thing's own
+   light and colour up to the overlay's ceiling (--frost-overlay, GLASS). It
+   is every popup in the app and there is no second, opaque popup surface.
+   A hairline all the way round, under the rim, keeps the edge where the
+   rim fades and the frost behind it is as light as the glass. The frost
+   costs only while a popup is open: a closed one is not rendered, or not
+   painted. */
 .glass-overlay {
   background: var(--glass-sheen), var(--tint-overlay);
   -webkit-backdrop-filter: var(--frost-overlay);
           backdrop-filter: var(--frost-overlay);
-  box-shadow: var(--lift-overlay);
+  box-shadow: var(--lift-overlay), inset 0 0 0 1px rgb(255 255 255 / 0.05);
   color: var(--fg);
 }
-/* A modal overlay is a SHEET: it lies over its own dimmed page, so the
-   worst it can frost is white at half strength, and it is thinner glass
-   than a menu, which can land on a white cover. The dim is only half: a
-   sheet of glass over a page gone black is a dark card. */
-/* The sheet's frost is a layer UNDER its content, not a filter on the
-   sheet: a sheet that carried the backdrop-filter itself was a backdrop
+/* A modal overlay is the same glass over its own page, stepped back by a
+   light dim. Its frost is a layer UNDER its content, not a filter on the
+   dialog: a dialog that carried the backdrop-filter itself was a backdrop
    root for everything in it, and an overlay inside it (a select's list,
    the cleanup's suggestions) could no longer blur — the sheet's own text
-   read crisply through it. So the sheet is bare, and its ::after is the
-   frost, tint and sheen, exactly as they were. (A modal's ::after is the
-   material's; a sheet's own accents live on its content.) */
+   read crisply through it. So the dialog is bare, and its ::after is the
+   frost, tint and sheen. (A modal's ::after is the material's; a sheet's
+   own accents live on its content.) */
 .glass-overlay:modal { background: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
 .glass-overlay:modal::after {
   content: ""; position: absolute; inset: 0; z-index: -1;
   border-radius: inherit; pointer-events: none;
-  background: var(--glass-sheen), var(--tint-sheet);
-  -webkit-backdrop-filter: var(--frost-sheet);
-          backdrop-filter: var(--frost-sheet);
+  background: var(--glass-sheen), var(--tint-overlay);
+  -webkit-backdrop-filter: var(--frost-overlay);
+          backdrop-filter: var(--frost-overlay);
 }
 .glass-overlay:modal::backdrop { background: var(--dim-modal); }
 .glass-plate {
@@ -2386,9 +2396,11 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .menu-item .hint { margin-left: auto; flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--fg-2); }
 .menu-item.danger { color: var(--danger); }
 /* A copy that landed takes the colour this app has for a thing you just did;
-   a refused one takes the failure colour, so the two never read alike. */
-.menu-item.done { color: var(--accent); }
-.menu-item.failed { color: var(--love); }
+   a refused one takes the failure colour, so the two never read alike. The
+   pointer is still on the item when it lands, so the state outranks the
+   hover — under the plain hover rule "Link copied" came up white. */
+.menu-item.done, .menu-item.done:is(:hover, :focus-visible) { color: var(--accent); }
+.menu-item.failed, .menu-item.failed:is(:hover, :focus-visible) { color: var(--love); }
 /* An action menu leads every item with its glyph, 16px in --fg-3, in one
    column: the labels line up, and the eye finds an item by its shape before
    it reads the word. The glyph comes up with its label under the pointer or
@@ -2400,7 +2412,8 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 .menu-item:hover:not(:disabled) > .icon:first-child,
 .menu-item:focus-visible > .icon:first-child,
 .menu-item:is(.danger, .done, .failed) > .icon:first-child { color: inherit; }
-.menu-item.liked > .icon:first-child { color: var(--rose-ink); }
+.menu-item.liked > .icon:first-child,
+.menu-item.liked:is(:hover, :focus-visible) > .icon:first-child { color: var(--rose-ink); }
 .menu-item[aria-busy="true"] > .icon:first-child { opacity: 0.45; }
 /* A state on an item — a chosen order, an active device — and the chevron
    of an item that opens a submenu sit at the item's far end, in a fixed
@@ -2778,10 +2791,17 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
    block is a block beside a block, and centring is what makes those a pair. */
 .set-ctl:has(> .set-check) { align-self: start; min-height: calc(var(--t-13) * 1.45); }
 
-/* The drawn checkbox, shared by Settings and any other boolean row: a raised
-   field at rest, the foam fill with the ink glyph when checked. 18px box,
-   hit target widened by the row's own label — the control is small
-   on purpose, but never smaller than a pointer can land on. */
+/* THE checkbox — every boolean in the app (Settings, the cleanup sheet's
+   ticks, the track editor's "use edited version"): a raised field at rest,
+   the foam fill with the ink glyph when checked. 18px box, hit target
+   widened by the row's own label — the control is small on purpose, but
+   never smaller than a pointer can land on.
+
+   Each state owns its own hover. A single `:hover` rule painted the
+   unchecked field over BOTH states, and it outranked `:checked` (three
+   simple selectors to two), so under the pointer every box read as off: a
+   click that turned one on looked like it did nothing. Hover now only
+   brightens the state the box is really in. */
 .set-check {
   appearance: none;
   display: grid; place-items: center;
@@ -2792,11 +2812,12 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   cursor: pointer;
   transition: background-color var(--d1) var(--ease), border-color var(--d1) var(--ease);
 }
-.set-check:hover:enabled { border-color: var(--fg-3); background: var(--raise-2); }
+.set-check:not(:checked):hover:enabled { border-color: var(--fg-3); background: var(--raise-2); }
 .set-check:checked {
   background: var(--accent);
   border-color: var(--accent);
 }
+.set-check:checked:hover:enabled { background: var(--accent-hi); border-color: var(--accent-hi); }
 .set-check:checked::before {
   content: "";
   width: 10px; height: 10px;
@@ -2825,12 +2846,13 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.17);
 }
 .sel-btn:hover:not(:disabled) .icon { color: var(--fg-1); }
-.sel-btn.open {
+/* Open outranks the hover: the pointer is on the trigger when the list
+   opens, and the plain hover rule took its foam ring and chevron away. */
+.sel-btn.open, .sel-btn.open:hover:not(:disabled) {
   background: var(--raise-2); color: var(--fg);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foam) 52%, transparent);
 }
-
-.sel-btn.open .icon { color: var(--accent); }
+.sel-btn.open .icon, .sel-btn.open:hover:not(:disabled) .icon { color: var(--accent); }
 .sel-btn:disabled { opacity: 0.45; }
 .sel-value { font-family: var(--font-number); font-variant-numeric: tabular-nums; }
 
@@ -3216,9 +3238,9 @@ img { -webkit-user-drag: none; display: block; max-width: 100%; }
 @media (prefers-reduced-transparency: reduce) {
   :root {
     --tint-chrome: var(--bg-nav); --tint-pane: var(--bg-1); --tint-strip: var(--bg-1);
-    --tint-overlay: var(--bg-sheet); --tint-sheet: var(--bg-sheet); --tint-plate: rgb(9 9 11 / 0.8);
+    --tint-overlay: var(--bg-sheet); --tint-plate: rgb(9 9 11 / 0.8);
     --tint-active: transparent; --tint-video: var(--bg-nav);
-    --frost-plane: none; --frost-strip: none; --frost-overlay: none; --frost-sheet: none;
+    --frost-plane: none; --frost-strip: none; --frost-overlay: none;
     --frost-video: none; --frost-plate: none;
   }
   .topbar, .tl-head { background: var(--bg-1); }

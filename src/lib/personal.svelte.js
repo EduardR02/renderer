@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { session, sessionEpoch, playback, lookupSavedIn, artistFollowChanged } from "./state.svelte.js";
+import { session, sessionEpoch, playback, lookupSavedIn, artistFollowChanged, appSettings } from "./state.svelte.js";
 
 /*
  * The personal Spotify app: the owner's own developer app for the same
@@ -82,6 +82,17 @@ export async function disconnectPersonal() {
 /** Device control is its own grant on the same app, asked for once. */
 export function personalDevicesAuthorized() {
   return personalConnected() && !!personal.status?.devices_authorized;
+}
+
+/** Devices turned on in Settings. Off is local: the grant stays, so on again
+    is instant, and while off nothing device-related runs at all. */
+export function devicesEnabled() {
+  return appSettings.devices_enabled !== false;
+}
+
+/** The player bar offers devices: granted, and turned on. */
+export function personalDevicesActive() {
+  return personalDevicesAuthorized() && devicesEnabled();
 }
 
 

@@ -19,8 +19,8 @@
 import { READ_COMMANDS } from "./real-commands.js";
 
 /** Handled by the fixture backend, because they only move local state that
-    real data survives: events, the simulated transport, the canvas setting,
-    and the session screens. */
+    real data survives: events, the simulated transport, the canvas and
+    devices settings, and the session screens. */
 const LOCAL_MOCK = new Set([
   "plugin:event|listen",
   "plugin:event|unlisten",
@@ -38,6 +38,7 @@ const LOCAL_MOCK = new Set([
   "move_queue",
   "clear_queue",
   "set_animated_canvas",
+  "set_devices_enabled",
   "enable_account_canvas",
   "login",
   "logout",

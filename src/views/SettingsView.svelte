@@ -75,6 +75,7 @@
     launchAtLogin: "",
     startMinimized: "",
     animatedCanvas: "",
+    devices: "",
   });
 
   const CACHE_LIMITS = [
@@ -190,6 +191,24 @@
       },
       "Could not update animated Canvas.",
     );
+  }
+
+  /* Off is local: the grant stays, so on again is instant. Playback on a
+     device comes back here, paused, before the devices go quiet. */
+  function updateDevices(enabled) {
+    return updateSetting(
+      "devices",
+      enabled,
+      () => api.setDevicesEnabled(enabled),
+      "Could not update device access.",
+    );
+  }
+
+  /* Asking for the grant is asking for devices: one turned off earlier
+     comes back on with it. */
+  async function allowDevices() {
+    await authorizePersonal(true);
+    if (appSettings.devices_enabled === false) await api.setDevicesEnabled(true);
   }
 
   function updateNormalisation(enabled) {
@@ -351,13 +370,26 @@
         <div class="set-row">
           <div>
             <div class="k">Device access</div>
-            <div class="d">Lets the player bar play on your other Spotify devices: a phone, a speaker, another Spotify app.</div>
+            <div class="d">
+              Lets the player bar play on your other Spotify devices: a phone, a speaker, another
+              Spotify app.
+              {#if personalDevicesAuthorized()}Off hides them and stops every device check; Spotify
+                keeps the permission, so turning it back on is instant.{/if}
+            </div>
+            {#if settingErrors.devices}<div class="inline-error" role="alert">{settingErrors.devices}</div>{/if}
           </div>
           <div class="set-ctl">
             {#if personalDevicesAuthorized()}
-              <span class="v status ok"><span class="status-dot"></span>Allowed</span>
+              <input
+                class="set-check"
+                type="checkbox"
+                aria-label="Device access"
+                checked={requestedSettings.devices ?? appSettings?.devices_enabled ?? true}
+                disabled={!settingsState.loaded || !!settingBusy}
+                onchange={(event) => updateDevices(event.currentTarget.checked)}
+              />
             {:else}
-              <button class="pill accent" disabled={personalBusy || personal.status?.authorization_pending} onclick={() => personalAction(() => authorizePersonal(true))}>Allow</button>
+              <button class="pill accent" disabled={personalBusy || personal.status?.authorization_pending} onclick={() => personalAction(allowDevices)}>Allow</button>
             {/if}
           </div>
         </div>

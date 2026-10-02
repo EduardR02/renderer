@@ -27,6 +27,7 @@
   import Ambient from "./components/Ambient.svelte";
   import { scrollbar } from "./lib/scrollbar.js";
   import { frost } from "./lib/ambient.svelte.js";
+  import { devicesEnabled } from "./lib/personal.svelte.js";
   import { vuMeterStyle } from "./lib/vu-meter.js";
   import LibraryView from "./views/LibraryView.svelte";
   import MadeForYouView from "./views/MadeForYouView.svelte";
@@ -259,24 +260,31 @@
      client burns CPU at idle — so gate it on focus as well as on playback.
      A class beats a JS ticker: the compositor stops on its own and nothing
      re-enters the main thread. */
-  /* The same signal paces a Spotify device: the shell reads one regularly only
-     while the window can be seen, and focus reads it at once. The mount call
-     covers a window that starts minimized. */
   $effect(() => {
     ui.windowFocused = document.hasFocus();
-    const visibility = () => api.setWindowVisible(!document.hidden).catch(() => {});
-    const on = () => {
-      ui.windowFocused = true;
-      api.setWindowVisible(true, true).catch(() => {});
-    };
+    const on = () => (ui.windowFocused = true);
     const off = () => (ui.windowFocused = false);
-    visibility();
     window.addEventListener("focus", on);
     window.addEventListener("blur", off);
-    document.addEventListener("visibilitychange", visibility);
     return () => {
       window.removeEventListener("focus", on);
       window.removeEventListener("blur", off);
+    };
+  });
+
+  /* The same signal paces a Spotify device: the shell reads one regularly only
+     while the window can be seen, and focus reads it at once. The first call
+     covers a window that starts minimized, and brings the shell up to date
+     when devices are turned back on. With devices off nothing listens. */
+  $effect(() => {
+    if (!devicesEnabled()) return;
+    const visibility = () => api.setWindowVisible(!document.hidden).catch(() => {});
+    const focus = () => api.setWindowVisible(true, true).catch(() => {});
+    visibility();
+    window.addEventListener("focus", focus);
+    document.addEventListener("visibilitychange", visibility);
+    return () => {
+      window.removeEventListener("focus", focus);
       document.removeEventListener("visibilitychange", visibility);
     };
   });

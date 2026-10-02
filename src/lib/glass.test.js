@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { CEILING, parseFrost } from "./haze.js";
+import { CEILING, parseFrost, saturateMatrix } from "./haze.js";
 
 /* THE GLASS against the haze's ceiling (app.css, GLASS; haze.js, CEILING).
 
@@ -162,14 +162,49 @@ function holds(surface, grounds) {
    it white). */
 const frostedWhite = (name) => [1, 1, 1].map((v) => v * parseFrost(token(name), 1).brightness);
 
-test("overlays keep their contrast over a white cover", () => {
+/* A filter chain's colour steps exactly as CSS runs them: in order, on
+   encoded values, each clamped to [0, 1]. The blur only averages colours,
+   so it can bring nothing outside the gamut; every step after it is here. */
+const chain = (value) => [...value.matchAll(/(saturate|brightness)\(\s*([\d.]+)\s*\)/g)]
+  .map(([, fn, amount]) => [fn, Number(amount)]);
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+function through(rgb, steps) {
+  let c = rgb;
+  for (const [fn, amount] of steps) {
+    if (fn === "brightness") c = c.map((v) => clamp01(v * amount));
+    else {
+      const m = saturateMatrix(amount);
+      c = [0, 1, 2].map((i) => clamp01(m[i * 3] * c[0] + m[i * 3 + 1] * c[1] + m[i * 3 + 2] * c[2]));
+    }
+  }
+  return c;
+}
+/** The brightest any colour at all can come out of `steps`. */
+function brightestThrough(steps) {
+  let worst = [0, 0, 0], wy = -1;
+  const N = 31;
+  for (let i = 0; i <= N; i++) for (let j = 0; j <= N; j++) for (let q = 0; q <= N; q++) {
+    const f = through([i / N, j / N, q / N], steps);
+    const y = Y(f);
+    if (y > wy) {
+      wy = y;
+      worst = f;
+    }
+  }
+  return worst;
+}
+
+test("popups keep their contrast over anything, a white cover included", () => {
+  const steps = chain(token("--frost-overlay"));
   const tint = rgba(token("--tint-overlay"));
-  const base = over(frostedWhite("--frost-overlay"), tint.rgb, tint.a);
-  // The material as .glass-overlay paints it: the sheen over the tint over
-  // the frost, and nothing else.
-  const body = rule(".glass-overlay").replace(/\s+/g, " ");
-  expect(body).toContain("background: var(--glass-sheen), var(--tint-overlay);");
-  expect(body).toContain("backdrop-filter: var(--frost-overlay);");
+  const base = over(brightestThrough(steps), tint.rgb, tint.a);
+  // The material as .glass-overlay paints it — the sheen over the tint over
+  // the frost — and a modal's ::after, which is the same glass.
+  for (const selector of [".glass-overlay", ".glass-overlay:modal::after"]) {
+    const body = rule(selector).replace(/\s+/g, " ");
+    expect(body).toContain("background: var(--glass-sheen), var(--tint-overlay);");
+    expect(body).toContain("backdrop-filter: var(--frost-overlay);");
+  }
   const sheened = over(base, [1, 1, 1], sheenOf());
   holds("an overlay", [["centre", base], ["sheen", sheened]]);
   // A lit item (menus, the speed presets, the listbox, the saved-in rows) is
@@ -180,6 +215,17 @@ test("overlays keep their contrast over a white cover", () => {
     if (c < 7) throw new Error(`--fg on a lit item, ${where}: ${c.toFixed(2)} under 7`);
     expect(c).toBeGreaterThanOrEqual(7);
   }
+});
+
+test("a popup shows what is behind it rather than going opaque", () => {
+  // The dark the pane and its rows are made of comes through at most of its
+  // own light and keeps its hue; a plain dimmer that held white down took
+  // it to black, which is what read as an opaque card.
+  const steps = chain(token("--frost-overlay"));
+  const pane = [0.12, 0.13, 0.16];
+  const seen = through(pane, steps);
+  for (let c = 0; c < 3; c++) expect(seen[c]).toBeGreaterThanOrEqual(pane[c] * 0.6);
+  expect(seen[2] - seen[0]).toBeGreaterThan(pane[2] - pane[0]);
 });
 
 test("the now-playing details keep their contrast over a white frame of the Canvas", () => {
@@ -204,19 +250,6 @@ test("the now-playing details keep their contrast over a white frame of the Canv
     ["card", over(over(glass, lift.rgb, lift.a), [1, 1, 1], sheenOf())],
     ["hovered card", over(over(glass, hover.rgb, hover.a), [1, 1, 1], sheenOf())],
   ]);
-});
-
-test("a modal sheet keeps its contrast over its own dimmed page", () => {
-  const frost = parseFrost(token("--frost-sheet"), 1);
-  const dim = rgba(token("--dim-modal"));
-  const page = over([1, 1, 1], dim.rgb, dim.a).map((v) => v * frost.brightness);
-  const tint = rgba(token("--tint-sheet"));
-  const bg = over(over(page, tint.rgb, tint.a), [1, 1, 1], sheenOf());
-  for (const [name, target] of Object.entries({ "--fg": 7, "--fg-2": 4.5, "--fg-3": 3 })) {
-    const c = contrast(hex(token(name)), bg);
-    if (c < target) throw new Error(`${name} on a sheet: ${c.toFixed(2)} under ${target}`);
-    expect(c).toBeGreaterThanOrEqual(target);
-  }
 });
 
 test("the button tier and the field keep their type legible on the planes", () => {

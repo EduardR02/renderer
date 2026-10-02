@@ -43,6 +43,10 @@ pub struct AppSettings {
     pub normalisation: bool,
     /// User-owned Spotify developer app ID, never an app secret.
     pub personal_client_id: String,
+    /// Spotify Connect devices from the player bar. Off is local only: the
+    /// grant is kept, so on again needs no new authorisation; while off no
+    /// device work runs at all.
+    pub devices_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -54,6 +58,7 @@ impl Default for AppSettings {
             animated_canvas: true,
             normalisation: false,
             personal_client_id: String::new(),
+            devices_enabled: true,
         }
     }
 }
@@ -1244,16 +1249,19 @@ mod tests {
         assert!(!settings.launch_at_login);
         assert!(!settings.start_minimized);
         assert!(!settings.normalisation, "normalisation defaults to off");
+        assert!(settings.devices_enabled, "devices stay on until turned off");
 
         let mut saved = AppSettings::default();
         saved.launch_at_login = true;
         saved.start_minimized = true;
         saved.normalisation = true;
+        saved.devices_enabled = false;
         let round_trip: AppSettings =
             serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
         assert!(round_trip.launch_at_login);
         assert!(round_trip.start_minimized);
         assert!(round_trip.normalisation);
+        assert!(!round_trip.devices_enabled);
     }
 
     fn membership(id: &str, revision: &str, uris: &[&str]) -> MembershipEntry {
